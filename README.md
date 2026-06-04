@@ -49,14 +49,14 @@ Everything updates live across clients via Supabase Realtime.
 
 - **Frontend** — React + Vite + TailwindCSS. `App.tsx` always renders `DashboardApp.tsx`. An unauthenticated visitor gets the login screen or the optional public org page.
 - **Backend** — an Express server (`server.ts`). All mutations go through a single `POST /api/services` RPC endpoint dispatched in `api/services.ts`; reads go through `GET /api/query`. The server runs under the Supabase service-role key, so the **server is the security boundary** (permission map + per-resource authz), not per-row tenant scoping.
-- **Database** — Supabase (PostgreSQL + Auth + Realtime). RLS stays enabled deny-by-default so a leaked anon/auth key reads nothing.
+- **Database** — Supabase (PostgreSQL + Realtime). RLS stays enabled deny-by-default so a leaked anon/auth key reads nothing.
 - **Auth** — Discord OAuth. On first boot the server seeds defaults and prints a one-time **admin setup code** to its console; the first Discord login that supplies that code becomes Admin. Subsequent users self-register at the default role and are promoted by an admin.
 
 ## 🚀 Quick Start
 
 > The full walkthrough — Supabase project, Discord app, environment variables, reverse proxy — lives in [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md).
 
-1. **Database** — in the Supabase SQL Editor, optionally run `reset_db.sql`, then run `schema.sql` (the consolidated single-org schema). Enable the Discord auth provider.
+1. **Database** — in the Supabase SQL Editor, optionally run `reset_db.sql`, then run `schema.sql` (the consolidated single-org schema).
 2. **Configure** — copy `.env.example` to `.env` and fill in your Supabase URL + service-role key, `JWT_SECRET`, `SECRETS_ENCRYPTION_KEY`, and Discord credentials (LiveKit / Gemini / UEX keys are optional).
 3. **Install & build**
    ```bash
@@ -79,7 +79,7 @@ npx tsc --noEmit  # type-check only
 ## 🧰 Tech Stack
 
 - **Frontend**: React, Vite, TailwindCSS, TipTap, Konva, Recharts
-- **Backend/Database**: Supabase (PostgreSQL, Auth, Realtime), Express
+- **Backend/Database**: Supabase (PostgreSQL, Realtime), Express
 - **Realtime voice**: LiveKit
 - **Deployment**: Coolify / Nixpacks on a VPS (any Node host works)
 
