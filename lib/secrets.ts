@@ -43,9 +43,8 @@ export async function getOrgSecret(key: string): Promise<string | null> {
             secretValue = decryptedKey || ai.apiKey;
         }
 
-        // Settings value wins; otherwise fall back to the .env config (the
-        // canonical secret source for a self-hosted single-org deployment).
-        return secretValue || process.env[key] || null;
+        // Env vars win; the DB/admin-console value is only a fallback.
+        return process.env[key] || secretValue || null;
 
     } catch (e) {
         log.error('secret fetch failed', { key, err: e });

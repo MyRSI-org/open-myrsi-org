@@ -26,7 +26,8 @@ function requesterFromUser(currentUser: any): RequesterContext | null {
 // paths still receive the full config.
 function bootDiscordConfig(discordConfig: unknown): { clientId: string | undefined } {
     const clientId = (discordConfig as { clientId?: string } | null | undefined)?.clientId;
-    return { clientId: clientId || process.env.DISCORD_CLIENT_ID };
+    // Env var wins over the DB value.
+    return { clientId: process.env.DISCORD_CLIENT_ID || clientId };
 }
 
 // A logged-out visitor's boot payload carries ONLY what the login /
@@ -471,7 +472,8 @@ async function handleInitialState(req: Request, res: Response) {
             realtimeToken: signRealtimeToken(currentUser.id),
             ...state,
             platformSettings,
-            discordConfig: { clientId: state.discordConfig?.clientId || process.env.DISCORD_CLIENT_ID, ...state.discordConfig },
+            // clientId after the spread so the env var wins over the DB value.
+            discordConfig: { ...state.discordConfig, clientId: process.env.DISCORD_CLIENT_ID || state.discordConfig?.clientId },
         }));
     } catch (e: any) {
         log.error('failed to fetch full state', { err: e });
@@ -779,9 +781,10 @@ async function handleState(req: Request, res: Response) {
         const responseBody: Record<string, unknown> = { ...(state as Record<string, unknown>) };
         const stateDiscord = (state as { discordConfig?: DiscordConfig } | null)?.discordConfig;
         if (stateDiscord !== undefined) {
+            // clientId after the spread so the env var wins over the DB value.
             responseBody.discordConfig = {
-                clientId: stateDiscord?.clientId || process.env.DISCORD_CLIENT_ID,
                 ...stateDiscord,
+                clientId: process.env.DISCORD_CLIENT_ID || stateDiscord?.clientId,
             };
         }
         return res.status(200).json(stripSecrets(responseBody));
