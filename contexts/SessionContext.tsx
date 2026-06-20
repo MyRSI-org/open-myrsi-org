@@ -27,7 +27,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { debugLog } from '../lib/debugLog';
-import { isValidOAuthState } from '../lib/oauthState';
+import { isValidOAuthState, oauthStateForServer } from '../lib/oauthState';
 import { User, UserRole } from '../types';
 import { useData } from './DataContext';
 import { useDataCore } from './DataCoreContext';
@@ -318,12 +318,12 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                     return;
                 }
 
-                // Strip nonce from state before sending to server (server only needs the claim key part)
-                let state: string | null = null;
-                if (rawState && rawState.startsWith('admin_setup:')) {
-                    const claimKey = rawState.split(':')[1]; // may be empty string
-                    state = claimKey ? `admin_setup:${claimKey}` : null;
-                }
+                // Forward the callback state verbatim. The server reads both the
+                // CSRF nonce (last `:`-segment, matched against its HttpOnly cookie)
+                // and the admin claim key (middle segment) out of it, so reshaping
+                // it here desyncs the two halves and 403s every login attempt. 
+                // Kudos to witherfork for the fix.
+                const state = oauthStateForServer(rawState);
 
                 try {
                     const redirectUri = window.location.origin;
@@ -432,7 +432,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                 }
             }
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on user identity (currentUser?.id) and the source-of-truth list (allUsers); a whole-currentUser dep would re-fire on every reconciliation tick and trigger an infinite refetch loop since setCurrentUser inside the effect mutates the dep.
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on user identity (currentUser?.id) and the source-of-truth list (allUsers); a whole-currentUser dep would re-fire on every reconciliation tick and trigger an infinite refetch loop since setCurrentUser inside the effect mutates the dep.
     }, [allUsers, currentUser?.id, fetchUserDetail]);
 
     // Real-time Sound & Alert Subscription

@@ -558,7 +558,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                         {(!isSidebarCollapsed || isMobileOpen) && (
                             <div className="text-center">
                                 <button onClick={() => handleNavClick('changelog')} className="text-[10px] text-slate-600 hover:text-sky-500 transition-colors font-mono">
-                                    v15.1.1-open (STABLE)
+                                    v15.1.2-open (STABLE)
                                 </button>
                             </div>
                         )}

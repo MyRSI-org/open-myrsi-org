@@ -19,3 +19,17 @@ export function isValidOAuthState(rawState: string | null | undefined, storedNon
     const receivedNonce = rawState.split(':').pop();
     return !!receivedNonce && receivedNonce === storedNonce;
 }
+
+/**
+ * The `state` value the callback forwards to the server — the raw callback state,
+ * unchanged. The server derives BOTH halves it needs out of this one string: the
+ * CSRF nonce (last `:`-segment, matched against its HttpOnly cookie in
+ * api/services.ts) and the admin claim key (segment [1], in api/actions/auth.ts).
+ * The client must therefore hand it over verbatim; reshaping it on the way out
+ * drops the nonce and desyncs the two halves, which fails the cookie binding and
+ * 403s the login attempt. Kept as a named, tested unit so that reshape can't creep back.
+ * Kudos to witherfork for the fix, applied in Contexts > SessionContext.tsx.
+ */
+export function oauthStateForServer(rawState: string | null | undefined): string | null {
+    return rawState ?? null;
+}
