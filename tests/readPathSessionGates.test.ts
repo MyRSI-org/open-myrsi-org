@@ -40,6 +40,7 @@ const h = vi.hoisted(() => ({
     decoded: null as any,
     user: null as any,
     forceLoggedOut: false,
+    watermarkRevoked: false,
     platformSettings: {} as any,
     calls: { getState: 0, signRealtimeToken: 0, getUserById: 0 },
 }));
@@ -59,6 +60,7 @@ function sbBuilder() {
 vi.mock('../lib/auth', () => ({
     verifyToken: () => h.decoded,
     isSessionForceLoggedOut: () => h.forceLoggedOut,
+    isSessionRevokedByWatermark: () => h.watermarkRevoked,
     signRealtimeToken: () => { h.calls.signRealtimeToken++; return 'rt-token'; },
     tokenIssuedAt: () => new Date(0),
 }));
@@ -101,6 +103,7 @@ beforeEach(() => {
     h.decoded = null;
     h.user = null;
     h.forceLoggedOut = false;
+    h.watermarkRevoked = false;
     h.platformSettings = {};
     h.calls = { getState: 0, signRealtimeToken: 0, getUserById: 0 };
 });
@@ -153,5 +156,46 @@ describe('readpath-authz#1 — force-logout enforced on ?target=initial-state', 
         expect(res.statusCode).toBe(200);
         expect(h.calls.getState).toBe(1);
         expect(h.calls.signRealtimeToken).toBe(1);
+    });
+});
+
+// Per-user revocation watermark (tokens_valid_from) on the READ paths. This is
+// the gap the dispatcher already closed (api/services.ts) but the read paths
+// did not: a token issued before the user's tokens_valid_from (admin revoke /
+// soft-delete / ban) must NOT keep reading — even when no PLATFORM-wide
+// force_logout_timestamp is set.
+describe('readpath-authz#2 — per-user tokens_valid_from enforced on read paths', () => {
+    it('initial-state: revoked-by-watermark token drops to public boot (no getState, no realtime mint)', async () => {
+        h.decoded = { userId: 6 };
+        h.user = { ...memberUser, tokensValidFrom: '2026-06-10T00:00:00.000Z' };
+        h.forceLoggedOut = false;   // platform force-logout NOT set
+        h.watermarkRevoked = true;  // but THIS user's sessions were individually revoked
+        h.platformSettings = {};    // no platform force_logout_timestamp
+
+        const res = mockRes();
+        await handler(mockReq({ target: 'initial-state' }, 'revoked-user-tok'), res);
+
+        // Public boot (login screen) — the user was loaded then nulled, so we never
+        // re-boot into authenticated state or mint a fresh realtime token.
+        expect(res.statusCode).toBe(200);
+        expect(res.body?.force_logout).toBeUndefined();
+        expect(h.calls.getUserById).toBe(1);
+        expect(h.calls.getState).toBe(0);
+        expect(h.calls.signRealtimeToken).toBe(0);
+    });
+
+    it('state: revoked-by-watermark token → 401 force_logout before serving a subset', async () => {
+        h.decoded = { userId: 6 };
+        h.user = { ...memberUser, tokensValidFrom: '2026-06-10T00:00:00.000Z' };
+        h.forceLoggedOut = false;
+        h.watermarkRevoked = true;
+        h.platformSettings = {};
+
+        const res = mockRes();
+        await handler(mockReq({ target: 'state', subset: 'main' }, 'revoked-user-tok'), res);
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body?.force_logout).toBe(true);
+        expect(h.calls.getState).toBe(0);
     });
 });

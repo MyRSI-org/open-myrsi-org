@@ -1,7 +1,7 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
 import { toQmCatalogItem, toQmLocation, toQmInventoryItem, toQmIssuance, toQmPlatformItem, toQmPlatformCategory } from './mappers.js';
 import { sanitizeImageUrl } from '../imageUrl.js';
-import { safeSearchTerm } from '../pgrest.js';
+import { safeSearchTerm, clampListOffset } from '../pgrest.js';
 import { log as baseLog } from '../log.js';
 import {
     fetchAllUexItems,
@@ -363,7 +363,7 @@ export interface ListInventoryOptions {
 
 export async function listInventory(opts: ListInventoryOptions = {}): Promise<QmInventoryItem[]> {
     const limit = Math.min(Math.max(opts.limit ?? 1000, 1), 1000);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
     let q = supabase.from('quartermaster_inventory')
         .select(INVENTORY_SELECT)
         ;
@@ -1146,7 +1146,7 @@ export interface ListPlatformItemsOptions {
  */
 export async function getPlatformItemCatalog(opts: ListPlatformItemsOptions = {}): Promise<QmPlatformItem[]> {
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
     let qb = supabase.from('quartermaster_catalog').select('*').eq('source', 'platform');
     if (opts.search && opts.search.trim()) {
         const safe = safeSearchTerm(opts.search); // allow-list before .or()

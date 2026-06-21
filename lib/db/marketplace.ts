@@ -11,6 +11,7 @@
 // columns (no wildcard) and embeds expose only public member fields.
 
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
+import { escapeLikePattern } from '../pgrest.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import { log as baseLog } from '../log.js';
 import { sendPushToUsers } from '../push.js';
@@ -223,7 +224,11 @@ export async function browseMarketplaceListings(filters: BrowseFilters = {}): Pr
     if (filters.listingType) q = q.eq('listing_type', filters.listingType);
     if (filters.categoryId) q = q.eq('category_id', filters.categoryId);
     if (filters.search) {
-        const safe = String(filters.search).replace(/[%,()]/g, '').slice(0, 80);
+        // Escape LIKE metacharacters (% _ \) so the term matches literally inside
+        // the %…% wrapper — a bare '%'/'_' would otherwise widen the match (the
+        // outer wildcards are intentional; the interpolated term must not add its
+        // own). Length-capped to bound the pattern.
+        const safe = escapeLikePattern(String(filters.search).slice(0, 80));
         if (safe) q = q.ilike('title', `%${safe}%`);
     }
     const { data, error } = await q.order('created_at', { ascending: false }).limit(200);

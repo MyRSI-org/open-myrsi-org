@@ -1,7 +1,7 @@
 
 import { Request, Response } from 'express';
 import * as db from '../lib/db.js';
-import { verifyToken, isSessionForceLoggedOut, signRealtimeToken } from '../lib/auth.js';
+import { verifyToken, isSessionForceLoggedOut, isSessionRevokedByWatermark, signRealtimeToken } from '../lib/auth.js';
 import { stripSensitiveUserFields, stripSensitiveUserFieldsBulk, RequesterContext } from '../lib/db/userFilters.js';
 import { filterByClearance } from '../lib/clearance.js';
 import type { DiscordConfig } from '../types.js';
@@ -223,6 +223,17 @@ export function stripSecrets(state: any): any {
         };
     }
 
+    // Safety net: the settings blob contains every settings row, so a secret
+    // added in the future (named like *_secret, *_api_key, *_password, *_webhook,
+    // or *_token) could reach the browser unless we catch it here. Drop any
+    // top-level text value whose key looks like a secret. Only plain strings are
+    // dropped, so the config objects and lists built above are left untouched.
+    for (const key of Object.keys(cleaned)) {
+        if (typeof cleaned[key] === 'string' && /(_api_key|_secret|_password|_webhook|_token)/i.test(key)) {
+            delete cleaned[key];
+        }
+    }
+
     return cleaned;
 }
 
@@ -423,6 +434,13 @@ async function handleInitialState(req: Request, res: Response) {
                 } catch (e) {
                     log.error('failed to fetch current user', { err: e });
                 }
+                // If this user's sessions were revoked (an admin revoke, delete, or
+                // ban), a token from before that must not boot back into the app or
+                // receive a new realtime token. Drop the user so the login screen
+                // shows instead. This is the same check the write path runs.
+                if (currentUser && isSessionRevokedByWatermark(decoded, currentUser.tokensValidFrom)) {
+                    currentUser = null;
+                }
             }
         }
     }
@@ -509,6 +527,12 @@ async function handleState(req: Request, res: Response) {
                     currentUser = await db.getUserById(decoded.userId);
                 } catch (e) {
                     log.warn('failed to resolve user for subset fetch', { err: e });
+                }
+                // If this user's sessions were revoked, stop them reading data here
+                // too — otherwise the revoke wouldn't take effect until the token
+                // expired on its own. Same check the write path runs.
+                if (currentUser && isSessionRevokedByWatermark(decoded, currentUser.tokensValidFrom)) {
+                    return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
                 }
             }
         }

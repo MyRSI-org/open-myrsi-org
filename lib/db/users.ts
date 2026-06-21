@@ -1,6 +1,7 @@
 
 import { User, ClearanceHistoryEntry, PositionHistoryEntry } from '../../types.js';
 import { supabase, handleSupabaseError, broadcastToOrg, getSystemRoles } from './common.js';
+import { escapeLikePattern } from '../pgrest.js';
 import type { Tables } from './rows.js';
 import { toUser, toReputationHistoryEntry, toRatingHistoryEntry } from './mappers.js';
 import { getAllSettings } from './system.js';
@@ -231,7 +232,7 @@ export async function createUser(userData: { discordId: string, name: string, av
     if (!error && data) {
         await supabase.from('service_requests')
             .update({ client_id: data.id })
-            .ilike('unregistered_client_rsi_handle', userData.rsiHandle)
+            .ilike('unregistered_client_rsi_handle', escapeLikePattern(userData.rsiHandle))
             .is('client_id', null);
 
         try {
@@ -1410,7 +1411,7 @@ export async function verifyRsiUpdate(userId: number) {
         // Link any past requests that match the new handle
         await supabase.from('service_requests')
             .update({ client_id: userId })
-            .ilike('unregistered_client_rsi_handle', user.rsi_handle_pending)
+            .ilike('unregistered_client_rsi_handle', escapeLikePattern(user.rsi_handle_pending))
             .is('client_id', null);
     }
 

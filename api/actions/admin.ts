@@ -446,6 +446,12 @@ export const adminActions = {
     'admin:adjust_rep': ({ targetUserId, newReputation, reason, userId }: AdjustRepPayload) => db.adminAdjustUserReputation(targetUserId, newReputation, userId, reason),
     'admin:update_user': (payload: UpdateUserPayload) => {
         const { targetUserId, user, ...rest } = payload;
+        // This handler only needs the weaker admin:user:update permission, so it
+        // must never change a user's clearance. Clearance can only be set through
+        // admin:update_user_clearance, which needs the stronger manage_clearance
+        // permission and records an audit entry. Remove it from the payload here;
+        // updateUser also re-checks clearance as a backstop for any other caller.
+        delete (rest as { clearanceLevelId?: unknown }).clearanceLevelId;
         // Pass the authenticated actor (injected by services.ts) so updateUser
         // can enforce the role-escalation guard when `details.roleId` is set.
         return db.updateUser(targetUserId, stripActorFields(rest), user);

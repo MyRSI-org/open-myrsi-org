@@ -255,7 +255,7 @@ export default async function handler(req: Request, res: Response) {
     </div>
     <p style="margin-top:1.5rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-align:center">First time visits may take a moment.</p>
   </div>
-  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.1.2-open</div>
+  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.1.3-open</div>
   <style>@keyframes __bsSweep{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}@keyframes __bsPulse{0%,100%{opacity:1}50%{opacity:0.5}}</style>
 </div>
 <script>(function(){var i=document.getElementById('__bs_icon__');if(i){i.onerror=function(){this.style.display='none';};}})();window.__BRANDING__=${safeBrandingJson};window.__SETUP_COMPLETED__=${setupCompletedFlag}${publicPageScript}</script>`;

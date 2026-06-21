@@ -114,7 +114,7 @@ const BootSplash: React.FC<BootSplashProps> = ({ branding, showExtendedWait, gen
             </div>
 
             <div className="absolute bottom-8 text-[10px] text-slate-600 font-mono uppercase tracking-[0.3em] text-center px-4">
-                {resolved.name ? `${resolved.name} // Termlink v15.1.2-open` : 'Termlink v15.1.2-open'}
+                {resolved.name ? `${resolved.name} // Termlink v15.1.3-open` : 'Termlink v15.1.3-open'}
             </div>
 
             <style>{`@keyframes splashSweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(350%); } }`}</style>

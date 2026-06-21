@@ -1,7 +1,7 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
 import { log as baseLog } from '../log.js';
 import { toWarehousePlatformCommodity, toWarehousePlatformCategory } from './mappers.js';
-import { safeSearchTerm } from '../pgrest.js';
+import { safeSearchTerm, clampListOffset } from '../pgrest.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import type { Tables } from './rows.js';
 import {
@@ -157,7 +157,7 @@ export async function listWarehouseCatalog(
     opts: ListWarehouseCatalogOptions = {},
 ): Promise<WarehouseCatalogItem[]> {
     const limit = Math.min(Math.max(opts.limit ?? 1000, 1), 1000);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
     const { data, error } = await supabase.from('warehouse_catalog')
         .select('*')
         
@@ -723,7 +723,7 @@ export async function listWarehouseStock(
     opts: ListWarehouseStockOptions = {},
 ): Promise<WarehouseStock[]> {
     const limit = Math.min(Math.max(opts.limit ?? 1000, 1), 1000);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
     let q = supabase.from('v_warehouse_stock_with_qty')
         .select(`
             id, catalog_id, location_id, notes, created_at, updated_at,
@@ -997,7 +997,8 @@ export async function listWarehouseMovements(filters: MovementFilters = {}): Pro
     // Clamp the client-supplied limit like the sibling list fns — a
     // warehouse:view member could otherwise request a huge embedded-join page.
     const moveLimit = Math.min(Math.max(filters.limit ?? 200, 1), 500);
-    q = q.range(filters.offset || 0, (filters.offset || 0) + moveLimit - 1);
+    const moveOffset = clampListOffset(filters.offset);
+    q = q.range(moveOffset, moveOffset + moveLimit - 1);
 
     const { data, error } = await q;
     if (error && error.code === '42P01') return [];
@@ -1298,7 +1299,7 @@ export interface ListPlatformCommoditiesOptions {
 
 export async function getPlatformCommodityCatalog(opts: ListPlatformCommoditiesOptions = {}): Promise<WarehousePlatformCommodity[]> {
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
     let qb = supabase.from('warehouse_platform_commodities').select('*');
     if (opts.search && opts.search.trim()) {
         const safe = safeSearchTerm(opts.search); // allow-list before .or()

@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { Request, Response } from 'express';
 import * as db from '../lib/db.js';
-import { verifyToken, isSessionForceLoggedOut, tokenIssuedAt } from '../lib/auth.js';
+import { verifyToken, isSessionForceLoggedOut, isSessionRevokedByWatermark } from '../lib/auth.js';
 import { buildOAuthStateCookie, clearOAuthStateCookie, readOAuthStateCookie, nonceMatches, isValidNonceShape } from '../lib/oauthStateCookie.js';
 import { isOpaqueServerError } from '../lib/errors.js';
 import { getClientIp } from '../lib/clientIp.js';
@@ -895,9 +895,9 @@ export default async function handler(req: Request, res: Response) {
     // Per-user session revocation: an HMAC token issued before this user's
     // tokens_valid_from watermark (set by an admin revoke or a soft-delete/ban)
     // is rejected. HMAC path only — the Supabase-token fallback has no issued-at.
-    // Fails to a force_logout the client handles.
-    if (decodedUser && fullUser.tokensValidFrom
-        && tokenIssuedAt(decodedUser).toISOString() < fullUser.tokensValidFrom) {
+    // Shared predicate with the read paths (api/query.ts) so the check can't
+    // drift. Fails to a force_logout the client handles.
+    if (decodedUser && isSessionRevokedByWatermark(decodedUser, fullUser.tokensValidFrom)) {
         return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
     }
 

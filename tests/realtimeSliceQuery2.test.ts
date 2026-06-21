@@ -31,7 +31,7 @@ const h = vi.hoisted(() => ({
     },
 }));
 
-vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0) }));
+vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0), isSessionRevokedByWatermark: () => false }));
 vi.mock('../lib/db', async () => {
     // The HR redaction helpers are REAL — these tests pin that the per-array
     // subsets cannot regress the viewer redaction by skipping them.

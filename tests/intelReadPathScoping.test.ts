@@ -158,14 +158,17 @@ describe('getIntelStats clearance ceiling (clearance-markers#2)', () => {
         h.resolveQuery = ({ table, calls }) => {
             if (table === 'intel_reports') {
                 const lte = calls.find(c => c.method === 'lte' && c.args[0] === 'classification_level');
-                if (lte) {
-                    const ceiling = Number(lte.args[1]);
-                    return { data: ALL_REPORTS.filter(r => r.classification_level <= ceiling), error: null };
-                }
-                return { data: ALL_REPORTS, error: null };
+                // getIntelStats now uses count-pushdown for the total (head:true →
+                // reads .count) and a bounded scan for the breakdown (reads .data),
+                // both still ceilinged by .lte('classification_level', N). Return
+                // both so either query shape resolves correctly.
+                const rows = lte
+                    ? ALL_REPORTS.filter(r => r.classification_level <= Number(lte.args[1]))
+                    : ALL_REPORTS;
+                return { data: rows, count: rows.length, error: null };
             }
-            if (table === 'warrants') return { data: [{ id: 'w1' }, { id: 'w2' }], error: null };
-            return { data: [], error: null };
+            if (table === 'warrants') return { data: [{ id: 'w1' }, { id: 'w2' }], count: 2, error: null };
+            return { data: [], count: 0, error: null };
         };
     }
 

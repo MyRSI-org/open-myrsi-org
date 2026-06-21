@@ -885,6 +885,11 @@ export async function searchIntelReports(query: string, subjectType?: string): P
     return (data || []).map(toHydratedIntelReport);
 }
 
+// Cap how many rows we read to build the threat-level breakdown, so a large
+// intel_reports table can't make this stats query pull everything. The total
+// count is fetched separately (see below) and stays exact.
+const INTEL_STATS_BREAKDOWN_CAP = 5000;
+
 export async function getIntelStats(user?: ClearanceUser | null) {
     // Mirror getIntelHubStats — a low-clearance viewer's report count + threat
     // breakdown must NOT include reports above their level (the
@@ -898,20 +903,28 @@ export async function getIntelStats(user?: ClearanceUser | null) {
         ? null
         : (user?.clearanceLevel?.level ?? 0);
 
-    let reportsQuery = supabase.from('intel_reports').select('threat_level, classification_level');
-    if (maxLevel !== null) reportsQuery = reportsQuery.lte('classification_level', maxLevel);
+    // Ask the database for just the total count (it sends back a number, not the
+    // rows). The breakdown does need each row's threat level, but we cap how many
+    // rows we read for it. So the total is exact and the breakdown is a sample.
+    let countQuery = supabase.from('intel_reports').select('id', { count: 'exact', head: true });
+    let breakdownQuery = supabase.from('intel_reports').select('threat_level').limit(INTEL_STATS_BREAKDOWN_CAP);
+    if (maxLevel !== null) {
+        countQuery = countQuery.lte('classification_level', maxLevel);
+        breakdownQuery = breakdownQuery.lte('classification_level', maxLevel);
+    }
 
     const canSeeWarrants = user?.role === 'Admin'
         || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
     const warrantsQuery = canSeeWarrants
-        ? supabase.from('warrants').select('id').eq('status', 'Active')
-        : Promise.resolve({ data: [] as { id: string }[] });
-    const [{ data: reports }, { data: warrants }] = await Promise.all([reportsQuery, warrantsQuery]);
+        ? supabase.from('warrants').select('id', { count: 'exact', head: true }).eq('status', 'Active')
+        : Promise.resolve({ count: 0 });
+    const [{ count: totalReports }, { data: breakdownRows }, { count: activeWarrants }] =
+        await Promise.all([countQuery, breakdownQuery, warrantsQuery]);
 
     return {
-        totalReports: reports?.length || 0,
-        activeWarrants: warrants?.length || 0,
-        threatBreakdown: (reports || []).reduce((acc: Record<string, number>, curr: { threat_level: string }) => {
+        totalReports: totalReports || 0,
+        activeWarrants: activeWarrants || 0,
+        threatBreakdown: (breakdownRows || []).reduce((acc: Record<string, number>, curr: { threat_level: string }) => {
             acc[curr.threat_level] = (acc[curr.threat_level] || 0) + 1;
             return acc;
         }, {} as Record<string, number>)

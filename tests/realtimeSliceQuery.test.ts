@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
     },
 }));
 
-vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0) }));
+vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0), isSessionRevokedByWatermark: () => false }));
 vi.mock('../lib/db', () => ({
     getPlatformSettings: async () => ({}),
     getUserById: async () => h.user,

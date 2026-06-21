@@ -190,10 +190,15 @@ export async function updateWikiPage(id: string, payload: WikiPagePayload, userI
             .from('wiki_pages')
             .select('parent_page_id, menu_structure_locked')
             .eq('id', id)
-            .single();
+            .maybeSingle();
         if (lookupErr && (lookupErr as { code?: string }).code === '42703') {
             log.warn('wiki_pages.menu_structure_locked column missing — skipping lock check; run migrations/add-wiki-page-menu-lock.sql', { migration: 'add-wiki-page-menu-lock.sql' });
             updates.parent_page_id = newParent;
+        } else if (lookupErr) {
+            // A real lookup error must NOT silently skip the lock check (fail
+            // closed). maybeSingle() already turns a non-existent id into a clean
+            // null with no error, so anything surfaced here is a genuine failure.
+            handleSupabaseError({ error: lookupErr, message: 'Failed to verify wiki page menu lock' });
         } else {
             const oldParent = existing?.parent_page_id || null;
             if (existing?.menu_structure_locked && newParent !== oldParent) {

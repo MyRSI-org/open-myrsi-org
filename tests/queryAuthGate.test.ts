@@ -28,7 +28,7 @@ function sbBuilder() {
 }
 
 vi.mock('../lib/context', () => ({ resolveContext: async () => h.ctx }));
-vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0) }));
+vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0), isSessionRevokedByWatermark: () => false }));
 vi.mock('../lib/db/organizations', () => ({ getAllPricingTiers: async () => [] }));
 vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),

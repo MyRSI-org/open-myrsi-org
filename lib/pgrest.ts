@@ -33,6 +33,18 @@ export function escapeLikePattern(value: unknown): string {
     return value.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
+/**
+ * Limit how far a client can page into a list. A very large offset makes the
+ * database skip that many rows before returning a page, which is slow, so we
+ * cap it. The cap is generous — no normal page would reach it. Anything that
+ * isn't a normal positive number falls back to 0.
+ */
+export const MAX_LIST_OFFSET = 100_000;
+export function clampListOffset(value: unknown, max = MAX_LIST_OFFSET): number {
+    const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
+    return Math.min(Math.max(n, 0), max);
+}
+
 /** Return a UUID if it matches the canonical shape, otherwise throw. */
 export function requireUuid(value: unknown, field = 'id'): string {
     if (typeof value !== 'string' || !UUID_RE.test(value)) {

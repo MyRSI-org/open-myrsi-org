@@ -55,9 +55,9 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
 
             <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full space-y-6">
 
-                <VersionCard version="15.1.2-open" title="Sign-In Fix" isLatest>
-                    <li><strong className="text-sky-400">[Fix]</strong> <strong className="font-semibold text-slate-100">Discord sign-in fix.</strong> The hardening in 15.1.1 added a server-side safety check to the sign-in handshake, but the app was handing that handshake back in a slightly different shape than the check expected, so it could turn people away when they tried to log in with Discord. This release lines the two halves back up, so sign-in completes normally again with the new protection still fully in place, and adds a test so the two can't quietly drift apart again. Thanks to witherfork from the community for spotting and providing a fix.</li>
-                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This one is a code-only fix. There are no database changes, so you do not need to re-run schema.sql for this update.</li>
+                <VersionCard version="15.1.3-open" title="Access Hardening" isLatest>
+                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">A small round of hardening.</strong> I brought a handful of improvements across from the hosted version. The main one: when an admin revokes someone's sessions or removes their account, that now takes effect right away for reading data too, not just for making changes. Around it are some quieter safeguards — a person's clearance can only be changed through the proper, logged path; an extra safety net keeps any future secret setting from ever reaching the browser; and a few list and search queries were tidied up. It is all invisible day to day; the point is that access stays with the people it is meant for. Tests were added to keep it that way.</li>
+                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This is a code-only update. There are no database changes, so you do not need to re-run schema.sql for this update.</li>
                 </VersionCard>
 
                 <div className="space-y-6">
@@ -66,6 +66,11 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
                         Version History
                         <span className="h-px bg-slate-700 grow ml-4"></span>
                     </h3>
+
+                    <VersionCard version="15.1.2-open" title="Sign-In Fix">
+                        <li><strong className="text-sky-400">[Fix]</strong> <strong className="font-semibold text-slate-100">Discord sign-in fix.</strong> The hardening in 15.1.1 added a server-side safety check to the sign-in handshake, but the app was handing that handshake back in a slightly different shape than the check expected, so it could turn people away when they tried to log in with Discord. This release lines the two halves back up, so sign-in completes normally again with the new protection still fully in place, and adds a test so the two can't quietly drift apart again. Thanks to witherfork from the community for spotting and providing a fix.</li>
+                        <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This one is a code-only fix. There are no database changes, so you do not need to re-run schema.sql for this update.</li>
+                    </VersionCard>
 
                     <VersionCard version="15.1.1-open" title="Hardening Pass">
                         <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Another round of hardening.</strong> I worked back through the platform and tightened a wide range of access and validation checks across operations, intel, the marketplace, alliance sharing, and sign-in and session handling. This closed a number of edge cases found in a deep review. Almost all of it is invisible day to day; the point is that data and actions stay with the people they are meant for. Tests were added to keep it that way. These reflect improvements made in the hosted version of myrsi.org since the release of 15.1.0-open</li>

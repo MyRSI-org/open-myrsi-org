@@ -2,6 +2,7 @@
 
 import { ServiceRequest, ServiceRequestStatus, UrgencyLevel, HydratedServiceRequest } from '../../types.js';
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
+import { escapeLikePattern } from '../pgrest.js';
 import { toServiceRequest } from './mappers.js';
 import { adminAdjustUserReputation } from './users.js';
 import { sendPushToStaff, sendPushToUsers } from '../push.js';
@@ -84,7 +85,7 @@ export async function createAdHocServiceRequest(req: Partial<ServiceRequest>, us
 
     const userQuery = supabase.from('users')
         .select('id')
-        .ilike('rsi_handle', req.unregisteredClientRsiHandle || '');
+        .ilike('rsi_handle', escapeLikePattern(req.unregisteredClientRsiHandle || ''));
 
     const { data: existingUser } = await userQuery.maybeSingle();
 

@@ -28,6 +28,7 @@ const h = vi.hoisted(() => ({
 vi.mock('../lib/auth', () => ({
     verifyToken: () => h.decoded,
     isSessionForceLoggedOut: () => false,
+    isSessionRevokedByWatermark: () => false,
     tokenIssuedAt: () => new Date(0),
 }));
 

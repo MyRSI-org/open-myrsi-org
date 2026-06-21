@@ -44,6 +44,19 @@ export function isSessionForceLoggedOut(token: AuthToken, forceLogoutTimestamp: 
     return tokenIssuedAt(token).toISOString() < forceLogoutTimestamp;
 }
 
+/**
+ * Has this user's session been revoked? Returns true if the token was issued
+ * before the user's tokens_valid_from time, which an admin sets when they
+ * "revoke sessions", delete, or ban the user. Both the write path
+ * (api/services) and the read paths (api/query) call this same function so
+ * they always agree. Returns false when no time is set — the token signature
+ * is the real check.
+ */
+export function isSessionRevokedByWatermark(token: AuthToken, tokensValidFrom: string | null | undefined): boolean {
+    if (!tokensValidFrom) return false;
+    return tokenIssuedAt(token).toISOString() < tokensValidFrom;
+}
+
 export function signToken(payload: Omit<AuthToken, 'exp'>): string {
     const expiry = Date.now() + TOKEN_LIFETIME_MS;
     const data = JSON.stringify({ ...payload, exp: expiry });

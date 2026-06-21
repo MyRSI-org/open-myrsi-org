@@ -23,7 +23,7 @@
 
 import { supabase, handleSupabaseError } from './common.js';
 import { toPlatformLocation } from './mappers.js';
-import { safeSearchTerm } from '../pgrest.js';
+import { safeSearchTerm, clampListOffset } from '../pgrest.js';
 import { stripHtmlSingleLine } from '../textSanitize.js';
 import {
     fetchUexStarSystems, fetchUexOrbits, fetchUexPlanets, fetchUexMoons,
@@ -63,7 +63,7 @@ export interface ListLocationsOptions {
  */
 export async function getPlatformLocations(opts: ListLocationsOptions = {}): Promise<PlatformLocation[]> {
     const limit = Math.min(Math.max(opts.limit ?? 200, 1), 2000);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const offset = clampListOffset(opts.offset);
 
     let qb = supabase.from('platform_locations').select('*');
     if (opts.kind) qb = qb.eq('kind', opts.kind);

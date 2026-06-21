@@ -6,6 +6,7 @@ import {
 } from '../../types.js';
 import type { Tables } from './rows.js';
 import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, getSystemRoles } from './common.js';
+import { escapeLikePattern } from '../pgrest.js';
 import { toHydratedApplication, toHRInterviewTemplate, toJobPosting, toHydratedInterview, toMiniUser, toTransferRequest, toPersonnelPosition } from './mappers.js';
 import { logHrPositionChange } from './users.js';
 import { sendPushToUsers } from '../push.js';
@@ -259,7 +260,7 @@ export async function getApplicationVettingData(id: string): Promise<Record<stri
 
 export async function createHRApplication(payload: CreateHRApplicationPayload) {
     // 1. Check if RSI Handle belongs to a registered user
-    const userQuery = supabase.from('users').select('id, discord_id, name').ilike('rsi_handle', payload.rsiHandle);
+    const userQuery = supabase.from('users').select('id, discord_id, name').ilike('rsi_handle', escapeLikePattern(payload.rsiHandle));
 
     const { data: existingUser } = await userQuery.maybeSingle();
 

@@ -1,4 +1,5 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
+import { clampListOffset } from '../pgrest.js';
 import { toTreasuryAccount, toLedgerEntry } from './mappers.js';
 import type { Tables } from './rows.js';
 import type {
@@ -135,7 +136,8 @@ export async function listLedgerEntries(
 
     const limit = Math.max(1, Math.min(500, opts.limit ?? 200));
     q = q.order('created_at', { ascending: false }).limit(limit);
-    if (opts.offset) q = q.range(opts.offset, opts.offset + limit - 1);
+    const offset = clampListOffset(opts.offset);
+    if (offset) q = q.range(offset, offset + limit - 1);
 
     const { data, error } = await q;
     if (error && error.code === '42P01') return [];
