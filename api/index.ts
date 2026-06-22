@@ -30,9 +30,22 @@ const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-function escapeHtml(str: string): string {
+export function escapeHtml(str: string): string {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
               .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Escape a value for safe use as JSON inside an inline <script>: handle </script>
+// breakout and HTML-comment tricks (< > &), plus the line/paragraph separators
+// U+2028/U+2029 (legal in JSON but not in JS strings on older engines). One place
+// for the window.__BRANDING__ / window.__PUBLIC_PAGE__ injection.
+export function escapeJsonForScript(value: unknown): string {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
 }
 
 export default async function handler(req: Request, res: Response) {
@@ -141,11 +154,7 @@ export default async function handler(req: Request, res: Response) {
             // The boot splash and window.__BRANDING__ should always show the
             // org's proper Logo URL — never the small favicon override.
             const safeSplashIconUrl = escapeHtml(splashIconUrl);
-            const brandingJson = JSON.stringify({ name: siteName, iconUrl: splashIconUrl });
-            const safeBrandingJson = brandingJson
-                .replace(/</g, '\\u003c')
-                .replace(/>/g, '\\u003e')
-                .replace(/&/g, '\\u0026');
+            const safeBrandingJson = escapeJsonForScript({ name: siteName, iconUrl: splashIconUrl });
 
             // Build the public page payload (only when admin has enabled it).
             // featuredTestimonialIds are INTENTIONALLY excluded — the client only
@@ -229,11 +238,7 @@ export default async function handler(req: Request, res: Response) {
                     links: allowedLinks,
                     announcements: announcementsForPublic,
                 };
-                const publicJson = JSON.stringify(publicPayload)
-                    .replace(/</g, '\\u003c')
-                    .replace(/>/g, '\\u003e')
-                    .replace(/&/g, '\\u0026');
-                publicPageScript = `;window.__PUBLIC_PAGE__=${publicJson}`;
+                publicPageScript = `;window.__PUBLIC_PAGE__=${escapeJsonForScript(publicPayload)}`;
             }
 
             const splashHtml = `
@@ -255,7 +260,7 @@ export default async function handler(req: Request, res: Response) {
     </div>
     <p style="margin-top:1.5rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-align:center">First time visits may take a moment.</p>
   </div>
-  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.1.3-open</div>
+  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.1.4-open</div>
   <style>@keyframes __bsSweep{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}@keyframes __bsPulse{0%,100%{opacity:1}50%{opacity:0.5}}</style>
 </div>
 <script>(function(){var i=document.getElementById('__bs_icon__');if(i){i.onerror=function(){this.style.display='none';};}})();window.__BRANDING__=${safeBrandingJson};window.__SETUP_COMPLETED__=${setupCompletedFlag}${publicPageScript}</script>`;

@@ -58,6 +58,34 @@ describe('stripSecrets', () => {
         expect(out.orgName).toBe('Acme');
     });
 
+    it('platformSettings is rebuilt from an allowlist — keeps the typed fields, drops a future nested secret', () => {
+        const out = stripSecrets({
+            platformSettings: {
+                maintenance_mode: true,
+                maintenance_message: 'Back at 9',
+                support_discord_url: 'https://discord.gg/x',
+                force_logout_timestamp: '2026-06-21T00:00:00.000Z',
+                support_api_key: 'sk-should-not-leak',   // future nested secret
+                webhook_secret: 'whsec-leak',
+                internal_flag: { hidden: true },
+            },
+        });
+        expect(out.platformSettings).toEqual({
+            maintenance_mode: true,
+            maintenance_message: 'Back at 9',
+            support_discord_url: 'https://discord.gg/x',
+            force_logout_timestamp: '2026-06-21T00:00:00.000Z',
+        });
+        expect(out.platformSettings.support_api_key).toBeUndefined();
+        expect(out.platformSettings.webhook_secret).toBeUndefined();
+        expect(out.platformSettings.internal_flag).toBeUndefined();
+    });
+
+    it('platformSettings boot projection (maintenance only) is unchanged by the allowlist', () => {
+        const out = stripSecrets({ platformSettings: { maintenance_mode: false, maintenance_message: null } });
+        expect(out.platformSettings).toEqual({ maintenance_mode: false, maintenance_message: null });
+    });
+
     it('is STRING-guarded — never nulls non-string values whose key looks secret-bearing', () => {
         const out = stripSecrets({
             webhook_endpoints: [{ id: 1 }, { id: 2 }],   // array preserved

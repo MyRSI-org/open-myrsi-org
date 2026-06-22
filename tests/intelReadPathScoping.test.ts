@@ -367,3 +367,20 @@ describe('intel bulk reportIds length cap (ratelimit#3)', () => {
         await expect(bulkDeleteIntelReports(['a', 'b', 'c'])).resolves.toBeUndefined();
     });
 });
+
+describe('intel bulk_add_tags tags-array bounds', () => {
+    beforeEach(() => { h.stateful = true; h.tables = { intel_reports: [] }; });
+
+    it('rejects an oversized tags array (write/storage amplification guard)', async () => {
+        const tooManyTags = Array.from({ length: 51 }, (_, i) => `t${i}`);
+        await expect(bulkAddIntelTags(['r1'], tooManyTags)).rejects.toThrow(/too many tags/i);
+    });
+
+    it('rejects a non-array tags value', async () => {
+        await expect(bulkAddIntelTags(['r1'], 'nope' as unknown as string[])).rejects.toThrow(/must be an array/i);
+    });
+
+    it('a within-cap tags array is accepted', async () => {
+        await expect(bulkAddIntelTags(['r1'], ['alpha', 'bravo'])).resolves.toBeUndefined();
+    });
+});

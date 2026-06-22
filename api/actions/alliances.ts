@@ -34,7 +34,14 @@ export const allianceActions = {
 
     // Management
     'alliance:list_peers': () => db.listAlliancePeers(),
-    'alliance:update_peer': ({ peerId, updates }: UpdatePeerPayload) => db.updateAlliancePeer(peerId, updates),
+    'alliance:update_peer': async ({ peerId, updates }: UpdatePeerPayload) => {
+        await db.updateAlliancePeer(peerId, updates);
+        // Lowering the clearance ceiling doesn't change any op, so the peer won't
+        // re-pull on its own. Pull back any shared ops that now exceed the new ceiling.
+        if (updates && updates.outboundMaxClearance !== undefined) {
+            await db.reconcilePeerClearanceShares(peerId);
+        }
+    },
     'alliance:delete_peer': ({ peerId }: PeerIdPayload) => db.revokeAlliancePeer(peerId),
 
     // Directory + self profile

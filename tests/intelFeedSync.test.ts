@@ -239,6 +239,20 @@ describe('feed ingest sanitization + caps (M6)', () => {
         expect(h.tables.intel_reports).toHaveLength(1);   // no duplicate row
         expect(h.tables.intel_reports[0].external_id).toBe('feed-r-1'); // linked to the feed
     });
+    it('does NOT relink a locally-authored report on content match (provenance-hijack guard)', async () => {
+        // A report WE authored (created_by_id set, source_feed_id null) that an ally
+        // happens to match by target+summary must NOT be relabeled as feed-sourced:
+        // that would steal its provenance AND drop it from our outbound re-share
+        // (outbound shares only source_feed_id IS NULL). Dedupe only — no mutation.
+        h.tables.intel_reports = [{ id: 'r-mine', target_id: 'Bandit', summary: 'spotted at HUR', external_id: null, source_feed_id: null, created_by_id: 42 }];
+        stubFetch({ ...emptyPayload, reports: [{ id: 'feed-r-1', target_id: 'Bandit', summary: 'spotted at HUR', threat_level: 'High', subject_type: 'Person' }] });
+        const res = await syncTrustedFeeds();
+        expect(res.totalReports).toBe(0);                  // deduped, not inserted
+        expect(h.tables.intel_reports).toHaveLength(1);    // no duplicate row
+        const row = h.tables.intel_reports[0];
+        expect(row.external_id).toBeNull();                // provenance NOT hijacked
+        expect(row.source_feed_id).toBeNull();             // still shareable outbound
+    });
     it('refuses an oversized response body before parsing', async () => {
         // text() returns a >8MB string → the byte ceiling rejects it (no parse, no ingest).
         const huge = 'x'.repeat(8 * 1024 * 1024 + 10);

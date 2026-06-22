@@ -4,6 +4,9 @@ import { DossierData } from "../types.js";
 import { supabase, saveDossierSummary } from "./db.js";
 
 import { getOrgSecret } from "./secrets.js";
+import { log as baseLog } from "./log.js";
+
+const log = baseLog.child({ module: 'lib.ai' });
 
 export async function generateDossierSummary(dossier: DossierData): Promise<string> {
     // 1. Fetch AI and Branding settings
@@ -13,7 +16,7 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
         .in('key', ['aiConfig', 'brandingConfig']);
 
     if (error || !settings) {
-        console.error("[AI] Failed to fetch settings:", error);
+        log.error('failed to fetch settings', { err: error });
         return "Error: Could not retrieve system configuration.";
     }
 
@@ -32,10 +35,10 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
     // 2. Validate API Key
     const apiKey = await getOrgSecret('GEMINI_API_KEY');
     // Never log key material (length / prefix is still a partial disclosure).
-    // Log only presence.
-    console.log(`[AI] API key lookup result: ${apiKey ? 'found' : 'NOT FOUND'}`);
+    // Log only presence, at debug (not on every dossier run in prod).
+    log.debug('gemini api key lookup', { found: !!apiKey });
     if (!apiKey) {
-        console.warn(`[AI] GEMINI_API_KEY missing. Ensure the key is set in admin settings or the server environment.`);
+        log.warn('gemini api key missing — set it in admin settings or the server environment');
         return "System Error: AI Service unreachable (Missing Credentials). Please configure a Gemini API key in your Organization Portal.";
     }
 
@@ -85,7 +88,8 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
         'gemini-flash-latest': 'gemini-2.5-flash',
     };
     const modelName = MODEL_MIGRATIONS[RAW_MODEL] || RAW_MODEL;
-    console.log(`[AI] Using model: ${modelName}${modelName !== RAW_MODEL ? ` (migrated from ${RAW_MODEL})` : ''} for target: ${dossier.targetId}`);
+    // Debug-level + no targetId (per-call intel PII must not sit in plaintext logs).
+    log.debug('using gemini model', { model: modelName, migratedFrom: modelName !== RAW_MODEL ? RAW_MODEL : undefined });
 
     try {
         const ai = new GoogleGenAI({ apiKey });
@@ -132,8 +136,10 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
     } catch (error: any) {
         const errMsg = error.message || '';
         const errStatus = error.status || error.statusCode || error.code || '';
-        console.error(`[AI] Gemini API Error — Status: ${errStatus}, Message: ${errMsg}`);
-        console.error("[AI] Full error:", JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+        // Log the curated status/message only — NOT a full own-property dump of the
+        // third-party error (the comment below warns it can carry internal request
+        // detail; dumping it to logs is the same leak class).
+        log.error('gemini api error', { status: errStatus, message: errMsg });
 
         // Check model not found FIRST — sunset models return NOT_FOUND and should not be confused with quota issues
         if (errStatus === 404 || errMsg.includes('NOT_FOUND') || errMsg.includes('not found') || errMsg.includes('is not available') || errMsg.includes('deprecated')) {
@@ -158,7 +164,7 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
         // Don't surface the raw third-party (Gemini SDK) error text to the
         // browser — it can carry internal request detail. Log it server-side and
         // return a generic message for the unmatched cases.
-        console.error('[AI] dossier summary failed:', errMsg);
+        log.error('dossier summary failed', { message: errMsg });
         return 'Error generating tactical summary. Please try again later or check the AI configuration.';
     }
 }
@@ -277,7 +283,7 @@ If a section has no entries, infer cautiously from the available information rat
     } catch (error: any) {
         const errMsg = String(error?.message || '');
         const errStatus = error?.status || error?.statusCode || error?.code || '';
-        console.error(`[AI] AAR Gemini error — Status: ${errStatus}, Message: ${errMsg}`);
+        log.error('aar gemini error', { status: errStatus, message: errMsg });
 
         // Some Gemini errors arrive as JSON-stringified payloads in error.message.
         // Try to extract the structured fields so we can match on status text.
@@ -313,7 +319,7 @@ If a section has no entries, infer cautiously from the available information rat
         // The matched cases above return curated, actionable text. For anything
         // else, log the real error server-side and surface a generic message
         // rather than the raw third-party error string.
-        console.error('[AI] draft failed:', extractedMessage || errMsg);
+        log.error('draft failed', { message: extractedMessage || errMsg });
         throw new Error('AI draft failed. Please try again later or verify the AI configuration.');
     }
 }

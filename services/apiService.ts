@@ -155,7 +155,7 @@ class ApiService {
         if (!response.ok) throw new Error('Failed to begin OAuth handshake');
     }
 
-    async discordCallback(code: string, state: string | null, redirectUri: string): Promise<{ user: any, isNewUser: boolean, adminSetupToken?: string, identityToken?: string }> {
+    async discordCallback(code: string, state: string | null, redirectUri: string): Promise<{ user: any, isNewUser: boolean, adminSetupToken?: string, identityToken?: string, verificationCode?: string }> {
         // Explicitly send action in query param to bypass auth middleware logic if body parsing fails
         const response = await fetch(`${API_URL}/services?target=auth&action=auth:discord_callback`, {
             method: 'POST',
@@ -250,8 +250,8 @@ class ApiService {
     }
 
     /** Validate + consume the admin claim code (after Discord sign-in) → admin grant. */
-    async redeemSetupCode(discordId: string, code: string): Promise<{ adminSetupToken?: string }> {
-        const res = await this.rpc('auth:redeem_setup_code', { discordId, code });
+    async redeemSetupCode(discordId: string, code: string, identityToken?: string): Promise<{ adminSetupToken?: string }> {
+        const res = await this.rpc('auth:redeem_setup_code', { discordId, code, identityToken });
         return (res?.data || {}) as { adminSetupToken?: string };
     }
 

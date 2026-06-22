@@ -25,6 +25,27 @@ describe('security headers (s5-2)', () => {
         expect(src).toMatch(/object-src 'none'/);
         expect(src).toMatch(/frame-ancestors 'none'/);
     });
+    // These four were set in server.ts but not pinned, so a refactor dropping any of
+    // them would still pass. Pin them at the source.
+    it('sets X-Content-Type-Options: nosniff', () => {
+        expect(src).toMatch(/setHeader\('X-Content-Type-Options',\s*'nosniff'\)/);
+    });
+    it('sets X-Frame-Options: DENY', () => {
+        expect(src).toMatch(/setHeader\('X-Frame-Options',\s*'DENY'\)/);
+    });
+    it('sets Referrer-Policy: strict-origin-when-cross-origin', () => {
+        expect(src).toMatch(/setHeader\('Referrer-Policy',\s*'strict-origin-when-cross-origin'\)/);
+    });
+    it('sets HSTS (Strict-Transport-Security) in production', () => {
+        expect(src).toMatch(/setHeader\('Strict-Transport-Security',\s*'max-age=\d+; includeSubDomains'\)/);
+    });
+    // connect-src must not use a bare `https:` (that would allow sending to any
+    // origin). It is built from an explicit allow-list constant.
+    it('CSP connect-src is an explicit allow-list, not bare https:', () => {
+        expect(src).toMatch(/connect-src \$\{CSP_CONNECT_SRC\}/);
+        expect(src).not.toMatch(/connect-src 'self' https:/);
+        expect(src).toMatch(/wss:\/\/\*\.supabase\.co/);
+    });
 });
 
 describe('slowloris timeouts (s5-3)', () => {
@@ -41,5 +62,15 @@ describe('terminal recovery handler (s5-10a) + AI-limiter prune (s5-5b)', () => 
     });
     it('wires the AI rate-limit prune into the periodic sweep', () => {
         expect(src).toMatch(/pruneAiRateLimitBuckets\(/);
+    });
+});
+
+describe('client-IP trust is secure by default', () => {
+    it("TRUST_PROXY_HOPS defaults to 0 (uses the unspoofable socket peer)", () => {
+        expect(src).toMatch(/TRUST_PROXY_HOPS \?\? '0'/);
+        expect(src).not.toMatch(/TRUST_PROXY_HOPS \?\? '1'/);
+    });
+    it('the abuse blackhole exempts loopback (no self-DoS behind a same-host proxy)', () => {
+        expect(src).toMatch(/isLoopbackIp\(ip\)/);
     });
 });

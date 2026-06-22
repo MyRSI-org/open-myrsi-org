@@ -8,6 +8,21 @@ export interface RequesterContext {
 
 const hasPerm = (perms: string[] | undefined, name: string) => !!perms && perms.includes(name);
 
+// Viewers holding any of these actually need other members' permissions/clearance
+// in the UI: HR pickers (filter members by hr:* perms), clearance management (shows
+// member clearance), warrant rap sheets (show the subject's clearance), dispatch
+// member selection, and roster admin. Everyone else — clients and ordinary members
+// — never reads another member's permissions or clearance on screen, so we strip
+// those for them: it's just "who's an admin / who can see classified" recon with no
+// use to the rank and file.
+const ROSTER_CAPABILITY_PERMS = [
+    'admin:view:roster', 'admin:user:update', 'admin:user:manage_clearance',
+    'hr:recruiter', 'hr:admin', 'hr:manager',
+    'warrant:view', 'warrant:create', 'warrant:manage',
+    'request:dispatch', 'request:manage_responders', 'request:set_lead',
+    'operations:manage',
+];
+
 /**
  * Strip sensitive fields from a User record before sending to a client,
  * based on the requester's role and permissions.
@@ -45,6 +60,8 @@ export function stripSensitiveUserFields(user: User, requester: RequesterContext
             conductRecord: [],
             limitingMarkers: [],
             discordId: '',
+            permissions: [],
+            clearanceLevel: undefined,
         };
     }
 
@@ -70,6 +87,13 @@ export function stripSensitiveUserFields(user: User, requester: RequesterContext
     // rank-and-file members.
     if (!isSelf && !hasPerm(perms, 'admin:view:roster') && !hasPerm(perms, 'admin:config:discord')) {
         out.discordId = '';
+    }
+    // Keep a member's own permissions/clearance, and keep them for viewers who
+    // actually use them (HR/clearance/warrant/dispatch/roster screens). Strip them
+    // for everyone else — recon value with no other UI use.
+    if (!isSelf && !ROSTER_CAPABILITY_PERMS.some((p) => hasPerm(perms, p))) {
+        out.permissions = [];
+        out.clearanceLevel = undefined;
     }
 
     return out;

@@ -532,7 +532,7 @@ const AppContent: React.FC = () => {
                     </button>
                 </div>
                 <div className="absolute bottom-8 text-[10px] text-slate-600 font-mono uppercase tracking-[0.3em]">
-                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.1.3-open
+                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.1.4-open
                 </div>
             </div>
         );

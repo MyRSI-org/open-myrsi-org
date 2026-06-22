@@ -29,6 +29,12 @@ const PLATFORM_SETTINGS_DEFAULTS: PlatformSettings = {
     support_discord_url: '',
 };
 
+// Last settings we read successfully, kept outside the TTL cache. If a later read
+// fails after the cache expires, fall back to this instead of bare defaults, so a
+// brief DB hiccup doesn't drop the force-logout timestamp (and maintenance flag)
+// and quietly turn force-logout off.
+let lastKnownGood: PlatformSettings | null = null;
+
 export async function getPlatformSettings(): Promise<PlatformSettings> {
     const cached = cache.get<PlatformSettings>('platform_settings');
     if (cached) return cached;
@@ -39,10 +45,13 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
         const stored = (data?.value as Partial<PlatformSettings>) || {};
         const settings = { ...PLATFORM_SETTINGS_DEFAULTS, ...stored };
         cache.set('platform_settings', settings, TTL.PLATFORM_SETTINGS);
+        lastKnownGood = settings;
         return settings;
     } catch (e) {
         log.error('fetch platform settings failed', { err: e });
-        return PLATFORM_SETTINGS_DEFAULTS;
+        // Fall back to the last good settings (keeps force-logout + maintenance
+        // alive across a brief outage) rather than bare defaults.
+        return lastKnownGood ?? PLATFORM_SETTINGS_DEFAULTS;
     }
 }
 
@@ -57,6 +66,7 @@ export async function updatePlatformSettings(patch: Partial<PlatformSettings>): 
     const { error } = await supabase.from('settings').upsert({ key: SETTINGS_KEY, value: next }, { onConflict: 'key' });
     handleSupabaseError({ error, message: 'Failed to update platform settings' });
     cache.invalidate('platform_settings');
+    lastKnownGood = next; // keep the fallback current after a write
     broadcastToOrg('settings_update', {});
     return next;
 }

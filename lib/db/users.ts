@@ -201,6 +201,21 @@ export async function createUser(userData: { discordId: string, name: string, av
         }
     }
 
+    // One RSI handle maps to one account. Refuse to bind a handle already linked to a
+    // live user — blocks impersonation collisions and the absorption of another
+    // user's handle-keyed ad-hoc requests (the re-parent below). escapeLikePattern
+    // makes the ILIKE an exact, case-insensitive match.
+    if (userData.rsiHandle) {
+        const { data: handleTaken } = await supabase.from('users')
+            .select('id')
+            .ilike('rsi_handle', escapeLikePattern(userData.rsiHandle))
+            .is('deleted_at', null)
+            .maybeSingle();
+        if (handleTaken) {
+            throw new Error('That RSI handle is already linked to another account.');
+        }
+    }
+
     // 1. Determine role via system role helper (is_system flag + ID order)
     const sysRoles = await getSystemRoles();
 

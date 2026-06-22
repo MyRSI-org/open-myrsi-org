@@ -54,7 +54,9 @@ setInterval(() => {
 }, 60_000).unref?.();
 
 function bumpAbuseCounter(ip: string): void {
-    if (ip === 'unknown') return;
+    // Never blackhole an unidentified caller or our own loopback (a same-host reverse
+    // proxy appears as loopback under the secure default) — that would 404 everyone.
+    if (ip === 'unknown' || isLoopbackIp(ip)) return;
     const now = Date.now();
     let t = ipAbuseTracker.get(ip);
     if (!t) {
@@ -108,6 +110,7 @@ import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allia
     getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, getPlatformSettings } from './lib/db.js';
 import { runFirstBootCheck } from './lib/firstBoot.js';
 import { verifyToken, signToken, isSessionForceLoggedOut } from './lib/auth.js';
+import { counts404TowardAbuse, isLoopbackIp } from './lib/abuseFilter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,12 +148,14 @@ if (process.env.NODE_ENV === 'production') {
 
 const app = express();
 // `trust proxy` controls how req.ip resolves X-Forwarded-For, and req.ip backs
-// every IP-keyed control (see lib/clientIp.ts). Default 1 = the single
-// TLS-terminating reverse proxy the deployment guide prescribes. Deeper chains
-// set TRUST_PROXY_HOPS to the real depth; a directly-exposed Node (no proxy)
-// MUST set 0, or the socket peer can spoof one X-Forwarded-For hop.
-const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? '1');
-app.set('trust proxy', Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
+// every IP-keyed control (see lib/clientIp.ts). SECURE BY DEFAULT: 0 = trust no
+// forwarded header and use the real TCP socket peer, which a client cannot spoof.
+// That's correct for a directly-exposed Node (the common self-host) out of the box —
+// no X-Forwarded-For spoofing, limiter-bypass, or victim-framing. Operators running
+// a reverse proxy set TRUST_PROXY_HOPS to the number of proxies in front (1 for a
+// single TLS terminator, 2+ for CDN→LB→app) so req.ip becomes the real client.
+const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? '0');
+app.set('trust proxy', Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 0);
 const port = process.env.PORT || 3000;
 
 // --- Early scanner / blackhole gate ---
@@ -184,6 +189,24 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(compression());
 
+// Explicit connect-src list for the CSP, replacing a bare `https:` (which let the
+// page send fetch/WebSocket/beacon to any https site — so an XSS could ship the
+// stored token anywhere). Lists exactly what the browser talks to: same-origin
+// /api, Supabase REST + Realtime (wildcard, plus the env origin for a custom domain),
+// LiveKit, and the Cloudflare analytics beacon. img-src/media-src keep `https:` for
+// user-supplied images.
+const SUPABASE_ORIGIN = (() => {
+    try { return process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL).origin : ''; } catch { return ''; }
+})();
+const CSP_CONNECT_SRC = [
+    "'self'",
+    SUPABASE_ORIGIN,
+    SUPABASE_ORIGIN ? SUPABASE_ORIGIN.replace(/^https:/, 'wss:') : '',
+    'https://*.supabase.co', 'wss://*.supabase.co',
+    'https://*.livekit.cloud', 'wss://*.livekit.cloud',
+    'https://cloudflareinsights.com',
+].filter(Boolean).join(' ');
+
 // Security Headers Middleware
 app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -209,7 +232,7 @@ app.use((req, res, next) => {
     // base-uri 'self' blocks an injected <base> from re-rooting relative URLs;
     // form-action 'self' blocks an injected form from exfiltrating to an
     // attacker origin. Neither falls back to default-src.
-    res.setHeader('Content-Security-Policy', `default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'nonce-${cspNonce}' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https:; connect-src 'self' https: wss://*.supabase.co wss://*.livekit.cloud; font-src 'self' data: https://cdnjs.cloudflare.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com https://docs.google.com https://drive.google.com https://calendar.google.com https://www.google.com https://open.spotify.com https://codepen.io https://stackblitz.com; media-src 'self' blob: https:; manifest-src 'self';`);
+    res.setHeader('Content-Security-Policy', `default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'nonce-${cspNonce}' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https:; connect-src ${CSP_CONNECT_SRC}; font-src 'self' data: https://cdnjs.cloudflare.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com https://docs.google.com https://drive.google.com https://calendar.google.com https://www.google.com https://open.spotify.com https://codepen.io https://stackblitz.com; media-src 'self' blob: https:; manifest-src 'self';`);
     // Only set HSTS if using HTTPS in production
     if (process.env.NODE_ENV === 'production') {
         res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
@@ -234,7 +257,9 @@ app.use((req, res, next) => {
         // Count non-scanner 404s towards the abuse threshold so wordlist
         // scanners that don't match SCANNER_PATH_RE still trip the blackhole.
         // Scanner-path 404s are already counted by the early-block middleware.
-        if (res.statusCode === 404) bumpAbuseCounter(ip);
+        // Ordinary browser/asset 404s are excluded so an office behind one IP can't
+        // block itself.
+        if (res.statusCode === 404 && counts404TowardAbuse(req.method, req.path)) bumpAbuseCounter(ip);
 
         if (isProd) {
             // Path only, no query — avoids persisting sensitive params.
@@ -855,6 +880,8 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
     // lib/db/allianceSync.ts. The tick caps its own wall-clock at 40s, under
     // the 50s fail-open lease hold.
     cron.schedule('* * * * *', async () => {
+      // fail-closed: skip this tick if the lease check errors, rather than letting
+      // every instance hit allies' rate limits at once.
       await withCronLease('alliance_sync', 50, async () => {
         const t0 = Date.now();
         try {
@@ -863,7 +890,7 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
         } catch (e) {
             log.error('cron alliance sync failed', { err: e });
         }
-      });
+      }, { failClosed: true });
     });
 
     log.info('cron jobs initialized');
@@ -894,4 +921,16 @@ const gracefulShutdown = (signal: string) => {
 if (isMainModule) {
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    // Log async failures that would otherwise be silent (or only show Node's default
+    // stderr trace). An unhandled rejection is logged but not fatal — one stray
+    // background error shouldn't take the server down. An uncaught exception leaves
+    // the process in an unknown state, so log it and shut down cleanly; the process
+    // manager (see DEPLOYMENT_GUIDE) restarts it.
+    process.on('unhandledRejection', (reason) => {
+        log.error('unhandled promise rejection', { err: reason });
+    });
+    process.on('uncaughtException', (err) => {
+        log.error('uncaught exception', { err });
+        gracefulShutdown('uncaughtException');
+    });
 }

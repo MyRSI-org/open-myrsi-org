@@ -1781,7 +1781,11 @@ export async function verifyApiKey(key: string) {
     // revoked key no longer matches.
     if (typeof key !== 'string' || !key) return null;
     const hash = createHash('sha256').update(key).digest('hex');
-    const { data } = await supabase.from('api_keys').select('id').eq('key_hash', hash).maybeSingle();
+    // Return the label too so callers can tell a manual feed key from an alliance
+    // key (labelled "alliance:<peerId>"). Both live in api_keys and verify the same
+    // way, so without the label the legacy feed couldn't tell them apart and an
+    // alliance key would skip the per-peer limits (the feed endpoint checks this).
+    const { data } = await supabase.from('api_keys').select('id, label').eq('key_hash', hash).maybeSingle();
     if (data) {
         await supabase.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', data.id);
         return data;

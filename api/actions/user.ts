@@ -87,6 +87,11 @@ interface UpdateUnitDetailsPayload {
 }
 
 export const userActions = {
+    // Real logout, server-side: move the caller's tokens_valid_from forward so a
+    // stolen token can't outlive the session (the dispatcher rejects any token issued
+    // before that time). userId is forced to the signed-in caller, so this only ever
+    // logs the caller out.
+    'user:logout': ({ userId }: { userId: number }) => db.revokeUserSessions(userId),
     'user:toggle_duty': ({ userId }: ToggleDutyPayload) => db.toggleUserDutyStatus(userId),
     'user:heartbeat': ({ userId }: HeartbeatPayload) => db.updateUserHeartbeat(userId),
     'user:initiate_rsi_update': ({ userId, newHandle }: InitiateRsiUpdatePayload) => db.initiateRsiHandleUpdate(userId, newHandle),

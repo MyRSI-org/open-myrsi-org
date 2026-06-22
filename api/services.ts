@@ -749,6 +749,10 @@ export default async function handler(req: Request, res: Response) {
         const ip = getClientIp(req);
         const check = checkAuthRateLimit(ip);
         if (!check.ok) {
+            // Log the trip so an operator can spot credential probing / OAuth
+            // hammering, matching the permission-denied and blackhole logs. IP and
+            // action only — no credential data.
+            log.warn('auth rate limit tripped', { ip, action, retryAfter: check.retryAfter });
             res.setHeader('Retry-After', String(check.retryAfter));
             return res.status(429).json({
                 success: false,
@@ -823,7 +827,7 @@ export default async function handler(req: Request, res: Response) {
             return res.status(200).json({ success: true, data: { ok: true } });
         }
         if (action === 'auth:discord_callback') {
-            const cookieNonce = readOAuthStateCookie(req.headers['cookie']);
+            const cookieNonce = readOAuthStateCookie(req.headers['cookie'], reqSecure);
             // The nonce is the last ':'-segment of state (login:<nonce> /
             // admin_setup:<key>:<nonce>) — reuse it rather than a separate field.
             const state = (payload as { state?: unknown } | null)?.state;
@@ -864,44 +868,29 @@ export default async function handler(req: Request, res: Response) {
         return res.status(401).json({ message: 'Unauthorized: Missing token' });
     }
 
+    // We only ever issue our own signed session tokens, so verify that token and
+    // load the user by its id. (An older fallback accepted any token Supabase Auth
+    // recognised — including the realtime token sent to the browser — and skipped
+    // the revocation checks below, so it was removed.) Reject anything that doesn't
+    // verify.
     const decodedUser = verifyToken(token);
-    let user = null;
-    let authUserId = null;
-
     if (!decodedUser) {
-        // Fallback: Verify as Supabase Token
-        const { data: { user: sbUser }, error } = await db.supabase.auth.getUser(token);
-        if (!error && sbUser) {
-            authUserId = sbUser.id;
-        } else {
-            return res.status(401).json({ message: 'Unauthorized: Invalid token signature' });
-        }
-    } else {
-        const dbUser = await db.getUserById(decodedUser.userId);
-        if (dbUser) authUserId = dbUser.auth_user_id;
-        user = dbUser;
+        return res.status(401).json({ message: 'Unauthorized: Invalid token signature' });
     }
 
-    if (!user && authUserId) {
-        user = await db.getUserByAuthId(authUserId);
-    }
-
+    const user = await db.getUserById(decodedUser.userId);
     if (!user) {
         return res.status(401).json({ message: 'Unauthorized: User account not found.' });
     }
 
     const fullUser = user;
 
-    // Per-user session revocation: an HMAC token issued before this user's
-    // tokens_valid_from watermark (set by an admin revoke or a soft-delete/ban)
-    // is rejected. HMAC path only — the Supabase-token fallback has no issued-at.
-    // Shared predicate with the read paths (api/query.ts) so the check can't
-    // drift. Fails to a force_logout the client handles.
-    if (decodedUser && isSessionRevokedByWatermark(decodedUser, fullUser.tokensValidFrom)) {
+    // Reject a token issued before this user's tokens_valid_from cutoff (set when an
+    // admin revokes the user's sessions, or bans/deletes them). Same check the read
+    // paths use, so the two can't drift. Returns force_logout for the client to act on.
+    if (isSessionRevokedByWatermark(decodedUser, fullUser.tokensValidFrom)) {
         return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
     }
-
-    if (!fullUser) return res.status(401).json({ message: 'Unauthorized: User data unavailable.' });
 
     // --- PAYLOAD INJECTION ---
     if (payload && typeof payload === 'object') {

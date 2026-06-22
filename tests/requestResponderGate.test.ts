@@ -34,7 +34,7 @@ vi.mock('../lib/db/users', () => ({
 }));
 vi.mock('../lib/push', () => ({ sendPushToStaff: vi.fn(async () => undefined), sendPushToUsers: vi.fn(async () => undefined) }));
 
-import { assertRequestResponderOrDuty, completeRequest } from '../lib/db/requests';
+import { assertRequestResponderOrDuty, completeRequest, acceptRequest } from '../lib/db/requests';
 
 beforeEach(() => { h.adjustRepCalls = []; h.resolveQuery = () => ({ data: null, error: null }); });
 
@@ -60,6 +60,44 @@ describe('assertRequestResponderOrDuty (disp-gate-1)', () => {
     it('rejects a plain member who is neither responder nor duty', async () => {
         h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { lead_responder_id: 99 }, error: null } : { data: null, error: null };
         await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:complete'] })).rejects.toThrow(/not assigned/i);
+    });
+});
+
+describe('acceptRequest terminal-status guard', () => {
+    const withStatus = (status: string | null) => (q: { table: string }) =>
+        q.table === 'service_requests' ? { data: status === null ? null : { status }, error: null } : { data: null, error: null };
+
+    it('throws when the request does not exist', async () => {
+        h.resolveQuery = withStatus(null);
+        await expect(acceptRequest('r1', 5, 5)).rejects.toThrow(/not found/i);
+    });
+    it('rejects accepting a terminal / in-progress request (no state resurrection)', async () => {
+        for (const status of ['Success', 'Failed', 'Cancelled', 'Refused', 'Aborted', 'In-Progress', 'Accepted']) {
+            h.resolveQuery = withStatus(status);
+            await expect(acceptRequest('r1', 5, 5), `status=${status}`).rejects.toThrow(/no longer be accepted/i);
+        }
+    });
+    it('allows accepting a Submitted request', async () => {
+        h.resolveQuery = withStatus('Submitted');
+        await expect(acceptRequest('r1', 5, 5)).resolves.toBeUndefined();
+    });
+    it('allows accepting a Triaged request', async () => {
+        h.resolveQuery = withStatus('Triaged');
+        await expect(acceptRequest('r1', 5, 5)).resolves.toBeUndefined();
+    });
+
+    // memberId scoping: only self, unless the caller has real dispatch duty.
+    it('a plain member can accept a request for THEMSELVES', async () => {
+        h.resolveQuery = withStatus('Submitted');
+        await expect(acceptRequest('r1', 5, 5, { id: 5, permissions: [] })).resolves.toBeUndefined();
+    });
+    it('a plain member CANNOT assign a different member as responder', async () => {
+        await expect(acceptRequest('r1', 99, 5, { id: 5, permissions: [] }))
+            .rejects.toThrow(/only accept a request for yourself/i);
+    });
+    it('a dispatch-duty holder CAN assign a different member', async () => {
+        h.resolveQuery = withStatus('Submitted');
+        await expect(acceptRequest('r1', 99, 5, { id: 5, permissions: ['request:set_lead'] })).resolves.toBeUndefined();
     });
 });
 

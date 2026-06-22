@@ -46,9 +46,33 @@ export interface Logger {
     child(context: Record<string, unknown>): Logger;
 }
 
-function serializeField(v: unknown): unknown {
+// Any field whose name looks like a secret (top-level or nested) is replaced with
+// '[REDACTED]' before it's written. Callers should still avoid logging secrets;
+// this is a backstop, depth-capped, so one stray log.error('x', { botToken }) can't
+// dump a credential into the logs.
+const SECRET_KEY_RE = /(authorization|secret|password|cookie|token|api[_-]?key|client[_-]?secret|bot[_-]?token|private[_-]?key|credential)/i;
+const REDACT_MAX_DEPTH = 4;
+
+function isPlainObject(v: object): boolean {
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+}
+
+function serializeField(v: unknown, depth = 0): unknown {
     if (v instanceof Error) {
         return { name: v.name, message: v.message, stack: v.stack };
+    }
+    // Only walk arrays and plain objects (let Date/Buffer/class instances serialize
+    // as before), redacting any secret-named keys along the way.
+    if (v && typeof v === 'object' && depth < REDACT_MAX_DEPTH) {
+        if (Array.isArray(v)) return v.map((item) => serializeField(item, depth + 1));
+        if (isPlainObject(v as object)) {
+            const out: Record<string, unknown> = {};
+            for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+                out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : serializeField(val, depth + 1);
+            }
+            return out;
+        }
     }
     return v;
 }
@@ -63,7 +87,7 @@ function emit(level: Exclude<Level, 'silent'>, context: Record<string, unknown>,
     };
     if (fields) {
         for (const k of Object.keys(fields)) {
-            record[k] = serializeField(fields[k]);
+            record[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : serializeField(fields[k]);
         }
     }
     const line = JSON.stringify(record) + '\n';

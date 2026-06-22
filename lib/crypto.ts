@@ -82,38 +82,10 @@ export function decryptSecret(value: string): string {
     }
 }
 
-/**
- * Mask a secret value for safe display.
- * Returns a hint showing the last 4 characters prefixed with bullets, or null if empty.
- * Example: "sk_abc123xyz" → "••••3xyz"
- */
-export function maskSecret(value: string | undefined | null): string | null {
-    if (!value || typeof value !== 'string') return null;
-    // Don't mask already-encrypted values that weren't decrypted
-    if (value.startsWith(ENCRYPTED_PREFIX)) return null;
-    const visibleChars = Math.min(4, value.length);
-    return '••••' + value.slice(-visibleChars);
-}
-
-/**
- * Replace sensitive fields in a config object with masked hints.
- * Returns an object with the same shape but sensitive values replaced with
- * `{ configured: true, hint: "••••xxxx" }`.
- * Non-sensitive fields are left as-is.
- */
-export function maskConfigSecrets(key: string, config: any): any {
-    if (!config || typeof config !== 'object') return config;
-    const fields = SENSITIVE_FIELDS[key];
-    if (!fields) return config;
-
-    const result = { ...config };
-    for (const field of fields) {
-        if (result[field] && typeof result[field] === 'string') {
-            result[field] = { configured: true, hint: maskSecret(result[field]) };
-        }
-    }
-    return result;
-}
+// maskSecret / maskConfigSecrets were removed — they had no callers. Settings sent
+// to the browser are never decrypted and masked; stripSecrets (api/query.ts) sends
+// presence flags only. Don't add a decrypt-then-mask path that would pull live
+// credentials into a response.
 
 /** List of sensitive field names within config JSONB objects */
 export const SENSITIVE_FIELDS: Record<string, string[]> = {

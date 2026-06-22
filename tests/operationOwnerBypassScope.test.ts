@@ -104,6 +104,18 @@ beforeEach(() => {
     h.calls = { getFullOperationDetails: 0, getUserById: 0, handlerCalls: [] };
 });
 
+describe('auth: only HMAC session tokens are accepted (no Supabase-token fallback)', () => {
+    it('a non-verifiable token is rejected 401, never loads a user, never dispatches', async () => {
+        h.decoded = null;          // verifyToken → null (e.g. a Supabase/realtime JWT, not our HMAC)
+        h.user = ownerNoManage;    // would be returned IF any user lookup ran — it must NOT run
+        const res = mockRes();
+        await handler(mockReq('operation:update_phase', { operationId: OP_ID, phaseId: 1, data: {} }), res);
+        expect(res.statusCode).toBe(401);
+        expect(h.calls.getUserById).toBe(0);
+        expect(h.calls.handlerCalls).toHaveLength(0);
+    });
+});
+
 describe('Finding 1 — owner bypass excludes finance/payout/alert/participant/status actions', () => {
     it('op OWNER lacking operations:manage is DENIED a finance action (set_payout_splits)', async () => {
         h.decoded = { userId: OWNER_ID };

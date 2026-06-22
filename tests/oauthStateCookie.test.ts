@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-    OAUTH_STATE_COOKIE, isValidNonceShape, buildOAuthStateCookie,
+    OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_SECURE, isValidNonceShape, buildOAuthStateCookie,
     clearOAuthStateCookie, readOAuthStateCookie, nonceMatches,
 } from '../lib/oauthStateCookie';
 
@@ -32,8 +32,12 @@ describe('buildOAuthStateCookie / clearOAuthStateCookie', () => {
         expect(c).toMatch(/Max-Age=\d+/);
         expect(c).not.toContain('Secure'); // http request
     });
-    it('adds Secure over HTTPS', () => {
-        expect(buildOAuthStateCookie(nonce, true)).toContain('Secure');
+    it('adds Secure + uses the __Host- prefix over HTTPS', () => {
+        const c = buildOAuthStateCookie(nonce, true);
+        expect(c).toContain('Secure');
+        expect(c).toContain(`${OAUTH_STATE_COOKIE_SECURE}=${nonce}`);
+        expect(c).toContain('Path=/');
+        expect(c).not.toContain('Domain='); // __Host- forbids Domain
     });
     it('clear sets Max-Age=0', () => {
         expect(clearOAuthStateCookie(false)).toContain('Max-Age=0');
@@ -41,13 +45,19 @@ describe('buildOAuthStateCookie / clearOAuthStateCookie', () => {
 });
 
 describe('readOAuthStateCookie', () => {
-    it('extracts the nonce from a cookie header among others', () => {
-        expect(readOAuthStateCookie(`foo=bar; ${OAUTH_STATE_COOKIE}=abc123; baz=qux`)).toBe('abc123');
+    it('extracts the nonce from a cookie header among others (http dev)', () => {
+        expect(readOAuthStateCookie(`foo=bar; ${OAUTH_STATE_COOKIE}=abc123; baz=qux`, false)).toBe('abc123');
+    });
+    it('reads the __Host- prefixed cookie on HTTPS', () => {
+        expect(readOAuthStateCookie(`${OAUTH_STATE_COOKIE_SECURE}=abc123`, true)).toBe('abc123');
+    });
+    it('on HTTPS, a plain (non-__Host-) oauth_state cookie is NOT honored (anti-fixation)', () => {
+        expect(readOAuthStateCookie(`${OAUTH_STATE_COOKIE}=attacker-set`, true)).toBeNull();
     });
     it('returns null when absent / empty', () => {
-        expect(readOAuthStateCookie('foo=bar')).toBeNull();
-        expect(readOAuthStateCookie(undefined)).toBeNull();
-        expect(readOAuthStateCookie(`${OAUTH_STATE_COOKIE}=`)).toBeNull();
+        expect(readOAuthStateCookie('foo=bar', false)).toBeNull();
+        expect(readOAuthStateCookie(undefined, false)).toBeNull();
+        expect(readOAuthStateCookie(`${OAUTH_STATE_COOKIE}=`, false)).toBeNull();
     });
 });
 
@@ -67,8 +77,8 @@ describe('begin -> callback round-trip', () => {
         // begin: cookie minted; client redirects with state=login:<nonce>
         const setCookie = buildOAuthStateCookie(nonce, true);
         // browser replays the cookie on the same-origin callback POST
-        const cookieHeader = setCookie.split(';')[0]; // "oauth_state=<nonce>"
-        const cookieNonce = readOAuthStateCookie(cookieHeader);
+        const cookieHeader = setCookie.split(';')[0]; // "__Host-oauth_state=<nonce>"
+        const cookieNonce = readOAuthStateCookie(cookieHeader, true);
         // server derives the nonce from state's last ':'-segment
         const state = `login:${nonce}`;
         const sentNonce = state.split(':').pop()!;

@@ -21,11 +21,12 @@ vi.mock('../lib/auth', () => ({
     signIdentityGrant: () => 'IDENTITY',
     verifyIdentityGrant: () => null,
 }));
-vi.mock('../lib/rsi', () => ({ verifyRsiHandle: async () => true }));
+vi.mock('../lib/rsi', () => ({ verifyRsiHandle: async () => true, generateRsiVerificationCode: () => 'MYRSI-test' }));
 vi.mock('../lib/db/userFilters', () => ({ stripSensitiveUserFields: (u: unknown) => u }));
+const DISCORD_ID = '123456789012345678'; // valid numeric snowflake
 vi.mock('../lib/discord', () => ({
     exchangeCodeForToken: async () => ({ access_token: 'at' }),
-    getDiscordUser: async () => ({ id: 'discord-123', username: 'newbie', global_name: 'Newbie' }),
+    getDiscordUser: async () => ({ id: '123456789012345678', username: 'newbie', global_name: 'Newbie' }),
     buildGlobalAvatarUrl: () => 'https://cdn/avatar.png',
 }));
 vi.mock('../lib/radio', () => ({}));
@@ -81,6 +82,18 @@ describe('auth:discord_callback admin-claim adminExists short-circuit', () => {
         expect(res.isNewUser).toBe(true);
         expect(res.user.isAdminSetup).toBe(true);
         expect(res.adminSetupToken).toBe('GRANT');
-        expect(spies.signAdminSetupGrant).toHaveBeenCalledWith('discord-123');
+        expect(spies.signAdminSetupGrant).toHaveBeenCalledWith(DISCORD_ID);
+    });
+});
+
+describe('auth:discord_callback rejects a malformed Discord id (filter-injection guard)', () => {
+    it('throws when Discord returns a non-numeric id (would otherwise hit a string-built .or() filter)', async () => {
+        spies.adminExists.mockResolvedValue(false);
+        const discord = await import('../lib/discord');
+        const spy = vi.spyOn(discord, 'getDiscordUser').mockResolvedValue({ id: 'evil.id,auth_user_id.neq.1', username: 'x' } as never);
+        await expect(
+            call('auth:discord_callback', { code: 'oauth-code', state: '', redirectUri: 'https://app/cb' }),
+        ).rejects.toThrow(/unexpected account id/i);
+        spy.mockRestore();
     });
 });

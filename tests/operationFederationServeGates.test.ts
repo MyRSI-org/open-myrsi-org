@@ -275,6 +275,7 @@ describe('fed#2: boundedInboundSnapshot caps the guest-INITIATED pull paths', ()
 
     it('reconcile pull persists an in-cap snapshot (control: the path itself works)', async () => {
         h.tables.mirrored_operations = [];
+        h.tables.alliance_peers = [{ id: 'peerA', status: 'Active', channels: { operations: true } }];
         h.respond = (_p, path) => {
             if (path === '/api/alliance/op-manifest') return { status: 200, json: { v: 1, fetchedAt: new Date().toISOString(), accepted: { op1: 5 }, invited: [] } };
             if (path.startsWith('/api/alliance/op/op1')) return { status: 200, json: { v: 1, op_id: 'op1', version: 5, snapshot: { name: 'healed' } } };

@@ -837,9 +837,20 @@ export async function bulkUpdateIntelAffiliation(reportIds: string[], affiliated
     await broadcastIntelUpdate({ kind: 'report' });
 }
 
+// Bulk tag writes add the given tags to every targeted row, so an unbounded or
+// unsanitised tags array means a lot of writes and stored junk. Cap the count (like
+// assertBulkReportIds) and clean each tag to a single line with a length cap.
+const MAX_BULK_TAGS = 50;
+function sanitizeBulkTags(tags: unknown): string[] {
+    if (!Array.isArray(tags)) throw new Error('tags must be an array');
+    if (tags.length > MAX_BULK_TAGS) throw new Error(`Too many tags in bulk operation (${tags.length}; max ${MAX_BULK_TAGS}).`);
+    return Array.from(new Set(tags.map((t) => stripHtmlSingleLine(String(t), 40)).filter(Boolean)));
+}
+
 export async function bulkAddIntelTags(reportIds: string[], tags: string[]) {
     assertBulkReportIds(reportIds);
-    if (!reportIds.length) return;
+    const safeTags = sanitizeBulkTags(tags);
+    if (!reportIds.length || !safeTags.length) return;
     // Batched: one read of all rows' current tags, then concurrent per-row writes.
     // Tags differ per row (merge+dedupe against each row's existing set) so a single
     // bulk UPDATE can't be used — but this collapses 2N sequential round-trips to
@@ -847,7 +858,7 @@ export async function bulkAddIntelTags(reportIds: string[], tags: string[]) {
     // (matches the old `if (!data) continue` skip).
     const { data: rows } = await supabase.from('intel_reports').select('id, tags').in('id', reportIds);
     await Promise.all((rows || []).map((row) => {
-        const newTags = Array.from(new Set([...(row.tags || []), ...tags]));
+        const newTags = Array.from(new Set([...(row.tags || []), ...safeTags]));
         return supabase.from('intel_reports').update({ tags: newTags }).eq('id', row.id);
     }));
     await broadcastIntelUpdate({ kind: 'report' });
@@ -1359,7 +1370,7 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                         // metacharacters in the peer-supplied target so a value of
                         // '%' can't match every row (full-table scan + mis-linking).
                         const { data: internalMatches } = await supabase.from('intel_reports')
-                            .select('id, summary, external_id')
+                            .select('id, summary, external_id, created_by_id, source_feed_id')
                             .ilike('target_id', escapeLikePattern(cleanTarget))
                             ;
 
@@ -1368,8 +1379,15 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                         );
 
                         if (existingInternal) {
-                            // Link existing report to feed if not already linked
-                            if (!existingInternal.external_id) {
+                            // Don't relink a report we wrote ourselves (has an author,
+                            // not from a feed) to an incoming feed item just because the
+                            // content matches. That would relabel it as "from <ally>" and
+                            // stop us re-sharing it (we only share reports with no feed
+                            // source). An ally could otherwise trigger this by guessing the
+                            // target and summary, so just skip it as a duplicate, no change.
+                            const isLocallyAuthored = existingInternal.created_by_id != null && existingInternal.source_feed_id == null;
+                            if (!existingInternal.external_id && !isLocallyAuthored) {
+                                // A prior feed-sourced row missing its external_id — safe to (re)link.
                                 await supabase.from('intel_reports').update({
                                     external_id: r.id,
                                     source_feed_id: feed.id,

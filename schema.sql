@@ -3046,8 +3046,12 @@ BEGIN
     ]
     LOOP
         EXECUTE format('DROP POLICY IF EXISTS authenticated_select ON public.%I;', t);
+        -- Require the realtime token's user_id to be a live (non-deleted) member,
+        -- like the §6b broadcast policies do, so a banned/removed account loses access
+        -- to these tables right away instead of at token expiry — rather than the
+        -- looser `auth.uid() IS NOT NULL`, which any token satisfies.
         EXECUTE format(
-            'CREATE POLICY authenticated_select ON public.%I FOR SELECT TO authenticated USING (auth.uid() IS NOT NULL);',
+            'CREATE POLICY authenticated_select ON public.%I FOR SELECT TO authenticated USING (EXISTS (SELECT 1 FROM public.users u WHERE u.id = NULLIF(auth.jwt()->>''user_id'', '''')::int AND u.deleted_at IS NULL));',
             t);
     END LOOP;
 END $$;
@@ -3329,7 +3333,7 @@ ON CONFLICT (name) DO NOTHING;
 -- JSON string. BUMP this whenever you change the schema (see AMENDMENT RULES at top);
 -- keep it aligned with the app version where practical.
 INSERT INTO public.settings (key, value)
-VALUES ('schema_version', '"15.1.1-open"'::jsonb)
+VALUES ('schema_version', '"15.1.4-open"'::jsonb)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Refresh PostgREST schema cache.

@@ -100,6 +100,32 @@ describe('sanitizeTiptapJson — wiki mode', () => {
         expect(out.content[0].attrs.src).toMatch(/^https:/);
     });
 
+    it('drops iframe/youtube nodes whose host is not allow-listed; keeps allow-listed embeds', () => {
+        const input = {
+            type: 'doc',
+            content: [
+                { type: 'iframe', attrs: { src: 'https://evil.example.com/embed' } },        // off-list → dropped
+                { type: 'youtube', attrs: { src: 'https://evil.example.com/embed' } },       // off-list → dropped
+                { type: 'iframe', attrs: { src: 'https://www.youtube.com/embed/abc' } },      // allow-listed → kept
+                { type: 'iframe', attrs: { src: 'https://player.vimeo.com/video/123' } },     // allow-listed → kept
+            ],
+        };
+        const out = sanitizeTiptapJson(input, 'wiki');
+        expect(out.content).toHaveLength(2);
+        const srcs = out.content.map((n: any) => n.attrs.src);
+        expect(srcs.some((s: string) => s.includes('youtube.com'))).toBe(true);
+        expect(srcs.some((s: string) => s.includes('vimeo.com'))).toBe(true);
+        expect(srcs.some((s: string) => s.includes('evil'))).toBe(false);
+    });
+
+    it('drops a non-https iframe even on an allow-listed host (write-boundary parity with CSP)', () => {
+        const input = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'keep' }] }, { type: 'iframe', attrs: { src: 'http://www.youtube.com/embed/abc' } }] };
+        const out = sanitizeTiptapJson(input, 'wiki');
+        // The http iframe is dropped; the paragraph survives.
+        expect(out.content).toHaveLength(1);
+        expect(out.content[0].type).toBe('paragraph');
+    });
+
     it('preserves the literal text of script-looking strings — Tiptap renders text as DOM textContent, not HTML', () => {
         const input = {
             type: 'doc',

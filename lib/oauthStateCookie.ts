@@ -11,7 +11,15 @@
 import { timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
+// On HTTPS use the `__Host-` prefix: the browser then requires Secure, Path=/ and no
+// Domain, so another site on a sibling subdomain (or the network) can't overwrite
+// this CSRF cookie. The prefix needs Secure, which plain-HTTP dev can't set, so dev
+// falls back to the plain name.
 export const OAUTH_STATE_COOKIE = 'oauth_state';
+export const OAUTH_STATE_COOKIE_SECURE = '__Host-oauth_state';
+function oauthCookieName(secure: boolean): string {
+    return secure ? OAUTH_STATE_COOKIE_SECURE : OAUTH_STATE_COOKIE;
+}
 // Short-lived — the redirect to Discord and back is seconds, not minutes.
 const MAX_AGE_SECONDS = 600;
 
@@ -29,31 +37,34 @@ export function isValidNonceShape(nonce: unknown): nonce is string {
  *  first-party cookie). Secure is set when the request arrived over HTTPS. */
 export function buildOAuthStateCookie(nonce: string, secure: boolean): string {
     const parts = [
-        `${OAUTH_STATE_COOKIE}=${nonce}`,
+        `${oauthCookieName(secure)}=${nonce}`,
         'Path=/',
         'HttpOnly',
         'SameSite=Lax',
         `Max-Age=${MAX_AGE_SECONDS}`,
     ];
-    if (secure) parts.push('Secure');
+    if (secure) parts.push('Secure'); // required by the __Host- prefix
     return parts.join('; ');
 }
 
 /** Build the Set-Cookie header value that clears the OAuth state cookie. */
 export function clearOAuthStateCookie(secure: boolean): string {
-    const parts = [`${OAUTH_STATE_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+    const parts = [`${oauthCookieName(secure)}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
     if (secure) parts.push('Secure');
     return parts.join('; ');
 }
 
-/** Extract the OAuth state nonce from a raw Cookie request header, or null. */
-export function readOAuthStateCookie(cookieHeader: string | undefined | null): string | null {
+/** Read the OAuth state nonce from the Cookie header, or null. On HTTPS only the
+ *  __Host- prefixed cookie is accepted, so a plain `oauth_state` set by another site
+ *  isn't read back. */
+export function readOAuthStateCookie(cookieHeader: string | undefined | null, secure = false): string | null {
     if (!cookieHeader || typeof cookieHeader !== 'string') return null;
+    const wanted = oauthCookieName(secure);
     for (const part of cookieHeader.split(';')) {
         const eq = part.indexOf('=');
         if (eq === -1) continue;
         const name = part.slice(0, eq).trim();
-        if (name === OAUTH_STATE_COOKIE) {
+        if (name === wanted) {
             return part.slice(eq + 1).trim() || null;
         }
     }

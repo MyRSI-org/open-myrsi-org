@@ -200,11 +200,29 @@ export async function updateRequestStatus(requestId: string, status: string, use
     handleSupabaseError({ error, message: 'Failed to update request status' });
 }
 
-export async function acceptRequest(requestId: string, memberId: number, userId: number) {
+// A request can only be ACCEPTED out of one of these states. Mirrors the client
+// UI, which offers "Accept" only on Submitted/Triaged.
+const ACCEPTABLE_FOR_ACCEPT: string[] = [ServiceRequestStatus.Submitted, ServiceRequestStatus.Triaged];
 
-    // Verify Org ownership first since insert on child table doesn't check parent org automatically without JOIN RLS or explicit check
-    const { count } = await supabase.from('service_requests').select('id', { count: 'exact', head: true }).eq('id', requestId);
-    if (!count) throw new Error("Request not found or access denied.");
+export async function acceptRequest(requestId: string, memberId: number, userId: number, actor?: RequestActor) {
+
+    // A member may accept a request only for THEMSELVES. Assigning a different
+    // member as responder is a dispatch action and needs real dispatch duty —
+    // otherwise any member could commandeer open requests and force-assign (and
+    // notification-spam) arbitrary users. The proper "assign someone else" path is
+    // adminAcceptAndAssignRequest (gated by request:set_lead / dispatch).
+    if (memberId !== userId && !hasRequestDuty(actor)) {
+        throw new Error('Forbidden: you can only accept a request for yourself.');
+    }
+
+    // Check the request exists and is still acceptable. Any member can hold
+    // request:accept, so without a status check one could push a finished or
+    // in-progress request back to 'Accepted' and fire a stray "Mission Assignment"
+    // notification. Read the status and bail if it's past the acceptable point.
+    // (This read also serves as the existence check the responder insert can't do.)
+    const { data: req } = await supabase.from('service_requests').select('status').eq('id', requestId).maybeSingle();
+    if (!req) throw new Error("Request not found or access denied.");
+    if (!ACCEPTABLE_FOR_ACCEPT.includes(req.status)) throw new Error('Request can no longer be accepted.');
 
     const { error } = await supabase.from('request_responders').insert({ request_id: requestId, user_id: memberId });
     if (!error) {
@@ -315,10 +333,10 @@ export async function completeRequest(requestId: string, report: RequestReport, 
  * else only on their own. Throws on violation.
  */
 export async function assertRequestOwnerOrDuty(requestId: string, user: { id: number; role?: string; permissions?: string[] }): Promise<void> {
-    const perms = Array.isArray(user.permissions) ? user.permissions : [];
-    const isDuty = user.role === 'Admin'
-        || perms.includes('request:dispatch') || perms.includes('request:triage') || perms.includes('request:accept');
-    if (isDuty) return;
+    // Use the shared dispatch-duty set. Notably this does NOT include request:accept
+    // (every member holds it) — otherwise any member could cancel or rate any
+    // request. Only the dispatch board (or the request's own client) may act here.
+    if (hasRequestDuty(user)) return;
     const { data } = await supabase.from('service_requests').select('client_id').eq('id', requestId).maybeSingle();
     if (!data) throw new Error('Request not found.');
     if (data.client_id !== user.id) throw new Error('Forbidden: you can only act on your own requests.');

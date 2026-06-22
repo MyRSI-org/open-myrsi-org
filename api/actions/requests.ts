@@ -242,7 +242,9 @@ export const requestActions = {
     },
     'request:triage': ({ requestId, notes, urgency, userId }: TriageRequestPayload) => db.updateRequestStatus(requestId, ServiceRequestStatus.Triaged, userId, notes, undefined, urgency ? { urgency } : undefined),
     'request:admin_accept': ({ requestId, leadResponderId, notes, urgency, userId }: AdminAcceptRequestPayload) => db.adminAcceptAndAssignRequest(requestId, leadResponderId, userId, notes, urgency),
-    'request:accept': ({ requestId, memberId, userId }: AcceptRequestPayload) => db.acceptRequest(requestId, memberId, userId),
+    // memberId is caller-supplied (not an actor field), so acceptRequest scopes it:
+    // a plain member can only accept for themselves; assigning others needs dispatch duty.
+    'request:accept': ({ requestId, memberId, userId, user }: AcceptRequestPayload & { user?: { id: number; role?: string; permissions?: string[] } }) => db.acceptRequest(requestId, memberId, userId, user),
     // start/complete are Member-default but act on a caller-supplied id — verify
     // the caller is a responder on (or has duty over) the request first.
     'request:start': async ({ requestId, userId, user }: StartRequestPayload) => {

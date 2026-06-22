@@ -1,8 +1,21 @@
+import { randomBytes } from 'node:crypto';
 import { log as baseLog } from './log.js';
 
 const log = baseLog.child({ module: 'lib.rsi' });
 
+// Generate a high-entropy, server-issued verification code for RSI handle linking.
+// It must be hard to guess and very unlikely to already appear on someone's public
+// profile, so that "the code is present on the page" really does prove the user
+// controls that bio.
+export function generateRsiVerificationCode(): string {
+    return `MYRSI-${randomBytes(9).toString('base64url')}`; // ~12 random chars
+}
+
 export async function verifyRsiHandle(rsiHandle: string, verificationCode: string): Promise<boolean> {
+    // The code must be long enough that a short, common substring of the page can't
+    // satisfy the check. Server-issued codes always clear this; it guards a caller
+    // that ever passes a trivial value.
+    if (typeof verificationCode !== 'string' || verificationCode.length < 10) return false;
     try {
         const url = `https://robertsspaceindustries.com/citizens/${encodeURIComponent(rsiHandle)}`;
         const response = await fetch(url, {

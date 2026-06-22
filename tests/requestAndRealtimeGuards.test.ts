@@ -114,10 +114,15 @@ describe('request WRITE ownership gate (cancel/rate BOLA fix)', () => {
         await expect(assertRequestOwnerOrDuty('r1', { id: 5, role: 'Client', permissions: ['request:rate'] }))
             .resolves.toBeUndefined();
     });
-    it('a duty-permission holder bypasses without an ownership lookup', async () => {
+    it('a dispatch-duty holder bypasses without an ownership lookup', async () => {
         h.queries = [];
-        await assertRequestOwnerOrDuty('r1', { id: 6, role: 'Member', permissions: ['request:accept'] });
+        await assertRequestOwnerOrDuty('r1', { id: 6, role: 'Member', permissions: ['request:dispatch'] });
         expect(h.queries.find(q => q.table === 'service_requests')).toBeUndefined();
+    });
+    it('request:accept alone is NOT dispatch duty — a non-owner cannot cancel/rate', async () => {
+        h.resolveQuery = () => ({ data: { client_id: 99 }, error: null });
+        await expect(assertRequestOwnerOrDuty('r1', { id: 6, role: 'Member', permissions: ['request:accept'] }))
+            .rejects.toThrow(/your own requests/i);
     });
 });
 

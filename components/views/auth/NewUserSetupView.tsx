@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { BrandingConfig } from '../../../types';
 
 interface NewUserSetupViewProps {
-    pendingUser: { name: string; avatarUrl: string; isAdminSetup?: boolean };
+    pendingUser: { name: string; avatarUrl: string; isAdminSetup?: boolean; verificationCode?: string };
     onSetupComplete: (rsiHandle: string, verificationCode: string) => Promise<void>;
     isAdminSetup: boolean;
     brandingConfig: BrandingConfig;
@@ -11,20 +11,18 @@ interface NewUserSetupViewProps {
 const NewUserSetupView: React.FC<NewUserSetupViewProps> = ({ pendingUser, onSetupComplete, isAdminSetup, brandingConfig }) => {
     const [step, setStep] = useState<'INPUT' | 'VERIFY'>('INPUT');
     const [rsiHandle, setRsiHandle] = useState('');
-    const [verificationCode, setVerificationCode] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [copied, setCopied] = useState(false);
 
-    const generateCode = () => {
-        const prefix = brandingConfig.name ? brandingConfig.name.substring(0, 6).toUpperCase().replace(/[^A-Z]/g, '') : 'ORG';
-        return `${prefix}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-    };
+    // Server-issued in auth:discord_callback. The user pastes THIS into their RSI
+    // bio; the server checks the profile for the same code it signed into the grant,
+    // so the code can't be a client-chosen value that already appears on a page.
+    const verificationCode = pendingUser.verificationCode || '';
 
     const handleNext = (e: React.FormEvent) => {
         e.preventDefault();
         if (rsiHandle.trim()) {
-            setVerificationCode(generateCode());
             setStep('VERIFY');
             setError(null);
         }

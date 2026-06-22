@@ -55,9 +55,10 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
 
             <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full space-y-6">
 
-                <VersionCard version="15.1.3-open" title="Access Hardening" isLatest>
-                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">A small round of hardening.</strong> I brought a handful of improvements across from the hosted version. The main one: when an admin revokes someone's sessions or removes their account, that now takes effect right away for reading data too, not just for making changes. Around it are some quieter safeguards — a person's clearance can only be changed through the proper, logged path; an extra safety net keeps any future secret setting from ever reaching the browser; and a few list and search queries were tidied up. It is all invisible day to day; the point is that access stays with the people it is meant for. Tests were added to keep it that way.</li>
-                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This is a code-only update. There are no database changes, so you do not need to re-run schema.sql for this update.</li>
+                <VersionCard version="15.1.4-open" title="Security Hardening" isLatest>
+                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Another security pass, and a review that went looking for ways to break in.</strong> A few things came up and I fixed them. A partnered org can no longer take over a joint operation you are sharing with them. The RSI handle check can no longer be fooled into linking a handle you do not own. Starting or cancelling a service request now stays with the people actually on it. And a sign-in now stays valid for about a day instead of a week, so a stolen session stops working much sooner. None of this changes how the app works from day to day. I added tests so it stays that way.</li>
+                    <li><strong className="font-semibold text-slate-100">Safer if you do not run a proxy.</strong> Rate limiting and abuse blocking used to assume there was a reverse proxy sitting in front of the app. They now work correctly on their own, so a plain setup is protected with no extra config. If you do put a proxy in front, set TRUST_PROXY_HOPS to how many there are so the app sees each visitor's real address.</li>
+                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This one touches the database. After updating, re-run schema.sql in your Supabase SQL editor. Running it again is safe.</li>
                 </VersionCard>
 
                 <div className="space-y-6">
@@ -66,6 +67,11 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
                         Version History
                         <span className="h-px bg-slate-700 grow ml-4"></span>
                     </h3>
+
+                    <VersionCard version="15.1.3-open" title="Access Hardening">
+                        <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">A small round of hardening.</strong> I brought a handful of improvements across from the hosted version. The main one: when an admin revokes someone's sessions or removes their account, that now takes effect right away for reading data too, not just for making changes. Around it are some quieter safeguards — a person's clearance can only be changed through the proper, logged path; an extra safety net keeps any future secret setting from ever reaching the browser; and a few list and search queries were tidied up. It is all invisible day to day; the point is that access stays with the people it is meant for. Tests were added to keep it that way.</li>
+                        <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This is a code-only update. There are no database changes, so you do not need to re-run schema.sql for this update.</li>
+                    </VersionCard>
 
                     <VersionCard version="15.1.2-open" title="Sign-In Fix">
                         <li><strong className="text-sky-400">[Fix]</strong> <strong className="font-semibold text-slate-100">Discord sign-in fix.</strong> The hardening in 15.1.1 added a server-side safety check to the sign-in handshake, but the app was handing that handshake back in a slightly different shape than the check expected, so it could turn people away when they tried to log in with Discord. This release lines the two halves back up, so sign-in completes normally again with the new protection still fully in place, and adds a test so the two can't quietly drift apart again. Thanks to witherfork from the community for spotting and providing a fix.</li>

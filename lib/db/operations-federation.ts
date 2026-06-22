@@ -236,6 +236,25 @@ export async function revokeAllyFromOperation(opId: string, peerId: string): Pro
 }
 
 /**
+ * Re-check a peer's shared ops against its current clearance ceiling. Run after an
+ * admin lowers the peer's allowed clearance: that change doesn't bump any op
+ * version, so the peer would otherwise keep showing ops it's no longer cleared for
+ * until they happen to change. Revoke any shared op that no longer fits under the
+ * ceiling; leave the rest alone.
+ */
+export async function reconcilePeerClearanceShares(peerId: string): Promise<void> {
+    const { data: shares } = await supabase.from('operation_allied_orgs')
+        .select('operation_id').eq('peer_id', peerId);
+    for (const row of (shares ?? []) as { operation_id: string }[]) {
+        const snapshot = await buildOperationSnapshot(row.operation_id, peerId);
+        if (snapshot === null) {
+            await revokeAllyFromOperation(row.operation_id, peerId)
+                .catch((e) => log.warn('clearance reconcile revoke failed', { opId: row.operation_id, peerId, err: e }));
+        }
+    }
+}
+
+/**
  * Push the current snapshot to every ACCEPTED ally (fire-and-forget).
  * Live-sync gating: pushes to a peer marked 'down' are DROPPED, not queued —
  * the guest's reconcile poll converges on recovery (versions make the drop
@@ -254,8 +273,10 @@ export async function pushOperationToAllies(opId: string, event: 'status_change'
     if (!allies || allies.length === 0) return;
     const peerIds = (allies as { peer_id: string }[]).map((a) => a.peer_id);
     const { data: healthRows } = await supabase.from('alliance_peers')
-        .select('id, sync_health').in('id', peerIds);
-    const downPeers = new Set(((healthRows ?? []) as { id: string; sync_health: string | null }[])
+        .select('id, sync_health, outbound_max_clearance').in('id', peerIds);
+    type PeerHealthRow = { id: string; sync_health: string | null; outbound_max_clearance: number | null };
+    const peerById = new Map(((healthRows ?? []) as PeerHealthRow[]).map((p) => [p.id, p]));
+    const downPeers = new Set(((healthRows ?? []) as PeerHealthRow[])
         .filter((p) => p.sync_health === 'down').map((p) => p.id));
     const env = await opEnvelope(opId);
     // Fetch the op ONCE, then project a RECIPIENT-SCOPED snapshot per peer (each
@@ -263,11 +284,20 @@ export async function pushOperationToAllies(opId: string, event: 'status_change'
     // peer ids). 'cancel' carries no snapshot.
     const fullOp = event === 'cancel' ? null : await getFullOperationDetails(opId);
     const restricted = fullOp ? await operationHasSyncRestrictedMarker(opId) : false;
+    // Apply the per-peer clearance ceiling here too. The push runs on every op
+    // change, so without this an op raised above a peer's allowed clearance (or a
+    // peer whose ceiling was lowered) would send its full details to that peer.
+    // Over the ceiling we send no snapshot — the same thing a poll returns, which
+    // also clears any copy the peer already held. A missing peer/ceiling counts as 0.
+    const opClearance = fullOp ? ((fullOp as HydratedOperation).clearanceLevel ?? 0) : 0;
+    const globalMax = fullOp ? await getMaxShareableClearance() : 0;
     let budgetDeferred = false;
     await Promise.all(peerIds.map((peerId) => {
         if (downPeers.has(peerId)) return Promise.resolve();
         if (!tryConsumeToken(peerId, { force: immediate })) { budgetDeferred = true; return Promise.resolve(); }
-        const snapshot = fullOp ? projectOperationSnapshot(fullOp as HydratedOperation, restricted, peerId) : null;
+        const peerMax = peerById.get(peerId)?.outbound_max_clearance ?? 0;
+        const overCeiling = !!fullOp && opClearance > Math.min(globalMax, peerMax);
+        const snapshot = (fullOp && !overCeiling) ? projectOperationSnapshot(fullOp as HydratedOperation, restricted, peerId) : null;
         return callAlliancePeer(peerId, '/api/alliance/op-mirror/push', { method: 'POST', body: { ...env, event, snapshot } })
             .then((res) => { if (res) void recordPeerSuccess(peerId).catch(() => undefined); })
             .catch((e) => {
@@ -446,6 +476,12 @@ function boundedInboundSnapshot(snapshot: HydratedOperation | null | undefined):
 /** Inbound (host invites us): store a pending mirror, visible only to admins. */
 export async function receiveMirrorInvite(peer: { id: string }, body: MirrorPayload): Promise<void> {
     if (!body?.op_id || typeof body.op_id !== 'string') throw new Error('malformed_request');
+    // Only accept op mirrors from a peer the local org has actually enabled the
+    // operations channel for. The op id alone doesn't prove the sender hosts it, so
+    // without this any active paired peer could claim to host an op id it learned of
+    // and squat the mirror — denying the real host and redirecting members' RSVP
+    // details to the attacker. This is the opt-in mirror of the host-side serve gate.
+    if (!(await peerOperationsChannelEnabled(peer.id))) return;
     // Refuse to clobber a mirror hosted by a DIFFERENT peer. Otherwise any Active
     // peer could upsert over a victim-hosted mirror (id is the host's
     // operation_id, known to co-allies) — redirecting the guest's RSVP pushes
@@ -465,6 +501,7 @@ export async function receiveMirrorInvite(peer: { id: string }, body: MirrorPayl
 
 /** Inbound (host pushes): version-gated snapshot replacement. */
 export async function receiveMirrorPush(peer: { id: string }, body: MirrorPayload): Promise<void> {
+    if (!(await peerOperationsChannelEnabled(peer.id))) return;          // ops channel must be enabled for this peer
     const { data: existing } = await supabase.from('mirrored_operations').select('version, host_peer_id').eq('id', body.op_id).maybeSingle();
     if (!existing || existing.host_peer_id !== peer.id) return;          // not ours / unknown
     if (body.event === 'cancel') {
@@ -481,6 +518,7 @@ export async function receiveMirrorPush(peer: { id: string }, body: MirrorPayloa
 }
 
 export async function receiveMirrorRevoke(peer: { id: string }, opId: string): Promise<void> {
+    if (!(await peerOperationsChannelEnabled(peer.id))) return;          // ops channel must be enabled for this peer
     await supabase.from('mirrored_operations').update({ revoked_at: nowIso() }).eq('id', opId).eq('host_peer_id', peer.id);
     broadcastToOrg('operation_update', { operationId: opId });
 }
@@ -666,6 +704,10 @@ const NO_INFO: Omit<MirrorReconcileResult, 'peerUp'> = { ok: false, pulled: 0, r
  * Throws on transport failure (caller feeds the health state machine).
  */
 export async function reconcileMirrorsWithPeer(peerId: string): Promise<MirrorReconcileResult> {
+    // Same opt-in as the push ingest: only sync op mirrors with a peer the local org
+    // has enabled the operations channel for, so a peer we don't run joint ops with
+    // can't seed a squatted mirror via the manifest-pull path either.
+    if (!(await peerOperationsChannelEnabled(peerId))) return { ...NO_INFO, peerUp: false };
     const res = await callAlliancePeer(peerId, '/api/alliance/op-manifest');
     if (!res) return { ...NO_INFO, peerUp: false };            // peer not Active locally — config, not health
     if (!res.ok) {

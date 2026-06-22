@@ -16,10 +16,12 @@ import type { Request } from 'express';
  *    which Cloudflare always sets/overwrites at its edge. Do NOT set this if
  *    the origin is directly reachable — a direct caller could then spoof it.
  *  - otherwise — CF-Connecting-IP is IGNORED and we use Express's `req.ip`,
- *    which resolves X-Forwarded-For against `trust proxy` (TRUST_PROXY_HOPS,
- *    default 1 = the single TLS-terminating reverse proxy of DEPLOYMENT_GUIDE
- *    §4; set 0 if Node is directly exposed, else the socket peer can spoof
- *    one XFF hop).
+ *    which resolves X-Forwarded-For against `trust proxy` (TRUST_PROXY_HOPS).
+ *    SECURE DEFAULT: 0 = trust no forwarded header and use the real TCP socket
+ *    peer (unspoofable), which is correct for a directly-exposed Node. Operators
+ *    behind a reverse proxy set TRUST_PROXY_HOPS to the number of proxies in
+ *    front (1 for a single TLS terminator, 2+ for CDN→LB→app) so req.ip becomes
+ *    the real client rather than the proxy.
  *
  * Never hand-parse X-Forwarded-For here: taking the FIRST (leftmost) hop
  * trusts a client-controlled value; rightmost-trusted resolution is exactly

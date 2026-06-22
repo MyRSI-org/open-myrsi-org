@@ -223,6 +223,22 @@ export function stripSecrets(state: any): any {
         };
     }
 
+    // Platform settings are one admin-editable blob with an open key shape, and the
+    // top-level secret-name check below doesn't look inside nested objects. So rebuild
+    // it from a known list of fields here (like the config objects above): any new
+    // secret-ish field added under platformSettings drops by default instead of
+    // reaching every member. Fields are copied only when present, so the login-screen
+    // projection (maintenance flag + message) is unchanged.
+    if (cleaned.platformSettings && typeof cleaned.platformSettings === 'object') {
+        const p = cleaned.platformSettings as Record<string, unknown>;
+        const safe: Record<string, unknown> = {};
+        if ('maintenance_mode' in p) safe.maintenance_mode = p.maintenance_mode === true;
+        if ('maintenance_message' in p) safe.maintenance_message = typeof p.maintenance_message === 'string' ? p.maintenance_message : null;
+        if (typeof p.support_discord_url === 'string') safe.support_discord_url = p.support_discord_url;
+        if (typeof p.force_logout_timestamp === 'string') safe.force_logout_timestamp = p.force_logout_timestamp;
+        cleaned.platformSettings = safe;
+    }
+
     // Safety net: the settings blob contains every settings row, so a secret
     // added in the future (named like *_secret, *_api_key, *_password, *_webhook,
     // or *_token) could reach the browser unless we catch it here. Drop any
@@ -830,6 +846,15 @@ async function handleFeed(req: Request, res: Response) {
     try {
         const keyData = await db.verifyApiKey(apiKey);
         if (!keyData) return res.status(403).json({ message: 'Invalid API Key' });
+
+        // Alliance keys (label "alliance:<peerId>") aren't allowed on this legacy
+        // feed: it returns the org-wide feed with every channel, which would skip the
+        // per-peer clearance limit and channel choices that /api/alliance/data applies.
+        // Paired allies must use that endpoint instead. "alliance:" is a reserved
+        // label prefix, so manually created keys must not start with it.
+        if (typeof (keyData as { label?: string }).label === 'string' && (keyData as { label: string }).label.startsWith('alliance:')) {
+            return res.status(403).json({ message: 'Use the alliance data channel for this key' });
+        }
 
         const since = req.query.since as string;
         const feedData = await db.getPublicFeedData(since);

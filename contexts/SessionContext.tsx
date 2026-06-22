@@ -327,13 +327,14 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
                 try {
                     const redirectUri = window.location.origin;
-                    const { user, isNewUser, adminSetupToken, identityToken } = await apiService.discordCallback(code, state, redirectUri);
+                    const { user, isNewUser, adminSetupToken, identityToken, verificationCode } = await apiService.discordCallback(code, state, redirectUri);
                     // Carry the server-signed grants into the pending-user blob so
                     // finalize_setup can present them: identityToken binds the new
                     // account to this Discord id; adminSetupToken (if any) authorizes
                     // the Admin role. Both decisions are made server-side from the
-                    // grants, not from any client flag.
-                    if (isNewUser) setPendingUser({ ...user, ...(adminSetupToken ? { adminSetupToken } : {}), ...(identityToken ? { identityToken } : {}) });
+                    // grants, not from any client flag. verificationCode is the
+                    // server-issued RSI code for the user to paste into their bio.
+                    if (isNewUser) setPendingUser({ ...user, ...(adminSetupToken ? { adminSetupToken } : {}), ...(identityToken ? { identityToken } : {}), ...(verificationCode ? { verificationCode } : {}) });
                     else {
                         setCurrentUser(user);
                         if (user.role === 'Admin') setNeedsSetup(false);
@@ -661,7 +662,11 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         window.location.href = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify&state=login:${nonce}`;
     }, [discordConfig, addToast, beginOAuth]);
 
-    const logout = useCallback(() => {
+    const logout = useCallback(async () => {
+        // Tell the server to end this session (so a stolen token stops working), then
+        // clear locally. Best-effort: always clear the local session even if the call
+        // fails (offline, or before the database column for it exists).
+        try { await apiService.rpc('user:logout', {}); } catch { /* fall through to local clear */ }
         localStorage.removeItem('myrsi_auth_token');
         setCurrentUser(null);
         setNeedsSetup(false);
@@ -756,7 +761,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     // RSI step's finalize then assigns the Admin role.
     const redeemAdminSetupCode = useCallback(async (code: string) => {
         if (!pendingUser?.discordId) throw new Error('Sign in with Discord first.');
-        const { adminSetupToken } = await apiService.redeemSetupCode(pendingUser.discordId, code);
+        const { adminSetupToken } = await apiService.redeemSetupCode(pendingUser.discordId, code, pendingUser.identityToken);
         if (!adminSetupToken) throw new Error('Invalid setup code.');
         setPendingUser((prev: any) => prev ? { ...prev, adminSetupToken, isAdminSetup: true } : prev);
         return adminSetupToken;

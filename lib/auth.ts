@@ -21,16 +21,27 @@ if (!SECRET) {
 
 const SIGNING_KEY = SECRET || randomBytes(32).toString('hex');
 
-const TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// Session-token lifetime. A FIXED, relatively short window is the only thing that
+// truly bounds a stolen token: per-request or "sliding" expiry does not help,
+// because an attacker holding the token would simply keep refreshing it. Server-side
+// revocation (tokens_valid_from / force_logout) and one-click Discord re-login cover
+// the rest. Re-auth has no password — it's a single Discord click.
+const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;           // 24 hours
+// Tokens minted before `iat` was added carried no issue time and a 7-day life;
+// derive their issue time from exp minus this so revocation comparisons stay correct.
+const LEGACY_TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface AuthToken {
     userId: number;
     exp: number;
+    /** Issued-at (ms). Absent on pre-change tokens — see tokenIssuedAt fallback. */
+    iat?: number;
 }
 
-/** Derive when the token was issued (exp minus lifetime) */
+/** When the token was issued: the explicit iat, or exp minus the legacy lifetime
+ *  for older tokens that predate the iat claim. */
 export function tokenIssuedAt(token: AuthToken): Date {
-    return new Date(token.exp - TOKEN_LIFETIME_MS);
+    return new Date(typeof token.iat === 'number' ? token.iat : token.exp - LEGACY_TOKEN_LIFETIME_MS);
 }
 
 /**
@@ -57,9 +68,9 @@ export function isSessionRevokedByWatermark(token: AuthToken, tokensValidFrom: s
     return tokenIssuedAt(token).toISOString() < tokensValidFrom;
 }
 
-export function signToken(payload: Omit<AuthToken, 'exp'>): string {
-    const expiry = Date.now() + TOKEN_LIFETIME_MS;
-    const data = JSON.stringify({ ...payload, exp: expiry });
+export function signToken(payload: Omit<AuthToken, 'exp' | 'iat'>): string {
+    const now = Date.now();
+    const data = JSON.stringify({ ...payload, iat: now, exp: now + TOKEN_LIFETIME_MS });
     const encodedData = Buffer.from(data).toString('base64');
     const signature = createHmac('sha256', SIGNING_KEY).update(encodedData).digest('hex');
     return `${encodedData}.${signature}`;
@@ -94,9 +105,10 @@ export function verifyToken(token: string | undefined): AuthToken | null {
         // full session token. Session tokens have no `purpose` field.
         if (payload.purpose) return null;
         if (typeof payload.userId !== 'number' || typeof payload.exp !== 'number') return null;
+        if (payload.iat !== undefined && typeof payload.iat !== 'number') return null;
         if (Date.now() > payload.exp) return null;
         // Return a normalised token — never trust extra fields a payload might carry.
-        return { userId: payload.userId, exp: payload.exp };
+        return { userId: payload.userId, exp: payload.exp, ...(typeof payload.iat === 'number' ? { iat: payload.iat } : {}) };
     } catch {
         return null;
     }
@@ -192,6 +204,9 @@ export function verifyAdminSetupGrant(token: string | undefined): { discordId: s
         const payload = JSON.parse(Buffer.from(encodedData, 'base64').toString());
         if (payload.purpose !== 'admin_setup') return null;
         if (typeof payload.discordId !== 'string' || !payload.discordId) return null;
+        // Make sure exp is a number, like verifyToken does — a non-number would make
+        // the expiry check below always pass (the token would never expire).
+        if (typeof payload.exp !== 'number') return null;
         if (Date.now() > payload.exp) return null;
         return { discordId: payload.discordId };
     } catch {
@@ -205,15 +220,18 @@ export function verifyAdminSetupGrant(token: string | undefined): { discordId: s
 // else's discord id (account squatting). Bound to discordId; short-lived.
 const IDENTITY_GRANT_LIFETIME_MS = 15 * 60 * 1000; // 15 minutes
 
-export function signIdentityGrant(discordId: string): string {
+export function signIdentityGrant(discordId: string, verificationCode: string): string {
     const expiry = Date.now() + IDENTITY_GRANT_LIFETIME_MS;
-    const data = JSON.stringify({ purpose: 'signup_identity', discordId, exp: expiry });
+    // The RSI verification code is carried INSIDE the signed grant (not taken from
+    // the client at finalize) so the user can only verify a handle by pasting OUR
+    // server-issued code into that handle's bio — a chosen value can't satisfy it.
+    const data = JSON.stringify({ purpose: 'signup_identity', discordId, vc: verificationCode, exp: expiry });
     const encodedData = Buffer.from(data).toString('base64');
     const signature = createHmac('sha256', SIGNING_KEY).update(encodedData).digest('hex');
     return `${encodedData}.${signature}`;
 }
 
-export function verifyIdentityGrant(token: string | undefined): { discordId: string } | null {
+export function verifyIdentityGrant(token: string | undefined): { discordId: string; vc?: string } | null {
     if (!token) return null;
 
     const parts = token.split('.');
@@ -230,8 +248,11 @@ export function verifyIdentityGrant(token: string | undefined): { discordId: str
         const payload = JSON.parse(Buffer.from(encodedData, 'base64').toString());
         if (payload.purpose !== 'signup_identity') return null;
         if (typeof payload.discordId !== 'string' || !payload.discordId) return null;
+        // Make sure exp is a number, like verifyToken does — a non-number would make
+        // the expiry check below always pass (the token would never expire).
+        if (typeof payload.exp !== 'number') return null;
         if (Date.now() > payload.exp) return null;
-        return { discordId: payload.discordId };
+        return { discordId: payload.discordId, vc: typeof payload.vc === 'string' ? payload.vc : undefined };
     } catch {
         return null;
     }

@@ -261,4 +261,32 @@ export default [
             }],
         },
     },
+
+    // Client code (components / contexts / hooks / services / root *.tsx) must not
+    // import server-only modules: Vite would bundle their code and any literals — the
+    // service-role Supabase client, key derivation, JWT signing, the Discord bot token
+    // — into the public client bundle. This turns that into a build failure instead of
+    // relying on review. Modules that are safe in both places (oauthState, the anon
+    // supabaseClient, audio*, slice*, debugLog, time, imageUrl, linkUrl, ...) aren't
+    // listed and stay importable. Client code reaches server logic via
+    // services/apiService.ts.
+    {
+        files: ['components/**/*.{ts,tsx}', 'contexts/**/*.{ts,tsx}', 'hooks/**/*.{ts,tsx}', 'services/**/*.{ts,tsx}', '*.tsx'],
+        rules: {
+            'no-restricted-imports': ['error', {
+                patterns: [{
+                    group: [
+                        '**/lib/db', '**/lib/db/**',
+                        '**/lib/secrets', '**/lib/crypto', '**/lib/auth', '**/lib/discord',
+                        '**/lib/push', '**/lib/radio', '**/lib/ai', '**/lib/pgrest',
+                        '**/lib/ssrf', '**/lib/firstBoot', '**/lib/cronLock', '**/lib/seeder',
+                        '**/lib/supabaseServer', '**/lib/abuseFilter',
+                        '**/api/services', '**/api/query', '**/api/public', '**/api/index', '**/api/sw',
+                        '**/api/actions/**',
+                    ],
+                    message: 'Server-only module — importing it into client code would ship server logic/secrets into the public client bundle. Reach it through services/apiService.ts instead.',
+                }],
+            }],
+        },
+    },
 ];

@@ -12,7 +12,8 @@ const h = vi.hoisted(() => ({
     ctx: null as any,
     decoded: null as any,
     user: null as any,
-    calls: { getWarrantsState: 0, getState: 0, getMainState: 0 },
+    apiKey: null as null | { id: number; label: string },
+    calls: { getWarrantsState: 0, getState: 0, getMainState: 0, getPublicFeedData: 0 },
 }));
 
 // Chainable, awaitable Supabase stub so handleInitialState's admin-count probe
@@ -39,6 +40,8 @@ vi.mock('../lib/db', () => ({
     getWarrantsState: async (_oid: string) => { h.calls.getWarrantsState++; return { warrants: [{ id: 'w1' }] }; },
     getMainState: async (_oid: string) => { h.calls.getMainState++; return { users: [] }; },
     getState: async (_oid: string) => { h.calls.getState++; return { warrants: [], users: [] }; },
+    verifyApiKey: async (_k: string) => h.apiKey,
+    getPublicFeedData: async (_since?: string) => { h.calls.getPublicFeedData++; return { reports: [], warrants: [], bulletins: [], _meta: { maxShareableLevel: 0 } }; },
 }));
 
 import handler from '../api/query';
@@ -53,14 +56,17 @@ function mockRes() {
 function mockReq(query: any, token?: string) {
     return { method: 'GET', query, headers: token ? { authorization: `Bearer ${token}` } : {} } as any;
 }
+function mockFeedReq(apiKey?: string) {
+    return { method: 'GET', query: { target: 'feed' }, headers: apiKey ? { 'x-api-key': apiKey } : {} } as any;
+}
 
 const TENANT = { type: 'TENANT', organizationId: 'org-1', ownerId: 'owner-auth-id', slug: 'jims' };
 const clientUser = { id: 5, organizationId: 'org-1', role: 'Client', permissions: [], auth_user_id: 'u5' };
 const memberUser = { id: 6, organizationId: 'org-1', role: 'Member', permissions: ['warrant:view', 'intel:view', 'hr:view'], auth_user_id: 'u6' };
 
 beforeEach(() => {
-    h.ctx = null; h.decoded = null; h.user = null;
-    h.calls = { getWarrantsState: 0, getState: 0, getMainState: 0 };
+    h.ctx = null; h.decoded = null; h.user = null; h.apiKey = null;
+    h.calls = { getWarrantsState: 0, getState: 0, getMainState: 0, getPublicFeedData: 0 };
 });
 
 describe('GET /api/query — non-tenant contexts get no org data', () => {
@@ -132,5 +138,39 @@ describe('GET /api/query?target=initial-state — never dumps full state without
         await handler(mockReq({ target: 'initial-state' }, 'tok'), res);
         expect(h.calls.getState).toBe(1);
         expect(res.statusCode).toBe(200);
+    });
+});
+
+describe('GET /api/query?target=feed — alliance key must not bypass per-peer scoping', () => {
+    it('a manual feed key → 200 with feed data', async () => {
+        h.apiKey = { id: 1, label: 'partner feed' };
+        const res = mockRes();
+        await handler(mockFeedReq('manual-key'), res);
+        expect(res.statusCode).toBe(200);
+        expect(h.calls.getPublicFeedData).toBe(1);
+        expect(Array.isArray(res.body.reports)).toBe(true);
+    });
+
+    it('an alliance directional key (label alliance:<peerId>) → 403, feed never built', async () => {
+        h.apiKey = { id: 2, label: 'alliance:peer-uuid-123' };
+        const res = mockRes();
+        await handler(mockFeedReq('alliance-inbound-key'), res);
+        expect(res.statusCode).toBe(403);
+        expect(h.calls.getPublicFeedData).toBe(0);
+    });
+
+    it('no key → 401', async () => {
+        const res = mockRes();
+        await handler(mockFeedReq(), res);
+        expect(res.statusCode).toBe(401);
+        expect(h.calls.getPublicFeedData).toBe(0);
+    });
+
+    it('unknown key → 403', async () => {
+        h.apiKey = null;
+        const res = mockRes();
+        await handler(mockFeedReq('bogus'), res);
+        expect(res.statusCode).toBe(403);
+        expect(h.calls.getPublicFeedData).toBe(0);
     });
 });

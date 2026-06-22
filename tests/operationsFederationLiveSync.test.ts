@@ -22,6 +22,9 @@ const h = vi.hoisted(() => ({
     peerCalls: [] as Array<{ peerId: string; path: string; body?: unknown }>,
     // path-prefix → responder; configured per test.
     respond: null as null | ((peerId: string, path: string) => unknown),
+    // Federation clearance ceiling inputs.
+    opClearance: 0,
+    globalMax: 5,
 }));
 
 vi.mock('../lib/db/common', () => {
@@ -100,8 +103,13 @@ vi.mock('../lib/db/common', () => {
 vi.mock('../lib/db/ops', () => ({
     // Minimal hydrated op for buildOperationSnapshot; the projection itself is
     // pinned in tests/operations-federation.projection.test.ts.
-    getFullOperationDetails: async (id: string) => ({ id, name: 'Op', participants: [], tasks: [], commandNodes: [], logistics: [], commsPlan: [], limitingMarkers: [] }),
+    getFullOperationDetails: async (id: string) => ({ id, name: 'Op', clearanceLevel: h.opClearance, participants: [], tasks: [], commandNodes: [], logistics: [], commsPlan: [], limitingMarkers: [] }),
 }));
+
+// operations-federation imports getMaxShareableClearance from ./system for the
+// egress ceiling — mock it deterministically (default high so the existing
+// snapshot/manifest tests, which use an unclassified op, are unaffected).
+vi.mock('../lib/db/system', () => ({ getMaxShareableClearance: async () => h.globalMax }));
 
 vi.mock('../lib/db/mappers', () => ({
     toMirroredOperation: (r: Record<string, unknown>) => r,
@@ -121,7 +129,7 @@ vi.mock('../lib/db/alliances', () => ({
 import {
     getOperationSnapshotForPeer, getOperationManifestForPeer,
     removeAlliedParticipant, receiveMirrorPush, receiveMirrorInvite,
-    pushOperationToAllies, scheduleAlliedPush,
+    pushOperationToAllies, scheduleAlliedPush, reconcilePeerClearanceShares,
     reconcileMirrorsWithPeer, __resetReconcileStateForTests,
 } from '../lib/db/operations-federation';
 import { __resetAllianceSyncStateForTests, tryConsumeToken, ALLIANCE_SYNC_DEFAULTS } from '../lib/db/allianceSyncState';
@@ -132,6 +140,14 @@ beforeEach(() => {
     h.peerCalls = [];
     h.respond = null;
     h.tables = {};
+    h.opClearance = 0;
+    h.globalMax = 5;
+    // The guest ingest + reconcile paths now require the operations channel to be
+    // enabled for the peer (the gate that blocks mirror-squat). Seed the peers these
+    // tests use as Active + ops-enabled. Host-push tests overwrite this with their own
+    // rows (the push path doesn't consult this gate).
+    h.tables.alliance_peers = ['peerA', 'peerB', 'attacker', 'victimHost', 'hostA', 'otherHost']
+        .map((id) => ({ id, status: 'Active', channels: { operations: true } }));
     __resetReconcileStateForTests();
     __resetAllianceSyncStateForTests();
 });
@@ -262,6 +278,28 @@ describe('receiveMirrorInvite cross-peer clobber guard (VULN-1 regression)', () 
     });
 });
 
+describe('mirror ingest requires the operations channel', () => {
+    it('receiveMirrorInvite from a peer without the ops channel creates NO mirror (squat blocked)', async () => {
+        h.tables.alliance_peers = [{ id: 'noops', status: 'Active', channels: {} }];
+        h.tables.mirrored_operations = [];
+        await receiveMirrorInvite({ id: 'noops' }, { v: 1, op_id: 'opX', version: 1, snapshot: { name: 'squat' } as never });
+        expect(h.tables.mirrored_operations).toHaveLength(0);
+    });
+    it('receiveMirrorPush from a peer without the ops channel is ignored', async () => {
+        h.tables.alliance_peers = [{ id: 'noops', status: 'Active', channels: {} }];
+        h.tables.mirrored_operations = [{ id: 'opX', host_peer_id: 'noops', version: 1, snapshot: { name: 'old' } }];
+        await receiveMirrorPush({ id: 'noops' }, { v: 1, op_id: 'opX', version: 2, event: 'full', snapshot: { name: 'new' } as never });
+        expect(h.tables.mirrored_operations[0].version).toBe(1); // unchanged
+    });
+    it('reconcileMirrorsWithPeer skips a peer without the ops channel (no manifest call)', async () => {
+        h.tables.alliance_peers = [{ id: 'noops', status: 'Active', channels: {} }];
+        h.respond = () => manifest({ opX: 1 });
+        const r = await reconcileMirrorsWithPeer('noops');
+        expect(r.peerUp).toBe(false);
+        expect(h.peerCalls).toHaveLength(0); // never reached the manifest fetch
+    });
+});
+
 describe('receiveMirrorPush replay safety', () => {
     it('a stale/lower version from a push NEVER rolls the mirror back', async () => {
         h.tables.mirrored_operations = [{ id: 'op1', host_peer_id: 'peerA', version: 10, snapshot: { name: 'current' } }];
@@ -325,6 +363,93 @@ describe('pushOperationToAllies live-sync gating', () => {
         h.tables.operation_allied_orgs = [];
         await pushOperationToAllies('op1', 'full');
         expect(h.peerCalls).toHaveLength(0);
+    });
+});
+
+describe('pushOperationToAllies clearance ceiling', () => {
+    const seedPeers = (peers: Array<{ id: string; outbound_max_clearance: number }>) => {
+        h.tables.operation_allied_orgs = peers.map((p) => ({ operation_id: 'op1', peer_id: p.id, accepted: true }));
+        h.tables.operations = [{ id: 'op1', joint_version: 3 }];
+        h.tables.alliance_peers = peers.map((p) => ({ id: p.id, sync_health: 'healthy', outbound_max_clearance: p.outbound_max_clearance }));
+        h.tables.operation_limiting_markers = [];
+        h.respond = () => ({ status: 200, json: { ok: true } });
+    };
+    const snapshotFor = (peerId: string) => {
+        const call = h.peerCalls.find((c) => c.peerId === peerId && c.path === '/api/alliance/op-mirror/push');
+        return (call?.body as { snapshot: unknown } | undefined)?.snapshot;
+    };
+
+    it('pushes a NULL snapshot to a peer below the op clearance (no content leak)', async () => {
+        h.opClearance = 5; h.globalMax = 5;
+        seedPeers([{ id: 'peerLow', outbound_max_clearance: 0 }]); // min(5,0)=0, 5>0
+        await pushOperationToAllies('op1', 'full');
+        expect(h.peerCalls).toHaveLength(1);
+        expect(snapshotFor('peerLow')).toBeNull();
+    });
+
+    it('pushes the projected snapshot to a peer at/above the op clearance', async () => {
+        h.opClearance = 2; h.globalMax = 5;
+        seedPeers([{ id: 'peerHi', outbound_max_clearance: 5 }]); // min(5,5)=5, 2<=5
+        await pushOperationToAllies('op1', 'full');
+        expect(snapshotFor('peerHi')).toBeTruthy();
+        expect((snapshotFor('peerHi') as { id: string }).id).toBe('op1');
+    });
+
+    it('enforces the ORG-WIDE ceiling even when the peer ceiling is higher', async () => {
+        h.opClearance = 3; h.globalMax = 2;
+        seedPeers([{ id: 'peerHi', outbound_max_clearance: 5 }]); // min(2,5)=2, 3>2
+        await pushOperationToAllies('op1', 'full');
+        expect(snapshotFor('peerHi')).toBeNull();
+    });
+
+    it('scopes per peer in ONE push: over-ceiling peer gets null, cleared peer gets content', async () => {
+        h.opClearance = 3; h.globalMax = 5;
+        seedPeers([
+            { id: 'peerLow', outbound_max_clearance: 0 }, // min(5,0)=0, 3>0 → null
+            { id: 'peerHi', outbound_max_clearance: 5 },  // min(5,5)=5, 3<=5 → content
+        ]);
+        await pushOperationToAllies('op1', 'full');
+        expect(snapshotFor('peerLow')).toBeNull();
+        expect(snapshotFor('peerHi')).toBeTruthy();
+    });
+
+    it('the ceiling also applies to immediate events (status_change/alert)', async () => {
+        h.opClearance = 5; h.globalMax = 5;
+        seedPeers([{ id: 'peerLow', outbound_max_clearance: 0 }]);
+        await pushOperationToAllies('op1', 'status_change');
+        expect(snapshotFor('peerLow')).toBeNull();
+    });
+
+    it('an unclassified op still pushes content to a ceiling-0 peer', async () => {
+        h.opClearance = 0; h.globalMax = 5;
+        seedPeers([{ id: 'peerLow', outbound_max_clearance: 0 }]); // min(5,0)=0, 0<=0
+        await pushOperationToAllies('op1', 'full');
+        expect(snapshotFor('peerLow')).toBeTruthy();
+    });
+});
+
+describe('reconcilePeerClearanceShares', () => {
+    it('revokes a share whose op now exceeds the (lowered) peer ceiling', async () => {
+        h.opClearance = 5; h.globalMax = 5;
+        h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
+        h.tables.operations = [{ id: 'op1', joint_version: 3 }];
+        h.tables.alliance_peers = [{ id: 'peerA', outbound_max_clearance: 0 }]; // min(5,0)=0, op 5 → over
+        h.tables.operation_limiting_markers = [];
+        h.respond = () => ({ status: 200, json: { ok: true } });
+        await reconcilePeerClearanceShares('peerA');
+        expect(h.peerCalls.some((c) => c.path === '/api/alliance/op-mirror/revoke')).toBe(true);
+        expect(h.tables.operation_allied_orgs).toHaveLength(0); // share clawed back
+    });
+    it('leaves a share still within the ceiling untouched', async () => {
+        h.opClearance = 0; h.globalMax = 5;
+        h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
+        h.tables.operations = [{ id: 'op1', joint_version: 3 }];
+        h.tables.alliance_peers = [{ id: 'peerA', outbound_max_clearance: 0 }]; // op 0 <= 0 → ok
+        h.tables.operation_limiting_markers = [];
+        h.respond = () => ({ status: 200, json: { ok: true } });
+        await reconcilePeerClearanceShares('peerA');
+        expect(h.peerCalls.some((c) => c.path === '/api/alliance/op-mirror/revoke')).toBe(false);
+        expect(h.tables.operation_allied_orgs).toHaveLength(1);
     });
 });
 

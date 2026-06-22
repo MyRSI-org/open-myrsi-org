@@ -1,4 +1,7 @@
 import { Node, mergeAttributes } from '@tiptap/core';
+// Single source of truth for the embed host allow-list, shared with the server-side
+// sanitizer (lib/tiptapValidate enforces it at the write boundary too). (api-1/fe-3)
+import { ALLOWED_EMBED_HOSTS } from '../../../../lib/tiptapValidate';
 
 export interface IframeOptions {
     allowFullscreen: boolean;
@@ -13,25 +16,12 @@ declare module '@tiptap/core' {
     }
 }
 
-const ALLOWED_IFRAME_HOSTS = [
-    'www.youtube.com',
-    'www.youtube-nocookie.com',
-    'player.vimeo.com',
-    'docs.google.com',
-    'drive.google.com',
-    'calendar.google.com',
-    'www.google.com',
-    'open.spotify.com',
-    'codepen.io',
-    'stackblitz.com',
-];
-
 function isAllowedIframeSrc(src: string | null): boolean {
     if (!src) return false;
     try {
         const url = new URL(src);
         if (url.protocol !== 'https:') return false;
-        return ALLOWED_IFRAME_HOSTS.some(host => url.hostname === host || url.hostname.endsWith('.' + host));
+        return ALLOWED_EMBED_HOSTS.some(host => url.hostname === host || url.hostname.endsWith('.' + host));
     } catch {
         return false;
     }

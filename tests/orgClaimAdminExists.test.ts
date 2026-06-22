@@ -36,4 +36,11 @@ describe('setup-code self-promotion block (L4)', () => {
         spies.adminExists.mockResolvedValue(true);
         await expect(call('auth:redeem_setup_code', { discordId: 'd1', code: 'SETUP-x' })).rejects.toThrow(/administrator already exists/i);
     });
+    it('auth:redeem_setup_code requires a proven OAuth identity token', async () => {
+        // No admin yet, but no/invalid identityToken → no admin-setup grant is minted
+        // for an unproven Discord id, and the setup code is never consumed.
+        spies.adminExists.mockResolvedValue(false);
+        await expect(call('auth:redeem_setup_code', { discordId: 'd1', code: 'SETUP-x' })).rejects.toThrow(/sign-in session has expired/i);
+        expect(spies.validateNote).not.toHaveBeenCalled();
+    });
 });

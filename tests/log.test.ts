@@ -75,6 +75,30 @@ describe('lib/log', () => {
         expect(rec.extra).toBe(true);
     });
 
+    it('redacts secret-named fields (top-level and nested)', () => {
+        log.info('x', {
+            botToken: 'super-secret',
+            authorization: 'Bearer abc',
+            userId: 42,                       // benign — kept
+            config: { apiKey: 'sk-leak', clientSecret: 'cs-leak', model: 'gemini' },
+            list: [{ password: 'pw' }],
+        });
+        const rec = lastLine(stdoutSpy);
+        expect(rec.botToken).toBe('[REDACTED]');
+        expect(rec.authorization).toBe('[REDACTED]');
+        expect(rec.userId).toBe(42);
+        const config = rec.config as Record<string, unknown>;
+        expect(config.apiKey).toBe('[REDACTED]');
+        expect(config.clientSecret).toBe('[REDACTED]');
+        expect(config.model).toBe('gemini'); // benign nested field kept
+        expect((rec.list as Array<Record<string, unknown>>)[0].password).toBe('[REDACTED]');
+        // No secret value survives anywhere in the serialized line.
+        const raw = JSON.stringify(rec);
+        for (const leak of ['super-secret', 'Bearer abc', 'sk-leak', 'cs-leak', 'pw']) {
+            expect(raw).not.toContain(leak);
+        }
+    });
+
     it('respects LOG_LEVEL=warn — suppresses debug/info, passes warn/error', () => {
         process.env.LOG_LEVEL = 'warn';
         refreshLogLevel();

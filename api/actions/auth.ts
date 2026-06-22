@@ -3,7 +3,7 @@ import * as db from '../../lib/db.js';
 import * as discord from '../../lib/discord.js';
 import * as radio from '../../lib/radio.js';
 import { signToken, signAdminSetupGrant, verifyAdminSetupGrant, signIdentityGrant, verifyIdentityGrant } from '../../lib/auth.js';
-import { verifyRsiHandle } from '../../lib/rsi.js';
+import { verifyRsiHandle, generateRsiVerificationCode } from '../../lib/rsi.js';
 import { stripSensitiveUserFields } from '../../lib/db/userFilters.js';
 import { adminExists } from '../../lib/firstBoot.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
@@ -148,7 +148,12 @@ export const authActions = {
         radio.assertRadioRateLimit(user?.id);
         return radio.getRadioStatus({ includeParticipants: user?.role === 'Admin' || (user?.permissions || []).includes('radio:manage') });
     },
-    'radio:reboot': () => radio.rebootRadioNetwork(),
+    'radio:reboot': ({ user }: { user?: RadioActor }) => {
+        // Throttle per user like the other radio actions: radio:manage controls who
+        // can reboot, but the limiter caps how often the LiveKit reboot can be called.
+        radio.assertRadioRateLimit(user?.id);
+        return radio.rebootRadioNetwork();
+    },
 
     // --- AUTH ACTIONS ---
     'auth:discord_callback': async ({ code, state, redirectUri }: DiscordCallbackPayload) => {
@@ -156,34 +161,34 @@ export const authActions = {
         if (!redirectUri) throw new Error('Missing redirect URI for token exchange.');
         log.info('discord callback', { redirectUri, hasState: !!state });
 
-        // Translate Discord OAuth credential errors into a machine-readable prefix
-        // so the login screen can show an actionable message instead of a silent
-        // bounce. `invalid_client` almost always means the Client Secret is wrong
-        // or rotated; `invalid_grant` usually means the redirect_uri doesn't
-        // match the registered one. Both require the org admin to fix config.
+        // Tag Discord credential errors with a prefix the login screen recognises so
+        // it can show a helpful message instead of a silent bounce. This action is
+        // public, so the message sent back stays generic — no config details, and no
+        // echo of the redirect URL the caller sent. The operator-facing detail is
+        // only written to the server log.
         let tokenData;
         try {
             tokenData = await discord.exchangeCodeForToken(code, redirectUri);
         } catch (err: unknown) {
             const raw = String((err instanceof Error ? err.message : err) || '');
             if (/invalid_client/i.test(raw)) {
-                throw new Error(
-                    'DISCORD_OAUTH_INVALID_CLIENT: Discord rejected this organization\'s OAuth credentials. '
-                    + 'The org admin should roll the Client Secret in the Discord Developer Portal '
-                    + '(OAuth2 → General Information → Reset Secret), then paste the new value into the '
-                    + 'org\'s Discord integration settings.'
-                );
+                log.warn('discord oauth invalid_client: reset the Client Secret in the Discord Developer Portal and update the org Discord settings', { redirectUri });
+                throw new Error('DISCORD_OAUTH_INVALID_CLIENT: Discord sign-in is misconfigured for this organization. Please contact your org administrator.');
             }
             if (/invalid_grant|redirect_uri/i.test(raw)) {
-                throw new Error(
-                    'DISCORD_OAUTH_REDIRECT_MISMATCH: Discord rejected the redirect URL. '
-                    + `Ask the org admin to add exactly "${redirectUri}" as an authorized Redirect in `
-                    + 'the Discord Developer Portal (OAuth2 → Redirects) — no trailing slash, no path.'
-                );
+                log.warn('discord oauth redirect mismatch: add the exact redirect URL as an authorized redirect in the Discord Developer Portal', { redirectUri });
+                throw new Error('DISCORD_OAUTH_REDIRECT_MISMATCH: Discord sign-in is misconfigured for this organization. Please contact your org administrator.');
             }
             throw err;
         }
         const discordUser = await discord.getDiscordUser(tokenData.access_token);
+        // Discord ids are plain numbers. Check the shape before using the id in any
+        // query — the auth_user_id update below builds a filter string from it, and a
+        // value with '.' or ',' could change how that filter is read. It comes from
+        // Discord, but don't trust an outside id's shape inside a query.
+        if (typeof discordUser?.id !== 'string' || !/^\d{1,25}$/.test(discordUser.id)) {
+            throw new Error('Discord returned an unexpected account id.');
+        }
         const avatarUrl = discord.buildGlobalAvatarUrl(discordUser);
 
         let isAdminClaim = false;
@@ -257,6 +262,10 @@ export const authActions = {
         // the flow also carried a valid (now-consumed) admin setup code, an
         // adminSetupToken additionally authorizes the Admin role — the client-side
         // `isAdminSetup` flag is cosmetic (drives UI copy) and is NOT trusted.
+        // Mint a server-issued RSI verification code, sign it into the identity grant
+        // (so finalize_setup verifies against OUR code, not a client-chosen one), and
+        // also return it for the user to paste into their RSI bio.
+        const verificationCode = generateRsiVerificationCode();
         return {
             isNewUser: true,
             user: {
@@ -265,7 +274,8 @@ export const authActions = {
                 avatarUrl,
                 isAdminSetup: isAdminClaim
             },
-            identityToken: signIdentityGrant(discordUser.id),
+            verificationCode,
+            identityToken: signIdentityGrant(discordUser.id, verificationCode),
             ...(isAdminClaim ? { adminSetupToken: signAdminSetupGrant(discordUser.id) } : {})
         };
     },
@@ -297,7 +307,10 @@ export const authActions = {
             }
         }
 
-        // Server-side RSI handle verification — prevent bypassing client-side checks.
+        // Server-side RSI handle verification. The code is the SERVER-issued one
+        // carried in the signed identity grant — NOT the client payload — so a caller
+        // can't pick a short string that already appears on a victim's public profile;
+        // they must paste our code into the bio of the handle they're claiming.
         // The offline "verify later" bypass is honored ONLY for the first-admin setup
         // context (valid adminSetupToken) — regular members MUST verify. On bypass the
         // handle is recorded UNVERIFIED (rsi_verified=false); this does NOT block the
@@ -306,10 +319,10 @@ export const authActions = {
         if (payload.skipVerification && isAdmin) {
             rsiVerified = false;
         } else {
-            if (!payload.verificationCode) {
-                throw new Error("RSI handle and verification code are required.");
+            if (!identity.vc) {
+                throw new Error("Your sign-in session has expired. Please sign in with Discord again.");
             }
-            const verified = await verifyRsiHandle(payload.rsiHandle, payload.verificationCode);
+            const verified = await verifyRsiHandle(payload.rsiHandle, identity.vc);
             if (!verified) {
                 throw new Error("Verification failed. Ensure the code is saved in your RSI bio and try again.");
             }
@@ -360,7 +373,7 @@ export const authActions = {
 
         return { success: true };
     },
-    'auth:redeem_setup_code': async ({ discordId, code }: { discordId?: string; code?: string }) => {
+    'auth:redeem_setup_code': async ({ discordId, code, identityToken }: { discordId?: string; code?: string; identityToken?: string }) => {
         // Reorders the admin claim to AFTER Discord sign-in (first-run wizard): the
         // just-authed pending user submits the console-printed setup code here. We
         // validate + consume it (rate-limited, single-use via validateClaimCode) and
@@ -369,8 +382,17 @@ export const authActions = {
         // authorization secret (proves server-console access) — same trust model as
         // the OAuth-state claim path.
         if (!discordId || !code) throw new Error('Discord identity and setup code are required.');
-        // First-admin-only — refuse once an admin is established.
+        // First admin only: stop here once an admin exists, before touching the code
+        // or identity, so a leftover code is never used after setup.
         if (await adminExists()) throw new Error('An administrator already exists for this organization.');
+        // Require proof the caller signed in with Discord as this same id (the
+        // identityToken from the callback) before issuing an admin-setup grant, so a
+        // grant is never handed out for an unverified identity. finalize_setup checks
+        // this again; this is the same guard, one step earlier.
+        const identity = verifyIdentityGrant(identityToken);
+        if (!identity || identity.discordId !== discordId) {
+            throw new Error('Your sign-in session has expired. Please sign in with Discord again.');
+        }
         await validateClaimCode(code);
         return { adminSetupToken: signAdminSetupGrant(discordId) };
     }
