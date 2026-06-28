@@ -78,7 +78,7 @@ export function decryptSecret(value: string): string {
         // fails in a confusing way far from the root cause. Most common cause: a
         // SECRETS_ENCRYPTION_KEY mismatch against the value written at encrypt time.
         log.error('decryption failed', { err: e });
-        throw new Error('Failed to decrypt stored secret (key mismatch or corrupted ciphertext).');
+        throw new Error('Failed to decrypt stored secret (key mismatch or corrupted ciphertext).', { cause: e });
     }
 }
 

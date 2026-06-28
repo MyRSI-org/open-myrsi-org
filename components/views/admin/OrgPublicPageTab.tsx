@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
 import { PublicPageConfig, PublicPageExternalLink, TestimonialCandidate } from '../../../types';
 import MinimalRichEditor from '../../shared/editor/MinimalRichEditor';
@@ -49,29 +49,30 @@ const TestimonialPickerModal: React.FC<{
     const [total, setTotal] = useState(0);
     const [search, setSearch] = useState('');
     const [offset, setOffset] = useState(0);
-    const [loading, setLoading] = useState(false);
+    // Mount-time fetch shows the spinner immediately by initializing loading=true, so the
+    // mount effect performs only the async fetch (no synchronous setLoading in the effect).
+    const [loading, setLoading] = useState(true);
     const limit = 20;
 
     const [loadError, setLoadError] = useState<string | null>(null);
+    // Async page fetch. All state settles on the promise chain (data/error/loading), so the
+    // mount effect that calls this has no synchronously-reachable setState to flag.
+    const fetchPage = useCallback(async (nextOffset: number, searchTerm: string) => {
+        await listTestimonialCandidates({ search: searchTerm, limit, offset: nextOffset })
+            .then((res) => { setItems(res.items || []); setTotal(res.total || 0); })
+            .catch((e: any) => { setItems([]); setTotal(0); setLoadError(e?.message || 'Failed to load testimonials.'); })
+            .finally(() => { setLoading(false); });
+    }, [listTestimonialCandidates]);
+    // Wrapper for user-initiated loads (search/prev/next): show the spinner and clear any
+    // prior error synchronously before fetching, matching the original load() semantics.
     const load = useCallback(async (nextOffset: number, searchTerm: string) => {
         setLoading(true);
         setLoadError(null);
-        try {
-            const res = await listTestimonialCandidates({ search: searchTerm, limit, offset: nextOffset });
-            setItems(res.items || []);
-            setTotal(res.total || 0);
-        } catch (e: any) {
-            setItems([]);
-            setTotal(0);
-            setLoadError(e?.message || 'Failed to load testimonials.');
-        } finally {
-            setLoading(false);
-        }
-    }, [listTestimonialCandidates]);
+        await fetchPage(nextOffset, searchTerm);
+    }, [fetchPage]);
 
-    useEffect(() => {
-        load(0, '');
-    }, [load]);
+    // Initial fetch on mount. loading starts true, so only the async fetch runs here.
+    useEffect(() => { fetchPage(0, ''); }, [fetchPage]);
 
     const handleSearch = (e: React.FormEvent) => {
         e.preventDefault();
@@ -179,7 +180,17 @@ const OrgPublicPageTab: React.FC = () => {
     // display previews without exposing ids publicly or re-fetching per row.
     const [previewById, setPreviewById] = useState<Record<string, TestimonialCandidate>>({});
 
-    useEffect(() => { setConfig(publicPageConfig); }, [publicPageConfig]);
+    // Re-seed the local editable form when the canonical config from context changes (e.g.
+    // after a save), using React's "adjust state during render" pattern with a prev-value
+    // tracker. config is user-editable local state, so it cannot be derived during render
+    // without discarding in-progress edits — but on a genuine source change we DO replace it,
+    // exactly as the old [publicPageConfig] effect did. React re-renders before paint, so this
+    // is behavior-equivalent to the effect-reset.
+    const [prevPublicPageConfig, setPrevPublicPageConfig] = useState(publicPageConfig);
+    if (publicPageConfig !== prevPublicPageConfig) {
+        setPrevPublicPageConfig(publicPageConfig);
+        setConfig(publicPageConfig);
+    }
 
     // Hydrate previews for any currently-selected ids we don't have cached.
     useEffect(() => {
@@ -499,7 +510,10 @@ export default OrgPublicPageTab;
 // plain text) and the editor's content-as-object API; legacy text upgrades to
 // JSON transparently on first save.
 const BlurbEditor: React.FC<{ value: string; onChange: (next: string) => void }> = ({ value, onChange }) => {
-    const initialContent = useMemo(() => {
+    // Seed the editor once at mount; the editor manages its own state thereafter.
+    // Re-seeding from `value` on every change would reset the user's caret position
+    // mid-edit, so this deliberately captures the initial `value` only.
+    const [initialContent] = useState(() => {
         const parsed = tryParseTiptapJson(value);
         if (parsed) return parsed;
         // Legacy plain text → wrap each line in a paragraph node so the
@@ -514,8 +528,7 @@ const BlurbEditor: React.FC<{ value: string; onChange: (next: string) => void }>
                 content: line ? [{ type: 'text', text: line }] : undefined,
             })),
         };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: editor manages its own state once mounted; re-seeding from `value` on every change would reset the user's caret position mid-edit.
-    }, []);
+    });
     return (
         <MinimalRichEditor
             content={initialContent}

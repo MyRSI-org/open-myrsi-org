@@ -19,7 +19,7 @@ const BulletinDetailModal: React.FC<BulletinDetailModalProps> = ({ isOpen, onClo
     const { securityClearances } = useMembers();
     const styles = getThreatStyles(bulletin.threatLevel);
     const isIndefinite = bulletin.durationMinutes === 0;
-    const [countdown, setCountdown] = useState(formatCountdown(bulletin.expiresAt, bulletin.durationMinutes));
+    const [countdown, setCountdown] = useState(() => formatCountdown(bulletin.expiresAt, bulletin.durationMinutes));
     const [isExpired, setIsExpired] = useState(false);
 
     useEffect(() => {
@@ -128,8 +128,8 @@ const BulletinDetailModal: React.FC<BulletinDetailModalProps> = ({ isOpen, onClo
                             <span className="px-1.5 py-0.5 rounded-sm text-[9px] font-black uppercase bg-slate-800 text-slate-300 border border-slate-700">
                                 {securityClearances.find(c => c.level === bulletin.classificationLevel)?.name || `LEVEL ${bulletin.classificationLevel}`}
                             </span>
-                            {reportMarkers.map((m, idx) => (
-                                <span key={typeof m?.id === 'number' ? m.id : idx} className="px-1.5 py-0.5 rounded-sm text-[9px] font-black uppercase bg-slate-950 text-sky-500 border border-slate-800">
+                            {reportMarkers.map((m) => (
+                                <span key={typeof m?.id === 'number' ? m.id : m?.code} className="px-1.5 py-0.5 rounded-sm text-[9px] font-black uppercase bg-slate-950 text-sky-500 border border-slate-800">
                                     {safe(m?.code)}
                                 </span>
                             ))}

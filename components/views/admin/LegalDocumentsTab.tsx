@@ -103,16 +103,20 @@ const DEFAULT_TOS_HTML = `
 </section>
 `;
 
+const ToolbarButton: React.FC<{ icon: string; cmd: string; arg?: string; title: string; onExec: (command: string, value?: string) => void }> = ({ icon, cmd, arg, title, onExec }) => (
+    <button
+        type="button"
+        onClick={(e) => { e.preventDefault(); onExec(cmd, arg); }}
+        className="p-2 text-slate-400 hover:text-white hover:bg-slate-700/50 rounded-sm transition-colors"
+        title={title}
+    >
+        <i className={`fa-solid ${icon}`}></i>
+    </button>
+);
+
 const RichTextEditor: React.FC<{ value: string; onChange: (html: string) => void }> = ({ value, onChange }) => {
     const editorRef = useRef<HTMLDivElement>(null);
     const [isFocused, setIsFocused] = useState(false);
-
-    useEffect(() => {
-        if (editorRef.current && !editorRef.current.innerHTML && value) {
-            editorRef.current.innerHTML = value;
-        }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: seeds the contentEditable div from `value` exactly once on mount; re-seeding on every `value` change would reset the user's caret position mid-edit.
-    }, []);
 
     useEffect(() => {
         if (editorRef.current) {
@@ -135,32 +139,21 @@ const RichTextEditor: React.FC<{ value: string; onChange: (html: string) => void
         if (editorRef.current) editorRef.current.focus();
     };
 
-    const ToolbarButton: React.FC<{ icon: string; cmd: string; arg?: string; title: string }> = ({ icon, cmd, arg, title }) => (
-        <button
-            type="button"
-            onClick={(e) => { e.preventDefault(); execCmd(cmd, arg); }}
-            className="p-2 text-slate-400 hover:text-white hover:bg-slate-700/50 rounded-sm transition-colors"
-            title={title}
-        >
-            <i className={`fa-solid ${icon}`}></i>
-        </button>
-    );
-
     return (
         <div className={`border rounded-lg overflow-hidden flex flex-col min-h-[400px] transition-all ${isFocused ? 'border-slate-400 ring-1 ring-slate-400/40' : 'border-slate-700 bg-slate-900/30'}`}>
             <div className="bg-slate-900/60 border-b border-slate-700 p-1 flex space-x-1 flex-wrap">
-                <ToolbarButton icon="fa-heading" cmd="formatBlock" arg="H2" title="Heading" />
-                <ToolbarButton icon="fa-paragraph" cmd="formatBlock" arg="P" title="Paragraph" />
+                <ToolbarButton icon="fa-heading" cmd="formatBlock" arg="H2" title="Heading" onExec={execCmd} />
+                <ToolbarButton icon="fa-paragraph" cmd="formatBlock" arg="P" title="Paragraph" onExec={execCmd} />
                 <div className="w-px h-6 bg-slate-700 mx-2 self-center"></div>
-                <ToolbarButton icon="fa-bold" cmd="bold" title="Bold" />
-                <ToolbarButton icon="fa-italic" cmd="italic" title="Italic" />
-                <ToolbarButton icon="fa-underline" cmd="underline" title="Underline" />
+                <ToolbarButton icon="fa-bold" cmd="bold" title="Bold" onExec={execCmd} />
+                <ToolbarButton icon="fa-italic" cmd="italic" title="Italic" onExec={execCmd} />
+                <ToolbarButton icon="fa-underline" cmd="underline" title="Underline" onExec={execCmd} />
                 <div className="w-px h-6 bg-slate-700 mx-2 self-center"></div>
-                <ToolbarButton icon="fa-list-ul" cmd="insertUnorderedList" title="Bullet List" />
-                <ToolbarButton icon="fa-list-ol" cmd="insertOrderedList" title="Numbered List" />
+                <ToolbarButton icon="fa-list-ul" cmd="insertUnorderedList" title="Bullet List" onExec={execCmd} />
+                <ToolbarButton icon="fa-list-ol" cmd="insertOrderedList" title="Numbered List" onExec={execCmd} />
                 <div className="w-px h-6 bg-slate-700 mx-2 self-center"></div>
-                <ToolbarButton icon="fa-rotate-left" cmd="undo" title="Undo" />
-                <ToolbarButton icon="fa-rotate-right" cmd="redo" title="Redo" />
+                <ToolbarButton icon="fa-rotate-left" cmd="undo" title="Undo" onExec={execCmd} />
+                <ToolbarButton icon="fa-rotate-right" cmd="redo" title="Redo" onExec={execCmd} />
             </div>
             <div
                 ref={editorRef}
@@ -182,9 +175,19 @@ const LegalDocumentsTab: React.FC = () => {
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
 
-    useEffect(() => {
-        setTosHtml(brandingConfig.termsOfService || '');
-    }, [brandingConfig.termsOfService]);
+    // Re-seed the local editable copy whenever the source-of-truth changes
+    // (initial hydration from the server, or refreshMain after a successful save).
+    // Done during render via a previous-value tracker — the React-recommended
+    // "adjusting state when a prop changes" pattern — instead of an effect, so it
+    // does not trigger a cascading render. Local edits (keystrokes / Reset Template)
+    // mutate tosHtml only, leaving brandingConfig.termsOfService unchanged, so the
+    // tracker stays equal and edits are preserved exactly as before.
+    const sourceTos = brandingConfig.termsOfService || '';
+    const [prevSourceTos, setPrevSourceTos] = useState<string>(sourceTos);
+    if (prevSourceTos !== sourceTos) {
+        setPrevSourceTos(sourceTos);
+        setTosHtml(sourceTos);
+    }
 
     const handleLoadDefaultTos = async () => {
         const confirmed = await confirm({ title: 'Reset Template', message: 'This will overwrite the current Terms of Service text with the default template. Continue?', confirmText: 'Reset', variant: 'danger' });

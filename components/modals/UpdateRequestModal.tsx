@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { ServiceRequestStatus, HydratedServiceRequest } from '../../types';
 import { useRequests } from '../../contexts/RequestsContext';
 
@@ -19,6 +19,28 @@ const completionStatuses = [
     ServiceRequestStatus.GameError,
 ];
 
+interface RepButtonProps {
+    value: number;
+    label: string;
+    icon: React.ReactNode;
+    activeClass: string;
+    repChange: number;
+    isLoading: boolean;
+    onSelect: (value: number) => void;
+}
+
+const RepButton: React.FC<RepButtonProps> = ({ value, label, icon, activeClass, repChange, isLoading, onSelect }) => (
+    <button
+        type="button"
+        onClick={() => onSelect(value)}
+        disabled={isLoading}
+        className={`flex-1 flex flex-col items-center justify-center p-3 rounded-xl border transition-all disabled:opacity-50 ${repChange === value ? activeClass : 'border-slate-700 bg-slate-900/50 text-slate-500 hover:border-slate-600 hover:text-slate-300'}`}
+    >
+        <div className={`text-xl mb-1 ${repChange === value ? 'text-white' : ''}`}>{icon}</div>
+        <span className="text-[10px] font-black uppercase tracking-wider">{label}</span>
+    </button>
+);
+
 const UpdateRequestModal: React.FC<UpdateRequestModalProps> = ({ isOpen, onClose, request }) => {
     const { updateRequestStatus } = useRequests();
     const { addToast } = useNotification();
@@ -31,7 +53,15 @@ const UpdateRequestModal: React.FC<UpdateRequestModalProps> = ({ isOpen, onClose
 
     const isCompletion = completionStatuses.includes(status);
 
-    useEffect(() => {
+    // Form-reset when the modal opens. React-documented "adjust state during render"
+    // pattern (previous-value tracker): re-seed the user-editable fields only on the
+    // closed -> open transition, exactly as the prior open-reset effect did. Reading
+    // request.* only here (not on every render) preserves the original behavior of NOT
+    // clobbering the user's in-progress edits when a realtime row update arrives while
+    // the modal is open.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setStatus(request.status);
             setNotes('');
@@ -40,8 +70,7 @@ const UpdateRequestModal: React.FC<UpdateRequestModalProps> = ({ isOpen, onClose
             setRepChange(0);
             setIsLoading(false);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on isOpen flip: adding request.* would clobber the user's in-progress edits on realtime row updates.
-    }, [isOpen]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();
@@ -69,18 +98,6 @@ const UpdateRequestModal: React.FC<UpdateRequestModalProps> = ({ isOpen, onClose
 
     const inputClass = "w-full bg-slate-950/50 border border-slate-700 rounded-lg p-2.5 text-white text-sm focus:border-amber-500 focus:ring-1 focus:ring-amber-500/50 outline-hidden transition-all";
     const labelClass = "block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5";
-
-    const RepButton: React.FC<{ value: number, label: string, icon: React.ReactNode, activeClass: string }> = ({ value, label, icon, activeClass }) => (
-        <button
-            type="button"
-            onClick={() => setRepChange(value)}
-            disabled={isLoading}
-            className={`flex-1 flex flex-col items-center justify-center p-3 rounded-xl border transition-all disabled:opacity-50 ${repChange === value ? activeClass : 'border-slate-700 bg-slate-900/50 text-slate-500 hover:border-slate-600 hover:text-slate-300'}`}
-        >
-            <div className={`text-xl mb-1 ${repChange === value ? 'text-white' : ''}`}>{icon}</div>
-            <span className="text-[10px] font-black uppercase tracking-wider">{label}</span>
-        </button>
-    )
 
     return (
         <WindowFrame
@@ -141,9 +158,9 @@ const UpdateRequestModal: React.FC<UpdateRequestModalProps> = ({ isOpen, onClose
                             <div>
                                 <label className={labelClass}>Client Conduct</label>
                                 <div className="flex items-center space-x-3">
-                                    <RepButton value={1} label="Positive" icon={<i className="fa-solid fa-thumbs-up" />} activeClass="bg-green-500/20 border-green-500 text-green-400 shadow-lg shadow-green-900/20" />
-                                    <RepButton value={0} label="Neutral" icon={<span className="font-mono text-lg font-bold">-</span>} activeClass="bg-slate-700 border-slate-500 text-white" />
-                                    <RepButton value={-1} label="Negative" icon={<i className="fa-solid fa-thumbs-down" />} activeClass="bg-red-500/20 border-red-500 text-red-400 shadow-lg shadow-red-900/20" />
+                                    <RepButton value={1} label="Positive" icon={<i className="fa-solid fa-thumbs-up" />} activeClass="bg-green-500/20 border-green-500 text-green-400 shadow-lg shadow-green-900/20" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
+                                    <RepButton value={0} label="Neutral" icon={<span className="font-mono text-lg font-bold">-</span>} activeClass="bg-slate-700 border-slate-500 text-white" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
+                                    <RepButton value={-1} label="Negative" icon={<i className="fa-solid fa-thumbs-down" />} activeClass="bg-red-500/20 border-red-500 text-red-400 shadow-lg shadow-red-900/20" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
                                 </div>
                             </div>
                         </div>

@@ -5,6 +5,7 @@ import { useData } from '../../../../contexts/DataContext';
 
 import { useFormatDate } from '../../../../contexts/AuthContext';
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { useNow } from '../../../../hooks/useNow';
 
 interface OpExecutionTabProps {
     operation: HydratedOperation;
@@ -56,12 +57,16 @@ const inputClass = "w-full bg-slate-900/80 border border-slate-700/50 text-white
 const labelClass = "text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1.5 block";
 
 const CountdownTimer: React.FC<{ targetTime: number }> = ({ targetTime }) => {
-    const [, setTick] = useState(0);
+    // `now` is the live wall-clock sample. It is seeded once at mount and then
+    // re-sampled by the 1s interval below, so the clock read happens in the
+    // timer callback (and lazy initialiser) rather than during render — keeping
+    // the displayed T-minus updating every second exactly as before.
+    const [now, setNow] = useState(() => Date.now());
     React.useEffect(() => {
-        const timer = setInterval(() => setTick(t => t + 1), 1000);
+        const timer = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(timer);
     }, []);
-    const diff = targetTime - Date.now();
+    const diff = targetTime - now;
     if (diff <= 0) return null;
     const mins = Math.floor(diff / 60000);
     const secs = Math.floor((diff % 60000) / 1000);
@@ -160,7 +165,7 @@ const OpExecutionTab: React.FC<OpExecutionTabProps> = ({ operation, canManage, o
     const entries = useMemo(() => operation.scheduleEntries || [], [operation.scheduleEntries]);
     const tasks = useMemo(() => operation.tasks || [], [operation.tasks]);
     const activeParticipants = useMemo(() => (operation.participants || []).filter(p => p.timeLeft === null), [operation.participants]);
-    const now = Date.now();
+    const now = useNow();
 
     const [addingPhase, setAddingPhase] = useState(false);
     const [newPhaseName, setNewPhaseName] = useState('');

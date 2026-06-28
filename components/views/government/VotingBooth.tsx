@@ -21,7 +21,7 @@ const VotingBooth: React.FC<VotingBoothProps> = ({ election, onSubmit, onCancel 
     const [selectedCandidateId, setSelectedCandidateId] = useState<number | null>(null);
 
     // Approval: select multiple candidates
-    const [approvedCandidateIds, setApprovedCandidateIds] = useState<Set<number>>(new Set());
+    const [approvedCandidateIds, setApprovedCandidateIds] = useState<Set<number>>(() => new Set());
 
     // Preferential (ranked): ordered list of candidate IDs
     const [rankedCandidates, setRankedCandidates] = useState<number[]>([]);

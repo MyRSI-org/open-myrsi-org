@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState } from 'react';
 import { HydratedOperation, OperationStatus, OperationPayoutMode, OperationCostCategory } from '../../../../types';
 import PieChart from '../../../charts/PieChart';
 import { useFormatDate } from '../../../../contexts/AuthContext';
@@ -42,15 +42,16 @@ const OpLedgerTab: React.FC<OpLedgerTabProps> = ({ operation, canManage, onOpenA
     const pieData = payouts.map(r => ({ name: r.name, value: r.amount }));
 
     const isCustom = operation.payoutMode === 'custom';
-    const [draftSplits, setDraftSplits] = useState<Record<number, string>>({});
-    const [savingSplits, setSavingSplits] = useState(false);
 
-    // Seed draft from current participants whenever the op or mode changes.
-    useEffect(() => {
-        if (!isCustom) {
-            setDraftSplits({});
-            return;
-        }
+    // Seed the editable draft from current participants. draftSplits is form
+    // state (the user types percentages into it), so it cannot be derived during
+    // render — that would clobber in-progress edits. It is (re-)seeded only when
+    // the seed key changes: op id, custom-vs-not mode, or the participant *count*
+    // (NOT individual participant data, so a realtime share update on an
+    // unrelated participant does not clobber the user's typed edits — this
+    // preserves the old exhaustive-deps exclusion).
+    const computeSeedSplits = (): Record<number, string> => {
+        if (!isCustom) return {};
         const seed: Record<number, string> = {};
         operation.participants.forEach(p => {
             const v = typeof p.payoutSharePercent === 'number'
@@ -58,9 +59,22 @@ const OpLedgerTab: React.FC<OpLedgerTabProps> = ({ operation, canManage, onOpenA
                 : 100 / Math.max(1, operation.participants.length);
             seed[p.userId] = v.toFixed(2);
         });
-        setDraftSplits(seed);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: re-seed draftSplits only when the participant set size changes (.length), not on individual participant data updates which would clobber the user's in-progress percent edits.
-    }, [isCustom, operation.id, operation.participants.length]);
+        return seed;
+    };
+
+    const splitsSeedKey = `${operation.id}|${isCustom ? '1' : '0'}|${operation.participants.length}`;
+    // Lazy-init to the mount seed so the first render matches the old mount effect.
+    const [draftSplits, setDraftSplits] = useState<Record<number, string>>(computeSeedSplits);
+    const [savingSplits, setSavingSplits] = useState(false);
+
+    // Re-seed during render when the key changes (the React-documented "adjust
+    // state during render" pattern; React re-renders before paint, so this is
+    // equivalent to the old effect-reset without firing the set-state-in-effect rule).
+    const [prevSplitsSeedKey, setPrevSplitsSeedKey] = useState(splitsSeedKey);
+    if (splitsSeedKey !== prevSplitsSeedKey) {
+        setPrevSplitsSeedKey(splitsSeedKey);
+        setDraftSplits(computeSeedSplits());
+    }
 
     const draftSum = Object.values(draftSplits).reduce((s, v) => s + (Number(v) || 0), 0);
     const draftValid = draftSum >= 99.9 && draftSum <= 100.1;

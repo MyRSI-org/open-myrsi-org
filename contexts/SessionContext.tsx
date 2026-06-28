@@ -24,7 +24,7 @@
 // drift (different bypass conditions, different telemetry) only edits one
 // site.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { debugLog } from '../lib/debugLog';
 import { isValidOAuthState, oauthStateForServer } from '../lib/oauthState';
@@ -99,6 +99,30 @@ export interface SessionContextValue {
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 
+// Boot-step copy for the splash loader, keyed on whether this page load is an
+// OAuth callback (a `code` query param). Computed once at mount via lazy initial
+// state so the step count is correct from frame 1 (the loader must not visibly
+// restart when the callback path is detected). `hasOAuthCode` is read from the
+// URL at the same instant the effect below would have read it (before the effect
+// runs window.history.replaceState), so the value is identical to the prior
+// effect-driven set.
+const computeBootSequenceSteps = (hasOAuthCode: boolean): { text: string; icon: string }[] =>
+    hasOAuthCode
+        ? [
+            { text: 'Establishing Uplink...', icon: 'fa-satellite-dish' },
+            { text: 'Handshaking Discord...', icon: 'fa-handshake' },
+            { text: 'Verifying Credentials...', icon: 'fa-id-card' },
+            { text: 'Loading Personnel Data...', icon: 'fa-users' },
+            { text: 'Syncing Comms...', icon: 'fa-tower-broadcast' },
+        ]
+        : [
+            { text: 'Initializing System...', icon: 'fa-power-off' },
+            { text: 'Checking Local Cache...', icon: 'fa-memory' },
+            { text: 'Connecting to Mainframe...', icon: 'fa-network-wired' },
+            { text: 'Loading Personnel Data...', icon: 'fa-users' },
+            { text: 'Syncing Comms...', icon: 'fa-tower-broadcast' },
+        ];
+
 export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { hydrateFullState, discordConfig, brandingConfig, allUsers, fetchUserDetail } = useData();
     const { setIsTogglingDuty, addToast, playSound, setEamMessage, setOperationAlert } = useUI();
@@ -130,7 +154,11 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const clearAuthError = useCallback(() => setAuthError(null), []);
     const [orgNotFound, setOrgNotFound] = useState(false);
     const [slug, setSlug] = useState<string | undefined>(undefined);
-    const [bootSequenceSteps, setBootSequenceSteps] = useState<{ text: string; icon: string }[]>([]);
+    const [bootSequenceSteps] = useState<{ text: string; icon: string }[]>(
+        () => computeBootSequenceSteps(
+            typeof window !== 'undefined' && !!new URLSearchParams(window.location.search).get('code'),
+        ),
+    );
     const [config, setConfig] = useState<any>(null);
     // Per-user JWT authorizing the PRIVATE realtime broadcast channels —
     // minted by the server into the boot payload. null = realtime off.
@@ -148,11 +176,16 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }, [pendingUser]);
 
     const lastEamTimestampRef = useRef<string>('');
-    const sessionStartTime = useRef<string>(new Date().toISOString());
+    // Session-start baseline for force-logout checks. The ref variable is named
+    // with the canonical `Ref` suffix; it is surfaced on the public
+    // SessionContextValue under the `sessionStartTime` key (consumed verbatim by
+    // ActivityContext), so the cross-file contract is preserved by the mapping in
+    // the value object below — not by the local variable name.
+    const sessionStartTimeRef = useRef<string>(new Date().toISOString());
     // Tracks which user IDs have already had their browser timezone auto-posted
     // this session, so we only fire the persist call once per login regardless
     // of how many times currentUser refreshes.
-    const tzAutoDetectedFor = useRef<Set<number>>(new Set());
+    const tzAutoDetectedForRef = useRef<Set<number>>(new Set());
 
     // Force-logout helper. Shared by:
     //   - refreshUser (page-load init path) — checks data.platformSettings.force_logout_timestamp
@@ -163,7 +196,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     // can early-return before applying any other state.
     const enforceForceLogout = useCallback((forceLogoutTimestamp: string | undefined | null): boolean => {
         if (!forceLogoutTimestamp) return false;
-        if (forceLogoutTimestamp <= sessionStartTime.current) return false;
+        if (forceLogoutTimestamp <= sessionStartTimeRef.current) return false;
         console.warn('[Auth] Force logout triggered (server-issued cutoff > session start)');
         localStorage.removeItem('myrsi_auth_token');
         window.location.href = '/?force_logout=1';
@@ -177,8 +210,8 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     useEffect(() => {
         if (!currentUser?.id) return;
         if (currentUser.timezone) return; // Already set, nothing to do.
-        if (tzAutoDetectedFor.current.has(currentUser.id)) return;
-        tzAutoDetectedFor.current.add(currentUser.id);
+        if (tzAutoDetectedForRef.current.has(currentUser.id)) return;
+        tzAutoDetectedForRef.current.add(currentUser.id);
 
         const detected = detectBrowserTimezone();
         if (!detected) return;
@@ -256,32 +289,13 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         }
     }, [currentUser, realtimeToken, registerRealtimeAuth]);
 
-    // OAuth callback handling — runs once on mount. The synchronous boot-step
-    // setup BEFORE the async init() call is load-bearing: BootSplash reads
-    // bootSequenceSteps to render the loader, and we want the step count to
-    // be correct from frame 1 (otherwise the loader visibly restarts when
-    // the code path is detected).
+    // OAuth callback handling — runs once on mount. The boot-step copy is
+    // derived from the same URL `code` flag during the lazy initial state of
+    // bootSequenceSteps above (so BootSplash has the right step count from
+    // frame 1 without a set-in-effect); this effect only drives the async init.
     useEffect(() => {
         const urlParams = new URLSearchParams(window.location.search);
         const code = urlParams.get('code');
-
-        if (code) {
-            setBootSequenceSteps([
-                { text: 'Establishing Uplink...', icon: 'fa-satellite-dish' },
-                { text: 'Handshaking Discord...', icon: 'fa-handshake' },
-                { text: 'Verifying Credentials...', icon: 'fa-id-card' },
-                { text: 'Loading Personnel Data...', icon: 'fa-users' },
-                { text: 'Syncing Comms...', icon: 'fa-tower-broadcast' }
-            ]);
-        } else {
-            setBootSequenceSteps([
-                { text: 'Initializing System...', icon: 'fa-power-off' },
-                { text: 'Checking Local Cache...', icon: 'fa-memory' },
-                { text: 'Connecting to Mainframe...', icon: 'fa-network-wired' },
-                { text: 'Loading Personnel Data...', icon: 'fa-users' },
-                { text: 'Syncing Comms...', icon: 'fa-tower-broadcast' }
-            ]);
-        }
 
         const init = async () => {
             await refreshUser();
@@ -375,6 +389,18 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         init();
     }, [refreshUser]);
 
+    // Latest-ref mirror of currentUser so the realtime reconcile effect below can
+    // read the current scalar values for its change-detection without listing the
+    // whole currentUser object as a dependency (which would re-fire the effect on
+    // every reconciliation it itself performs). This sync effect has no dep array
+    // so it runs on every commit, and it is declared before the reconcile effect,
+    // so currentUserRef.current equals the just-committed currentUser that the
+    // reconcile closure would otherwise have captured — behaviour-identical.
+    const currentUserRef = useRef(currentUser);
+    useEffect(() => {
+        currentUserRef.current = currentUser;
+    });
+
     // SYNC CURRENT USER WITH REALTIME UPDATES
     // This allows remote radio control (admin changing user channel) to reflect immediately.
     //
@@ -387,21 +413,22 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     // also async-refresh the full user via the user_detail endpoint so heavy
     // fields stay in sync with server state (e.g. cert awarded by an admin).
     useEffect(() => {
-        if (currentUser && allUsers.length > 0) {
-            const updatedUser = allUsers.find(u => u.id === currentUser.id);
+        const cu = currentUserRef.current;
+        if (cu && allUsers.length > 0) {
+            const updatedUser = allUsers.find(u => u.id === currentUser?.id);
             if (updatedUser) {
                 const hasChanged =
-                    updatedUser.voiceChannelName !== currentUser.voiceChannelName ||
-                    updatedUser.isDuty !== currentUser.isDuty ||
-                    updatedUser.roleId !== currentUser.roleId ||
-                    updatedUser.role !== currentUser.role ||
-                    updatedUser.permissions?.length !== currentUser.permissions?.length ||
-                    updatedUser.reputation !== currentUser.reputation ||
-                    updatedUser.clearanceLevel?.id !== currentUser.clearanceLevel?.id ||
-                    updatedUser.rank?.id !== currentUser.rank?.id ||
-                    updatedUser.unit?.id !== currentUser.unit?.id ||
-                    updatedUser.position?.id !== currentUser.position?.id ||
-                    updatedUser.secondaryPosition?.id !== currentUser.secondaryPosition?.id;
+                    updatedUser.voiceChannelName !== cu.voiceChannelName ||
+                    updatedUser.isDuty !== cu.isDuty ||
+                    updatedUser.roleId !== cu.roleId ||
+                    updatedUser.role !== cu.role ||
+                    updatedUser.permissions?.length !== cu.permissions?.length ||
+                    updatedUser.reputation !== cu.reputation ||
+                    updatedUser.clearanceLevel?.id !== cu.clearanceLevel?.id ||
+                    updatedUser.rank?.id !== cu.rank?.id ||
+                    updatedUser.unit?.id !== cu.unit?.id ||
+                    updatedUser.position?.id !== cu.position?.id ||
+                    updatedUser.secondaryPosition?.id !== cu.secondaryPosition?.id;
 
                 if (hasChanged) {
                     setCurrentUser(prev => prev ? {
@@ -420,7 +447,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                     // Async refresh of heavy fields. Fire-and-forget; failure
                     // is logged inside fetchUserDetail and falls back to
                     // whatever heavy data was last hydrated on login.
-                    fetchUserDetail(currentUser.id).then(fullUser => {
+                    fetchUserDetail(cu.id).then(fullUser => {
                         if (!fullUser) return;
                         setCurrentUser(prev => prev && prev.id === fullUser.id ? {
                             ...prev,
@@ -433,7 +460,6 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                 }
             }
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on user identity (currentUser?.id) and the source-of-truth list (allUsers); a whole-currentUser dep would re-fire on every reconciliation tick and trigger an infinite refetch loop since setCurrentUser inside the effect mutates the dep.
     }, [allUsers, currentUser?.id, fetchUserDetail]);
 
     // Real-time Sound & Alert Subscription
@@ -770,17 +796,17 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const value: SessionContextValue = {
         currentUser, pendingUser, isLoadingAuth, isInitialized, needsSetup, setupCompleted, bootResolved, authError, clearAuthError, bootSequenceSteps, orgNotFound, slug,
         login, logout, handleLogin: login, handleNewUserSetup, handleFinalizeAdminSetup, redeemAdminSetupCode, hasPermission, refreshUser,
-        config, sessionStartTime,
+        config, sessionStartTime: sessionStartTimeRef,
         toggleDutyStatus,
         updateUserSpecializations, updateDisplayName, updateUserPreferences, initiateRsiHandleUpdate, verifyRsiHandleUpdate, cancelRsiHandleUpdate, syncCurrentUserRoles, deleteCurrentUser,
         claimAdminAccount,
     };
 
-    return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+    return <SessionContext value={value}>{children}</SessionContext>;
 };
 
 export const useSession = (): SessionContextValue => {
-    const ctx = useContext(SessionContext);
+    const ctx = use(SessionContext);
     if (!ctx) throw new Error('useSession must be used within a SessionProvider');
     return ctx;
 };
@@ -816,14 +842,27 @@ export const useFormatDate = () => {
         [prefs],
     );
 
-    // Default-callable: const fmt = useFormatDate(); fmt(iso) → date-time string
-    const callable = formatDateTime as typeof formatDateTime & {
-        date: typeof formatDate;
-        time: typeof formatTime;
-        prefs: FormatPrefs;
-    };
-    callable.date = formatDate;
-    callable.time = formatTime;
-    callable.prefs = prefs;
-    return callable;
+    // Default-callable: const fmt = useFormatDate(); fmt(iso) → date-time string.
+    // Build a fresh wrapper function (rather than mutating the memoized
+    // formatDateTime, which React treats as immutable) and hang the date/time/prefs
+    // members off it. Memoized on the underlying callbacks/prefs so the reference
+    // stays stable while prefs are unchanged — same contract as before.
+    return useMemo(() => {
+        // Default-callable: the returned value is a function (date-time formatter)
+        // with `.date`/`.time`/`.prefs` members hung off it. Build the whole value
+        // in one expression via Object.assign on a brand-new local function so no
+        // post-creation mutation happens — the members are assigned as part of
+        // constructing the value, not by mutating a props/state/shared object.
+        const callable = (iso?: string | null, presetOverride?: DateFormatPreset) =>
+            formatDateTime(iso, presetOverride);
+        return Object.assign(callable, {
+            date: formatDate,
+            time: formatTime,
+            prefs,
+        }) as typeof formatDateTime & {
+            date: typeof formatDate;
+            time: typeof formatTime;
+            prefs: FormatPrefs;
+        };
+    }, [formatDateTime, formatDate, formatTime, prefs]);
 };

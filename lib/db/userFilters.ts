@@ -33,6 +33,35 @@ const HR_METADATA_PERMS = [
     'hr:recruiter', 'hr:manager', 'hr:admin',
 ];
 
+// Backing perms for the genuine apex Admin. The real Admin role is seeded with
+// EVERY permission (seeder.ts assigns `permissions.map(p => p.name)` to 'Admin'),
+// so it holds all of these — they are exactly the granular sensitive-field perms
+// the allow-list ladder restores one by one. They let the full-record bypass below
+// tell a real Admin from a *forged* Admin tier.
+//
+// Why this matters: `requester.role` is the *inferred* UserRole tier from toUser
+// (lib/db/mappers.ts), which currently collapses ANY role holding `admin:access`
+// to UserRole.Admin. `admin:access` is only an admin-dashboard gate perm (the
+// seeded Dispatcher carries it too), so a scoped custom role granted `admin:access`
+// arrives here with `role === 'Admin'` yet none of the real management perms.
+// Trusting the tier alone would hand every member's adminNotes / personnelNotes /
+// conductRecord / clearanceLevel / limitingMarkers / discordId to that non-Admin
+// admin-console role. We therefore withhold the full bypass when the Admin tier is
+// derived *solely* from `admin:access` (no apex perm backing) and fall through to
+// the granular ladder instead, so such a role only sees fields its explicit perms
+// grant. A real Admin — and any caller passing the Admin tier without the
+// forgeable `admin:access` signal — keeps the byte-for-byte legacy view.
+// (The deeper fix — stop inferring UserRole.Admin from admin:access in toUser, and
+// likewise in clearance.ts canViewAllClassifications — is out of this cluster's
+// scope; this gate closes the strip-boundary leak regardless of the mapper.)
+const APEX_ADMIN_PERMS = [
+    'admin:user:update',
+    'user:manage:personnel_notes',
+    'user:manage:conduct_record',
+    'admin:user:manage_clearance',
+    'admin:view:roster',
+];
+
 /**
  * Strip sensitive fields from a User record before sending to a client,
  * based on the requester's role and permissions.
@@ -44,7 +73,9 @@ const HR_METADATA_PERMS = [
  *   conductRecord     → self OR `user:manage:conduct_record`
  *   limitingMarkers   → self OR `admin:user:manage_clearance`
  *
- * Admin role bypasses all checks (matches services.ts dispatcher behavior).
+ * The genuine apex Admin (tier Admin AND holding the full APEX_ADMIN_PERMS set —
+ * not merely an `admin:access`-derived Admin tier) bypasses all checks. A scoped
+ * custom role with `admin:access` only falls through to the granular ladder.
  *
  * If `requester` is null (unauthenticated path or no resolved user), all
  * sensitive fields are stripped — defense-in-depth.
@@ -75,9 +106,18 @@ export function stripSensitiveUserFields(user: User, requester: RequesterContext
         };
     }
 
-    if (requester.role === 'Admin') return base;
-
     const perms = requester.permissions;
+
+    // Full-record bypass for the Admin tier — but NOT when that tier is forged from
+    // `admin:access` alone. A scoped role whose only admin signal is `admin:access`
+    // yet lacks the real apex perm backing is treated as non-Admin here and falls
+    // through to the granular ladder (see APEX_ADMIN_PERMS note). A genuine Admin
+    // holds the full apex set, so it still returns the unstripped record.
+    if (requester.role === 'Admin') {
+        const adminTierForgedFromAccess =
+            hasPerm(perms, 'admin:access') && !APEX_ADMIN_PERMS.every((p) => hasPerm(perms, p));
+        if (!adminTierForgedFromAccess) return base;
+    }
 
     if (isSelf) {
         // Self sees their own record. adminNotes stay admin-only by UX intent, so they

@@ -32,30 +32,44 @@ export default function QmCatalogTab({ catalog, canAdmin, onRefresh }: Props) {
     const [platformResults, setPlatformResults] = useState<QmCatalogItem[]>([]);
     const [searchLoading, setSearchLoading] = useState(false);
     const [searchError, setSearchError] = useState<string | null>(null);
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
 
-    useEffect(() => {
-        if (!includePlatform || !debouncedSearch) {
+    // Drive the synchronous parts of the platform search during render with a
+    // previous-key tracker (the React-documented "adjust state during render"
+    // pattern; React re-renders before paint, so it is equivalent to the old
+    // synchronous effect sets without firing the set-state-in-effect rule):
+    //   - search switched off / query cleared -> clear stale results, loading, error
+    //   - new query -> begin loading, clear prior error
+    // The effect below keeps only the async fetch and its async result sets.
+    const platformSearchActive = includePlatform && debouncedSearch ? debouncedSearch : null;
+    const [prevPlatformSearchActive, setPrevPlatformSearchActive] = useState<string | null>(platformSearchActive);
+    if (platformSearchActive !== prevPlatformSearchActive) {
+        setPrevPlatformSearchActive(platformSearchActive);
+        if (platformSearchActive === null) {
             setPlatformResults([]);
             setSearchLoading(false);
             setSearchError(null);
-            return;
+        } else {
+            setSearchLoading(true);
+            setSearchError(null);
         }
-        const seq = ++requestSeq.current;
-        setSearchLoading(true);
-        setSearchError(null);
+    }
+
+    useEffect(() => {
+        if (!includePlatform || !debouncedSearch) return;
+        const seq = ++requestSeqRef.current;
         rpcAction('qm:search_catalog', { query: debouncedSearch, source: 'platform', limit: 100 })
             .then((rows: any) => {
-                if (seq !== requestSeq.current) return;
+                if (seq !== requestSeqRef.current) return;
                 setPlatformResults(Array.isArray(rows) ? rows : []);
             })
             .catch((err: any) => {
-                if (seq !== requestSeq.current) return;
+                if (seq !== requestSeqRef.current) return;
                 setSearchError(err?.message || 'Search failed');
                 setPlatformResults([]);
             })
             .finally(() => {
-                if (seq === requestSeq.current) setSearchLoading(false);
+                if (seq === requestSeqRef.current) setSearchLoading(false);
             });
     }, [debouncedSearch, includePlatform, rpcAction]);
 

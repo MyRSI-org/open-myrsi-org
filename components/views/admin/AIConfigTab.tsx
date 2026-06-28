@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
 
 import { AIConfig } from '../../../types';
@@ -13,14 +13,24 @@ const AIConfigTab: React.FC = () => {
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
 
-    useEffect(() => {
+    // Sync the locally-editable config from the external ConfigContext store
+    // whenever the server snapshot (aiConfig) changes. Done during render via
+    // the React "adjust state during render" pattern with a previous-value
+    // tracker on the aiConfig identity, instead of a synchronous set-in-effect.
+    // The merge is identical to the old effect ({...prev, ...aiConfig}): server
+    // fields overlay the current local config, preserving any local-only fields.
+    // prevAiConfig starts at null (aiConfig is never null) so the merge also
+    // runs on first render, matching the old mount-time effect.
+    const [prevAiConfig, setPrevAiConfig] = useState<AIConfig | null>(null);
+    if (aiConfig !== prevAiConfig) {
+        setPrevAiConfig(aiConfig);
         if (aiConfig) {
             setConfig(prev => ({
                 ...prev,
                 ...aiConfig
             }));
         }
-    }, [aiConfig]);
+    }
 
     const handleSave = async () => {
         setIsSaving(true);

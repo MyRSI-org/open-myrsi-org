@@ -39,6 +39,24 @@ const VALID_THREAT_LEVELS = new Set<string>(Object.values(IntelThreatLevel));
 export const normalizeThreatLevel = (v: unknown): string =>
     typeof v === 'string' && VALID_THREAT_LEVELS.has(v) ? v : 'Medium';
 
+// Intel report evidence URLs are persisted and later rendered as anchor href
+// (<a href=…>) in the client, so an unvalidated string is a link-injection /
+// stored-XSS sink (javascript:/data: URIs). Run each through the same
+// public-link allowlist the feed-ingest path uses (https:/discord: only;
+// javascript:/data:/http: and private hosts rejected), drop rejected entries,
+// and cap the count so a hostile/buggy client can't store an unbounded array.
+// Returns undefined for a non-array input so a partial update leaves the column
+// untouched (matching the "skip if not supplied" behaviour); an array
+// that fully fails the allowlist normalises to [].
+const MAX_EVIDENCE_URLS = 20;
+function sanitizeEvidenceUrls(raw: unknown): string[] | undefined {
+    if (!Array.isArray(raw)) return undefined;
+    return raw
+        .map((u) => sanitizePublicLinkUrl(u))
+        .filter((u): u is string => Boolean(u))
+        .slice(0, MAX_EVIDENCE_URLS);
+}
+
 // Clearance / limiting-marker filter for intel report/bulletin bodies, enforced
 // server-side via the shared clearance util. intel:manage holders (and Admins)
 // see all classifications.
@@ -66,20 +84,45 @@ function broadcastIntelUpdate(payload?: { kind: 'report' | 'dossier'; targetId?:
     broadcastToOrg('intel_update', payload ?? {});
 }
 
+// Federated warrants arrive as fully peer-controlled JSON. The own-org
+// create/update paths run `action` through stripHtmlSingleLine(…, 200) and treat
+// status/uec_reward as known shapes; the feed-ingest path must apply the same
+// hygiene or a hostile/buggy peer could store unbounded `action` text, an
+// arbitrary `status` string (warrants.status is plain text, not a DB enum), or a
+// junk/overflow reward. Pure + exported for unit testing.
+const VALID_WARRANT_STATUSES = new Set<string>(Object.values(WarrantStatus));
+export function normalizeWarrantStatus(v: unknown): WarrantStatus {
+    return typeof v === 'string' && VALID_WARRANT_STATUSES.has(v) ? (v as WarrantStatus) : WarrantStatus.Active;
+}
+
+// uec_reward is rendered as a number; coerce to a bounded non-negative integer.
+// Non-finite / negative → null (no reward); huge values are clamped so a peer
+// can't store an absurd/overflow bounty.
+const MAX_WARRANT_UEC_REWARD = 1_000_000_000_000;
+export function normalizeWarrantUecReward(v: unknown): number | null {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.min(Math.floor(n), MAX_WARRANT_UEC_REWARD);
+}
+
 // --- WARRANTS ---
 
 export async function createWarrant(payload: Record<string, unknown>, userId?: number) {
-    const targetRsiHandle = payload.targetRsiHandle as string;
-    const reason = payload.reason as string;
+    // Own-org write boundary: strip HTML + length-cap the free-text fields,
+    // mirroring the hygiene the feed-ingest path applies to peer-supplied
+    // warrants (no unbounded handle/reason/notes blobs land in the DB).
+    const targetRsiHandle = stripHtmlSingleLine(payload.targetRsiHandle, 200);
+    const reason = stripHtml(payload.reason, 8000);
     const issuer = userId || (payload.issuedById as number | undefined);
     const { data: created, error } = await supabase.from('warrants').insert({
         target_rsi_handle: targetRsiHandle,
         reason: reason,
-        action: payload.action as string | undefined,
+        action: payload.action !== undefined ? stripHtmlSingleLine(payload.action, 200) : undefined,
         uec_reward: payload.uecReward as number | undefined,
         status: payload.status as string | undefined,
         issued_by: issuer,
-        notes: payload.notes as string | undefined
+        notes: payload.notes !== undefined ? stripHtml(payload.notes, 8000) : undefined
     }).select('id').single();
 
     handleSupabaseError({ error, message: 'Failed to create warrant' });
@@ -112,7 +155,17 @@ export async function updateWarrant(id: string, updates: Record<string, unknown>
         status?: string;
         notes?: string;
     };
-    const dbUpdates: Record<string, unknown> = { target_rsi_handle: inner.targetRsiHandle, reason: inner.reason, action: inner.action, uec_reward: inner.uecReward, status: inner.status, notes: inner.notes, updated_at: new Date().toISOString() };
+    // Same write-boundary hygiene as createWarrant; undefined fields are left
+    // untouched so a partial update only clamps what it actually changes.
+    const dbUpdates: Record<string, unknown> = {
+        target_rsi_handle: inner.targetRsiHandle !== undefined ? stripHtmlSingleLine(inner.targetRsiHandle, 200) : undefined,
+        reason: inner.reason !== undefined ? stripHtml(inner.reason, 8000) : undefined,
+        action: inner.action !== undefined ? stripHtmlSingleLine(inner.action, 200) : undefined,
+        uec_reward: inner.uecReward,
+        status: inner.status,
+        notes: inner.notes !== undefined ? stripHtml(inner.notes, 8000) : undefined,
+        updated_at: new Date().toISOString(),
+    };
     if (inner.status === WarrantStatus.Claimed) { dbUpdates.claimed_by = updates.claimedById as number | undefined; dbUpdates.claimed_at = new Date().toISOString(); }
     else if (inner.status === WarrantStatus.Active) { dbUpdates.claimed_by = null; dbUpdates.claimed_at = null; }
 
@@ -168,6 +221,10 @@ export async function getWarrantByIdHydrated(warrantId: string) {
 export async function addWarrantNote(warrantId: string, content: string, authorId: number) {
     const trimmed = (content || '').trim();
     if (!trimmed) throw new Error('Warrant note content is required');
+    // Write-boundary hygiene: strip HTML + length-cap the note body (parity with
+    // the warrant reason/notes caps) so an unbounded/markup-laden note can't be
+    // stored or mirrored onto warrants.notes.
+    const capped = stripHtml(trimmed, 8000);
 
     // Verify the warrant exists before inserting.
     const { count } = await supabase
@@ -180,7 +237,7 @@ export async function addWarrantNote(warrantId: string, content: string, authorI
     const { error } = await supabase.from('warrant_notes').insert({
         warrant_id: warrantId,
         author_id: authorId,
-        content: trimmed,
+        content: capped,
     });
     if (error?.code === '42P01') {
         // Table doesn't exist yet — log and continue without the thread row.
@@ -191,7 +248,7 @@ export async function addWarrantNote(warrantId: string, content: string, authorI
     }
 
     await supabase.from('warrants').update({
-        notes: trimmed,
+        notes: capped,
         updated_at: new Date().toISOString(),
     }).eq('id', warrantId);
 
@@ -258,10 +315,10 @@ export async function createIntelReport(reportData: Record<string, unknown>) {
     const { data, error } = await supabase.from('intel_reports').insert({
         target_id: stripHtmlSingleLine(reportData.targetId as string, 200),
         subject_type: reportData.subjectType as string | undefined,
-        threat_level: (reportData.threat_level as string | undefined) || (reportData.threatLevel as string | undefined),
-        tags: reportData.tags as string[] | undefined,
+        threat_level: normalizeThreatLevel((reportData.threat_level as string | undefined) || (reportData.threatLevel as string | undefined)),
+        tags: sanitizeFeedTags(reportData.tags),
         summary: stripHtml(reportData.summary as string | undefined, 8000),
-        evidence_urls: reportData.evidenceUrls as string[] | undefined,
+        evidence_urls: sanitizeEvidenceUrls(reportData.evidenceUrls),
         created_by_id: reportData.createdById as number | null | undefined,
         affiliated_org: stripHtmlSingleLine(reportData.affiliatedOrg as string | undefined, 200) || null,
         classification_level: (reportData.classificationLevel as number | undefined) || 0
@@ -296,10 +353,10 @@ export async function updateIntelReport(id: string, updates: Record<string, unkn
 
     const markerIds = updates.markerIds as number[] | undefined;
     const { error } = await supabase.from('intel_reports').update({
-        threat_level: updates.threatLevel as string | undefined,
-        tags: updates.tags as string[] | undefined,
+        threat_level: normalizeThreatLevel(updates.threatLevel),
+        tags: sanitizeFeedTags(updates.tags),
         summary: stripHtml(updates.summary, 8000),
-        evidence_urls: updates.evidenceUrls as string[] | undefined,
+        evidence_urls: sanitizeEvidenceUrls(updates.evidenceUrls),
         subject_type: updates.subjectType as string | undefined,
         affiliated_org: stripHtmlSingleLine(updates.affiliatedOrg, 200) || null,
         classification_level: (updates.classificationLevel as number | undefined) || 0
@@ -451,15 +508,37 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
         }
     }
 
-    // owner_id + clearance_level + limiting markers are selected solely to feed
-    // canUserSeeOpInList below — they are NOT part of the mapped projection
-    // returned to the browser.
+    // owner_id + clearance_level + limiting markers + is_special are selected
+    // solely to feed canUserSeeOpInList below — they are NOT part of the mapped
+    // projection returned to the browser. The participants embed is inner-joined to
+    // the dossier SUBJECT (so it lists only ops the subject is in); it does NOT
+    // describe the VIEWER, so the viewer's own active participations are fetched
+    // separately (viewerParticipationPromise) to drive the special-op gate.
     const opsQuery = targetUserId
         ? safeFetch((() => {
-            const q = supabase.from('operations').select('id, name, status, type, description, created_at, owner_id, clearance_level, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code)), participants:operation_participants!inner(user_id)').eq('participants.user_id', targetUserId);
+            const q = supabase.from('operations').select('id, name, status, type, description, created_at, owner_id, clearance_level, is_special, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code)), participants:operation_participants!inner(user_id)').eq('participants.user_id', targetUserId);
             return q;
         })(), [], 'Failed to get operations')
         : Promise.resolve([]);
+
+    // Special operations are invite-only: a clearance-0 special op
+    // has no clearance/marker barrier (the join PIN is the gate), so the
+    // clearance-only filter would leak its existence/name/status/description to any
+    // intel:view holder. Engage canUserSeeOpInList's special-op participation gate
+    // by passing is_special + the VIEWER's active participation. The dossier ops
+    // embed can't supply that (it's the subject's), so fetch the viewer's own
+    // active operation_participants once, in parallel. Skipped for the
+    // operations:manage / Admin bypass population (they see every special op) and
+    // when there is no viewer id (fails closed → no participation → special ops
+    // hidden).
+    const viewerCanSeeAllOps = canViewAllClassifications(viewer, ['operations:manage']);
+    const viewerParticipationPromise: Promise<Set<string>> =
+        !isOrg && targetUserId && viewer?.id != null && !viewerCanSeeAllOps
+            ? safeFetch<{ operation_id: string }[]>(
+                supabase.from('operation_participants').select('operation_id').eq('user_id', viewer.id).is('time_left', null) as unknown as SafeFetchQuery<{ operation_id: string }[]>,
+                [], 'Failed to get viewer participation',
+            ).then((rows) => new Set((rows || []).map((p) => String(p.operation_id))))
+            : Promise.resolve(new Set<string>());
 
     // Build org-scoped warrant query
     const warrantQuery = supabase.from('warrants').select('id, target_rsi_handle, reason, action, uec_reward, status, issued_by, claimed_by, source_feed_id, external_id, notes, created_at, issuedBy:users!warrants_issued_by_fkey(id, name, avatar_url, role_id), claimedBy:users!warrants_claimed_by_fkey(id, name, avatar_url, role_id), feed:alliance_peers(id, label)').ilike('target_rsi_handle', safeTarget);
@@ -479,13 +558,14 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
             null, 'Failed to get summary')
         : Promise.resolve(null);
 
-    const [reports, warrants, requests, opsData, summary, orgReportArrays] = await Promise.all([
+    const [reports, warrants, requests, opsData, summary, orgReportArrays, viewerActiveOpIds] = await Promise.all([
         safeFetch(reportsQuery, [], 'Failed to get reports'),
         isOrg ? Promise.resolve([]) : safeFetch(warrantQuery, [], 'Failed to get warrants'),
         isOrg ? Promise.resolve([]) : safeFetch(requestsQuery, [], 'Failed to get requests'),
         isOrg ? Promise.resolve([]) : opsQuery,
         summaryPromise,
         Promise.all(orgReportPromises),
+        viewerParticipationPromise,
     ]);
 
     // Merge org-affiliated reports into primary reports (dedupe by id).
@@ -522,14 +602,21 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
     // Mirror the ops list/detail gate (canUserSeeOpInList) before mapping so the
     // dossier doesn't leak compartmented op existence, status and tactical
     // description to any intel:view holder. The gate fields
-    // (owner_id/clearance_level/markers) are consumed here and dropped from the
-    // mapped projection.
+    // (owner_id/clearance_level/markers/is_special) are consumed here and dropped
+    // from the mapped projection. is_special engages the invite-only
+    // participation gate: a clearance-0 special op is shown only to the owner, the
+    // operations:manage / Admin bypass population, or an ACTIVE participant
+    // (viewerActiveOpIds), matching the list/slice/detail/action paths.
     type DossierOpRow = Tables<'operations'> & { limiting_markers?: { marker?: unknown }[] };
     const mappedOperations = ((opsData || []) as unknown as DossierOpRow[])
         .filter((op) => !!viewer && canUserSeeOpInList(viewer, {
             ownerId: op.owner_id,
             clearanceLevel: op.clearance_level ?? 0,
             limitingMarkers: embeddedMarkers(op.limiting_markers),
+            isSpecial: op.is_special,
+            participants: viewerActiveOpIds.has(String(op.id))
+                ? [{ userId: viewer.id as number, timeLeft: null }]
+                : [],
         }))
         .map((op) => ({
             id: op.id,
@@ -737,35 +824,62 @@ export interface IntelHubStats {
     recentCount7d: number;
 }
 
+// Bounded candidate scan for the non-bypass (clearance + marker filtered) stats
+// paths. Matches getIntelTargetIndex's ceiling so stats/index stay consistent
+// (the index already scans this many rows): a non-bypass viewer's counts are
+// derived from the same population the index is, so stats total <= index count.
+const INTEL_STATS_SCAN_CAP = 20000;
+
 /**
- * Aggregate intel counters for the hub hero stats. Org-wide; not clearance-filtered
- * (today's pre-fix UI numbers weren't either, and a clearance-aware count would
- * require a per-user join over every report — too expensive on the hot read path).
+ * Aggregate intel counters for the hub hero stats. Clearance + limiting-marker
+ * filtered per viewer (the count itself reveals classified-activity volume, so a
+ * level-only ceiling would still leak how many compartmented reports exist that
+ * the viewer cannot read). Admin / intel:manage see all via an exact count
+ * pushdown; everyone else is derived from a bounded marker-filtered scan
+ * (mirrors getIntelTargetIndex so stats/index/list cannot drift).
  */
 export async function getIntelHubStats(user?: ClearanceUser | null): Promise<IntelHubStats> {
-    // Counts are clearance-ceilinged — a low-clearance viewer's stats must not
-    // include reports they cannot read (the count itself reveals classified
-    // activity volume). Admin / intel:manage see all.
-    const maxLevel = canViewAllClassifications(user, ['intel:manage'])
-        ? null
-        : (user?.clearanceLevel?.level ?? 0);
-    const base = () => {
-        let q = supabase.from('intel_reports').select('id', { count: 'exact', head: true });
-        if (maxLevel !== null) q = q.lte('classification_level', maxLevel);
-        return q;
-    };
-
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const [totalRes, criticalRes, recentRes] = await Promise.all([
-        base(),
-        base().in('threat_level', [IntelThreatLevel.Critical, IntelThreatLevel.High]),
-        base().gte('created_at', sevenDaysAgo),
-    ]);
-    return {
-        totalReports: totalRes.count ?? 0,
-        criticalCount: criticalRes.count ?? 0,
-        recentCount7d: recentRes.count ?? 0,
-    };
+
+    // Bypass population (Admin / intel:manage): they read everything, so the fast
+    // exact count-pushdown (head:true, no per-row scan) is correct.
+    if (canViewAllClassifications(user, ['intel:manage'])) {
+        const base = () => supabase.from('intel_reports').select('id', { count: 'exact', head: true });
+        const [totalRes, criticalRes, recentRes] = await Promise.all([
+            base(),
+            base().in('threat_level', [IntelThreatLevel.Critical, IntelThreatLevel.High]),
+            base().gte('created_at', sevenDaysAgo),
+        ]);
+        return {
+            totalReports: totalRes.count ?? 0,
+            criticalCount: criticalRes.count ?? 0,
+            recentCount7d: recentRes.count ?? 0,
+        };
+    }
+
+    // Non-bypass: clearance-LEVEL ceiling in SQL, limiting-MARKER exclusion per
+    // row in code — a viewer cleared to level N but lacking compartment marker X
+    // must not see the marker-X reports counted (volume inference). Bounded by
+    // INTEL_STATS_SCAN_CAP (trades count-pushdown exactness for marker
+    // correctness, same tradeoff getIntelTargetIndex already accepts).
+    const maxLevel = user?.clearanceLevel?.level ?? 0;
+    const { data } = await supabase.from('intel_reports')
+        .select('id, threat_level, classification_level, created_at, intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .lte('classification_level', maxLevel)
+        .order('created_at', { ascending: false })
+        .limit(INTEL_STATS_SCAN_CAP);
+
+    let totalReports = 0;
+    let criticalCount = 0;
+    let recentCount7d = 0;
+    for (const row of (data || []) as Array<{ threat_level?: string; classification_level?: number | null; created_at?: string; intel_report_limiting_markers?: Array<{ marker?: unknown }> | null }>) {
+        const markers = (row.intel_report_limiting_markers || []).map((m) => m.marker).filter(Boolean);
+        if (!passesClearance(user, row.classification_level ?? 0, markers, ['intel:manage'])) continue;
+        totalReports++;
+        if (row.threat_level === IntelThreatLevel.Critical || row.threat_level === IntelThreatLevel.High) criticalCount++;
+        if (row.created_at && row.created_at >= sevenDaysAgo) recentCount7d++;
+    }
+    return { totalReports, criticalCount, recentCount7d };
 }
 
 export interface IntelTargetIndexEntry {
@@ -854,7 +968,9 @@ function assertBulkReportIds(reportIds: unknown): asserts reportIds is string[] 
 
 export async function bulkUpdateIntelAffiliation(reportIds: string[], affiliatedOrg: string) {
     assertBulkReportIds(reportIds);
-    const { error = null } = await supabase.from('intel_reports').update({ affiliated_org: affiliatedOrg })
+    // Clamp affiliated_org to a single line + length cap, matching the single-row
+    // updateIntelAffiliation path (no raw store on the bulk path either).
+    const { error = null } = await supabase.from('intel_reports').update({ affiliated_org: stripHtmlSingleLine(affiliatedOrg, 200) || null })
         .in('id', reportIds)
         ;
     handleSupabaseError({ error, message: 'Bulk update failed' });
@@ -927,42 +1043,64 @@ const INTEL_STATS_BREAKDOWN_CAP = 5000;
 
 export async function getIntelStats(user?: ClearanceUser | null) {
     // Mirror getIntelHubStats — a low-clearance viewer's report count + threat
-    // breakdown must NOT include reports above their level (the
-    // counts/distribution themselves reveal classified-activity volume). Apply
-    // the same classification-level ceiling in SQL. Admin / intel:manage holders
-    // (read-side bypass) see everything (maxLevel = null). The warrant
+    // breakdown must NOT include reports above their clearance LEVEL or carrying a
+    // limiting MARKER they don't hold (the counts/distribution themselves reveal
+    // classified-activity volume, and a level-only ceiling still leaks the volume
+    // of a compartment the viewer can't read). Admin / intel:manage holders
+    // (read-side bypass) see everything via the exact count-pushdown. The warrant
     // aggregation is ceilinged via warrant:view: warrants are a separate
     // compartment gated by warrant:view in the dossier/read paths, so a viewer
     // without it sees an activeWarrants count of 0 here too.
-    const maxLevel = canViewAllClassifications(user, ['intel:manage'])
-        ? null
-        : (user?.clearanceLevel?.level ?? 0);
-
-    // Ask the database for just the total count (it sends back a number, not the
-    // rows). The breakdown does need each row's threat level, but we cap how many
-    // rows we read for it. So the total is exact and the breakdown is a sample.
-    let countQuery = supabase.from('intel_reports').select('id', { count: 'exact', head: true });
-    let breakdownQuery = supabase.from('intel_reports').select('threat_level').limit(INTEL_STATS_BREAKDOWN_CAP);
-    if (maxLevel !== null) {
-        countQuery = countQuery.lte('classification_level', maxLevel);
-        breakdownQuery = breakdownQuery.lte('classification_level', maxLevel);
-    }
+    const seeAll = canViewAllClassifications(user, ['intel:manage']);
 
     const canSeeWarrants = user?.role === 'Admin'
         || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
     const warrantsQuery = canSeeWarrants
         ? supabase.from('warrants').select('id', { count: 'exact', head: true }).eq('status', 'Active')
         : Promise.resolve({ count: 0 });
-    const [{ count: totalReports }, { data: breakdownRows }, { count: activeWarrants }] =
-        await Promise.all([countQuery, breakdownQuery, warrantsQuery]);
 
+    if (seeAll) {
+        // Bypass: exact total via count-pushdown + a bounded breakdown sample.
+        const countQuery = supabase.from('intel_reports').select('id', { count: 'exact', head: true });
+        const breakdownQuery = supabase.from('intel_reports').select('threat_level').limit(INTEL_STATS_BREAKDOWN_CAP);
+        const [{ count: totalReports }, { data: breakdownRows }, { count: activeWarrants }] =
+            await Promise.all([countQuery, breakdownQuery, warrantsQuery]);
+        return {
+            totalReports: totalReports || 0,
+            activeWarrants: activeWarrants || 0,
+            threatBreakdown: (breakdownRows || []).reduce((acc: Record<string, number>, curr: { threat_level: string }) => {
+                acc[curr.threat_level] = (acc[curr.threat_level] || 0) + 1;
+                return acc;
+            }, {} as Record<string, number>)
+        };
+    }
+
+    // Non-bypass: clearance-LEVEL ceiling in SQL, limiting-MARKER exclusion per
+    // row in code (mirrors getIntelTargetIndex / getIntelHubStats). Both the total
+    // and the breakdown are derived from the SAME marker-filtered set so the
+    // distribution can't reveal compartmented volume either. Bounded by
+    // INTEL_STATS_SCAN_CAP.
+    const maxLevel = user?.clearanceLevel?.level ?? 0;
+    const reportsQuery = supabase.from('intel_reports')
+        .select('id, threat_level, classification_level, intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .lte('classification_level', maxLevel)
+        .order('created_at', { ascending: false })
+        .limit(INTEL_STATS_SCAN_CAP);
+    const [{ data: rows }, { count: activeWarrants }] = await Promise.all([reportsQuery, warrantsQuery]);
+
+    let totalReports = 0;
+    const threatBreakdown: Record<string, number> = {};
+    for (const row of (rows || []) as Array<{ threat_level?: string; classification_level?: number | null; intel_report_limiting_markers?: Array<{ marker?: unknown }> | null }>) {
+        const markers = (row.intel_report_limiting_markers || []).map((m) => m.marker).filter(Boolean);
+        if (!passesClearance(user, row.classification_level ?? 0, markers, ['intel:manage'])) continue;
+        totalReports++;
+        const threat = String(row.threat_level ?? '');
+        if (threat) threatBreakdown[threat] = (threatBreakdown[threat] || 0) + 1;
+    }
     return {
-        totalReports: totalReports || 0,
+        totalReports,
         activeWarrants: activeWarrants || 0,
-        threatBreakdown: (breakdownRows || []).reduce((acc: Record<string, number>, curr: { threat_level: string }) => {
-            acc[curr.threat_level] = (acc[curr.threat_level] || 0) + 1;
-            return acc;
-        }, {} as Record<string, number>)
+        threatBreakdown,
     };
 }
 
@@ -1522,9 +1660,12 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                             const { data: insertedWarrant, error: warrantInsertErr } = await supabase.from('warrants').insert({
                                 target_rsi_handle: cleanHandle,
                                 reason: cleanReason,
-                                action: w.action,
-                                uec_reward: w.uec_reward,
-                                status: w.status,
+                                // Mirror the own-org warrant write boundary: strip+cap
+                                // action, constrain status to the WarrantStatus enum, and
+                                // bound uec_reward (peer JSON is fully untrusted).
+                                action: w.action != null ? stripHtmlSingleLine(w.action, 200) : null,
+                                uec_reward: normalizeWarrantUecReward(w.uec_reward),
+                                status: normalizeWarrantStatus(w.status),
                                 created_at: w.created_at || w.issued_at || new Date().toISOString(),
                                 source_feed_id: feed.id,
                                 external_id: w.id != null ? String(w.id) : null,

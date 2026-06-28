@@ -5,11 +5,16 @@
 
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
-import react from 'eslint-plugin-react';
+import eslintReact from '@eslint-react/eslint-plugin';
 import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 import unusedImports from 'eslint-plugin-unused-imports';
 import globals from 'globals';
+
+// @eslint-react replaces the unmaintained eslint-plugin-react (no ESLint 10
+// support). Its non-type-checked preset carries no `files`/parser of its own,
+// so we scope it to **/*.tsx and rely on the typescript-eslint parser block.
+const eslintReactRecommended = eslintReact.configs['recommended-typescript'];
 
 export default [
     {
@@ -68,20 +73,26 @@ export default [
 
     {
         files: ['**/*.tsx'],
-        plugins: { react },
+        ...eslintReactRecommended,
         languageOptions: {
             parserOptions: {
                 ecmaFeatures: { jsx: true },
             },
         },
-        settings: { react: { version: '19' } },
         rules: {
-            ...react.configs.recommended.rules,
-            'react/react-in-jsx-scope': 'off', // React 19 / new JSX transform
-            'react/prop-types': 'off',         // TypeScript handles prop typing
-            // Off: legitimate ' and " in JSX text are parsed unambiguously by
-            // the modern JSX transform, so the rule adds only cosmetic churn.
-            'react/no-unescaped-entities': 'off',
+            ...eslintReactRecommended.rules,
+            // Deconflict with eslint-plugin-react-hooks (the official React
+            // plugin): it owns the hooks + React-Compiler rules below, so the
+            // overlapping @eslint-react versions are off here. This also keeps
+            // the inline `eslint-disable react-hooks/*` directives valid under
+            // --report-unused-disable-directives.
+            '@eslint-react/exhaustive-deps': 'off',
+            '@eslint-react/rules-of-hooks': 'off',
+            '@eslint-react/set-state-in-effect': 'off',
+            '@eslint-react/set-state-in-render': 'off',
+            '@eslint-react/purity': 'off',
+            '@eslint-react/use-memo': 'off',
+            '@eslint-react/error-boundaries': 'off',
         },
     },
 

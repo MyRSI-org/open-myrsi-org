@@ -1,17 +1,104 @@
 
 import { supabase, handleSupabaseError } from '../common.js';
 
+// Explicit column list — never `*`. A wildcard here evades the wildcard-select
+// ratchet (it only flags string literals passed directly to `.select(...)`, not a
+// const) and would auto-ship any column later added to government_orders to every
+// gov:view client with no mapper gate. Enumerate exactly what toGovernmentOrder maps.
 const ORDER_SELECT = `
-    *,
+    id, issuer_position_id, issuer_user_id, number, title, preamble, body, rationale,
+    status, effective_at, expires_at, issued_at, revoked_at, revoked_by_user_id,
+    revoked_by_position_id, revoked_reason, created_at, updated_at,
     issuer_position:government_positions!government_orders_issuer_position_id_fkey(id, name, icon),
     issuer:users!government_orders_issuer_user_id_fkey(id, name, avatar_url, rsi_handle),
     revoked_by:users!government_orders_revoked_by_user_id_fkey(id, name, avatar_url, rsi_handle)
 `;
 
-// Raw government_orders row (with joined embeds) as returned to the client. The
-// embeds aren't captured by the generated Row types, so the shape stays loose;
-// only the fields read for draft-visibility filtering are named explicitly.
+// Raw government_orders row (with joined embeds) as returned by Supabase. The
+// embeds aren't captured by the generated Row types, so the input shape stays
+// loose; toGovernmentOrder narrows it field-by-field before it reaches the wire.
 type GovernmentOrderRow = { status?: string; issuer_user_id?: number; [k: string]: unknown };
+
+// Joined-embed projections — exactly the columns ORDER_SELECT requests.
+interface OrderUserEmbed { id: number; name: string | null; avatar_url: string | null; rsi_handle: string | null }
+interface OrderPositionEmbed { id: number; name: string | null; icon: string | null }
+
+// The order shape sent to the client (snake_case, matching the OrdersTab consumer).
+// Every field is enumerated; unexpected columns from the DB row are dropped here so
+// a column added to government_orders later can never auto-leak to gov:view clients.
+export interface GovernmentOrder {
+    id: string;
+    issuer_position_id: number | null;
+    issuer_user_id: number | null;
+    number: string | null;
+    title: string | null;
+    preamble: string | null;
+    body: string | null;
+    rationale: string | null;
+    status: string | null;
+    effective_at: string | null;
+    expires_at: string | null;
+    issued_at: string | null;
+    revoked_at: string | null;
+    revoked_by_user_id: number | null;
+    revoked_by_position_id: number | null;
+    revoked_reason: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+    issuer_position: OrderPositionEmbed | null;
+    issuer: OrderUserEmbed | null;
+    revoked_by: OrderUserEmbed | null;
+}
+
+function toUserEmbed(raw: unknown): OrderUserEmbed | null {
+    const u = Array.isArray(raw) ? raw[0] : raw;
+    if (!u || typeof u !== 'object') return null;
+    const r = u as Record<string, unknown>;
+    return {
+        id: r.id as number,
+        name: (r.name as string | null) ?? null,
+        avatar_url: (r.avatar_url as string | null) ?? null,
+        rsi_handle: (r.rsi_handle as string | null) ?? null,
+    };
+}
+
+function toPositionEmbed(raw: unknown): OrderPositionEmbed | null {
+    const p = Array.isArray(raw) ? raw[0] : raw;
+    if (!p || typeof p !== 'object') return null;
+    const r = p as Record<string, unknown>;
+    return {
+        id: r.id as number,
+        name: (r.name as string | null) ?? null,
+        icon: (r.icon as string | null) ?? null,
+    };
+}
+
+/** Narrow a raw government_orders row (with embeds) to the enumerated wire shape. */
+function toGovernmentOrder(raw: GovernmentOrderRow): GovernmentOrder {
+    return {
+        id: raw.id as string,
+        issuer_position_id: (raw.issuer_position_id as number | null) ?? null,
+        issuer_user_id: (raw.issuer_user_id as number | null) ?? null,
+        number: (raw.number as string | null) ?? null,
+        title: (raw.title as string | null) ?? null,
+        preamble: (raw.preamble as string | null) ?? null,
+        body: (raw.body as string | null) ?? null,
+        rationale: (raw.rationale as string | null) ?? null,
+        status: (raw.status as string | null) ?? null,
+        effective_at: (raw.effective_at as string | null) ?? null,
+        expires_at: (raw.expires_at as string | null) ?? null,
+        issued_at: (raw.issued_at as string | null) ?? null,
+        revoked_at: (raw.revoked_at as string | null) ?? null,
+        revoked_by_user_id: (raw.revoked_by_user_id as number | null) ?? null,
+        revoked_by_position_id: (raw.revoked_by_position_id as number | null) ?? null,
+        revoked_reason: (raw.revoked_reason as string | null) ?? null,
+        created_at: (raw.created_at as string | null) ?? null,
+        updated_at: (raw.updated_at as string | null) ?? null,
+        issuer_position: toPositionEmbed(raw.issuer_position),
+        issuer: toUserEmbed(raw.issuer),
+        revoked_by: toUserEmbed(raw.revoked_by),
+    };
+}
 
 // A position the user holds that is authorized to issue orders.
 type OrderIssuingPosition = { id: number; name?: string; icon?: string | null; can_issue_orders: boolean };
@@ -30,34 +117,36 @@ export interface GovernmentOrderInput {
 }
 
 /** List orders for an org. Drafts visible only to their author. Auto-expires stale active orders on read. */
-export async function listGovernmentOrders(viewerUserId?: number): Promise<GovernmentOrderRow[]> {
+export async function listGovernmentOrders(viewerUserId?: number): Promise<GovernmentOrder[]> {
     await supabase.from('government_orders')
         .update({ status: 'expired', updated_at: new Date().toISOString() })
-        
+
         .eq('status', 'active')
         .lt('expires_at', new Date().toISOString());
 
     const { data } = await supabase.from('government_orders')
         .select(ORDER_SELECT)
-        
+
         .order('issued_at', { ascending: false, nullsFirst: false })
         .order('created_at', { ascending: false })
         .limit(200);
 
     const rows = (data || []) as GovernmentOrderRow[];
-    return rows.filter(r => r.status !== 'draft' || r.issuer_user_id === viewerUserId);
+    return rows
+        .filter(r => r.status !== 'draft' || r.issuer_user_id === viewerUserId)
+        .map(toGovernmentOrder);
 }
 
-export async function getGovernmentOrder(orderId: string, viewerUserId?: number): Promise<GovernmentOrderRow | null> {
+export async function getGovernmentOrder(orderId: string, viewerUserId?: number): Promise<GovernmentOrder | null> {
     const { data } = await supabase.from('government_orders')
         .select(ORDER_SELECT)
         .eq('id', orderId)
-        
+
         .maybeSingle();
     const row = data as GovernmentOrderRow | null;
     if (!row) return null;
     if (row.status === 'draft' && row.issuer_user_id !== viewerUserId) return null;
-    return row;
+    return toGovernmentOrder(row);
 }
 
 /** Verify caller currently holds a position with can_issue_orders. Throws if not. */
@@ -80,7 +169,7 @@ async function assertCanIssueOrders(userId: number, positionId?: number): Promis
     return eligible[0];
 }
 
-export async function createGovernmentOrder(input: GovernmentOrderInput, userId: number): Promise<GovernmentOrderRow | null> {
+export async function createGovernmentOrder(input: GovernmentOrderInput, userId: number): Promise<GovernmentOrder | null> {
     if (!input.title?.trim() || !input.body?.trim()) throw new Error('Title and body are required.');
 
     const pos = await assertCanIssueOrders(userId, input.issuerPositionId);
@@ -108,7 +197,7 @@ export async function createGovernmentOrder(input: GovernmentOrderInput, userId:
     // No broadcast: orders are not part of the government subset and are
     // RPC-fetched on demand (gov:list_orders) — emitting government_update
     // here only triggered a wasted full-bundle refetch on every client.
-    return data as GovernmentOrderRow | null;
+    return data ? toGovernmentOrder(data as GovernmentOrderRow) : null;
 }
 
 export async function updateGovernmentOrder(orderId: string, patch: Partial<GovernmentOrderInput>, userId: number): Promise<void> {

@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { HRInterviewTemplate } from '../../../types';
 import { useData } from '../../../contexts/DataContext';
 
@@ -12,53 +12,92 @@ interface CreateTemplateModalProps {
     template?: HRInterviewTemplate;
 }
 
+// Editable questions carry a stable client-only id so React keys survive
+// reorder/remove without falling back to the array index. The id is purely a
+// rendering concern — it is stripped at submit time, so the wire payload stays
+// the bare `string[]` the server expects.
+interface QuestionDraft {
+    id: string;
+    text: string;
+}
+
 const CreateTemplateModal: React.FC<CreateTemplateModalProps> = ({ isOpen, onClose, template }) => {
     const { rpcAction, refreshHR } = useData();
     const { addToast } = useNotification();
     const [name, setName] = useState('');
     const [description, setDescription] = useState('');
-    const [questions, setQuestions] = useState<string[]>([]);
+    const [questions, setQuestions] = useState<QuestionDraft[]>([]);
     const [newQuestion, setNewQuestion] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [isFetching, setIsFetching] = useState(false);
     const isEditing = !!template;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (template) {
-                setName(template.name);
-                setDescription(template.description);
-                fetchQuestions(template.id);
-            } else {
-                setName('');
-                setDescription('');
-                setQuestions([]);
-                setIsFetching(false);
-            }
-            setIsLoading(false);
-        }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on isOpen / template flip; fetchQuestions is an inline async helper that closes over current state at call time.
-    }, [isOpen, template]);
+    // Monotonic counter for synthetic question keys. Only ever read in event
+    // handlers / the async fetch (never during render), so it stays render-pure.
+    const questionIdRef = useRef(0);
+    const nextQuestionId = useCallback(() => `q-${questionIdRef.current++}`, []);
 
-    const fetchQuestions = async (id: number) => {
-        setIsFetching(true);
-        try {
-            const details: HRInterviewTemplate = await rpcAction('hr:get_template_details', { id });
-            if (details && details.questions) {
-                setQuestions(details.questions.sort((a, b) => a.orderIndex - b.orderIndex).map(q => q.questionText));
-            }
-        } catch (error) {
-            console.error("Failed to fetch template questions:", error);
-            addToast("Load Failed", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: "Could not load question details." });
-        } finally {
+    // Seed / reset the editable form during render whenever the modal opens or
+    // the selected template changes (React's "adjust state during render" pattern).
+    // Tracking both isOpen and template reproduces the old open-reset effect: a new
+    // open event, or swapping the edited template while open, re-hydrates the fields.
+    // This runs before paint, so it is behaviour-equivalent to the previous effect's
+    // synchronous seeding — without the cascading-render setState-in-effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevTemplate, setPrevTemplate] = useState(template);
+    if (isOpen && (!prevIsOpen || template !== prevTemplate)) {
+        setPrevIsOpen(isOpen);
+        setPrevTemplate(template);
+        if (template) {
+            setName(template.name);
+            setDescription(template.description);
+            // Async question load resolves isFetching to false; mark it loading up
+            // front so there's no flash of the empty-question state for editing.
+            setIsFetching(true);
+        } else {
+            setName('');
+            setDescription('');
+            setQuestions([]);
             setIsFetching(false);
         }
-    };
+        setIsLoading(false);
+    } else if (!isOpen && prevIsOpen) {
+        // Keep the trackers in step with the closed state so the next open
+        // (even to the same template reference) is detected as a fresh open event.
+        setPrevIsOpen(false);
+        setPrevTemplate(template);
+    }
+
+    // Fetch the template's questions when editing. The async body runs in a
+    // microtask (after the first await), so it performs no synchronous setState
+    // in the effect; isFetching(true) is seeded above during render. A cancelled
+    // flag drops a stale response if the template changes or the modal closes.
+    useEffect(() => {
+        if (!isOpen || !template) return;
+        const id = template.id;
+        let cancelled = false;
+        (async () => {
+            try {
+                const details: HRInterviewTemplate = await rpcAction('hr:get_template_details', { id });
+                if (cancelled) return;
+                if (details && details.questions) {
+                    setQuestions(details.questions.sort((a, b) => a.orderIndex - b.orderIndex).map(q => ({ id: nextQuestionId(), text: q.questionText })));
+                }
+            } catch (error) {
+                if (cancelled) return;
+                console.error("Failed to fetch template questions:", error);
+                addToast("Load Failed", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: "Could not load question details." });
+            } finally {
+                if (!cancelled) setIsFetching(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [isOpen, template, rpcAction, addToast, nextQuestionId]);
 
     const handleAddQuestion = (e: React.FormEvent) => {
         e.preventDefault();
         if (newQuestion.trim()) {
-            setQuestions([...questions, newQuestion.trim()]);
+            setQuestions([...questions, { id: nextQuestionId(), text: newQuestion.trim() }]);
             setNewQuestion('');
         }
     };
@@ -84,7 +123,8 @@ const CreateTemplateModal: React.FC<CreateTemplateModalProps> = ({ isOpen, onClo
         const data = {
             name: name.trim(),
             description: description.trim(),
-            questions
+            // Strip the synthetic ids — the server expects a bare string[].
+            questions: questions.map(q => q.text),
         };
 
         try {
@@ -172,9 +212,9 @@ const CreateTemplateModal: React.FC<CreateTemplateModalProps> = ({ isOpen, onClo
                                 </div>
                                 <div className="space-y-2">
                                     {questions.map((q, i) => (
-                                        <div key={i} className="flex items-center gap-3 bg-slate-900/40 p-3 rounded-lg border border-slate-800 group hover:border-slate-700 transition-colors">
+                                        <div key={q.id} className="flex items-center gap-3 bg-slate-900/40 p-3 rounded-lg border border-slate-800 group hover:border-slate-700 transition-colors">
                                             <span className="text-slate-500 font-mono text-[10px] font-bold w-6 text-center">{i + 1}.</span>
-                                            <p className="flex-1 text-sm text-slate-300">{q}</p>
+                                            <p className="flex-1 text-sm text-slate-300">{q.text}</p>
                                             <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                                 <button type="button" onClick={() => moveQuestion(i, -1)} disabled={i === 0} className="text-slate-500 hover:text-white p-1.5 rounded-sm hover:bg-slate-800 disabled:opacity-30 transition-colors"><i className="fa-solid fa-arrow-up text-xs"></i></button>
                                                 <button type="button" onClick={() => moveQuestion(i, 1)} disabled={i === questions.length - 1} className="text-slate-500 hover:text-white p-1.5 rounded-sm hover:bg-slate-800 disabled:opacity-30 transition-colors"><i className="fa-solid fa-arrow-down text-xs"></i></button>

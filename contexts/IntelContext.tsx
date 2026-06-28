@@ -14,7 +14,7 @@
 // registered here via registerRefreshIntel; the bulletin CRUD methods call it
 // after their RPC completes.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, use, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     IntelBulletin, IntelHubStats, IntelThreatLevel,
@@ -57,7 +57,7 @@ const IntelContext = createContext<IntelContextValue | null>(null);
 export const IntelProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { rpcAction, registerSliceSetter } = useDataCore();
 
-    const [intelTargetIndex, setIntelTargetIndex] = useState<Map<string, IntelThreatLevel>>(new Map());
+    const [intelTargetIndex, setIntelTargetIndex] = useState<Map<string, IntelThreatLevel>>(() => new Map());
     const [intelHubStats, setIntelHubStats] = useState<IntelHubStats>({ totalReports: 0, criticalCount: 0, recentCount7d: 0 });
     const [intelDataVersion, setIntelDataVersion] = useState<number>(0);
     const [activeBulletins, setActiveBulletins] = useState<IntelBulletin[]>([]);
@@ -121,11 +121,11 @@ export const IntelProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         registerRefreshIntel,
     ]);
 
-    return <IntelContext.Provider value={value}>{children}</IntelContext.Provider>;
+    return <IntelContext value={value}>{children}</IntelContext>;
 };
 
 export const useIntel = (): IntelContextValue => {
-    const ctx = useContext(IntelContext);
+    const ctx = use(IntelContext);
     if (!ctx) throw new Error('useIntel must be used within an IntelProvider');
     return ctx;
 };

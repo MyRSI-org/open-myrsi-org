@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import parse from 'html-react-parser';
 import { Announcement } from '../../types';
 import Notice from '../ui/Notice';
 
@@ -181,10 +182,13 @@ const BlurbCard: React.FC<{ text: string; html?: string }> = ({ text, html }) =>
                 // classes are no-ops. The `.minimal-rich-editor-content`
                 // rules in index.css are what give headings/lists/links
                 // their visible structure — match the editor's own wrapper.
-                <div
-                    className="minimal-rich-editor-content max-w-none text-sm sm:text-base"
-                    dangerouslySetInnerHTML={{ __html: html }}
-                />
+                <div className="minimal-rich-editor-content max-w-none text-sm sm:text-base">
+                    {/* html is server-emitted blurbHtml, sanitized via tiptapJsonToSafeHtml
+                        (lib/tiptapValidate.ts): tag allowlist + javascript:-URL stripping +
+                        escapeHtml on every text node. Rendered to React elements via
+                        html-react-parser — no raw HTML injection. */}
+                    {parse(html)}
+                </div>
             ) : (
                 <p className="text-slate-300 text-sm sm:text-base leading-relaxed whitespace-pre-line">
                     {text}
@@ -231,9 +235,9 @@ const TestimonialsCard: React.FC<{ slug: string }> = ({ slug }) => {
             <CardHeader icon="fa-solid fa-comment-dots" title="What Clients Say" id="testimonials-heading">
                 {items.length > 1 && (
                     <div className="flex items-center gap-1.5">
-                        {items.map((_, i) => (
+                        {items.map((t, i) => (
                             <button
-                                key={i}
+                                key={t.id}
                                 type="button"
                                 onClick={() => setIndex(i)}
                                 aria-label={`Show testimonial ${i + 1}`}

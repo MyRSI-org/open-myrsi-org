@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { User, ServiceRequestStatus } from '../../../types';
 import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
 import { useData } from '../../../contexts/DataContext';
@@ -79,9 +79,15 @@ const AdminClientDetailView: React.FC<AdminClientDetailViewProps> = ({ user, onB
     const [isPromoted, setIsPromoted] = useState(false);
     const [activeTab, setActiveTab] = useState<Tab>('profile');
 
-    useEffect(() => {
+    // Reset the controlled admin-notes textarea when the displayed user changes.
+    // Adjust-state-during-render (tracking the previous user reference) instead of an
+    // effect: re-seeds editable local state on identity change with the exact same
+    // value as the old effect, without an extra commit. (https://react.dev/reference/react/useState#storing-information-from-previous-renders)
+    const [prevUser, setPrevUser] = useState(userToDisplay);
+    if (userToDisplay !== prevUser) {
+        setPrevUser(userToDisplay);
         setAdminNotes(userToDisplay.adminNotes || '');
-    }, [userToDisplay]);
+    }
 
     const clientStats = useMemo(() => {
         const clientRequests = hydratedServiceRequests.filter(req => req.clientId === userToDisplay.id);

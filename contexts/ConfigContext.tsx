@@ -17,7 +17,7 @@
 // (would cycle). updateDiscordConfig and the external-tool methods refresh their
 // own subsets ('discord', 'external_tools') rather than 'main'.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     BrandingConfig, DiscordConfig, HeroCardConfig, OpenGraphConfig, RadioConfig,
@@ -337,11 +337,11 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         registerRefreshMainState, registerRefreshDiscord, registerRefreshExternalTools,
     ]);
 
-    return <ConfigContext.Provider value={value}>{children}</ConfigContext.Provider>;
+    return <ConfigContext value={value}>{children}</ConfigContext>;
 };
 
 export const useConfig = (): ConfigContextValue => {
-    const ctx = useContext(ConfigContext);
+    const ctx = use(ConfigContext);
     if (!ctx) throw new Error('useConfig must be used within a ConfigProvider');
     return ctx;
 };

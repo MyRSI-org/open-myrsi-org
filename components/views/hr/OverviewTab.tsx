@@ -1,5 +1,5 @@
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useHR } from '../../../contexts/HRContext';
 import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
@@ -12,6 +12,49 @@ interface OverviewTabProps {
     setActiveTab: (tab: string) => void;
 }
 
+// Probation banner. Hoisted to module scope (was an in-JSX IIFE the React
+// Compiler can't optimize). `now` is captured by the caller and passed in so
+// this stays a pure render of its props.
+const ProbationBanner: React.FC<{
+    probationEnd: string;
+    probationStart?: string;
+    now: number;
+    fmt: ReturnType<typeof useFormatDate>;
+}> = ({ probationEnd, probationStart, now, fmt }) => {
+    const end = new Date(probationEnd);
+    const start = probationStart ? new Date(probationStart) : null;
+    const daysLeft = Math.ceil((end.getTime() - now) / (1000 * 60 * 60 * 24));
+    const isOverdue = daysLeft <= 0;
+    const progress = start ? Math.min(100, Math.round(((now - start.getTime()) / (end.getTime() - start.getTime())) * 100)) : 100;
+
+    return (
+        <div className={`border rounded-xl p-5 relative overflow-hidden ${isOverdue ? 'bg-red-950/20 border-red-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${isOverdue ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`}>
+                    <i className="fa-solid fa-hourglass-half"></i>
+                </div>
+                <div className="flex-1 min-w-0">
+                    <p className={`text-[10px] font-black uppercase tracking-widest ${isOverdue ? 'text-red-300' : 'text-amber-300'}`}>
+                        {isOverdue ? 'Probation Review Pending' : 'Probation Period Active'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                        {isOverdue
+                            ? `Your probation ended ${Math.abs(daysLeft)} day${Math.abs(daysLeft) !== 1 ? 's' : ''} ago. A review is pending.`
+                            : `${daysLeft} day${daysLeft !== 1 ? 's' : ''} remaining — ends ${fmt.date(end.toISOString())}`
+                        }
+                    </p>
+                    <div className="mt-2.5 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                        <div
+                            className={`h-full rounded-full transition-all ${isOverdue ? 'bg-red-500' : daysLeft <= 7 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                            style={{ width: `${Math.min(progress, 100)}%` }}
+                        ></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 const OverviewTab: React.FC<OverviewTabProps> = ({ setActiveTab }) => {
     const { currentUser, hasPermission } = useAuth();
     const fmt = useFormatDate();
@@ -20,6 +63,11 @@ const OverviewTab: React.FC<OverviewTabProps> = ({ setActiveTab }) => {
     const { setIsManageSpecializationsModalOpen, openTransferModal, openRequestClearanceModal } = useModalRegistry();
 
     const isHR = hasPermission('hr:recruiter') || hasPermission('hr:manager') || hasPermission('hr:admin');
+
+    // Capture "now" once at mount so the timeline/probation derivations stay pure
+    // across re-renders (reading the clock during render is impure). This view has
+    // no live ticking requirement — the value is stable for the session.
+    const [now] = useState(() => Date.now());
 
     const stats = useMemo(() => {
         const myMissions = hydratedServiceRequests.filter(
@@ -83,7 +131,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({ setActiveTab }) => {
 
         if (currentUser?.probationEnd) {
             const end = new Date(currentUser.probationEnd);
-            if (end.getTime() <= Date.now()) {
+            if (end.getTime() <= now) {
                 events.push({
                     id: 'probation-complete',
                     date: end,
@@ -106,7 +154,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({ setActiveTab }) => {
         }
 
         return events.sort((a, b) => b.date.getTime() - a.date.getTime());
-    }, [currentUser, memberSince]);
+    }, [currentUser, memberSince, now]);
 
     const tintMap: Record<string, { border: string; bg: string; text: string }> = {
         amber:   { border: 'border-amber-500/30',   bg: 'bg-amber-500/10',   text: 'text-amber-300' },
@@ -120,41 +168,14 @@ const OverviewTab: React.FC<OverviewTabProps> = ({ setActiveTab }) => {
             {/* Main body (left column) */}
             <div className="flex-1 min-w-0 space-y-6 order-2 lg:order-1">
                 {/* Probation Banner */}
-                {currentUser?.probationEnd && (() => {
-                    const now = new Date();
-                    const end = new Date(currentUser.probationEnd);
-                    const start = currentUser.probationStart ? new Date(currentUser.probationStart) : null;
-                    const daysLeft = Math.ceil((end.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-                    const isOverdue = daysLeft <= 0;
-                    const progress = start ? Math.min(100, Math.round(((now.getTime() - start.getTime()) / (end.getTime() - start.getTime())) * 100)) : 100;
-
-                    return (
-                        <div className={`border rounded-xl p-5 relative overflow-hidden ${isOverdue ? 'bg-red-950/20 border-red-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
-                            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
-                                <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${isOverdue ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`}>
-                                    <i className="fa-solid fa-hourglass-half"></i>
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                    <p className={`text-[10px] font-black uppercase tracking-widest ${isOverdue ? 'text-red-300' : 'text-amber-300'}`}>
-                                        {isOverdue ? 'Probation Review Pending' : 'Probation Period Active'}
-                                    </p>
-                                    <p className="text-xs text-slate-400 mt-1">
-                                        {isOverdue
-                                            ? `Your probation ended ${Math.abs(daysLeft)} day${Math.abs(daysLeft) !== 1 ? 's' : ''} ago. A review is pending.`
-                                            : `${daysLeft} day${daysLeft !== 1 ? 's' : ''} remaining — ends ${fmt.date(end.toISOString())}`
-                                        }
-                                    </p>
-                                    <div className="mt-2.5 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                                        <div
-                                            className={`h-full rounded-full transition-all ${isOverdue ? 'bg-red-500' : daysLeft <= 7 ? 'bg-amber-500' : 'bg-emerald-500'}`}
-                                            style={{ width: `${Math.min(progress, 100)}%` }}
-                                        ></div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    );
-                })()}
+                {currentUser?.probationEnd && (
+                    <ProbationBanner
+                        probationEnd={currentUser.probationEnd}
+                        probationStart={currentUser.probationStart}
+                        now={now}
+                        fmt={fmt}
+                    />
+                )}
 
                 {/* HR Command Center (Conditional) */}
                 {isHR && (

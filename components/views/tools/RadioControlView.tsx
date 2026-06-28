@@ -239,7 +239,10 @@ const RadioControlView: React.FC = () => {
 
     const [activeRooms, setActiveRooms] = useState<ActiveRoom[]>([]);
     const [isLoading, setIsLoading] = useState(true);
-    const [isRefreshing, setIsRefreshing] = useState(false);
+    // Starts true: the mount effect kicks off a status fetch immediately, so the
+    // refresh control is "in progress" from the first paint (the async fetch
+    // clears it). This avoids a synchronous setState inside the mount effect.
+    const [isRefreshing, setIsRefreshing] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
     const [hideEmpty, setHideEmpty] = useState(false);
 
@@ -259,8 +262,10 @@ const RadioControlView: React.FC = () => {
     const [isChannelModalOpen, setIsChannelModalOpen] = useState(false);
     const [editingChannel, setEditingChannel] = useState<RadioChannel | undefined>(undefined);
 
-    const fetchStatus = async () => {
-        setIsRefreshing(true);
+    // Core async load: performs the RPC and updates rooms/loading. Does NOT flip
+    // the refreshing flag on entry, so the mount effect can call it without a
+    // synchronous setState (isRefreshing already initialises to true).
+    const loadStatus = useCallback(async () => {
         try {
             // Use RPC Action instead of GET fetch to handle auth
             const data = await rpcAction('radio:status', {});
@@ -271,14 +276,24 @@ const RadioControlView: React.FC = () => {
             setIsRefreshing(false);
             setIsLoading(false);
         }
-    };
+    }, [rpcAction]);
+
+    // Interactive/poll refresh: shows the spinner immediately, then loads.
+    const fetchStatus = useCallback(async () => {
+        setIsRefreshing(true);
+        await loadStatus();
+    }, [loadStatus]);
 
     useEffect(() => {
-        fetchStatus();
+        // Mount: isRefreshing already starts true, so just run the async load.
+        // All setState calls happen after the awaited RPC (never synchronously
+        // in the effect body). Subsequent polls use fetchStatus, which flips the
+        // spinner on each tick from inside the timer callback.
+        const runInitialLoad = async () => { await loadStatus(); };
+        void runInitialLoad();
         const interval = setInterval(fetchStatus, 15000); // Poll every 15s (reduces N+1 LiveKit API calls)
         return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: mount-once status poll; fetchStatus is an inline helper that captures fresh state on each tick.
-    }, []);
+    }, [loadStatus, fetchStatus]);
 
     const unitChannels = useMemo<RadioChannel[]>(() => {
         return units
@@ -452,8 +467,7 @@ const RadioControlView: React.FC = () => {
             console.error("Failed to transfer user:", err);
             addToast("Transfer Failed", <i className="fa-solid fa-circle-exclamation"></i>, 'bg-red-500/10 text-red-400 border-red-500/50', { description: "Failed to move the operator." });
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on rpcAction + addToast (the only effectful deps); fetchStatus is the polling helper above and gets called via setTimeout to refresh after the transfer settles — wrapping it as a dep would re-bind the callback on every poll.
-    }, [rpcAction, addToast]);
+    }, [rpcAction, addToast, fetchStatus]);
 
     const handleBroadcastAlert = async () => {
         if (!broadcastMessage.trim()) return;

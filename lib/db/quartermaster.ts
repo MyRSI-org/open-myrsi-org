@@ -569,6 +569,38 @@ export async function listIssuances(
     return ((data || []) as unknown as Parameters<typeof toQmIssuance>[0][]).map(toQmIssuance);
 }
 
+/**
+ * Computes current on-hand (SUM of movement deltas) for one or more inventory
+ * rows. Backs the over-issue guard on the issuance write paths below.
+ *
+ * The stored procs (schema.sql qm_fulfil_issuance / qm_issue_direct) are the
+ * authoritative, transaction-safe backstop and MUST raise QM_INSUFFICIENT_STOCK
+ * themselves (mirroring warehouse_fulfil_request / warehouse_adjust_stock). This
+ * TS-layer pre-check fails closed before the RPC so a member-created 'requested'
+ * issuance with an arbitrary quantity can't drive quantityOnHand negative
+ * (silent ledger corruption), gives a friendlier error, and is unit-pinnable in
+ * the DB-less test harness.
+ */
+async function getInventoryOnHandMap(inventoryIds: number[]): Promise<Map<number, number>> {
+    const map = new Map<number, number>();
+    if (!inventoryIds.length) return map;
+    const { data, error } = await supabase.from('quartermaster_inventory_movements')
+        .select('inventory_id, delta')
+        .in('inventory_id', inventoryIds);
+    handleSupabaseError({ error, message: 'Failed to compute on-hand quantity' });
+    for (const m of (data || []) as { inventory_id: number; delta: number }[]) {
+        map.set(m.inventory_id, (map.get(m.inventory_id) || 0) + Number(m.delta));
+    }
+    return map;
+}
+
+async function assertSufficientOnHand(inventoryId: number, quantity: number): Promise<void> {
+    const onHand = (await getInventoryOnHandMap([inventoryId])).get(inventoryId) || 0;
+    if (onHand - quantity < 0) {
+        throw new Error(`QM_INSUFFICIENT_STOCK: have ${onHand}, need ${quantity}`);
+    }
+}
+
 export interface RequestIssuanceInput {
     inventoryId: number;
     issuedToUserId?: number;   // defaults to requester
@@ -629,13 +661,18 @@ export async function fulfilIssuance(
     // companion broadcast below can carry it (clients then refresh only the
     // affected armory row/page instead of everything).
     const { data: row, error: scopeErr } = await supabase.from('quartermaster_issuances')
-        .select('id, status, inventory_id')
+        .select('id, status, inventory_id, quantity')
         .eq('id', issuanceId)
 
         .maybeSingle();
     handleSupabaseError({ error: scopeErr, message: 'Failed to load issuance' });
     if (!row) throw new Error('Issuance not found.');
     if (row.status !== 'requested') return false;
+
+    // Fail closed before posting the negative 'issue' movement so a poison
+    // 'requested' issuance (qm:request lets a member pick the quantity) can't
+    // drive on-hand negative when fulfilled. The proc is the hard backstop.
+    await assertSufficientOnHand(row.inventory_id, Number(row.quantity));
 
     const { data, error } = await supabase.rpc('qm_fulfil_issuance', {
         p_issuance_id: issuanceId,
@@ -669,10 +706,14 @@ export async function issueDirect(
     handleSupabaseError({ error: scopeErr, message: 'Failed to load inventory' });
     if (!invRow) throw new Error('Inventory item not found.');
 
+    const qty = Math.trunc(Number(input.quantity));
+    // Fail closed on over-issue before posting the negative movement (proc backstop).
+    await assertSufficientOnHand(input.inventoryId, qty);
+
     const { data, error } = await supabase.rpc('qm_issue_direct', {
         p_inventory_id: input.inventoryId,
         p_issued_to: input.issuedToUserId,
-        p_quantity: Math.trunc(Number(input.quantity)),
+        p_quantity: qty,
         p_due_back_at: input.dueBackAt ?? null,
         p_actor_id: actorUserId,
         p_notes: input.notes ?? null,
@@ -721,6 +762,28 @@ export async function issueDirectBulk(
     const validIds = new Set((invRows || []).map((r: { id: number }) => r.id));
     for (const id of invIds) {
         if (!validIds.has(id)) throw new Error(`Inventory item ${id} not found in this org.`);
+    }
+
+    // Fail closed on over-issue BEFORE the proc posts the negative movements.
+    // Sum the required quantity PER inventory id (a kit may list the same row on
+    // more than one line) and reject if any item's total draw would drive its
+    // on-hand (SUM of movement deltas) negative. Mirrors the single-row pre-checks
+    // on fulfilIssuance / issueDirect. The qm_issue_bulk proc additionally
+    // re-checks per line inside its transaction as the authoritative backstop
+    // (see schema.sql qm_issue_direct / qm_issue_bulk).
+    const requiredByInventoryId = new Map<number, number>();
+    for (const l of input.lines) {
+        requiredByInventoryId.set(
+            l.inventoryId,
+            (requiredByInventoryId.get(l.inventoryId) || 0) + Math.trunc(Number(l.quantity)),
+        );
+    }
+    const onHandByInventoryId = await getInventoryOnHandMap(invIds);
+    for (const [id, required] of requiredByInventoryId) {
+        const onHand = onHandByInventoryId.get(id) || 0;
+        if (onHand - required < 0) {
+            throw new Error(`QM_INSUFFICIENT_STOCK: inventory ${id} has ${onHand}, need ${required}`);
+        }
     }
 
     const payload = input.lines.map(l => ({
@@ -1022,9 +1085,20 @@ export async function listLowStockInventory(
 // CSV export — inventory snapshot
 // ---------------------------------------------------------------------------
 
-function csvEscape(value: unknown): string {
+// Two concerns, applied in order (mirrors finances.ts csvEscape):
+//  1. Formula injection (OWASP CSV-injection): a cell beginning with = + - @
+//     (or a leading TAB/CR some apps strip before evaluating the next char) is
+//     auto-evaluated as a formula by Excel/LibreOffice/Sheets. The user-controlled
+//     name (custom_name) and notes columns are stored verbatim by
+//     createInventoryItem/updateInventoryItem, so neutralize at the output
+//     boundary by prefixing a single quote — apps then render the cell as literal
+//     text and never execute it.
+//  2. Quote-wrapping: preserve the existing RFC-4180 escaping for cells that
+//     contain a delimiter/quote/newline.
+export function csvEscapeQm(value: unknown): string {
     if (value === null || value === undefined) return '';
-    const str = String(value);
+    let str = String(value);
+    if (/^[=+\-@\t\r]/.test(str)) str = "'" + str;
     if (/[",\n\r]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
     return str;
 }
@@ -1048,7 +1122,7 @@ export async function exportInventoryCsv(): Promise<string> {
             r.quantityOnIssue,
             r.acquiredAt,
             r.notes,
-        ].map(csvEscape).join(','));
+        ].map(csvEscapeQm).join(','));
     }
     return lines.join('\n');
 }
@@ -1301,8 +1375,15 @@ export async function syncPlatformItemCatalog() {
     };
 }
 
+// Identity/sync-key fields must not be admin-editable. Overwriting any of these
+// would corrupt the UEX re-sync (external_uuid is the onConflict upsert key) and
+// the org-import FK remap (external_uuid/external_id are the catalog-match keys),
+// creating duplicate/orphan rows or mis-resolved references. This is a deny-list
+// mirroring warehouse's COMMODITY_PROTECTED_FIELDS — the operator-editable
+// display columns (name/category/subcategory/attributes/flags/links/etc.) are
+// intentionally NOT listed and flow through unchanged.
 const QM_PLATFORM_PROTECTED_FIELDS = new Set([
-    'id', 'source', 'created_at',
+    'id', 'source', 'created_at', 'slug', 'external_uuid', 'external_id', 'last_synced_at',
 ]);
 
 export async function updatePlatformItem(id: number, patch: Record<string, unknown>) {

@@ -173,11 +173,11 @@ export const authActions = {
             const raw = String((err instanceof Error ? err.message : err) || '');
             if (/invalid_client/i.test(raw)) {
                 log.warn('discord oauth invalid_client: reset the Client Secret in the Discord Developer Portal and update the org Discord settings', { redirectUri });
-                throw new Error('DISCORD_OAUTH_INVALID_CLIENT: Discord sign-in is misconfigured for this organization. Please contact your org administrator.');
+                throw new Error('DISCORD_OAUTH_INVALID_CLIENT: Discord sign-in is misconfigured for this organization. Please contact your org administrator.', { cause: err });
             }
             if (/invalid_grant|redirect_uri/i.test(raw)) {
                 log.warn('discord oauth redirect mismatch: add the exact redirect URL as an authorized redirect in the Discord Developer Portal', { redirectUri });
-                throw new Error('DISCORD_OAUTH_REDIRECT_MISMATCH: Discord sign-in is misconfigured for this organization. Please contact your org administrator.');
+                throw new Error('DISCORD_OAUTH_REDIRECT_MISMATCH: Discord sign-in is misconfigured for this organization. Please contact your org administrator.', { cause: err });
             }
             throw err;
         }

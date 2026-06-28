@@ -19,6 +19,9 @@ const fetchAgent = new Agent({
     keepAliveMaxTimeout: 60_000,
     connections: 50,
     pipelining: 1,
+    // undici 8 defaults allowH2 to true; pin this pool to HTTP/1.1 so the tuned
+    // keep-alive / connection-pool behavior stays identical to the undici 7 setup.
+    allowH2: false,
 });
 
 const customFetch: typeof globalThis.fetch = (input, init) =>

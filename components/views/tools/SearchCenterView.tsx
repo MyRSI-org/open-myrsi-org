@@ -35,7 +35,10 @@ const SearchCenterView: React.FC = () => {
     const [intelResults, setIntelResults] = useState<HydratedIntelligenceReport[]>([]);
     const [isSearchingIntel, setIsSearchingIntel] = useState(false);
     const [isFiltersDrawerOpen, setIsFiltersDrawerOpen] = useState(false);
-    const [announcement, setAnnouncement] = useState('');
+    // Debounced result-count message for the aria-live region. Only ever set by
+    // the 300ms timer below (when there IS a query); the empty-query "clear" is
+    // derived during render rather than via a synchronous effect setState.
+    const [debouncedAnnouncement, setDebouncedAnnouncement] = useState('');
 
     const filtersApi = useSearchFilters();
     const prefetch = usePrefetchSearchSubsets();
@@ -83,19 +86,23 @@ const SearchCenterView: React.FC = () => {
         isSearchingIntel,
     });
 
-    // Aria-live announcement — debounced 300ms.
+    // Aria-live announcement — debounced 300ms. The empty-query reset is handled
+    // by the render-time derivation below (announcement), so this effect only
+    // owns the debounced "N results" message and never sets state synchronously.
     useEffect(() => {
         const trimmed = globalSearchQuery.trim();
-        if (!trimmed) {
-            setAnnouncement('');
-            return;
-        }
+        if (!trimmed) return;
         const handle = setTimeout(() => {
             const typesHit = Object.values(counts).filter(n => n > 0).length;
-            setAnnouncement(`${totalCount} ${totalCount === 1 ? 'result' : 'results'} across ${typesHit} ${typesHit === 1 ? 'type' : 'types'}`);
+            setDebouncedAnnouncement(`${totalCount} ${totalCount === 1 ? 'result' : 'results'} across ${typesHit} ${typesHit === 1 ? 'type' : 'types'}`);
         }, 300);
         return () => clearTimeout(handle);
     }, [totalCount, counts, globalSearchQuery]);
+
+    // When the query is empty the live region clears immediately (no debounce);
+    // otherwise it shows the most recent debounced message. Deriving this during
+    // render is exactly equivalent to the old synchronous setAnnouncement('').
+    const announcement = globalSearchQuery.trim() ? debouncedAnnouncement : '';
 
     // Keyboard nav — listener attaches to the page container, scrolls the
     // scroll container directly.

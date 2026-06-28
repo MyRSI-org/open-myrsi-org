@@ -44,7 +44,7 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
 
     const [adjustTarget, setAdjustTarget] = useState<QmInventoryItem | null>(null);
 
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
 
     // Server-side: location only (catalog category isn't a column on inventory;
     // we still client-filter by category over the visible page).
@@ -62,7 +62,7 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
     }, [rpcAction, filterPayload]);
 
     const load = useCallback(async () => {
-        const seq = ++requestSeq.current;
+        const seq = ++requestSeqRef.current;
         setLoading(true);
         try {
             const r = await rpcAction('qm:list_inventory', {
@@ -70,26 +70,35 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
                 limit: PAGE_SIZE,
                 offset: page * PAGE_SIZE,
             });
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             setItems(Array.isArray(r) ? r : []);
             setHasLoadedOnce(true);
         } catch (err: any) {
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             addToast('Failed to load inventory', <i className="fa-solid fa-xmark" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: err?.message });
         } finally {
-            if (seq === requestSeq.current) setLoading(false);
+            if (seq === requestSeqRef.current) setLoading(false);
         }
     }, [rpcAction, filterPayload, page, addToast]);
 
     // Reset page when filter changes (skip first mount).
-    const isFirstFilterChange = useRef(true);
+    const isFirstFilterChangeRef = useRef(true);
     useEffect(() => {
-        if (isFirstFilterChange.current) { isFirstFilterChange.current = false; return; }
+        if (isFirstFilterChangeRef.current) { isFirstFilterChangeRef.current = false; return; }
         setPage(0);
     }, [filterPayload]);
 
-    useEffect(() => { load(); }, [load, refreshKey]);
-    useEffect(() => { loadCount(); }, [loadCount, refreshKey]);
+    // Data-fetch effects. The async work runs in an inner async function (the
+    // React idiom for awaiting inside an effect, since the effect callback can't
+    // itself be async). load()'s synchronous setLoading(true) still fires during
+    // commit exactly as before, and the result sets stay on the awaited path —
+    // behaviour is identical to a bare load()/loadCount() call.
+    useEffect(() => {
+        void (async () => { await load(); })();
+    }, [load, refreshKey]);
+    useEffect(() => {
+        void (async () => { await loadCount(); })();
+    }, [loadCount, refreshKey]);
 
     const requestItem = async (item: QmInventoryItem) => {
         const qtyStr = window.prompt(`Request how many of "${item.catalog?.name || item.customName}"?`, '1');

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { isSafeImageUrl } from '../../lib/imageUrl';
 
 interface AwardIconProps {
@@ -20,7 +20,15 @@ interface AwardIconProps {
 const AwardIcon: React.FC<AwardIconProps> = ({ imageUrl, icon, fallbackIcon, className, alt }) => {
     const [failed, setFailed] = useState(false);
 
-    useEffect(() => { setFailed(false); }, [imageUrl]);
+    // Reset the "failed to load" flag when the source URL changes, computed
+    // during render (the React-recommended "adjust state when a prop changes"
+    // pattern) so the new image gets a fresh chance to load. Replaces an effect
+    // that called setFailed(false) on imageUrl change.
+    const [lastImageUrl, setLastImageUrl] = useState(imageUrl);
+    if (imageUrl !== lastImageUrl) {
+        setLastImageUrl(imageUrl);
+        setFailed(false);
+    }
 
     const canUseImage = !!imageUrl && isSafeImageUrl(imageUrl) && !failed;
 

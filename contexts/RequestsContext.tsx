@@ -16,7 +16,7 @@
 // DataContext registers its refresh callback here at mount; CRUD methods call
 // it after their RPC completes.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import { useNotification } from './NotificationContext';
 import { useConfig } from './ConfigContext';
@@ -239,11 +239,11 @@ export const RequestsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         registerRefreshRequests, registerRefreshUser,
     ]);
 
-    return <RequestsContext.Provider value={value}>{children}</RequestsContext.Provider>;
+    return <RequestsContext value={value}>{children}</RequestsContext>;
 };
 
 export const useRequests = (): RequestsContextValue => {
-    const ctx = useContext(RequestsContext);
+    const ctx = use(RequestsContext);
     if (!ctx) throw new Error('useRequests must be used within a RequestsProvider');
     return ctx;
 };

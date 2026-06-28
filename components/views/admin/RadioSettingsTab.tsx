@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useConfig } from '../../../contexts/ConfigContext';
 
@@ -22,23 +22,51 @@ const RadioSettingsTab: React.FC = () => {
     const [newName, setNewName] = useState('');
     const [newColor, setNewColor] = useState('#38bdf8');
 
-    // Drag State
-    const [localChannels, setLocalChannels] = useState<RadioChannel[]>([]);
+    // Drag State. Seed the local draggable list from the canonical channels on mount —
+    // the old sync effect seeded it on first run; lazy-initialising here yields the same
+    // sorted list with no transient empty render.
+    const [localChannels, setLocalChannels] = useState<RadioChannel[]>(
+        () => [...radioChannels].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0))
+    );
     const [draggedChannel, setDraggedChannel] = useState<RadioChannel | null>(null);
     const [dropTargetId, setDropTargetId] = useState<string | null>(null);
     const [dropPosition, setDropPosition] = useState<'before' | 'after' | null>(null);
     const [isReordering, setIsReordering] = useState(false);
 
-    useEffect(() => {
+    // Re-seed the local editable form when the canonical config from context changes (e.g.
+    // after a save). config is user-editable local state, so it cannot be derived during
+    // render without discarding in-progress edits. Uses the React "adjust state during
+    // render" pattern (previous-value tracker) instead of an effect: it runs during render
+    // and React re-renders before paint, so it is behaviour-equivalent to the old re-sync
+    // effect with no extra paint.
+    const [prevRadioConfig, setPrevRadioConfig] = useState(radioConfig);
+    if (radioConfig !== prevRadioConfig) {
+        setPrevRadioConfig(radioConfig);
         setConfig(radioConfig);
-    }, [radioConfig]);
+    }
 
-    useEffect(() => {
-        // Sync local channels with global state initially and when not dragging
+    // Sync the local draggable channel list with global state initially and whenever the
+    // external list changes while not actively reordering. localChannels is mutated locally
+    // during drag reordering, so overwriting it mid-drag would discard the user's in-progress
+    // order — hence the !isReordering guard, preserved exactly.
+    //
+    // This faithfully reproduces the old effect, whose deps were [radioChannels, isReordering]:
+    // it re-seeded both when radioChannels changed (while not reordering) AND when reordering
+    // ended (isReordering true→false), re-syncing to the server-confirmed order. Two render-time
+    // trackers reproduce both triggers. prevRadioChannels is advanced only when we actually
+    // re-seed, so a radioChannels change that arrives mid-reorder stays pending and is applied
+    // the moment reordering ends — exactly as the effect did.
+    const [prevRadioChannels, setPrevRadioChannels] = useState(radioChannels);
+    const [prevIsReordering, setPrevIsReordering] = useState(isReordering);
+    const radioChannelsChanged = radioChannels !== prevRadioChannels;
+    const isReorderingChanged = isReordering !== prevIsReordering;
+    if (radioChannelsChanged || isReorderingChanged) {
+        if (isReorderingChanged) setPrevIsReordering(isReordering);
         if (!isReordering) {
+            setPrevRadioChannels(radioChannels);
             setLocalChannels([...radioChannels].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
         }
-    }, [radioChannels, isReordering]);
+    }
 
     const handleUpdateConfig = async () => {
         setIsSavingConfig(true);

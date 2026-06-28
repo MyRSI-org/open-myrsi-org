@@ -11,7 +11,7 @@
 // Must mount INSIDE SessionProvider: the heartbeat needs Session's `logout`
 // for the force-logout path.
 
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, use, useEffect, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { useSession } from './SessionContext';
 
@@ -28,8 +28,10 @@ export const ActivityProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const { currentUser, sessionStartTime, logout } = useSession();
     const [idleTime, setIdleTime] = useState(0);
 
-    const lastHeartbeat = useRef<number>(Date.now());
-    const lastInteraction = useRef<number>(Date.now());
+    // Seeded with the mount timestamp inside the idle effect below — avoids
+    // calling the impure Date.now() during render.
+    const lastHeartbeatRef = useRef<number>(0);
+    const lastInteractionRef = useRef<number>(0);
 
     // Heartbeat loop — checks every minute whether a heartbeat is due.
     useEffect(() => {
@@ -37,14 +39,14 @@ export const ActivityProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
         const heartbeatInterval = setInterval(() => {
             const now = Date.now();
-            const timeSinceLastHeartbeat = now - lastHeartbeat.current;
-            const timeSinceLastInteraction = now - lastInteraction.current;
+            const timeSinceLastHeartbeat = now - lastHeartbeatRef.current;
+            const timeSinceLastInteraction = now - lastInteractionRef.current;
 
             // Send heartbeat if:
             // 1. It's been at least 4.5 minutes since the last one (buffer for 5m limit)
             // 2. The user has interacted recently (within last 5 minutes)
             if (timeSinceLastHeartbeat > 4.5 * 60 * 1000 && timeSinceLastInteraction < 5 * 60 * 1000) {
-                lastHeartbeat.current = now;
+                lastHeartbeatRef.current = now;
                 apiService.rpc('user:heartbeat', { userId: currentUser.id }).then((result: any) => {
                     // Force-logout enforcement, compared against the session's
                     // start baseline. Mirrors SessionContext.refreshUser's page-load path.
@@ -63,11 +65,17 @@ export const ActivityProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     // Idle counter + interaction listeners.
     useEffect(() => {
+        // Seed the heartbeat/interaction baselines at mount (replaces the
+        // Date.now() ref initializers, which would run impurely during render).
+        const mountedAt = Date.now();
+        lastHeartbeatRef.current = mountedAt;
+        lastInteractionRef.current = mountedAt;
+
         const timer = setInterval(() => setIdleTime(prev => prev + 1), 60000);
 
         const resetIdle = () => {
             setIdleTime(0);
-            lastInteraction.current = Date.now();
+            lastInteractionRef.current = Date.now();
         };
 
         window.addEventListener('mousemove', resetIdle);
@@ -85,11 +93,11 @@ export const ActivityProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     const value: ActivityContextValue = { idleTime };
 
-    return <ActivityContext.Provider value={value}>{children}</ActivityContext.Provider>;
+    return <ActivityContext value={value}>{children}</ActivityContext>;
 };
 
 export const useActivity = (): ActivityContextValue => {
-    const ctx = useContext(ActivityContext);
+    const ctx = use(ActivityContext);
     if (!ctx) throw new Error('useActivity must be used within an ActivityProvider');
     return ctx;
 };

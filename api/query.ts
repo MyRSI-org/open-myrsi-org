@@ -815,7 +815,13 @@ async function handleState(req: Request, res: Response) {
             case 'government_elections': state = { governmentElections: await db.getElectionsState().catch(() => []) }; break;
             case 'government_legislation': state = { governmentLegislation: await db.getLegislationState().catch(() => []) }; break;
             case 'government_motions': state = { governmentMotions: await db.getMotionsState().catch(() => []) }; break;
-            case 'settings': state = await db.getAllSettings({ decryptSecrets: false }); break;
+            // (No 'settings' subset: the client refreshes config keys via the
+            // 'main' subset — see contexts/DataCoreContext.tsx "there is no
+            // separate 'settings' subset". This branch reduced EVERY settings row
+            // into one blob, had no SUBSET_REQUIRED_PERMISSION gate, and relied
+            // solely on stripSecrets, so it was a dead, ungated round-trip. An
+            // ?subset=settings probe now falls through to the unknown-subset
+            // reject below — mirroring the removed 'alliances' subset above.)
             // No subset → legacy "full state" refresh (now permission-gated inside
             // getState). A non-empty UNKNOWN subset string is rejected rather than
             // silently falling through to the full aggregate (defence-in-depth so a

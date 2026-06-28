@@ -11,9 +11,13 @@
 
 const HTML_TAG_RE = /<[^>]*>/g;
 // Strip C0 control chars except \t (0x09), \n (0x0A), \r (0x0D), plus DEL (0x7F).
-// Matching control chars in the regex is the entire point of this sanitiser.
-// eslint-disable-next-line no-control-regex
-const CTRL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+// Expressed as a negated allowlist of the code units to KEEP — \t, \n, \r,
+// printable ASCII (0x20-0x7E) and everything from 0x80 up (non-ASCII text) —
+// which matches exactly the same set as the explicit denylist but avoids
+// spelling out control-char escapes (no need to disable no-control-regex).
+// DEL (0x7F) deliberately falls in the gap between 0x7E and 0x80, so it is left
+// out of the allowlist and stripped along with the C0 controls.
+const CTRL_RE = /[^\t\n\r\x20-\x7E\x80-\uffff]/g;
 
 /**
  * Strip HTML tags and control characters, trim, and cap to `max` characters.

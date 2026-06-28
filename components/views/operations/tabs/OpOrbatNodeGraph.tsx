@@ -32,6 +32,9 @@ interface LayoutNode {
 }
 
 interface Edge {
+    /** Stable identity for React keys: parent -> child node ids. */
+    parentId: number;
+    childId: number;
     x1: number; y1: number;
     x2: number; y2: number;
 }
@@ -85,6 +88,8 @@ function computeLayout(roots: EnrichedNode[]): { layoutNodes: LayoutNode[]; edge
                 const { w: cw } = getNodeDims(child);
                 positionNode(child, childX, childY);
                 edges.push({
+                    parentId: node.id,
+                    childId: child.id,
                     x1: nodeX + w / 2,
                     y1: y + h,
                     x2: childX + (childW - cw) / 2 + cw / 2,
@@ -171,7 +176,12 @@ const OpOrbatNodeGraph: React.FC<OpOrbatNodeGraphProps> = ({ operation, canManag
     }, []);
 
     const zoomRef = useRef({ zoom, panX, panY });
-    zoomRef.current = { zoom, panX, panY };
+    // Mirror the latest transform into a ref so the once-registered wheel handler
+    // can read current values without re-subscribing. Written in an effect (post-commit)
+    // rather than during render; the handler only reads it at event time, so timing is identical.
+    useEffect(() => {
+        zoomRef.current = { zoom, panX, panY };
+    }, [zoom, panX, panY]);
 
     useEffect(() => {
         const el = containerRef.current;
@@ -229,11 +239,11 @@ const OpOrbatNodeGraph: React.FC<OpOrbatNodeGraphProps> = ({ operation, canManag
                                 overflow: 'visible',
                             }}
                         >
-                            {edges.map((edge, i) => {
+                            {edges.map((edge) => {
                                 const offset = Math.abs(edge.y2 - edge.y1) * 0.5;
                                 return (
                                     <path
-                                        key={i}
+                                        key={`e-${edge.parentId}-${edge.childId}`}
                                         d={`M ${edge.x1},${edge.y1} C ${edge.x1},${edge.y1 + offset} ${edge.x2},${edge.y2 - offset} ${edge.x2},${edge.y2}`}
                                         fill="none"
                                         stroke="rgb(56,189,248)"

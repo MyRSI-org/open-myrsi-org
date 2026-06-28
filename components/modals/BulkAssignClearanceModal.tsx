@@ -79,20 +79,28 @@ const BulkAssignClearanceModal: React.FC<BulkAssignClearanceModalProps> = ({ isO
     const { addToast, confirm } = useNotification();
     const { hasPermission } = useAuth();
 
-    const [selected, setSelected] = useState<Set<number>>(new Set());
+    const [selected, setSelected] = useState<Set<number>>(() => new Set());
     const [search, setSearch] = useState('');
     const debouncedSearch = useDebouncedValue(search, 200);
-    const [unitFilter, setUnitFilter] = useState<Set<number>>(new Set());
+    const [unitFilter, setUnitFilter] = useState<Set<number>>(() => new Set());
     // 'unchanged' = leave the level alone server-side (sends undefined).
     // 'clear' = explicitly clear (sends null).
     // numeric string = set to that level id.
     const [levelChoice, setLevelChoice] = useState<'unchanged' | 'clear' | string>('unchanged');
-    const [markerIds, setMarkerIds] = useState<Set<number>>(new Set());
+    const [markerIds, setMarkerIds] = useState<Set<number>>(() => new Set());
     const [markerMode, setMarkerMode] = useState<'replace' | 'add'>('replace');
     const [submitting, setSubmitting] = useState(false);
 
     // Reset state every time the modal closes so the next open is clean.
-    useEffect(() => {
+    // These are transient local form fields (member selection, search, filters,
+    // pending level/marker choices) — not auth/session state; the permission
+    // gate below is unaffected. Implemented with the React "adjust state during
+    // render" pattern (prev-value tracker): when isOpen transitions to false the
+    // fields are re-seeded to their initial values before paint, equivalent to
+    // the old reset-on-close effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (!isOpen) {
             setSelected(new Set());
             setSearch('');
@@ -102,7 +110,7 @@ const BulkAssignClearanceModal: React.FC<BulkAssignClearanceModalProps> = ({ isO
             setMarkerMode('replace');
             setSubmitting(false);
         }
-    }, [isOpen]);
+    }
 
     // Filtered member list — clients are excluded since they don't carry
     // clearance, mirroring AdminUserDetailView's scope.

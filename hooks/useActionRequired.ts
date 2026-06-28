@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNow } from './useNow';
 import { useData } from '../contexts/DataContext';
 import { useHR } from '../contexts/HRContext';
 import { useIntel } from '../contexts/IntelContext';
@@ -52,6 +53,7 @@ export function useActionRequired(): UseActionRequiredResult {
     const { currentUser, hasPermission } = useAuth();
 
     const [recentOrders, setRecentOrders] = useState<any[]>([]);
+    const now = useNow();
 
     const governmentEnabled = governmentsFeatureConfig?.enabled === true;
     const canSeeGovernment = hasPermission('gov:view');
@@ -205,7 +207,6 @@ export function useActionRequired(): UseActionRequiredResult {
 
         // --- Government: recent executive orders (<48h old, active) ---
         if (governmentEnabled && canSeeGovernment && recentOrders.length > 0) {
-            const now = Date.now();
             const freshOrders = recentOrders.filter((o: any) => {
                 if (o.status !== 'active') return false;
                 const issuedAt = o.issued_at || o.issuedAt;
@@ -231,7 +232,6 @@ export function useActionRequired(): UseActionRequiredResult {
 
         // --- Critical intel bulletins (<24h old, high/critical threat) ---
         if (hasPermission('intel:view') && Array.isArray(activeBulletins)) {
-            const now = Date.now();
             const critical = activeBulletins.filter((b: any) => {
                 const threat = String(b.threatLevel || '').toLowerCase();
                 if (threat !== 'high' && threat !== 'critical') return false;
@@ -265,7 +265,7 @@ export function useActionRequired(): UseActionRequiredResult {
         });
 
         return out;
-    }, [currentUser, hasPermission, hrApplicants, hydratedServiceRequests, governmentEnabled, canSeeGovernment, governmentElections, recentOrders, activeBulletins]);
+    }, [currentUser, hasPermission, hrApplicants, hydratedServiceRequests, governmentEnabled, canSeeGovernment, governmentElections, recentOrders, activeBulletins, now]);
 
     return {
         items,

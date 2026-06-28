@@ -28,6 +28,10 @@ import { useNotification } from '../../../contexts/NotificationContext';
 
 type Tab = 'stock' | 'movements' | 'withdrawals' | 'catalog' | 'locations';
 
+// Stable keys for the fixed-length loading skeletons (static, never reordered).
+const STAT_SKELETON_KEYS = ['stat-0', 'stat-1', 'stat-2', 'stat-3'] as const;
+const ROW_SKELETON_KEYS = ['row-0', 'row-1', 'row-2', 'row-3'] as const;
+
 const TABS: readonly { key: Tab; label: string; icon: string; managerOnly?: boolean }[] = [
     { key: 'stock',       label: 'Stock',       icon: 'fa-boxes-stacked' },
     { key: 'movements',   label: 'Movements',   icon: 'fa-clock-rotate-left' },
@@ -85,9 +89,12 @@ export default function WarehouseView() {
         }
     }, [rpcAction, canView]);
 
-    const loadMovements = useCallback(async () => {
+    // Async fetch only — no synchronous loading set, so it can run inside the
+    // tab-change effect without a cascading sync render. The loading flag is
+    // raised separately by the imperative wrapper (event handlers) or by the
+    // render-time tab tracker (on tab change) before this runs.
+    const fetchMovements = useCallback(async () => {
         if (!canView) return;
-        setMovementsLoading(true);
         try {
             const rows: WarehouseMovement[] = await rpcAction('warehouse:list_movements', { limit: 200 });
             setMovements(rows || []);
@@ -99,15 +106,37 @@ export default function WarehouseView() {
         }
     }, [rpcAction, canView, addToast]);
 
-    useEffect(() => {
-        refreshWarehouse();
-        refreshOverview();
-        loadLocations();
-    }, [refreshWarehouse, refreshOverview, loadLocations]);
+    // Imperative refresh for event handlers (Refresh button, refreshAll): raise
+    // the loading flag then fetch — identical to the previous loadMovements.
+    const loadMovements = useCallback(async () => {
+        if (!canView) return;
+        setMovementsLoading(true);
+        await fetchMovements();
+    }, [canView, fetchMovements]);
 
     useEffect(() => {
-        if (tab === 'movements') loadMovements();
-    }, [tab, loadMovements]);
+        // Fire the three initial fetches concurrently (as before). Each is an
+        // async request whose setState lands only after its awaited RPC
+        // resolves — none runs synchronously on the effect's sync path.
+        void (async () => { await refreshWarehouse(); })();
+        void (async () => { await refreshOverview(); })();
+        void (async () => { await loadLocations(); })();
+    }, [refreshWarehouse, refreshOverview, loadLocations]);
+
+    // Raise the movements loading flag during render when the Movements tab is
+    // entered (React re-renders before paint), replacing the old in-effect
+    // synchronous setMovementsLoading(true). The effect below then performs only
+    // the async fetch — matching the previous "loadMovements on tab change".
+    const [prevTab, setPrevTab] = useState(tab);
+    if (tab !== prevTab) {
+        setPrevTab(tab);
+        if (tab === 'movements' && canView) setMovementsLoading(true);
+    }
+
+    useEffect(() => {
+        if (tab !== 'movements') return;
+        void (async () => { await fetchMovements(); })();
+    }, [tab, fetchMovements]);
 
     const [stockRefreshKey, setStockRefreshKey] = useState(0);
     const bumpStockRefresh = useCallback(() => setStockRefreshKey((k) => k + 1), []);
@@ -210,8 +239,8 @@ export default function WarehouseView() {
                 {initialLoading ? (
                     <div className="space-y-6" aria-busy="true" aria-live="polite">
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                            {Array.from({ length: 4 }).map((_, i) => (
-                                <div key={i} className="rounded-xl border border-white/5 bg-slate-900/40 p-5 space-y-3 animate-pulse">
+                            {STAT_SKELETON_KEYS.map((key) => (
+                                <div key={key} className="rounded-xl border border-white/5 bg-slate-900/40 p-5 space-y-3 animate-pulse">
                                     <Skeleton className="h-3 w-16" />
                                     <Skeleton className="h-8 w-24" />
                                     <Skeleton className="h-3 w-32" />
@@ -219,8 +248,8 @@ export default function WarehouseView() {
                             ))}
                         </div>
                         <div className="space-y-2">
-                            {Array.from({ length: 4 }).map((_, i) => (
-                                <Skeleton key={i} className="h-12 w-full" />
+                            {ROW_SKELETON_KEYS.map((key) => (
+                                <Skeleton key={key} className="h-12 w-full" />
                             ))}
                         </div>
                     </div>

@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useData } from '../../contexts/DataContext';
 
 import { RadioChannel } from '../../types';
@@ -23,20 +23,29 @@ const RadioChannelModal: React.FC<RadioChannelModalProps> = ({ isOpen, onClose, 
 
     const isEditing = !!channel;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (channel) {
-                setId(channel.id);
-                setName(channel.name);
-                setColor(channel.color);
-            } else {
-                setId('');
-                setName('');
-                setColor('#38bdf8');
-            }
-            setIsLoading(false);
+    // Reset/seed the user-editable form fields when the dialog opens or the
+    // selected channel changes while open. Done during render via the React
+    // "adjust state during render" pattern (re-renders before paint), which is
+    // behaviour-equivalent to the previous open/selection-change reset effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    const [prevChannel, setPrevChannel] = useState(channel);
+    if (isOpen && (isOpen !== prevIsOpen || channel !== prevChannel)) {
+        setPrevIsOpen(isOpen);
+        setPrevChannel(channel);
+        if (channel) {
+            setId(channel.id);
+            setName(channel.name);
+            setColor(channel.color);
+        } else {
+            setId('');
+            setName('');
+            setColor('#38bdf8');
         }
-    }, [isOpen, channel]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || channel !== prevChannel) {
+        setPrevIsOpen(isOpen);
+        setPrevChannel(channel);
+    }
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();

@@ -1026,14 +1026,48 @@ export async function createWithdrawalRequest(
     if (!Number.isFinite(input.requestedQuantity) || input.requestedQuantity <= 0) {
         throw new Error('Requested quantity must be positive.');
     }
+    const requestedQuantity = Math.trunc(input.requestedQuantity);
     const allowed: WarehouseReasonCategory[] = ['sale', 'craft', 'transport', 'other'];
     if (!allowed.includes(input.reasonCategory)) throw new Error(`Invalid reason category: ${input.reasonCategory}`);
+
+    // A pending/approved request's requested_quantity feeds the view-computed
+    // v_warehouse_stock_with_qty.quantity_reserved (schema.sql), which is
+    // consumed server-side — deleteWarehouseStock() refuses to delete while
+    // reserved > 0, and managers see available = on_hand − reserved. An
+    // unbounded requestedQuantity would therefore let any warehouse:request
+    // holder pin ANY stock row against deletion and drive its availability
+    // negative (and could overflow the view's integer SUM). Bound the new
+    // reservation by AVAILABILITY (on_hand − already-reserved), not raw on_hand:
+    // otherwise N rate-limited requests could each individually pass an on-hand
+    // check yet inflate aggregate quantity_reserved well beyond what physically
+    // exists. Read both figures from the same explicit-column qty view BEFORE the
+    // insert and reject a non-existent stock id explicitly (don't rely on the FK).
+    const { data: stockQty, error: stockErr } = await supabase
+        .from('v_warehouse_stock_with_qty')
+        .select('id, quantity_on_hand, quantity_reserved')
+        .eq('id', input.stockId)
+        .maybeSingle();
+    handleSupabaseError({ error: stockErr, message: 'Failed to validate stock row' });
+    if (!stockQty) throw new Error('Stock row not found.');
+    const onHand = Number(stockQty.quantity_on_hand) || 0;
+    const reserved = Number(stockQty.quantity_reserved) || 0;
+    const available = onHand - reserved;
+    if (requestedQuantity > available) {
+        // Keep the plain "only N on hand" wording when nothing is reserved yet
+        // (the availability ceiling reduces to on-hand); surface the breakdown
+        // only once existing reservations are what's constraining the request.
+        throw new Error(
+            reserved > 0
+                ? `Cannot reserve ${requestedQuantity} unit(s): only ${available} available (${onHand} on hand, ${reserved} already reserved).`
+                : `Cannot reserve ${requestedQuantity} unit(s): only ${onHand} on hand.`,
+        );
+    }
 
     const { data, error } = await supabase.from('warehouse_requests')
         .insert({
             stock_id: input.stockId,
             requested_by_user_id: requesterUserId,
-            requested_quantity: Math.trunc(input.requestedQuantity),
+            requested_quantity: requestedQuantity,
             reason_category: input.reasonCategory,
             reason_notes: input.reasonNotes?.trim() || null,
         })
@@ -1217,6 +1251,21 @@ export interface WarehouseStockExportPage {
     filename?: string;
 }
 
+// Spreadsheet formula-injection neutralization for CSV-export-only string
+// fields. A cell beginning with = + - @ (or a leading TAB/CR that some apps
+// strip before evaluating the next char) is auto-evaluated as a formula by
+// Excel/LibreOffice/Sheets, so an operator who merely opens the export executes
+// the payload. The warehouse stock export ships operator-controlled
+// commodity/quality/category/unit/location/notes to the client, which assembles
+// the CSV (WhStockTab.handleStartCsvExport), so neutralize at this output
+// boundary by prefixing a literal-text apostrophe (mirrors the formula branch of
+// lib/db/finances.csvEscape). We deliberately prepend ONLY the marker here and
+// do NOT RFC-4180 quote-wrap — the client assembler already quote-wraps, so
+// wrapping here would double-wrap benign delimiter-bearing values.
+function neutralizeCsvFormula(value: string): string {
+    return /^[=+\-@\t\r]/.test(value) ? "'" + value : value;
+}
+
 // Stock CSV export, paginated. Returns raw row objects so the client can
 // assemble the CSV in one Blob at the end of the loop — avoids re-streaming
 // the header on every page and avoids the server holding an unbounded string
@@ -1231,14 +1280,14 @@ export async function exportWarehouseCsv(
     const stocks = await listWarehouseStock({ offset: safeOffset, limit: safeLimit });
 
     const rows: WarehouseStockExportRow[] = stocks.map((s) => ({
-        commodity: s.catalog?.name ?? '',
-        quality: s.catalog?.qualityLabel ?? '',
-        category: s.catalog?.category ?? '',
-        unit: s.catalog?.unit ?? '',
-        location: s.location?.name ?? '',
+        commodity: neutralizeCsvFormula(s.catalog?.name ?? ''),
+        quality: neutralizeCsvFormula(s.catalog?.qualityLabel ?? ''),
+        category: neutralizeCsvFormula(s.catalog?.category ?? ''),
+        unit: neutralizeCsvFormula(s.catalog?.unit ?? ''),
+        location: neutralizeCsvFormula(s.location?.name ?? ''),
         onHand: s.quantityOnHand,
         reserved: s.quantityReserved,
-        notes: s.notes ?? '',
+        notes: neutralizeCsvFormula(s.notes ?? ''),
     }));
 
     const consumedThroughEnd = safeOffset + rows.length;

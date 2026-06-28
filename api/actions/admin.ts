@@ -59,6 +59,18 @@ function assertDangerZone(user: { role?: string } | undefined, confirmPhrase: st
     }
 }
 
+// Platform-lifecycle carve-out (mirrors assertDangerZone, no confirm phrase):
+// maintenance-mode toggle + force-logout-all are apex controls that can lock out
+// or sign out the entire platform. They must require the genuine Admin role, not
+// merely a delegated permission (admin:access was seeded to the non-Admin
+// Dispatcher). This is the load-bearing fail-closed gate even if the dispatcher's
+// permission mapping is ever loosened. The dispatcher injects `user`.
+function assertAdminRole(user: { role?: string } | undefined): void {
+    if (user?.role !== 'Admin') {
+        throw new Error('Only an Admin may perform this action.');
+    }
+}
+
 // Config-update handlers: spread `...rest` into the matching db.update*Config
 // call. rest is a partial config tree.
 type DiscordConfigPayload = OrgScopedPayload & Partial<DiscordConfig>;
@@ -67,7 +79,11 @@ type BrandingConfigPayload = OrgScopedPayload & Partial<BrandingConfig>;
 type PublicPageConfigPayload = OrgScopedPayload & Partial<PublicPageConfig>;
 type OpenGraphConfigPayload = OrgScopedPayload & Partial<OpenGraphConfig>;
 type AIConfigPayload = OrgScopedPayload & Partial<AIConfig>;
-type RadioConfigPayload = OrgScopedPayload & Partial<RadioConfig>;
+// Voice-server (LiveKit) credentials — url/apiKey/apiSecret. The dispatcher
+// injects `user`; the handler asserts the genuine Admin role so this
+// credential-bearing write is not reachable via the operational radio:manage
+// perm (held by the non-Admin Dispatcher for channel CRUD / reboot).
+type RadioConfigPayload = OrgScopedPayload & Partial<RadioConfig> & { user?: { role?: string } };
 type WikiHomeConfigPayload = OrgScopedPayload & Partial<WikiHomeConfig>;
 
 interface ListTestimonialCandidatesPayload extends OrgScopedPayload {
@@ -389,7 +405,13 @@ interface DeleteLocationPayload extends OrgScopedPayload {
     locationId: number;
 }
 
-interface DbPrunePayload extends OrgScopedPayload {
+// admin:db:* maintenance family. The dispatcher injects the authenticated `user`;
+// these handlers assert the genuine Admin role (fail-closed backstop beyond the
+// admin:db:destroy perm gate) before touching the DB.
+interface DbMaintenancePayload extends OrgScopedPayload {
+    user?: { role?: string };
+}
+interface DbPrunePayload extends DbMaintenancePayload {
     retentionDays: number;
     targets: string[];
 }
@@ -434,7 +456,7 @@ export const adminActions = {
     'admin:get_intel_sharing_config': async () => { return db.getIntelSharingConfig(); },
     'admin:update_opengraph_config': async (payload: OpenGraphConfigPayload) => { await db.updateOpenGraphConfig(stripActorFields(payload)); },
     'admin:update_ai_config': async (payload: AIConfigPayload) => { await db.updateAIConfig(stripActorFields(payload)); },
-    'admin:update_radio_config': async (payload: RadioConfigPayload) => { await db.updateRadioConfig(stripActorFields(payload)); },
+    'admin:update_radio_config': async (payload: RadioConfigPayload) => { assertAdminRole(payload.user); await db.updateRadioConfig(stripActorFields(payload)); },
     'admin:update_wiki_home_config': async (payload: WikiHomeConfigPayload) => { await db.updateWikiHomeConfig(stripActorFields(payload)); },
 
     // --- ANNOUNCEMENTS ---
@@ -628,9 +650,13 @@ export const adminActions = {
     'admin:seed_default_locations': () => db.seedDefaultLocations(),
 
     // --- DB MAINTENANCE ---
-    'admin:db:check': () => db.runDatabaseHealthCheck(),
-    'admin:db:repair': () => db.repairDatabase(),
-    'admin:db:prune': ({ retentionDays, targets }: DbPrunePayload) => db.pruneDatabaseData(retentionDays, targets),
+    // Genuine-Admin gate on the whole family (load-bearing fail-closed backstop to
+    // the admin:db:destroy perm enforced by the dispatcher): check is a count oracle
+    // over read-gated domains, repair re-seeds RBAC / promotes an Admin, and prune
+    // issues raw mass DELETEs. None may be triggered by a non-Admin (e.g. Dispatcher).
+    'admin:db:check': ({ user }: DbMaintenancePayload) => { assertAdminRole(user); return db.runDatabaseHealthCheck(); },
+    'admin:db:repair': ({ user }: DbMaintenancePayload) => { assertAdminRole(user); return db.repairDatabase(); },
+    'admin:db:prune': ({ user, retentionDays, targets }: DbPrunePayload) => { assertAdminRole(user); return db.pruneDatabaseData(retentionDays, targets); },
     'admin:db:reset_finances': () => db.resetFinancesData(),
     'admin:db:reset_quartermaster': () => db.resetQuartermasterData(),
     // Danger Zone. userId is the dispatcher-injected acting admin (ACTOR_ID_FIELDS),
@@ -649,15 +675,23 @@ export const adminActions = {
 
     // --- Maintenance mode + force-logout (org-wide operational settings) ---
     'admin:get_platform_settings': () => db.getPlatformSettings(),
-    'admin:update_platform_settings': ({ maintenanceMode, maintenanceMessage }: { maintenanceMode?: boolean; maintenanceMessage?: string }) => {
+    'admin:update_platform_settings': ({ user, maintenanceMode, maintenanceMessage }: { user?: { role?: string }; maintenanceMode?: boolean; maintenanceMessage?: string }) => {
+        // Genuine-Admin gate: enabling maintenance mode locks out every non-Admin
+        // (including the actor) until a true Admin lifts it — a non-Admin must never
+        // be able to trigger that irreversible-to-them lockout.
+        assertAdminRole(user);
         const patch: Record<string, unknown> = {};
         if (maintenanceMode !== undefined) patch.maintenance_mode = !!maintenanceMode;
         if (maintenanceMessage !== undefined) patch.maintenance_message = String(maintenanceMessage);
         return db.updatePlatformSettings(patch);
     },
     // Timestamp is set server-side (now) so a client can't backdate it; tokens
-    // issued before it are 401'd by the dispatcher/read-path enforcement.
-    'admin:force_logout_all': () => db.updatePlatformSettings({ force_logout_timestamp: new Date().toISOString() }),
+    // issued before it are 401'd by the dispatcher/read-path enforcement. Advancing
+    // it kills EVERY live session platform-wide — genuine Admin only.
+    'admin:force_logout_all': ({ user }: { user?: { role?: string } }) => {
+        assertAdminRole(user);
+        return db.updatePlatformSettings({ force_logout_timestamp: new Date().toISOString() });
+    },
     // Revoke ONE user's live sessions (compromised/leaked token) without removing
     // the account. targetUserId is a target-identity field (not actor-forced).
     'admin:revoke_user_sessions': ({ targetUserId }: { targetUserId: number }) => db.revokeUserSessions(targetUserId),

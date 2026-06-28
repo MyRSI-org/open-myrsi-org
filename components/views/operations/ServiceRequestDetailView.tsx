@@ -6,6 +6,7 @@ import {
     ThreatLevel,
     WarrantStatus,
     IntelThreatLevel,
+    User,
 } from '../../../types';
 import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
 import { useRequests } from '../../../contexts/RequestsContext';
@@ -118,6 +119,83 @@ const AddNoteCard: React.FC<{ requestId: string }> = ({ requestId }) => {
             >
                 {submitting ? <i className="fa-solid fa-spinner animate-spin" aria-hidden /> : 'Log Entry'}
             </button>
+        </div>
+    );
+};
+
+// Reputation bar for the client identity card. Hoisted to module scope so the
+// JSX isn't an IIFE (which the React Compiler can't optimize).
+const ClientReputationBar: React.FC<{ client: User }> = ({ client }) => {
+    const repA = ACCENTS[reputationAccent(client.reputation)];
+    const pct = Math.max(0, Math.min(100, client.reputation));
+    return (
+        <div className="mt-2">
+            <div className="flex items-center justify-between text-[10px] font-mono uppercase tracking-widest mb-1">
+                <span className="text-slate-500">Reputation</span>
+                <span className={`font-bold ${repA.text}`}>{client.reputation}</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-slate-900 border border-white/5 overflow-hidden">
+                <div className={`h-full ${repA.dot} transition-all`} style={{ width: `${pct}%` }} />
+            </div>
+        </div>
+    );
+};
+
+// Operational team roster (lead + responders). Hoisted to module scope so the
+// JSX isn't an IIFE (which the React Compiler can't optimize).
+const OperationalTeamRoster: React.FC<{ assignedMembers: User[]; leadResponderId?: number }> = ({ assignedMembers, leadResponderId }) => {
+    if (assignedMembers.length === 0) {
+        return (
+            <div className="text-center py-4 text-slate-500 italic text-xs uppercase tracking-widest bg-slate-950/30 rounded-lg border border-dashed border-white/5">
+                Unit unassigned
+            </div>
+        );
+    }
+    const lead = assignedMembers.find(m => m.id === leadResponderId);
+    const others = assignedMembers.filter(m => m.id !== leadResponderId);
+    return (
+        <div className="space-y-3">
+            {lead && (
+                <div>
+                    <p className="text-[9px] font-black text-amber-400/80 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+                        <i className="fa-solid fa-crown text-[9px]" aria-hidden /> Lead Responder
+                    </p>
+                    <div className="flex items-center gap-3 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/5">
+                        <div className="relative shrink-0">
+                            <img src={lead.avatarUrl} alt="" className="w-10 h-10 rounded-full border-2 border-amber-400 object-cover" />
+                            <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-500 border-2 border-slate-950 flex items-center justify-center">
+                                <i className="fa-solid fa-crown text-[7px] text-black" aria-hidden />
+                            </div>
+                        </div>
+                        <div className="min-w-0 flex-1">
+                            <p className="text-sm font-bold truncate text-amber-100">{lead.name}</p>
+                            <p className="text-[9px] text-slate-500 uppercase tracking-widest truncate">{lead.rank?.name || 'Operative'}</p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {others.length > 0 && (
+                <div>
+                    <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-1.5">
+                        Responding Unit · {others.length}
+                    </p>
+                    <div className="space-y-1.5">
+                        {others.map(member => (
+                            <div
+                                key={member.id}
+                                className="flex items-center gap-2.5 p-2 rounded-lg border border-white/5 bg-slate-950/30"
+                            >
+                                <img src={member.avatarUrl} alt="" className="w-8 h-8 rounded-full border-2 border-slate-700 shrink-0 object-cover" />
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-xs font-bold truncate text-slate-200">{member.name}</p>
+                                    <p className="text-[9px] text-slate-500 uppercase tracking-widest truncate">{member.rank?.name || 'Operative'}</p>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
@@ -492,21 +570,7 @@ const ServiceRequestDetailView: React.FC<ServiceRequestDetailViewProps> = ({
                                 <div className="min-w-0 flex-1">
                                     <h3 className="text-lg font-bold text-white truncate">{clientDisplayName}</h3>
                                     <p className="text-sky-400 font-mono text-xs truncate">@{clientDisplayHandle}</p>
-                                    {request.client && (() => {
-                                        const repA = ACCENTS[reputationAccent(request.client.reputation)];
-                                        const pct = Math.max(0, Math.min(100, request.client.reputation));
-                                        return (
-                                            <div className="mt-2">
-                                                <div className="flex items-center justify-between text-[10px] font-mono uppercase tracking-widest mb-1">
-                                                    <span className="text-slate-500">Reputation</span>
-                                                    <span className={`font-bold ${repA.text}`}>{request.client.reputation}</span>
-                                                </div>
-                                                <div className="h-1.5 rounded-full bg-slate-900 border border-white/5 overflow-hidden">
-                                                    <div className={`h-full ${repA.dot} transition-all`} style={{ width: `${pct}%` }} />
-                                                </div>
-                                            </div>
-                                        );
-                                    })()}
+                                    {request.client && <ClientReputationBar client={request.client} />}
                                 </div>
                             </div>
                         </SectionCard>
@@ -556,59 +620,7 @@ const ServiceRequestDetailView: React.FC<ServiceRequestDetailViewProps> = ({
                                 </span>
                             )}
                         >
-                            {request.assignedMembers.length === 0 ? (
-                                <div className="text-center py-4 text-slate-500 italic text-xs uppercase tracking-widest bg-slate-950/30 rounded-lg border border-dashed border-white/5">
-                                    Unit unassigned
-                                </div>
-                            ) : (() => {
-                                const lead = request.assignedMembers.find(m => m.id === request.leadResponderId);
-                                const others = request.assignedMembers.filter(m => m.id !== request.leadResponderId);
-                                return (
-                                    <div className="space-y-3">
-                                        {lead && (
-                                            <div>
-                                                <p className="text-[9px] font-black text-amber-400/80 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
-                                                    <i className="fa-solid fa-crown text-[9px]" aria-hidden /> Lead Responder
-                                                </p>
-                                                <div className="flex items-center gap-3 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/5">
-                                                    <div className="relative shrink-0">
-                                                        <img src={lead.avatarUrl} alt="" className="w-10 h-10 rounded-full border-2 border-amber-400 object-cover" />
-                                                        <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-500 border-2 border-slate-950 flex items-center justify-center">
-                                                            <i className="fa-solid fa-crown text-[7px] text-black" aria-hidden />
-                                                        </div>
-                                                    </div>
-                                                    <div className="min-w-0 flex-1">
-                                                        <p className="text-sm font-bold truncate text-amber-100">{lead.name}</p>
-                                                        <p className="text-[9px] text-slate-500 uppercase tracking-widest truncate">{lead.rank?.name || 'Operative'}</p>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {others.length > 0 && (
-                                            <div>
-                                                <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-1.5">
-                                                    Responding Unit · {others.length}
-                                                </p>
-                                                <div className="space-y-1.5">
-                                                    {others.map(member => (
-                                                        <div
-                                                            key={member.id}
-                                                            className="flex items-center gap-2.5 p-2 rounded-lg border border-white/5 bg-slate-950/30"
-                                                        >
-                                                            <img src={member.avatarUrl} alt="" className="w-8 h-8 rounded-full border-2 border-slate-700 shrink-0 object-cover" />
-                                                            <div className="min-w-0 flex-1">
-                                                                <p className="text-xs font-bold truncate text-slate-200">{member.name}</p>
-                                                                <p className="text-[9px] text-slate-500 uppercase tracking-widest truncate">{member.rank?.name || 'Operative'}</p>
-                                                            </div>
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })()}
+                            <OperationalTeamRoster assignedMembers={request.assignedMembers} leadResponderId={request.leadResponderId} />
                         </SectionCard>
 
                         {((request.secondaryClientHandles && request.secondaryClientHandles.length > 0) || request.partyInfo) && (

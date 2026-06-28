@@ -55,14 +55,23 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
         }
     }, [rpcAction]);
 
-    // Pre-select the existing channel, falling back to the org default.
-    useEffect(() => {
-        if (pickerChannelId) return;
-        const existing = operation.discordAnnouncementChannelId
-            || discordConfig?.defaultOperationAnnounceChannelId
-            || '';
-        if (existing) setPickerChannelId(existing);
-    }, [operation.discordAnnouncementChannelId, discordConfig?.defaultOperationAnnounceChannelId, pickerChannelId]);
+    // Pre-select the existing channel, falling back to the org default. This is a
+    // one-time seed of a user-editable dropdown: once pickerChannelId is set
+    // (by this seed or a later user click) it is never re-seeded. We do it during
+    // render with a previous-value tracker (the React-documented "adjust state
+    // during render" pattern) instead of an effect — React re-renders before
+    // paint so it is behaviour-equivalent, and the `!pickerChannelId` guard keeps
+    // it from clobbering the operator's choice if the stored/default channel
+    // arrives or changes asynchronously after they pick. The null sentinel makes
+    // the first render seed too, matching the old effect that ran once on mount.
+    const existingPickerChannelId = operation.discordAnnouncementChannelId
+        || discordConfig?.defaultOperationAnnounceChannelId
+        || '';
+    const [prevExistingPickerChannelId, setPrevExistingPickerChannelId] = useState<string | null>(null);
+    if (existingPickerChannelId !== prevExistingPickerChannelId) {
+        setPrevExistingPickerChannelId(existingPickerChannelId);
+        if (!pickerChannelId && existingPickerChannelId) setPickerChannelId(existingPickerChannelId);
+    }
 
     const handleRepostAnnouncement = useCallback(async () => {
         if (!pickerChannelId) {
@@ -139,7 +148,7 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
     const [editScheduledStart, setEditScheduledStart] = useState('');
     const [editScheduledEnd, setEditScheduledEnd] = useState('');
     const [editClearanceLevel, setEditClearanceLevel] = useState('0');
-    const [editMarkers, setEditMarkers] = useState<Set<number>>(new Set());
+    const [editMarkers, setEditMarkers] = useState<Set<number>>(() => new Set());
     const [editIsSpecial, setEditIsSpecial] = useState(false);
     const [editJoinCode, setEditJoinCode] = useState('');
     const [editIsJoint, setEditIsJoint] = useState(false);

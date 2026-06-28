@@ -22,6 +22,13 @@ const defaultChecklist: VettingChecklist = {
     interview: 'pending'
 };
 
+const StatusDot: React.FC<{ status: string }> = ({ status }) => {
+    let color = 'bg-slate-600';
+    if (status === 'clear') color = 'bg-green-500 shadow-green-500/50';
+    if (status === 'flagged') color = 'bg-red-500 shadow-red-500/50';
+    return <div className={`w-2 h-2 rounded-full ${color} shadow-[0_0_8px]`} />;
+};
+
 const getClearanceColor = (level: number) => {
     switch (level) {
         case 1: return 'text-green-400 border-green-500/30 bg-green-500/10';
@@ -53,7 +60,7 @@ const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onC
     const [finalStatus, setFinalStatus] = useState<'Hired' | 'Rejected' | 'Revoked' | null>(null);
     const [finalNotes, setFinalNotes] = useState('');
     const [selectedLevelId, setSelectedLevelId] = useState<string>('');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set());
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set());
 
     const cachedLinkedMember = useMemo(() => allUsers.find(u => u.id === applicant.linkedUserId), [allUsers, applicant.linkedUserId]);
     // The roster cache trims `limitingMarkers` to keep main-subset egress small.
@@ -86,11 +93,26 @@ const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onC
     // list — it's recruiter-grade PII rendered one applicant at a time). vettingLoading
     // guards the save handlers so a save fired before the fetch lands can't overwrite
     // the real vetting record with the empty default.
+    //
+    // Reset the editable, async-loaded vetting state when the selected applicant
+    // changes or the modal (re)opens, clearing the previous applicant's
+    // recruiter-grade PII before the new fetch lands. This runs during render
+    // (React's "adjust state on a key change" pattern) rather than in an effect.
+    // vettingLoading/vettingData already initialize to exactly these reset values,
+    // so on first mount this is a no-op; it only does visible work on a later
+    // applicant change / reopen, ahead of the async refetch in the effect below.
+    const vettingResetKey = `${isOpen ? 1 : 0}:${applicant.id}`;
+    const [prevVettingResetKey, setPrevVettingResetKey] = useState(vettingResetKey);
+    if (vettingResetKey !== prevVettingResetKey) {
+        setPrevVettingResetKey(vettingResetKey);
+        if (isOpen) {
+            setVettingLoading(true);
+            setVettingData({ stage: 'investigation', checks: { ...defaultChecklist }, comments: {} });
+        }
+    }
     useEffect(() => {
         if (!isOpen) return;
         let cancelled = false;
-        setVettingLoading(true);
-        setVettingData({ stage: 'investigation', checks: { ...defaultChecklist }, comments: {} });
         (async () => {
             try {
                 const loaded = (await rpcAction('hr:get_application_data', { id: applicant.id })) as Partial<VettingData> | null;
@@ -110,21 +132,51 @@ const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onC
         return () => { cancelled = true; };
     }, [isOpen, applicant.id, rpcAction]);
 
-    useEffect(() => {
+    // Seed the editable clearance form fields from the (lazy-loaded) full linked
+    // member, and reset the final-determination fields, when the modal opens, the
+    // applicant changes, or that linked-member record arrives. These are
+    // user-editable <select>/marker controls that feed updateUserClearance on
+    // finalize, so they must be component state. This runs during render (React's
+    // "adjust state on a key change" pattern) rather than in an effect, which
+    // preserves the original timing: the seed re-runs on exactly the same input
+    // changes the effect keyed on (isOpen/applicant/linkedMember). Getting the
+    // markers right is security-relevant — a wrong seed could clear the user's
+    // existing limiting markers on save (see fullLinkedMember note above).
+    // seedTracker starts null so the block also runs on the initial render (mirroring
+    // the effect firing on mount), guarded by isOpen exactly as before.
+    const [seedTracker, setSeedTracker] = useState<{
+        isOpen: boolean;
+        applicant: HydratedHRApplication;
+        linkedMember: typeof linkedMember;
+    } | null>(null);
+    if (
+        !seedTracker
+        || seedTracker.isOpen !== isOpen
+        || seedTracker.applicant !== applicant
+        || seedTracker.linkedMember !== linkedMember
+    ) {
+        setSeedTracker({ isOpen, applicant, linkedMember });
         if (isOpen) {
             if (linkedMember) {
                 setSelectedLevelId(linkedMember.clearanceLevel?.id.toString() || '');
                 setSelectedMarkers(new Set(linkedMember.limitingMarkers?.map(m => m.id)));
             }
-
             setFinalStatus(null);
             setFinalNotes('');
-
-            rpcAction('intel:get_dossier', { targetId: applicant.rsiHandle })
-                .then(setDossier)
-                .catch(console.error);
         }
-    }, [isOpen, applicant, linkedMember, rpcAction]);
+    }
+
+    // Dossier lookup is async I/O so it stays in an effect. It re-runs when the
+    // modal opens or the applicant changes (the dossier is a function of
+    // applicant.rsiHandle); dossier is intentionally not cleared between
+    // applicants, matching the original (the prior dossier shows until the new
+    // one lands).
+    useEffect(() => {
+        if (!isOpen) return;
+        rpcAction('intel:get_dossier', { targetId: applicant.rsiHandle })
+            .then(setDossier)
+            .catch(console.error);
+    }, [isOpen, applicant, rpcAction]);
 
     const handleSaveProgress = async () => {
         if (vettingLoading) return; // don't persist the empty default before the fetch lands
@@ -170,14 +222,7 @@ const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onC
         } catch (err) { console.error(err); } finally { setIsLoading(false); }
     };
 
-    const StatusDot: React.FC<{ status: string }> = ({ status }) => {
-        let color = 'bg-slate-600';
-        if (status === 'clear') color = 'bg-green-500 shadow-green-500/50';
-        if (status === 'flagged') color = 'bg-red-500 shadow-red-500/50';
-        return <div className={`w-2 h-2 rounded-full ${color} shadow-[0_0_8px]`} />;
-    };
-
-    const inputClass = "w-full bg-slate-950/50 border border-slate-700 rounded-lg p-3 text-sm text-slate-200 focus:border-emerald-500/40 focus:ring-1 focus:ring-emerald-500/50 outline-hidden transition-all resize-none";
+    const inputClass ="w-full bg-slate-950/50 border border-slate-700 rounded-lg p-3 text-sm text-slate-200 focus:border-emerald-500/40 focus:ring-1 focus:ring-emerald-500/50 outline-hidden transition-all resize-none";
 
     return (
         <WindowFrame

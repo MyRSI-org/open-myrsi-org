@@ -18,6 +18,193 @@ import { useNotification } from '../../../contexts/NotificationContext';
 
 type FleetTab = 'hangar' | 'fleet' | 'organization';
 
+// Stable keys for the fixed-length loading-skeleton placeholders. These rows
+// carry no data and are never reordered or filtered, so module-scope constant
+// keys are the correct stable identity (instead of the array index).
+const STAT_SKELETON_KEYS = ['s0', 's1', 's2', 's3'] as const;
+const CARD_SKELETON_KEYS = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7'] as const;
+
+interface AssignShipsPickerProps {
+    assigningGroup: FleetGroup;
+    userShips: UserShip[];
+    assignSearch: string;
+    setAssignSearch: (value: string) => void;
+    assignExpandedOwners: Set<number>;
+    setAssignExpandedOwners: (next: Set<number>) => void;
+    toggleAssignOwner: (userId: number) => void;
+    onAssign: (fleetGroupId: number, userShipId: number) => void;
+}
+
+/**
+ * Owner-grouped + searchable ship picker for the "Assign Ships" modal. Extracted
+ * from an inline render IIFE so the React Compiler can optimise it as a normal
+ * component. Pure render: identical markup and behaviour to the previous inline
+ * block; all editable state still lives in the parent and is passed via props.
+ */
+const AssignShipsPicker: React.FC<AssignShipsPickerProps> = ({
+    assigningGroup,
+    userShips,
+    assignSearch,
+    setAssignSearch,
+    assignExpandedOwners,
+    setAssignExpandedOwners,
+    toggleAssignOwner,
+    onAssign,
+}) => {
+    const assignedIds = new Set((assigningGroup.assignedShips || []).map(a => a.id));
+    const available = userShips.filter(s => !assignedIds.has(s.id));
+    const term = assignSearch.trim().toLowerCase();
+
+    // Groups keyed by userId → { user, ships[], hasMatch }
+    interface OwnerBucket { userId: number; userName: string; avatarUrl?: string; ships: UserShip[]; hasMatch: boolean }
+    const bucketMap = new Map<number, OwnerBucket>();
+    for (const s of available) {
+        const userId = s.userId;
+        const userName = s.user?.name || 'Unknown';
+        const b = bucketMap.get(userId);
+        const nameMatch = term ? (
+            (s.customName || '').toLowerCase().includes(term)
+            || (s.ship?.name || '').toLowerCase().includes(term)
+            || (s.ship?.manufacturer || '').toLowerCase().includes(term)
+            || userName.toLowerCase().includes(term)
+        ) : false;
+        if (b) {
+            b.ships.push(s);
+            b.hasMatch = b.hasMatch || nameMatch;
+        } else {
+            bucketMap.set(userId, {
+                userId,
+                userName,
+                avatarUrl: s.user?.avatarUrl,
+                ships: [s],
+                hasMatch: nameMatch,
+            });
+        }
+    }
+    const buckets = Array.from(bucketMap.values()).sort((a, b) => a.userName.localeCompare(b.userName));
+
+    // When searching, filter ships within each bucket and show only buckets
+    // that have any match. Also auto-expand those buckets.
+    const filteredBuckets = term
+        ? buckets
+            .map(b => ({
+                ...b,
+                ships: b.ships.filter(s =>
+                    (s.customName || '').toLowerCase().includes(term)
+                    || (s.ship?.name || '').toLowerCase().includes(term)
+                    || (s.ship?.manufacturer || '').toLowerCase().includes(term)
+                    || b.userName.toLowerCase().includes(term)
+                ),
+            }))
+            .filter(b => b.ships.length > 0)
+        : buckets;
+
+    const isExpanded = (userId: number) => !!term || assignExpandedOwners.has(userId);
+
+    return (
+        <div className="flex flex-col" style={{ maxHeight: 'calc(70vh - 60px)' }}>
+            {available.length > 0 && (
+                <div className="p-3 border-b border-slate-800/60 shrink-0">
+                    <div className="relative">
+                        <i className="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+                        <input
+                            type="search"
+                            value={assignSearch}
+                            onChange={(e) => setAssignSearch(e.target.value)}
+                            placeholder="Search ships, owners, manufacturers…"
+                            className="w-full bg-slate-950/50 border border-slate-700 rounded-lg pl-10 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:ring-1 focus:ring-orange-500/50 focus:border-orange-500/40 outline-hidden"
+                        />
+                    </div>
+                    <div className="flex items-center justify-between mt-2">
+                        <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest">
+                            {filteredBuckets.reduce((sum, b) => sum + b.ships.length, 0)} ships · {filteredBuckets.length} owners
+                        </span>
+                        {!term && assignExpandedOwners.size > 0 && (
+                            <button
+                                onClick={() => setAssignExpandedOwners(new Set())}
+                                className="text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-white"
+                            >
+                                Collapse all
+                            </button>
+                        )}
+                        {!term && assignExpandedOwners.size === 0 && filteredBuckets.length > 0 && (
+                            <button
+                                onClick={() => setAssignExpandedOwners(new Set(filteredBuckets.map(b => b.userId)))}
+                                className="text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-white"
+                            >
+                                Expand all
+                            </button>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                {available.length === 0 ? (
+                    <EmptyState
+                        icon="fa-circle-check"
+                        accent="emerald"
+                        heading="All ships assigned"
+                        description="Every ship in the org is already in a fleet group."
+                        compact
+                    />
+                ) : filteredBuckets.length === 0 ? (
+                    <EmptyState
+                        icon="fa-filter"
+                        accent="slate"
+                        heading="No matches"
+                        description="Try a different search term."
+                        compact
+                    />
+                ) : filteredBuckets.map(b => {
+                    const expanded = isExpanded(b.userId);
+                    return (
+                        <div key={b.userId} className="bg-slate-900/60 border border-slate-700/50 rounded-lg overflow-hidden">
+                            <button
+                                onClick={() => toggleAssignOwner(b.userId)}
+                                className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-800/60 transition-colors"
+                            >
+                                {b.avatarUrl && (
+                                    <img src={b.avatarUrl} alt="" className="w-7 h-7 rounded-full shrink-0" />
+                                )}
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-sm font-bold text-white truncate">{b.userName}</p>
+                                    <p className="text-[10px] text-slate-500 font-mono">{b.ships.length} {b.ships.length === 1 ? 'ship' : 'ships'}</p>
+                                </div>
+                                <i className={`fa-solid fa-chevron-${expanded ? 'up' : 'down'} text-slate-500 text-xs shrink-0`}></i>
+                            </button>
+                            {expanded && (
+                                <div className="border-t border-slate-800/80 divide-y divide-slate-800/60">
+                                    {b.ships.map(us => (
+                                        <div key={us.id} className="flex items-center justify-between p-3 hover:bg-slate-800/40 transition-colors">
+                                            <div className="flex items-center gap-3 min-w-0">
+                                                {us.ship?.imageUrl && (
+                                                    <img src={us.ship.imageUrl} alt="" className="w-10 h-7 object-cover rounded-sm opacity-70 shrink-0" />
+                                                )}
+                                                <div className="min-w-0">
+                                                    <p className="text-sm font-bold text-white truncate">{us.customName || us.ship?.name}</p>
+                                                    <p className="text-[10px] text-slate-500 truncate">
+                                                        {us.customName && us.ship?.name ? <><span className="text-orange-300/80 font-mono">{us.ship.name}</span> · </> : null}
+                                                        {us.ship?.manufacturer}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <button onClick={() => onAssign(assigningGroup.id, us.id)}
+                                                className="flex items-center gap-2 px-3 py-1.5 text-[10px] font-black uppercase tracking-widest text-orange-300 bg-orange-500/10 border border-orange-500/30 hover:bg-orange-500/20 rounded-lg transition-colors shrink-0">
+                                                <i className="fa-solid fa-plus"></i>Assign
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+
 const FleetManagerView: React.FC = () => {
     const { currentUser, hasPermission } = useAuth();
     const { rpcAction } = useData();
@@ -39,14 +226,14 @@ const FleetManagerView: React.FC = () => {
     const [assigningGroup, setAssigningGroup] = useState<FleetGroup | null>(null);
     const [isBusy, setIsBusy] = useState(false);
     const [selectMode, setSelectMode] = useState(false);
-    const [selectedShips, setSelectedShips] = useState<Set<number>>(new Set());
+    const [selectedShips, setSelectedShips] = useState<Set<number>>(() => new Set());
 
     // Org Fleet display mode — "stacked" (default) collapses duplicates of the
     // same platform ship into one card with a count, avoiding the 20-Arrow wall
     // of cards. "individual" is the legacy one-card-per-instance view.
     const [fleetViewMode, setFleetViewMode] = useState<'stacked' | 'individual'>('stacked');
     /** Per-group (groupName + shipId) expansion state for stacked cards. */
-    const [expandedStacks, setExpandedStacks] = useState<Set<string>>(new Set());
+    const [expandedStacks, setExpandedStacks] = useState<Set<string>>(() => new Set());
     const toggleStack = useCallback((key: string) => {
         setExpandedStacks(prev => {
             const next = new Set(prev);
@@ -61,7 +248,7 @@ const FleetManagerView: React.FC = () => {
 
     // Assign-to-Group picker state
     const [assignSearch, setAssignSearch] = useState('');
-    const [assignExpandedOwners, setAssignExpandedOwners] = useState<Set<number>>(new Set());
+    const [assignExpandedOwners, setAssignExpandedOwners] = useState<Set<number>>(() => new Set());
     const toggleAssignOwner = useCallback((userId: number) => {
         setAssignExpandedOwners(prev => {
             const next = new Set(prev);
@@ -69,11 +256,17 @@ const FleetManagerView: React.FC = () => {
             return next;
         });
     }, []);
-    // Reset search + collapse owners when the modal closes/opens on a new group
-    useEffect(() => {
+    // Reset search + collapse owners when the modal closes/opens on a new group.
+    // Done with a render-time previous-id tracker (React's "adjust state during
+    // render" pattern) so the reset happens before paint without an effect — and
+    // covers the same transitions the effect did (null->id, id->id', id->null).
+    const assigningGroupId = assigningGroup?.id;
+    const [prevAssigningGroupId, setPrevAssigningGroupId] = useState(assigningGroupId);
+    if (assigningGroupId !== prevAssigningGroupId) {
+        setPrevAssigningGroupId(assigningGroupId);
         setAssignSearch('');
         setAssignExpandedOwners(new Set());
-    }, [assigningGroup?.id]);
+    }
 
     const canManageOwn = hasPermission('fleet:manage_own');
     const canViewFleet = hasPermission('fleet:view');
@@ -490,16 +683,16 @@ const FleetManagerView: React.FC = () => {
                 {isInitialLoading ? (
                     <div className="space-y-6 animate-pulse">
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                            {[...Array(4)].map((_, i) => (
-                                <div key={i} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
+                            {STAT_SKELETON_KEYS.map(key => (
+                                <div key={key} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
                                     <div className="h-8 bg-slate-800 rounded-sm w-16 mx-auto mb-2"></div>
                                     <div className="h-3 bg-slate-800 rounded-sm w-20 mx-auto"></div>
                                 </div>
                             ))}
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                            {[...Array(8)].map((_, i) => (
-                                <div key={i} className="bg-slate-900/60 border border-slate-800 rounded-xl overflow-hidden">
+                            {CARD_SKELETON_KEYS.map(key => (
+                                <div key={key} className="bg-slate-900/60 border border-slate-800 rounded-xl overflow-hidden">
                                     <div className="h-32 bg-slate-800"></div>
                                     <div className="p-3 space-y-2">
                                         <div className="h-4 bg-slate-800 rounded-sm w-3/4"></div>
@@ -934,160 +1127,18 @@ const FleetManagerView: React.FC = () => {
                 isOpen={!!assigningGroup}
                 onClose={() => setAssigningGroup(null)}
             >
-                {(() => {
-                    const assignedIds = new Set((assigningGroup?.assignedShips || []).map(a => a.id));
-                    const available = userShips.filter(s => !assignedIds.has(s.id));
-                    const term = assignSearch.trim().toLowerCase();
-
-                    // Groups keyed by userId → { user, ships[], hasMatch }
-                    interface OwnerBucket { userId: number; userName: string; avatarUrl?: string; ships: UserShip[]; hasMatch: boolean }
-                    const bucketMap = new Map<number, OwnerBucket>();
-                    for (const s of available) {
-                        const userId = s.userId;
-                        const userName = s.user?.name || 'Unknown';
-                        const b = bucketMap.get(userId);
-                        const nameMatch = term ? (
-                            (s.customName || '').toLowerCase().includes(term)
-                            || (s.ship?.name || '').toLowerCase().includes(term)
-                            || (s.ship?.manufacturer || '').toLowerCase().includes(term)
-                            || userName.toLowerCase().includes(term)
-                        ) : false;
-                        if (b) {
-                            b.ships.push(s);
-                            b.hasMatch = b.hasMatch || nameMatch;
-                        } else {
-                            bucketMap.set(userId, {
-                                userId,
-                                userName,
-                                avatarUrl: s.user?.avatarUrl,
-                                ships: [s],
-                                hasMatch: nameMatch,
-                            });
-                        }
-                    }
-                    const buckets = Array.from(bucketMap.values()).sort((a, b) => a.userName.localeCompare(b.userName));
-
-                    // When searching, filter ships within each bucket and show only buckets
-                    // that have any match. Also auto-expand those buckets.
-                    const filteredBuckets = term
-                        ? buckets
-                            .map(b => ({
-                                ...b,
-                                ships: b.ships.filter(s =>
-                                    (s.customName || '').toLowerCase().includes(term)
-                                    || (s.ship?.name || '').toLowerCase().includes(term)
-                                    || (s.ship?.manufacturer || '').toLowerCase().includes(term)
-                                    || b.userName.toLowerCase().includes(term)
-                                ),
-                            }))
-                            .filter(b => b.ships.length > 0)
-                        : buckets;
-
-                    const isExpanded = (userId: number) => !!term || assignExpandedOwners.has(userId);
-
-                    return (
-                        <div className="flex flex-col" style={{ maxHeight: 'calc(70vh - 60px)' }}>
-                            {available.length > 0 && (
-                                <div className="p-3 border-b border-slate-800/60 shrink-0">
-                                    <div className="relative">
-                                        <i className="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
-                                        <input
-                                            type="search"
-                                            value={assignSearch}
-                                            onChange={(e) => setAssignSearch(e.target.value)}
-                                            placeholder="Search ships, owners, manufacturers…"
-                                            className="w-full bg-slate-950/50 border border-slate-700 rounded-lg pl-10 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:ring-1 focus:ring-orange-500/50 focus:border-orange-500/40 outline-hidden"
-                                        />
-                                    </div>
-                                    <div className="flex items-center justify-between mt-2">
-                                        <span className="text-[10px] text-slate-500 font-mono uppercase tracking-widest">
-                                            {filteredBuckets.reduce((sum, b) => sum + b.ships.length, 0)} ships · {filteredBuckets.length} owners
-                                        </span>
-                                        {!term && assignExpandedOwners.size > 0 && (
-                                            <button
-                                                onClick={() => setAssignExpandedOwners(new Set())}
-                                                className="text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-white"
-                                            >
-                                                Collapse all
-                                            </button>
-                                        )}
-                                        {!term && assignExpandedOwners.size === 0 && filteredBuckets.length > 0 && (
-                                            <button
-                                                onClick={() => setAssignExpandedOwners(new Set(filteredBuckets.map(b => b.userId)))}
-                                                className="text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-white"
-                                            >
-                                                Expand all
-                                            </button>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-
-                            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                                {available.length === 0 ? (
-                                    <EmptyState
-                                        icon="fa-circle-check"
-                                        accent="emerald"
-                                        heading="All ships assigned"
-                                        description="Every ship in the org is already in a fleet group."
-                                        compact
-                                    />
-                                ) : filteredBuckets.length === 0 ? (
-                                    <EmptyState
-                                        icon="fa-filter"
-                                        accent="slate"
-                                        heading="No matches"
-                                        description="Try a different search term."
-                                        compact
-                                    />
-                                ) : filteredBuckets.map(b => {
-                                    const expanded = isExpanded(b.userId);
-                                    return (
-                                        <div key={b.userId} className="bg-slate-900/60 border border-slate-700/50 rounded-lg overflow-hidden">
-                                            <button
-                                                onClick={() => toggleAssignOwner(b.userId)}
-                                                className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-800/60 transition-colors"
-                                            >
-                                                {b.avatarUrl && (
-                                                    <img src={b.avatarUrl} alt="" className="w-7 h-7 rounded-full shrink-0" />
-                                                )}
-                                                <div className="min-w-0 flex-1">
-                                                    <p className="text-sm font-bold text-white truncate">{b.userName}</p>
-                                                    <p className="text-[10px] text-slate-500 font-mono">{b.ships.length} {b.ships.length === 1 ? 'ship' : 'ships'}</p>
-                                                </div>
-                                                <i className={`fa-solid fa-chevron-${expanded ? 'up' : 'down'} text-slate-500 text-xs shrink-0`}></i>
-                                            </button>
-                                            {expanded && (
-                                                <div className="border-t border-slate-800/80 divide-y divide-slate-800/60">
-                                                    {b.ships.map(us => (
-                                                        <div key={us.id} className="flex items-center justify-between p-3 hover:bg-slate-800/40 transition-colors">
-                                                            <div className="flex items-center gap-3 min-w-0">
-                                                                {us.ship?.imageUrl && (
-                                                                    <img src={us.ship.imageUrl} alt="" className="w-10 h-7 object-cover rounded-sm opacity-70 shrink-0" />
-                                                                )}
-                                                                <div className="min-w-0">
-                                                                    <p className="text-sm font-bold text-white truncate">{us.customName || us.ship?.name}</p>
-                                                                    <p className="text-[10px] text-slate-500 truncate">
-                                                                        {us.customName && us.ship?.name ? <><span className="text-orange-300/80 font-mono">{us.ship.name}</span> · </> : null}
-                                                                        {us.ship?.manufacturer}
-                                                                    </p>
-                                                                </div>
-                                                            </div>
-                                                            <button onClick={() => handleAssignShip(assigningGroup!.id, us.id)}
-                                                                className="flex items-center gap-2 px-3 py-1.5 text-[10px] font-black uppercase tracking-widest text-orange-300 bg-orange-500/10 border border-orange-500/30 hover:bg-orange-500/20 rounded-lg transition-colors shrink-0">
-                                                                <i className="fa-solid fa-plus"></i>Assign
-                                                            </button>
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            )}
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        </div>
-                    );
-                })()}
+                {assigningGroup && (
+                    <AssignShipsPicker
+                        assigningGroup={assigningGroup}
+                        userShips={userShips}
+                        assignSearch={assignSearch}
+                        setAssignSearch={setAssignSearch}
+                        assignExpandedOwners={assignExpandedOwners}
+                        setAssignExpandedOwners={setAssignExpandedOwners}
+                        toggleAssignOwner={toggleAssignOwner}
+                        onAssign={handleAssignShip}
+                    />
+                )}
             </WindowFrame>
         </div>
     );

@@ -14,7 +14,7 @@
 // field. Unlike HR (which nests under data.hr.*), the fleet payload puts these
 // at the top level, so each setter keys off its own data-payload field.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     PlatformShip, UserShip, FleetGroup,
@@ -101,11 +101,11 @@ export const FleetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         registerRefreshFleet,
     ]);
 
-    return <FleetContext.Provider value={value}>{children}</FleetContext.Provider>;
+    return <FleetContext value={value}>{children}</FleetContext>;
 };
 
 export const useFleet = (): FleetContextValue => {
-    const ctx = useContext(FleetContext);
+    const ctx = use(FleetContext);
     if (!ctx) throw new Error('useFleet must be used within a FleetProvider');
     return ctx;
 };

@@ -17,7 +17,7 @@
 // DataContext's optimisticUpdate 'operations'/'warrants' branches write through
 // the setOperations/setWarrants setters exposed here.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     HydratedOperation, HydratedWarrant, OperationTemplate, OperationTemplatePayload,
@@ -294,11 +294,11 @@ export const OperationsProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         registerRefreshOperations, registerRefreshWarrants,
     ]);
 
-    return <OperationsContext.Provider value={value}>{children}</OperationsContext.Provider>;
+    return <OperationsContext value={value}>{children}</OperationsContext>;
 };
 
 export const useOperations = (): OperationsContextValue => {
-    const ctx = useContext(OperationsContext);
+    const ctx = use(OperationsContext);
     if (!ctx) throw new Error('useOperations must be used within an OperationsProvider');
     return ctx;
 };

@@ -24,6 +24,21 @@ const defaultChecklist: VettingChecklist = {
     interview: 'pending'
 };
 
+// Unique sentinels distinct from every real value, used to force the first render
+// to consider each render-time "adjust state" seed exactly once (mirroring the way
+// the old seeding effects always ran once on mount).
+const CLEARANCE_SEED_SENTINEL = Symbol('clearanceSeedInitial');
+const CASE_FILE_SYNC_SENTINEL = Symbol('caseFileSyncInitial');
+
+// Hoisted to module scope (was nested in the view): pure presentational dot,
+// closes over no parent state.
+const StatusDot: React.FC<{ status: string }> = ({ status }) => {
+    let color = 'bg-slate-600';
+    if (status === 'clear') color = 'bg-green-500 shadow-green-500/50';
+    if (status === 'flagged') color = 'bg-red-500 shadow-red-500/50';
+    return <div className={`w-2 h-2 rounded-full ${color} shadow-[0_0_8px]`} />;
+};
+
 const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId, onBack }) => {
     const { rpcAction, refreshHR, refreshMainState, optimisticUpdate, isFetching, fetchUserDetail } = useData();
     const {
@@ -67,34 +82,67 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
 
     // Security/Transfer Outcome State
     const [selectedLevelId, setSelectedLevelId] = useState<string>('');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set());
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set());
 
     // Hire Assignment State (unit, rank, clearance for new hires)
     const [hireUnitId, setHireUnitId] = useState<string>('');
     const [hireRankId, setHireRankId] = useState<string>('');
     const [hireClearanceLevelId, setHireClearanceLevelId] = useState<string>('');
-    const [hireClearanceMarkers, setHireClearanceMarkers] = useState<Set<number>>(new Set());
+    const [hireClearanceMarkers, setHireClearanceMarkers] = useState<Set<number>>(() => new Set());
 
     // --- INITIALIZATION ---
 
-    useEffect(() => {
-        if (!applicationId) return;
-        const found = hrApplicants.find(a => a.id === applicationId);
-        if (found) {
-            // Merge with interviews found in global state
-            const linkedInterviews = hrInterviews.filter(i => i.applicationId === applicationId);
-            setCaseFile({ ...found, interviews: linkedInterviews });
+    // Sync caseFile from the realtime applicant list, merging in the linked
+    // interviews. This has retention semantics: caseFile is only *replaced* when the
+    // applicant is present in the realtime list, and is never cleared on a transient
+    // absence (a pure useMemo would flash "not found" during a refetch gap). Because
+    // of that retention it cannot be a plain derived value, so it stays in state and
+    // is adjusted during render via a prev-input tracker (React re-renders before
+    // paint). The tracker keys on the same inputs the old effect depended on
+    // [hrApplicants, hrInterviews, applicationId], so a fresh merged object is
+    // produced on exactly the same changes — preserving downstream memo invalidation
+    // cadence. The sentinel forces the first render to consider the seed once, the
+    // way the effect always ran on mount.
+    const [prevCaseFileInputs, setPrevCaseFileInputs] = useState<{
+        hrApplicants: typeof hrApplicants | typeof CASE_FILE_SYNC_SENTINEL;
+        hrInterviews: typeof hrInterviews;
+        applicationId: string;
+    }>({ hrApplicants: CASE_FILE_SYNC_SENTINEL, hrInterviews, applicationId });
+    if (
+        !Object.is(prevCaseFileInputs.hrApplicants, hrApplicants) ||
+        !Object.is(prevCaseFileInputs.hrInterviews, hrInterviews) ||
+        !Object.is(prevCaseFileInputs.applicationId, applicationId)
+    ) {
+        setPrevCaseFileInputs({ hrApplicants, hrInterviews, applicationId });
+        if (applicationId) {
+            const found = hrApplicants.find(a => a.id === applicationId);
+            if (found) {
+                // Merge with interviews found in global state
+                const linkedInterviews = hrInterviews.filter(i => i.applicationId === applicationId);
+                setCaseFile({ ...found, interviews: linkedInterviews });
+            }
         }
-    }, [hrApplicants, hrInterviews, applicationId]);
+    }
 
     // Vetting data is lazy-loaded per case (it's recruiter-grade PII, not shipped in
     // the bulk list). vettingLoading guards the save handler so a save fired before
     // the fetch lands can't overwrite the real record with the empty default.
+    //
+    // The synchronous reset (loading -> true, data -> empty default) that clears the
+    // prior case's PII before the async fetch lands runs here during render via a
+    // prev-key tracker on the fetch inputs (applicationId / rpcAction). React
+    // re-renders before paint, so this is equivalent to the old effect's pre-fetch
+    // reset, but keeps a synchronous setState out of the effect body. Guarded on a
+    // truthy applicationId, matching the old effect's early return.
+    const [prevVettingKey, setPrevVettingKey] = useState<{ id: string; rpc: typeof rpcAction }>({ id: applicationId, rpc: rpcAction });
+    if (applicationId && (applicationId !== prevVettingKey.id || rpcAction !== prevVettingKey.rpc)) {
+        setPrevVettingKey({ id: applicationId, rpc: rpcAction });
+        setVettingLoading(true);
+        setVettingData({ checks: { ...defaultChecklist }, comments: {} });
+    }
     useEffect(() => {
         if (!applicationId) return;
         let cancelled = false;
-        setVettingLoading(true);
-        setVettingData({ checks: { ...defaultChecklist }, comments: {} });
         (async () => {
             try {
                 const loaded = (await rpcAction('hr:get_application_data', { id: applicationId })) as { checks?: Partial<VettingChecklist>; comments?: Record<string, string> } | null;
@@ -136,7 +184,7 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
     }, [applicationId, rpcAction]);
 
     useEffect(() => {
-        fetchLogs();
+        void (async () => { await fetchLogs(); })();
     }, [fetchLogs]);
 
     // --- DERIVED DATA ---
@@ -148,8 +196,20 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
     // the user's actual records. Lazy-fetch the fully-hydrated record.
     const cachedLinkedMember = useMemo(() => allUsers.find(u => u.id === caseFile?.linkedUserId), [allUsers, caseFile]);
     const [fullLinkedMember, setFullLinkedMember] = useState<typeof cachedLinkedMember | null>(null);
+    // Clear the lazily-fetched, fully-hydrated member to null the moment the case
+    // unlinks its user, so stale PII is dropped before any re-fetch. Done during
+    // render via a prev-key tracker (React re-renders before paint) so no
+    // synchronous setState sits in the effect. Only resets when the new linked
+    // user is absent — a truthy A->B change keeps showing A until B's fetch lands,
+    // exactly as the previous effect did.
+    const linkedUserId = caseFile?.linkedUserId;
+    const [prevLinkedUserId, setPrevLinkedUserId] = useState(linkedUserId);
+    if (linkedUserId !== prevLinkedUserId) {
+        setPrevLinkedUserId(linkedUserId);
+        if (!linkedUserId) setFullLinkedMember(null);
+    }
     useEffect(() => {
-        if (!caseFile?.linkedUserId) { setFullLinkedMember(null); return; }
+        if (!caseFile?.linkedUserId) return;
         let cancelled = false;
         (async () => {
             const full = await fetchUserDetail(caseFile.linkedUserId!);
@@ -225,8 +285,9 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
 
     // Requested markers parsed from case notes (e.g. "REQUESTED MARKERS: CODE1, CODE2")
     const requestedMarkerIds = useMemo(() => {
-        if (caseConfig.type !== 'VETTING' || !caseFile?.notes) return [];
-        const match = caseFile.notes.match(/REQUESTED MARKERS:\s*(.+)/i);
+        const notes = caseFile?.notes;
+        if (caseConfig.type !== 'VETTING' || !notes) return [];
+        const match = notes.match(/REQUESTED MARKERS:\s*(.+)/i);
         if (!match || !match[1]) return [];
         const codes = match[1].split(',').map(c => c.trim().toUpperCase()).filter(Boolean);
         return limitingMarkers.filter(m => codes.includes(m.code?.toUpperCase())).map(m => m.id);
@@ -242,8 +303,35 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
         return { job, title: job?.title || title || source };
     }, [caseFile?.referralSource, caseConfig.type, hrJobs]);
 
-    // Pre-fill clearance fields: for VETTING use requested values, otherwise use current member values
-    useEffect(() => {
+    // Pre-fill clearance fields: for VETTING use requested values, otherwise use
+    // current member values. This seeds *editable* form state (the user then edits
+    // it independently), so it is not a pure render-time value. It is performed via
+    // the React "adjust state during render" pattern with a prev-input tracker that
+    // reproduces the old effect exactly: the seed is reconsidered only when one of
+    // the tracked inputs changes (mirroring the effect's dependency array), and is
+    // applied only while the one-shot guard `linkedMember && !selectedLevelId`
+    // holds. Reconsidering only on input change is what prevents a render loop when
+    // the seed resolves to an empty level (the same role the dep array played).
+    // Security-sensitive: fields, values, the VETTING/non-VETTING branch and the
+    // guard are preserved byte-for-byte from the previous effect.
+    // Sentinel ensures the first render "considers" the seed exactly once, the way
+    // the effect always ran once on mount (a tracker seeded with the real current
+    // values would skip that first consideration).
+    const [prevClearanceSeedInputs, setPrevClearanceSeedInputs] = useState<{
+        linkedMember: typeof linkedMember | typeof CLEARANCE_SEED_SENTINEL;
+        selectedLevelId: string | typeof CLEARANCE_SEED_SENTINEL;
+        caseType: string;
+        requestedLevel: typeof requestedLevel;
+        requestedMarkerIds: typeof requestedMarkerIds;
+    }>({ linkedMember: CLEARANCE_SEED_SENTINEL, selectedLevelId: CLEARANCE_SEED_SENTINEL, caseType: caseConfig.type, requestedLevel, requestedMarkerIds });
+    const clearanceSeedInputsChanged =
+        !Object.is(prevClearanceSeedInputs.linkedMember, linkedMember) ||
+        !Object.is(prevClearanceSeedInputs.selectedLevelId, selectedLevelId) ||
+        !Object.is(prevClearanceSeedInputs.caseType, caseConfig.type) ||
+        !Object.is(prevClearanceSeedInputs.requestedLevel, requestedLevel) ||
+        !Object.is(prevClearanceSeedInputs.requestedMarkerIds, requestedMarkerIds);
+    if (clearanceSeedInputsChanged) {
+        setPrevClearanceSeedInputs({ linkedMember, selectedLevelId, caseType: caseConfig.type, requestedLevel, requestedMarkerIds });
         if (linkedMember && !selectedLevelId) {
             if (caseConfig.type === 'VETTING') {
                 setSelectedLevelId(requestedLevel?.id.toString() || linkedMember.clearanceLevel?.id.toString() || '');
@@ -254,7 +342,7 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
                 setSelectedMarkers(new Set(linkedMember.limitingMarkers?.map(m => m.id)));
             }
         }
-    }, [linkedMember, selectedLevelId, caseConfig.type, requestedLevel, requestedMarkerIds]);
+    }
 
     // --- ACTIONS ---
 
@@ -520,13 +608,6 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
         if (c === 'red') return `text-red-400 border-red-500/${opacity} bg-red-500/${Number(opacity) / 2}`;
         if (c === 'blue') return `text-blue-400 border-blue-500/${opacity} bg-blue-500/${Number(opacity) / 2}`;
         return `text-slate-400 border-slate-500/${opacity} bg-slate-500/${Number(opacity) / 2}`;
-    };
-
-    const StatusDot: React.FC<{ status: string }> = ({ status }) => {
-        let color = 'bg-slate-600';
-        if (status === 'clear') color = 'bg-green-500 shadow-green-500/50';
-        if (status === 'flagged') color = 'bg-red-500 shadow-red-500/50';
-        return <div className={`w-2 h-2 rounded-full ${color} shadow-[0_0_8px]`} />;
     };
 
     const canManage = hasPermission('hr:admin') || hasPermission('hr:manager');

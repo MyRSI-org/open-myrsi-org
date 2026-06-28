@@ -51,9 +51,12 @@ export default function FinancesView() {
 
     const visibleTabs = useMemo(() => TABS.filter((t) => !t.permission || hasPermission(t.permission)), [hasPermission]);
 
-    const refresh = useCallback(async () => {
+    // Pure fetch: guards on canView, then every setState runs after the awaited
+    // RPCs (or in finally). No synchronous setIsLoading(true) here, so this is
+    // safe to run directly from the mount effect. isLoading already initialises
+    // to true, so the spinner shows on mount with no extra render pass.
+    const fetchFinances = useCallback(async () => {
         if (!canView) return;
-        setIsLoading(true);
         try {
             const [ov, accs, led] = await Promise.all([
                 rpcAction('finance:get_overview', {}),
@@ -72,7 +75,21 @@ export default function FinancesView() {
         }
     }, [rpcAction, canView, addToast]);
 
-    useEffect(() => { refresh(); }, [refresh]);
+    // Imperative refresh for handlers (modal submits, tab refresh, realtime
+    // fallback): flips the spinner back on before refetching. Called from event
+    // handlers / other effects callbacks only, so the synchronous setIsLoading(true)
+    // here is not a set-in-effect. Guard order matches the original: when the
+    // viewer can't read finances we bail before touching the loading flag.
+    const refresh = useCallback(async () => {
+        if (!canView) return;
+        setIsLoading(true);
+        await fetchFinances();
+    }, [canView, fetchFinances]);
+
+    // Mount-time data fetch. Awaiting fetchFinances inside an async IIFE keeps
+    // every state update on the post-await path the rule recognises (no
+    // synchronous set-in-effect) — same timing as a bare call.
+    useEffect(() => { void (async () => { await fetchFinances(); })(); }, [fetchFinances]);
 
     // The overview tab is an aggregate (balances + pending counts + 30-day
     // net) — recompute-only; refreshed alongside every row splice below.
@@ -151,13 +168,15 @@ export default function FinancesView() {
         };
     }, [refresh, refreshOverview, rpcAction, canView]);
 
-    useEffect(() => {
-        // Auto-select the first active account for the ledger filter
-        if (selectedAccountId === null && accounts.length > 0) {
-            const firstActive = accounts.find((a) => a.isActive) || accounts[0];
-            setSelectedAccountId(firstActive.id);
-        }
-    }, [accounts, selectedAccountId]);
+    // Effective ledger filter: until the user explicitly picks an account
+    // (selectedAccountId !== null), default to the first active account (or the
+    // first account). Derived during render instead of via a set-state effect so
+    // there's no extra render pass; once the user selects, that choice wins.
+    const effectiveSelectedAccountId = useMemo(() => {
+        if (selectedAccountId !== null) return selectedAccountId;
+        if (accounts.length === 0) return null;
+        return (accounts.find((a) => a.isActive) || accounts[0]).id;
+    }, [selectedAccountId, accounts]);
 
     if (!canView) {
         return (
@@ -262,7 +281,7 @@ export default function FinancesView() {
                 {!isLoading && !firstRun && tab === 'ledger' && (
                     <FinancesLedgerTab
                         accounts={accounts}
-                        selectedAccountId={selectedAccountId}
+                        selectedAccountId={effectiveSelectedAccountId}
                         onSelectAccount={setSelectedAccountId}
                         entries={entries}
                         canManage={canManage}

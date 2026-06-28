@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { SpecializationTag } from '../../types';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -24,7 +24,15 @@ const SpecializationModal: React.FC<SpecializationModalProps> = ({ isOpen, onClo
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!tag;
 
-    useEffect(() => {
+    // Seed/reset the editable form when the modal opens or the edited tag
+    // changes while open. Adjusts state during render (React's documented
+    // pattern) instead of in an effect; the controlled fields must stay
+    // user-editable so they cannot be derived during render.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevTag, setPrevTag] = useState(tag);
+    if (isOpen !== prevIsOpen || tag !== prevTag) {
+        setPrevIsOpen(isOpen);
+        setPrevTag(tag);
         if (isOpen) {
             if (tag) {
                 setName(tag.name);
@@ -41,7 +49,7 @@ const SpecializationModal: React.FC<SpecializationModalProps> = ({ isOpen, onClo
             }
             setIsLoading(false);
         }
-    }, [isOpen, tag]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

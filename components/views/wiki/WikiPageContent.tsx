@@ -30,6 +30,26 @@ const WikiPageContent: React.FC<WikiPageContentProps> = ({
     const [menuStructureLocked, setMenuStructureLocked] = useState<boolean>(!!page.menuStructureLocked);
     const [isDeleting, setIsDeleting] = useState(false);
 
+    // Re-seed the editable copies of the page fields when the selected page.id
+    // changes (navigation). Done during render via a previous-value tracker
+    // (React re-renders before paint, so it is behavior-equivalent to the old
+    // [page.id] form-reset effect) instead of a synchronous setState in an
+    // effect. Keyed ONLY on page.id — exactly like the effect's single-dep
+    // array — so realtime updates to the OTHER page.* fields do not clobber the
+    // user's in-progress edits; the fields/values/guards below match the old
+    // effect (and handleCancel) verbatim.
+    const [prevPageId, setPrevPageId] = useState(page.id);
+    if (page.id !== prevPageId) {
+        setPrevPageId(page.id);
+        setIsEditing(false);
+        setShowSettings(false);
+        setEditTitle(page.title);
+        setClassificationLevel(page.classificationLevel);
+        setSelectedMarkerIds(page.limitingMarkers?.map((m) => m.id) || []);
+        setParentPageId(page.parentPageId);
+        setMenuStructureLocked(!!page.menuStructureLocked);
+    }
+
     const handleSave = async (contentJson: any) => {
         await onSave(page.id, {
             title: editTitle.trim() || page.title,
@@ -75,17 +95,6 @@ const WikiPageContent: React.FC<WikiPageContentProps> = ({
         setParentPageId(page.parentPageId);
         setMenuStructureLocked(!!page.menuStructureLocked);
     };
-
-    React.useEffect(() => {
-        setIsEditing(false);
-        setShowSettings(false);
-        setEditTitle(page.title);
-        setClassificationLevel(page.classificationLevel);
-        setSelectedMarkerIds(page.limitingMarkers?.map((m) => m.id) || []);
-        setParentPageId(page.parentPageId);
-        setMenuStructureLocked(!!page.menuStructureLocked);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on page.id flip; adding the other page.* fields would clobber the user's in-progress edits on realtime row updates.
-    }, [page.id]);
 
     if (isEditing) {
         return (

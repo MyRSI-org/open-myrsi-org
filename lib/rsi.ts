@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { log as baseLog } from './log.js';
+import { ssrfSafeFetch } from './ssrf.js';
 
 const log = baseLog.child({ module: 'lib.rsi' });
 
@@ -18,7 +19,11 @@ export async function verifyRsiHandle(rsiHandle: string, verificationCode: strin
     if (typeof verificationCode !== 'string' || verificationCode.length < 10) return false;
     try {
         const url = `https://robertsspaceindustries.com/citizens/${encodeURIComponent(rsiHandle)}`;
-        const response = await fetch(url, {
+        // The handle is user-supplied (reachable PRE-AUTH via auth:finalize_setup),
+        // so route this outbound request through the mandated SSRF guard: it pins
+        // the vetted DNS answer (defeats rebind/poisoning of the fixed public host),
+        // refuses redirects, and enforces the central response-body ceiling.
+        const response = await ssrfSafeFetch(url, {
             headers: {
                 // Setting a user-agent is good practice and can avoid some blocks
                 'User-Agent': 'MyRSI-Dashboard-Verification/1.0'
@@ -45,6 +50,6 @@ export async function verifyRsiHandle(rsiHandle: string, verificationCode: strin
             throw error;
         }
         // Generic error for network issues, etc.
-        throw new Error('Could not connect to RobertsSpaceIndustries.com to verify your handle. Please try again later.');
+        throw new Error('Could not connect to RobertsSpaceIndustries.com to verify your handle. Please try again later.', { cause: error });
     }
 }

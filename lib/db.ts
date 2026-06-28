@@ -1,6 +1,7 @@
 
 import { supabase, handleSupabaseError, getSystemRoles, broadcastToOrg } from './db/common.js';
 import { toUser, toRank, toUnit, toAnnouncement, toServiceRequest, toSpecializationTag, toCertification, toCommendation } from './db/mappers.js';
+import { redactRequestFeedbackForViewer } from './db/requests.js';
 
 import * as users from './db/users.js';
 import * as ops from './db/ops.js';
@@ -147,7 +148,10 @@ export async function getRequestsState(currentUser?: { id: number; role?: string
     const { data, error } = await query;
 
     handleSupabaseError({ error, message: 'Failed to get requests' });
-    return { requests: (data || []).map(r => toServiceRequest(r as unknown as Parameters<typeof toServiceRequest>[0])) };
+    // Strip the permission-gated free-text feedback per viewer (request:view:feedback).
+    // canSeeAllRequests admits any request:accept holder (every Member), so without
+    // this strip the candid feedback would cross the wire to all members.
+    return { requests: (data || []).map(r => redactRequestFeedbackForViewer(toServiceRequest(r as unknown as Parameters<typeof toServiceRequest>[0]), currentUser)) };
 }
 
 export async function getRequestDetail(requestId: string, currentUser?: { id: number; role?: string; permissions?: string[] } | null) {
@@ -169,7 +173,9 @@ export async function getRequestDetail(requestId: string, currentUser?: { id: nu
         const isResponder = (request.assignedMemberIds || []).includes(currentUser?.id as number);
         if (!isOwn && !isResponder) return null;
     }
-    return request;
+    // Redact the permission-gated free-text feedback for non-feedback viewers
+    // (mirrors the list path so detail/list can't drift).
+    return redactRequestFeedbackForViewer(request, currentUser);
 }
 
 export async function getAnnouncementsState(currentUser?: { role?: string; permissions?: string[] } | null) {

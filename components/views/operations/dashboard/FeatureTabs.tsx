@@ -38,22 +38,22 @@ export default function FeatureTabs() {
         return 'operations';
     });
 
-    useEffect(() => {
-        try { sessionStorage.setItem(STORAGE_KEY, active); } catch { /* ignore */ }
-    }, [active]);
+    // If the active tab disappears (feature disabled / perm lost), fall back to
+    // 'operations'. Derived during render so there's no corrective setState in
+    // an effect; the next user interaction overwrites `active` normally.
+    const effectiveActive: TabKey = tabs.some((t) => t.key === active) ? active : 'operations';
 
-    // If the active tab disappears (feature disabled / perm lost), fall back
     useEffect(() => {
-        if (!tabs.some((t) => t.key === active)) setActive('operations');
-    }, [active, tabs]);
+        try { sessionStorage.setItem(STORAGE_KEY, effectiveActive); } catch { /* ignore */ }
+    }, [effectiveActive]);
 
-    const current = tabs.find((t) => t.key === active) || tabs[0];
+    const current = tabs.find((t) => t.key === effectiveActive) || tabs[0];
 
     return (
         <div className="bg-slate-900/60 border border-slate-700/50 rounded-xl overflow-hidden shadow-xl">
             <div className="flex items-center gap-1 px-3 pt-3 overflow-x-auto scrollbar-hide border-b border-white/5 bg-slate-900/40">
                 {tabs.map((t) => {
-                    const isActive = active === t.key;
+                    const isActive = effectiveActive === t.key;
                     return (
                         <button
                             key={t.key}

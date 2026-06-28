@@ -9,9 +9,9 @@ interface SEOConfig {
 }
 
 export function useSEO(config: SEOConfig) {
-    useEffect(() => {
-        const { title, description, image, url } = config;
+    const { title, description, image, url } = config;
 
+    useEffect(() => {
         if (title) {
             document.title = title;
         }
@@ -49,6 +49,5 @@ export function useSEO(config: SEOConfig) {
         if (description) updateMeta('meta[name="twitter:description"]', 'content', description);
         if (image) updateMeta('meta[name="twitter:image"]', 'content', image);
 
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on the four specific config fields the effect updates; a whole-`config` dep would re-fire on every object identity change (since callers rarely memoize a literal config object).
-    }, [config.title, config.description, config.image, config.url]);
+    }, [title, description, image, url]);
 }

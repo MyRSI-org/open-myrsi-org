@@ -19,7 +19,7 @@ const RequestClearanceModal: React.FC<RequestClearanceModalProps> = ({ isOpen, o
     const { addToast } = useNotification();
 
     const [targetLevelId, setTargetLevelId] = useState<string>('');
-    const [requestedMarkers, setRequestedMarkers] = useState<Set<number>>(new Set());
+    const [requestedMarkers, setRequestedMarkers] = useState<Set<number>>(() => new Set());
     const [justification, setJustification] = useState('');
     const [isLoading, setIsLoading] = useState(false);
 

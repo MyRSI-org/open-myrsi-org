@@ -22,22 +22,38 @@ export default function WhTransferStockDialog({ isOpen, fromStock, onClose, onSu
     const [candidates, setCandidates] = useState<WarehouseStock[]>([]);
     const [loadingCandidates, setLoadingCandidates] = useState(false);
 
-    useEffect(() => {
+    // Reset the user-editable form fields whenever the dialog opens or the
+    // source stock changes, and flip the candidate-loading flag on at the same
+    // moment the async fetch below is about to start. Done during render via the
+    // React "adjust state during render" pattern (re-renders before paint), which
+    // is behaviour-equivalent to the previous open/id-change reset effect and to
+    // the synchronous setLoadingCandidates(true) at fetch start.
+    const fromStockId = fromStock?.id;
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    const [prevFromStockId, setPrevFromStockId] = useState(fromStockId);
+    if (isOpen !== prevIsOpen || fromStockId !== prevFromStockId) {
+        setPrevIsOpen(isOpen);
+        setPrevFromStockId(fromStockId);
         if (isOpen) {
             setToStockId('');
             setQuantity('');
             setNotes('');
             setSubmitting(false);
+            // Enter the loading state synchronously when (re)opening with a
+            // source stock — mirrors the old setLoadingCandidates(true) that ran
+            // at fetch start, so there is no spinner flash regression.
+            if (fromStock) setLoadingCandidates(true);
         }
-    }, [isOpen, fromStock?.id]);
+    }
 
     // Load other stocks of the same commodity when the dialog opens. Avoids
     // having to keep the full warehouseStock array in DataContext just for
     // this dropdown — the catalog filter limits the read to a handful of rows.
+    // The loading flag is flipped on above (render-time) so this effect only
+    // performs the async fetch and its async result sets.
     useEffect(() => {
         if (!isOpen || !fromStock) return;
         let cancelled = false;
-        setLoadingCandidates(true);
         rpcAction('warehouse:list_stock', { catalogId: fromStock.catalogId, limit: 200 })
             .then((rows: WarehouseStock[] | undefined) => {
                 if (cancelled) return;

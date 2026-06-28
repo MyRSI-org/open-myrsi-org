@@ -50,6 +50,23 @@ const n = (v: unknown, fallback = 0): number => {
     return fallback;
 };
 
+// Stable synthetic React key for the rare malformed server record that is missing its
+// own id. Keyed by object identity so the same record keeps the same key across
+// re-renders (unlike an array index, which shifts when the list mutates). This is a
+// render-only key; it never touches any submit payload.
+const synthKeys = new WeakMap<object, string>();
+let synthKeySeq = 0;
+const stableKey = (obj: unknown): string => {
+    if (obj == null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        return `k${synthKeySeq++}`;
+    }
+    const existing = synthKeys.get(obj as object);
+    if (existing) return existing;
+    const k = `k${synthKeySeq++}`;
+    synthKeys.set(obj as object, k);
+    return k;
+};
+
 const THREAT_LEVELS = [IntelThreatLevel.None, IntelThreatLevel.Low, IntelThreatLevel.Medium, IntelThreatLevel.High, IntelThreatLevel.Critical];
 
 const DossierView: React.FC<DossierViewProps> = ({
@@ -72,34 +89,49 @@ const DossierView: React.FC<DossierViewProps> = ({
 
     // Memoise the `? : []` derivations so the empty-array branch keeps a stable reference,
     // letting downstream memos recompute only when the dossier slice actually changes.
+    // The raw slices are read into locals so the memo body and dependency reference the
+    // same expression, letting the React Compiler preserve the manual memoization.
+    const rawReports = dossier?.reports;
+    const rawWarrants = dossier?.warrants;
     const reports: HydratedIntelligenceReport[] = useMemo(
-        () => Array.isArray(dossier?.reports) ? dossier.reports : [],
-        [dossier?.reports],
+        () => Array.isArray(rawReports) ? rawReports : [],
+        [rawReports],
     );
     const warrants = useMemo(
-        () => Array.isArray(dossier?.warrants) ? dossier.warrants : [],
-        [dossier?.warrants],
+        () => Array.isArray(rawWarrants) ? rawWarrants : [],
+        [rawWarrants],
     );
     const requests = Array.isArray(dossier?.requests) ? dossier.requests : [];
     const operations = Array.isArray(dossier?.operations) ? dossier.operations : [];
     const affiliates = Array.isArray(dossier?.affiliates) ? dossier.affiliates : [];
     const targetId = s(dossier?.targetId);
 
-    const [aiSummary, setAiSummary] = useState<string | null>(null);
+    // Seed the locally-editable AI summary from the dossier's cached summary (if any).
+    // `aiSummary` diverges from `dossier.cachedSummary` after the user clicks Generate
+    // (which sets fresh text without mutating the dossier prop), so it is editable state,
+    // not a pure derivation.
+    const seedSummary = (d: DossierData | undefined): string | null =>
+        typeof d?.cachedSummary === 'string' && d.cachedSummary.length > 0 ? d.cachedSummary : null;
+
+    const [aiSummary, setAiSummary] = useState<string | null>(() => seedSummary(dossier));
     const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
     const [activeTab, setActiveTab] = useState<'overview' | 'reports' | 'affiliations'>('overview');
     const [selectedReport, setSelectedReport] = useState<HydratedIntelligenceReport | null>(null);
-    const [systemTime, setSystemTime] = useState(new Date());
+    const [systemTime, setSystemTime] = useState(() => new Date());
     const [aiError, setAiError] = useState<string | null>(null);
 
-    useEffect(() => {
-        if (typeof dossier?.cachedSummary === 'string' && dossier.cachedSummary.length > 0) {
-            setAiSummary(dossier.cachedSummary);
-        } else {
-            setAiSummary(null);
-        }
+    // Reset the locally-editable AI summary/error state when the dossier target or its
+    // cached summary changes, using the React "adjust state during render" pattern with a
+    // previous-value tracker. This re-seeds before paint (no effect, no flash) and is
+    // behavior-equivalent to the old reset-on-id-change effect.
+    const [prevSummaryKey, setPrevSummaryKey] = useState<string | undefined>(dossier?.cachedSummary);
+    const [prevTargetKey, setPrevTargetKey] = useState<string | undefined>(dossier?.targetId);
+    if (dossier?.cachedSummary !== prevSummaryKey || dossier?.targetId !== prevTargetKey) {
+        setPrevSummaryKey(dossier?.cachedSummary);
+        setPrevTargetKey(dossier?.targetId);
+        setAiSummary(seedSummary(dossier));
         setAiError(null);
-    }, [dossier?.cachedSummary, dossier?.targetId]);
+    }
 
     useEffect(() => {
         const timer = setInterval(() => setSystemTime(new Date()), 1000);
@@ -142,8 +174,10 @@ const DossierView: React.FC<DossierViewProps> = ({
         if (!raw) return false;
         const lastGen = new Date(raw).getTime();
         if (isNaN(lastGen)) return false;
-        return (Date.now() - lastGen) < 24 * 60 * 60 * 1000;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: systemTime ticks every second to re-evaluate Date.now() against the 24h cooldown; removing it would freeze the cooldown check.
+        // Read the wall-clock time from `systemTime` (ticks every second) instead of
+        // calling Date.now() during render, keeping the memo pure while still
+        // re-evaluating the 24h cooldown on each tick.
+        return (systemTime.getTime() - lastGen) < 24 * 60 * 60 * 1000;
     }, [dossier?.cachedSummaryDate, systemTime]);
 
     const timeLeft = useMemo(() => {
@@ -151,12 +185,13 @@ const DossierView: React.FC<DossierViewProps> = ({
         if (!raw) return '';
         const lastGen = new Date(raw).getTime();
         if (isNaN(lastGen)) return '';
-        const diff = (lastGen + 24 * 60 * 60 * 1000) - Date.now();
+        // Same pattern as isLocked above — drive the countdown from the per-second
+        // `systemTime` tick rather than an impure Date.now() call during render.
+        const diff = (lastGen + 24 * 60 * 60 * 1000) - systemTime.getTime();
         if (diff <= 0) return '';
         const hours = Math.floor(diff / (1000 * 60 * 60));
         const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
         return `${hours}h ${mins}m`;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: same pattern as isLocked above — systemTime tick drives Date.now()-based countdown.
     }, [dossier?.cachedSummaryDate, systemTime]);
 
     const handleGenerateSummary = async () => {
@@ -217,6 +252,39 @@ const DossierView: React.FC<DossierViewProps> = ({
 
     const humanisedError = useMemo(() => aiError ? humaniseAiError(aiError) : null, [aiError]);
 
+    // AI Analysis Card header derivations — computed here (instead of an IIFE in JSX)
+    // so the React Compiler can optimize them. Pure string derivations, no side effects.
+    const aiAvailable = !!aiConfig.enabled;
+    const aiHeaderAccent = !aiAvailable
+        ? 'bg-slate-700/30 border border-slate-600/40 text-slate-400'
+        : humanisedError
+            ? (humanisedError.kind === 'quota' ? 'bg-amber-500/10 border border-amber-500/30 text-amber-300' : 'bg-red-500/10 border border-red-500/30 text-red-300')
+            : 'bg-indigo-500/10 border border-indigo-500/30 text-indigo-300';
+    const aiHeaderIcon = !aiAvailable
+        ? 'fa-key'
+        : humanisedError
+            ? (humanisedError.kind === 'quota' ? 'fa-clock' : 'fa-circle-exclamation')
+            : 'fa-microchip';
+    const aiSubtitle = !aiAvailable
+        ? 'Awaiting configuration'
+        : humanisedError
+            ? humanisedError.title
+            : aiSummary
+                ? 'Analysis available'
+                : 'Ready to scan';
+
+    // Split the (immutable) AI summary into header/body tokens for rendering. The whole
+    // list is regenerated wholesale whenever `aiSummary` changes and is never reordered,
+    // so the array index is a stable, collision-free key per summary (a char-offset key
+    // collides when split() emits a zero-length leading token before a header).
+    const summaryParts = useMemo(() => {
+        if (!aiSummary) return [];
+        return aiSummary.split(/(\[\d\.\d\].*)/).map((part, i) => {
+            const isHeader = typeof part === 'string' && part.startsWith('[') && part.includes(']');
+            return { key: `p${i}`, part, isHeader };
+        });
+    }, [aiSummary]);
+
     const statItems: { label: string; value: number; icon: string; accent: keyof typeof ACCENTS }[] = [
         { label: 'Reports', value: reports.length, icon: 'fa-file-lines', accent: 'sky' },
         ...(!isOrg ? [
@@ -232,6 +300,19 @@ const DossierView: React.FC<DossierViewProps> = ({
         { id: 'reports' as const, label: 'Intel Reports', icon: 'fa-file-lines', count: reports.length },
         { id: 'affiliations' as const, label: isOrg ? 'Known Members' : 'Affiliations', icon: isOrg ? 'fa-users' : 'fa-diagram-project', count: affiliates.length },
     ];
+
+    // The drilldown stack is an ordered path where the same target id can legitimately
+    // repeat (cycles), so a breadcrumb's stable identity is its cumulative path prefix
+    // (e.g. "A", "A>A", "A>A>B") rather than its bare position. Precompute that key here so
+    // it stays stable as the stack only grows/shrinks at the end.
+    const breadcrumbCrumbs = useMemo(
+        () => breadcrumbStack.map((id, idx) => ({
+            id,
+            idx,
+            key: breadcrumbStack.slice(0, idx + 1).join('›'),
+        })),
+        [breadcrumbStack],
+    );
 
     return (
         <div className="h-full flex flex-col overflow-y-auto custom-scrollbar animate-fade-in bg-slate-950">
@@ -307,10 +388,10 @@ const DossierView: React.FC<DossierViewProps> = ({
                         >
                             <i className="fa-solid fa-house text-[10px]" aria-hidden /> Intel Hub
                         </button>
-                        {breadcrumbStack.map((id, idx) => {
+                        {breadcrumbCrumbs.map(({ id, idx, key }) => {
                             const isLast = idx === breadcrumbStack.length - 1;
                             return (
-                                <React.Fragment key={`${id}-${idx}`}>
+                                <React.Fragment key={key}>
                                     <i className="fa-solid fa-chevron-right text-[9px] text-slate-700" aria-hidden />
                                     {isLast ? (
                                         <span className="text-rose-300 font-bold whitespace-nowrap truncate max-w-[180px] inline-flex items-center gap-1.5" title={id}>
@@ -389,37 +470,20 @@ const DossierView: React.FC<DossierViewProps> = ({
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                         <div className="lg:col-span-2 space-y-6">
                             {/* AI Analysis Card — always rendered. When AI isn't configured for the
-                                org, the Generate button is disabled and the empty state explains why. */}
-                            {(() => {
-                                const aiAvailable = !!aiConfig.enabled;
-                                const headerAccent = !aiAvailable
-                                    ? 'bg-slate-700/30 border border-slate-600/40 text-slate-400'
-                                    : humanisedError
-                                        ? (humanisedError.kind === 'quota' ? 'bg-amber-500/10 border border-amber-500/30 text-amber-300' : 'bg-red-500/10 border border-red-500/30 text-red-300')
-                                        : 'bg-indigo-500/10 border border-indigo-500/30 text-indigo-300';
-                                const headerIcon = !aiAvailable
-                                    ? 'fa-key'
-                                    : humanisedError
-                                        ? (humanisedError.kind === 'quota' ? 'fa-clock' : 'fa-circle-exclamation')
-                                        : 'fa-microchip';
-                                const subtitle = !aiAvailable
-                                    ? 'Awaiting configuration'
-                                    : humanisedError
-                                        ? humanisedError.title
-                                        : aiSummary
-                                            ? 'Analysis available'
-                                            : 'Ready to scan';
-                                return (
+                                org, the Generate button is disabled and the empty state explains why.
+                                Header derivations (aiAvailable / aiHeaderAccent / aiHeaderIcon /
+                                aiSubtitle) are computed in the component body above. */}
+                            {(
                                 <div className="rounded-xl border border-white/10 bg-slate-900/40 overflow-hidden">
                                     <div className="px-5 py-3 bg-slate-950/40 border-b border-white/5 flex justify-between items-center gap-3">
                                         <div className="flex items-center gap-3 min-w-0">
-                                            <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${headerAccent}`}>
-                                                <i className={`fa-solid ${headerIcon}`} aria-hidden />
+                                            <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${aiHeaderAccent}`}>
+                                                <i className={`fa-solid ${aiHeaderIcon}`} aria-hidden />
                                             </div>
                                             <div className="min-w-0">
                                                 <h3 className="text-sm font-bold text-white">AI Tactical Analysis</h3>
                                                 <p className="text-[10px] text-slate-500 uppercase tracking-widest">
-                                                    {subtitle}
+                                                    {aiSubtitle}
                                                     {aiAvailable && aiSummary && !humanisedError && dossier.cachedSummaryDate && (
                                                         <span className="text-slate-600 normal-case tracking-normal"> · generated {timeAgoShort(dossier.cachedSummaryDate)} ago</span>
                                                     )}
@@ -494,16 +558,16 @@ const DossierView: React.FC<DossierViewProps> = ({
                                         {/* Summary available — render even if AI was later disabled, so cached summaries stay visible */}
                                         {aiSummary && (
                                             <div className="text-slate-300 leading-relaxed text-sm whitespace-pre-wrap font-mono">
-                                                {aiSummary.split(/(\[\d\.\d\].*)/).map((part, i) => {
-                                                    if (typeof part === 'string' && part.startsWith('[') && part.includes(']')) {
+                                                {summaryParts.map(({ key, part, isHeader }) => {
+                                                    if (isHeader) {
                                                         return (
-                                                            <div key={i} className="inline-flex items-center gap-2 mt-6 mb-3 pb-2 text-base font-black tracking-widest text-indigo-300 border-b border-indigo-500/20 w-full not-first:mt-8">
+                                                            <div key={key} className="inline-flex items-center gap-2 mt-6 mb-3 pb-2 text-base font-black tracking-widest text-indigo-300 border-b border-indigo-500/20 w-full not-first:mt-8">
                                                                 <i className="fa-solid fa-bookmark text-indigo-400 text-sm" aria-hidden />
                                                                 <span>{part}</span>
                                                             </div>
                                                         );
                                                     }
-                                                    return <span key={i}>{s(part)}</span>;
+                                                    return <span key={key}>{s(part)}</span>;
                                                 })}
                                             </div>
                                         )}
@@ -518,8 +582,7 @@ const DossierView: React.FC<DossierViewProps> = ({
                                         )}
                                     </div>
                                 </div>
-                                );
-                            })()}
+                            )}
 
                             {/* Active Warrants (detailed) */}
                             {!isOrg && activeWarrants.length > 0 && (
@@ -530,14 +593,14 @@ const DossierView: React.FC<DossierViewProps> = ({
                                         <span className="text-[10px] font-mono font-bold text-red-400/60 ml-auto">{activeWarrants.length}</span>
                                     </div>
                                     <div className="divide-y divide-white/5">
-                                        {activeWarrants.map((w, idx) => {
+                                        {activeWarrants.map((w) => {
                                             const wId = s(w.id);
                                             const wAction = s(w.action);
                                             const wReason = s(w.reason);
                                             const wIssuedAt = formatDateCompact(w.issuedAt, fmt.prefs);
                                             const wReward = n(w.uecReward);
                                             return (
-                                                <div key={wId || idx} className="p-4 flex justify-between items-start gap-4 hover:bg-red-500/5 transition-colors">
+                                                <div key={wId || stableKey(w)} className="p-4 flex justify-between items-start gap-4 hover:bg-red-500/5 transition-colors">
                                                     <div className="flex-1 min-w-0">
                                                         <div className="flex items-center gap-3 mb-1">
                                                             <span className="text-xs font-black text-red-300 uppercase tracking-widest">{wAction} Advisory</span>
@@ -667,7 +730,7 @@ const DossierView: React.FC<DossierViewProps> = ({
                     <div className="pb-8">
                         {affiliates.length > 0 ? (
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                {affiliates.map((aff: any, idx: number) => {
+                                {affiliates.map((aff: any) => {
                                     const affTargetId = s(aff?.targetId);
                                     const affThreat = s(aff?.threatLevel) as IntelThreatLevel;
                                     const affDate = formatDateCompact(aff?.lastReportedAt, fmt.prefs);
@@ -675,7 +738,7 @@ const DossierView: React.FC<DossierViewProps> = ({
                                     const affAlarm = threatIsAlarm(affThreat);
                                     return (
                                         <button
-                                            key={affTargetId || idx}
+                                            key={affTargetId || stableKey(aff)}
                                             onClick={() => onDrilldown(affTargetId)}
                                             className="group relative rounded-xl overflow-hidden border border-white/10 bg-linear-to-br from-slate-900/80 via-slate-900/60 to-slate-950/80 p-4 text-left hover:border-white/20 hover:shadow-xl transition-all"
                                         >

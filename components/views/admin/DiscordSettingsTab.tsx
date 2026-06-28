@@ -41,15 +41,20 @@ const DiscordSettingsTab: React.FC = () => {
 
     // Sync local state from discordConfig. Any referential change to discordConfig
     // means a fresh server snapshot, so flip configLoaded immediately rather than
-    // gating on whether channel IDs are populated.
-    useEffect(() => {
-        if (!discordConfig) return;
+    // gating on whether channel IDs are populated. The locally-editable channel fields
+    // must not be derived during render (that would discard in-progress user edits), so
+    // we re-seed them via the adjust-state-during-render pattern (previous-value tracker)
+    // on the exact same condition and with the exact same values/guard as the old effect.
+    // (https://react.dev/reference/react/useState#storing-information-from-previous-renders)
+    const [prevDiscordConfig, setPrevDiscordConfig] = useState<typeof discordConfig | null>(null);
+    if (discordConfig && discordConfig !== prevDiscordConfig) {
+        setPrevDiscordConfig(discordConfig);
         setNewRequestChannelId(discordConfig.newRequestChannelId || '');
         setIntelChannelId(discordConfig.intelChannelId || '');
         setEamChannelId(discordConfig.eamChannelId || '');
         setDefaultOperationAnnounceChannelId(discordConfig.defaultOperationAnnounceChannelId || '');
         setConfigLoaded(true);
-    }, [discordConfig]);
+    }
 
     // --- Role Mapping State ---
     const [isFetching, setIsFetching] = useState(false);

@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { useData } from '../../contexts/DataContext';
 import apiService from '../../services/apiService';
 import BulkActionShell from '../shared/BulkActionShell';
@@ -30,14 +30,24 @@ const BulkPromoteToMemberModal: React.FC<Props> = ({ selectedUsers, onClose }) =
         });
     };
 
+    // Latest values for the one-shot completion side-effect below. Updated every
+    // render (in an effect, before the auto-close effect) so the auto-close can
+    // read current props/state without listing them as triggers — it must fire
+    // only on bulk.state transitions, not when aggregate/onClose/refresh change.
+    const completionRef = useRef({ targetIds, aggregate: bulk.aggregate, addToast, refreshMainState, onClose });
+    useEffect(() => {
+        completionRef.current = { targetIds, aggregate: bulk.aggregate, addToast, refreshMainState, onClose };
+    });
+
     useEffect(() => {
         if (bulk.state === 'done' || bulk.state === 'cancelled') {
+            const { targetIds, aggregate, addToast, refreshMainState, onClose } = completionRef.current;
             const total = targetIds.length;
             const wasCancelled = bulk.state === 'cancelled';
-            const parts: string[] = [`Promoted ${bulk.aggregate.updated}`];
-            if (bulk.aggregate.skipped > 0) parts.push(`${bulk.aggregate.skipped} skipped`);
+            const parts: string[] = [`Promoted ${aggregate.updated}`];
+            if (aggregate.skipped > 0) parts.push(`${aggregate.skipped} skipped`);
             const msg = wasCancelled
-                ? `Cancelled — updated ${bulk.aggregate.updated} of ${total}`
+                ? `Cancelled — updated ${aggregate.updated} of ${total}`
                 : parts.join(', ');
             addToast(
                 msg,
@@ -48,7 +58,6 @@ const BulkPromoteToMemberModal: React.FC<Props> = ({ selectedUsers, onClose }) =
             const id = window.setTimeout(onClose, 1500);
             return () => window.clearTimeout(id);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional auto-close on bulk completion: keyed on bulk.state transitions only; aggregate fields and onClose/refreshMainState are read for the one-shot toast/close, not as triggers.
     }, [bulk.state]);
 
     const isRunning = bulk.state === 'running';

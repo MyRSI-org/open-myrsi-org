@@ -12,7 +12,7 @@ import {
     type OperationAnnouncementEmbedInput,
 } from '../../lib/discord.js';
 import { log as baseLog } from '../../lib/log.js';
-import { passesClearance } from '../../lib/clearance.js';
+import { passesClearance, canViewAllClassifications } from '../../lib/clearance.js';
 import { assertAiRateLimit } from '../../lib/aiRateLimit.js';
 import type {
     OperationPayoutMode,
@@ -326,9 +326,22 @@ export const operationActions = {
         // the caller's clearance. Owner and operations:manage holders bypass
         // (mirrors getOperations()).
         const isOwner = op.ownerId === user?.id;
+        const canManage = canViewAllClassifications(user, ['operations:manage']);
         if (!isOwner && !passesClearance(user, op.clearanceLevel, op.limitingMarkers, ['operations:manage'])) {
             throw new Error('Insufficient clearance to view this operation.');
         }
+        // Special operations are invite-only: their planning content
+        // (roe / commander notes / comms plan / tasks / board) is readable only by
+        // the owner, operations:manage holders, and ACTIVE participants — mirrors
+        // the client `hasAccess` gate and canUserSeeOpInList / assertOpVisibleToUser
+        // so list / slice / detail / action gates can't drift. A clearance-0
+        // special op must not be openable by every member.
+        if (op.isSpecial && !isOwner && !canManage
+            && !op.participants?.some(p => p.userId === user?.id && p.timeLeft == null)) {
+            throw new Error('Insufficient access to view this special operation.');
+        }
+        // Strip the join PIN for anyone but the owner / managers.
+        if (!isOwner && !canManage) op.joinCode = undefined;
         return op;
     },
     'operation:delete': async ({ operationId, userId }: DeletePayload) => {
@@ -466,7 +479,10 @@ export const operationActions = {
     // clearance predicate (assertOpVisibleToUser) — without it a member could
     // join/write to ops the list/detail gates hide from them.
     'operation:join': async ({ operationId, userId, joinCode, user }: JoinPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
-        await db.assertOpVisibleToUser(operationId, user);
+        // isJoinAttempt: a first-time joiner isn't yet a participant, so the
+        // special-op participation gate must be skipped here — the join PIN
+        // (checked in joinOperation) is the invite. Clearance is still enforced.
+        await db.assertOpVisibleToUser(operationId, user, { isJoinAttempt: true });
         return db.joinOperation(operationId, userId, joinCode);
     },
     'operation:leave': async ({ operationId, targetUserId, userId, user }: LeavePayload) => {
@@ -518,7 +534,9 @@ export const operationActions = {
     },
     'operation:reset_readiness': ({ operationId }: ResetReadinessPayload) => db.resetOperationReadiness(operationId),
     'operation:join_with_role': async ({ operationId, userId, roleRequested, shipUtilized, joinCode, shipId, userShipId, user }: JoinWithRolePayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
-        await db.assertOpVisibleToUser(operationId, user);
+        // See operation:join — the join PIN gates special-op joins, so exempt this
+        // path from the participation gate while keeping the clearance check.
+        await db.assertOpVisibleToUser(operationId, user, { isJoinAttempt: true });
         return db.joinOperation(operationId, userId, joinCode, roleRequested, shipUtilized, shipId, userShipId);
     },
     'operation:update_participant': ({ operationId, targetUserId, updates }: UpdateParticipantPayload) => db.updateOperationParticipant(operationId, targetUserId, updates),

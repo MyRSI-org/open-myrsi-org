@@ -48,12 +48,19 @@ export default function OnboardingWizard() {
 
     // Advance forward only when auth state implies a later step (OAuth return → claim;
     // finalize → import). Never moves backwards (e.g. while on import/congrats).
-    useEffect(() => {
-        setStep((s) => {
-            const want: Step = currentUser ? 'import' : pendingUser ? (pendingUser.adminSetupToken ? 'rsi' : 'claim') : s;
-            return STEP_ORDER.indexOf(want) > STEP_ORDER.indexOf(s) ? want : s;
-        });
-    }, [currentUser, pendingUser]);
+    // Implemented with React's "adjust state during render" pattern + a previous-value
+    // tracker on the auth-derived target step: when that target changes (OAuth
+    // round-trip / reload) we ratchet `step` forward, never to an equal-or-earlier
+    // step. Runs during render (before paint), so it is equivalent to the old
+    // reconcile-in-effect and cannot loop (the ratchet only ever advances).
+    const wantStep: Step | null = currentUser ? 'import' : pendingUser ? (pendingUser.adminSetupToken ? 'rsi' : 'claim') : null;
+    const [prevWantStep, setPrevWantStep] = useState(wantStep);
+    if (wantStep !== prevWantStep) {
+        setPrevWantStep(wantStep);
+        if (wantStep && STEP_ORDER.indexOf(wantStep) > STEP_ORDER.indexOf(step)) {
+            setStep(wantStep);
+        }
+    }
 
     const go = (s: Step) => setStep(s);
     const activeIdx = STEP_ORDER.indexOf(step);
@@ -166,7 +173,27 @@ function PreflightStep({ onNext }: { onNext: () => void }) {
         finally { setLoading(false); }
     }, []);
 
-    useEffect(() => { void check(); }, [check]);
+    // Fetch on mount. `loading` already initialises to true and `error` to '',
+    // so the effect performs ONLY the async fetch (no synchronous pre-fetch
+    // setState) — its setStatus/setError/setLoading(false) all run after the
+    // await, off the synchronous render path. Behaviourally identical to the old
+    // `void check()` on mount (whose leading setLoading(true)/setError('') were
+    // no-ops against the initial state). The "Re-check" button still calls
+    // check(), which does the synchronous reset in an event handler.
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const result = (await apiService.preflight()) || null;
+                if (!cancelled) setStatus(result);
+            } catch (e) {
+                if (!cancelled) setError(e instanceof Error ? e.message : 'Preflight failed');
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     const criticalOk = !!status && CHECKS.filter(c => c.critical).every(c => status[c.key]);
     const anyRestartNeeded = !!status && CHECKS.some(c => !status[c.key] && c.requiresRestart);
@@ -336,14 +363,17 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
     const [parseError, setParseError] = useState('');
     const [running, setRunning] = useState(false);
     const [pct, setPct] = useState(0);
-    const [logLines, setLogLines] = useState<string[]>([]);
+    const [logLines, setLogLines] = useState<{ id: number; text: string }[]>([]);
     const [done, setDone] = useState(false);
     const [error, setError] = useState('');
     const [users, setUsers] = useState<ImportUserOption[]>([]);
     const [mergeUserId, setMergeUserId] = useState<number | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
+    // Monotonic id source for log lines so each entry has a stable, unique key
+    // (the text is non-unique and the array index is unstable across resets).
+    const logIdRef = useRef(0);
 
-    const pushLog = (line: string) => setLogLines((l) => [...l, line]);
+    const pushLog = (line: string) => setLogLines((l) => [...l, { id: logIdRef.current++, text: line }]);
     useEffect(() => { logRef.current?.scrollTo({ top: logRef.current.scrollHeight }); }, [logLines]);
 
     const onFile = (file: File) => {
@@ -438,7 +468,7 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
                         <div className={`h-full ${error ? 'bg-rose-500' : done ? 'bg-emerald-500' : 'bg-sky-500'} transition-all duration-300`} style={{ width: `${pct}%` }} />
                     </div>
                     <div ref={logRef} className="h-40 overflow-y-auto rounded-lg border border-white/5 bg-slate-950 p-3 font-mono text-[11px] text-slate-400 space-y-0.5">
-                        {logLines.map((l, i) => <div key={i} className={l.startsWith('⚠') ? 'text-amber-400' : l.startsWith('✗') ? 'text-rose-400' : ''}>{l}</div>)}
+                        {logLines.map((l) => <div key={l.id} className={l.text.startsWith('⚠') ? 'text-amber-400' : l.text.startsWith('✗') ? 'text-rose-400' : ''}>{l.text}</div>)}
                     </div>
                 </div>
             )}

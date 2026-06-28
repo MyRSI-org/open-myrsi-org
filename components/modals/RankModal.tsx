@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Rank } from '../../types';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -21,20 +21,29 @@ const RankModal: React.FC<RankModalProps> = ({ isOpen, onClose, rank }) => {
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!rank;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (rank) {
-                setName(rank.name);
-                setIconUrl(rank.iconUrl);
-                setSortOrder(rank.sortOrder || 0);
-            } else {
-                setName('');
-                setIconUrl('');
-                setSortOrder(0);
-            }
-            setIsLoading(false);
+    // Reset/seed the user-editable form fields when the dialog opens or the
+    // selected rank changes while open. Done during render via the React
+    // "adjust state during render" pattern (re-renders before paint), which is
+    // behaviour-equivalent to the previous open/selection-change reset effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevRank, setPrevRank] = useState(rank);
+    if (isOpen && (isOpen !== prevIsOpen || rank !== prevRank)) {
+        setPrevIsOpen(isOpen);
+        setPrevRank(rank);
+        if (rank) {
+            setName(rank.name);
+            setIconUrl(rank.iconUrl);
+            setSortOrder(rank.sortOrder || 0);
+        } else {
+            setName('');
+            setIconUrl('');
+            setSortOrder(0);
         }
-    }, [isOpen, rank]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || rank !== prevRank) {
+        setPrevIsOpen(isOpen);
+        setPrevRank(rank);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

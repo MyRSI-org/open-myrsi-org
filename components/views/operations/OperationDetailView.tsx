@@ -44,7 +44,7 @@ const PHASE_STEPS = [
 ] as const;
 
 const MissionClock: React.FC<{ operation: HydratedOperation }> = ({ operation }) => {
-    const [now, setNow] = useState(Date.now());
+    const [now, setNow] = useState(() => Date.now());
 
     useEffect(() => {
         if (operation.status !== OperationStatus.Active && operation.status !== OperationStatus.Scheduled) return;
@@ -121,7 +121,12 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
         }
     }, [rpcAction, initialOperation.id]);
 
-    useEffect(() => { fetchFullDetails(); }, [fetchFullDetails]);
+    // fetchFullDetails awaits a network RPC before its setFullDetails call, so the
+    // state update is already off the synchronous effect path. Awaiting it inside
+    // an inline async function makes that deferral explicit (the setState happens
+    // in an async continuation, not the effect body) without changing timing:
+    // both forms fire-and-forget the same promise after the same awaited RPC.
+    useEffect(() => { void (async () => { await fetchFullDetails(); })(); }, [fetchFullDetails]);
 
     // Refetch the per-op detail bundle when a realtime operation_update broadcast lands.
     // Gated by id so unrelated ops don't refetch; trailing-debounced so a burst of remote
@@ -208,41 +213,53 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
 
     // Recover from a stale activeSection when the available nav items change
     // (e.g. operation moves out of Active — 'live-status' is no longer valid).
-    useEffect(() => {
-        const canManageOp = currentUser?.id === operation.ownerId || hasPermission('operations:manage');
-        const isActiveOp = operation.status === OperationStatus.Active;
-        const valid = new Set<OpSection>([
-            'situation', 'mission', 'execution', 'admin-logistics', 'command-signals',
-            ...(isActiveOp ? ['live-status', 'live-overview'] as const : []),
-            ...(isActiveOp && canManageOp ? ['live-command'] as const : []),
-            ...(canManageOp ? ['administer'] as const : []),
-            ...(operation.status === OperationStatus.Concluded ? ['aar'] as const : []),
-        ]);
-        if (!valid.has(activeSection)) setActiveSection('situation');
-    }, [operation.status, operation.ownerId, currentUser?.id, hasPermission, activeSection]);
+    // activeSection is user-controlled persistent state (localStorage + nav
+    // clicks), so it is clamped (not derived): the adjustment only fires when the
+    // current selection is no longer valid. Running this during render (React's
+    // documented "adjust state during render" pattern) is behavior-equivalent to
+    // the old effect — the guard is self-terminating because 'situation' is always
+    // valid, so the next render leaves it untouched.
+    const canManageOp = currentUser?.id === operation.ownerId || hasPermission('operations:manage');
+    const isActiveOp = operation.status === OperationStatus.Active;
+    const validSections = new Set<OpSection>([
+        'situation', 'mission', 'execution', 'admin-logistics', 'command-signals',
+        ...(isActiveOp ? ['live-status', 'live-overview'] as const : []),
+        ...(isActiveOp && canManageOp ? ['live-command'] as const : []),
+        ...(canManageOp ? ['administer'] as const : []),
+        ...(operation.status === OperationStatus.Concluded ? ['aar'] as const : []),
+    ]);
+    if (!validSections.has(activeSection)) setActiveSection('situation');
 
     // Op Radio — lives at this level so it persists across tab switches
     const opRadio = useOpRadio(initialOperation.id);
+    // Destructure the members the effects below depend on into plain locals so the
+    // exhaustive-deps linter can track each one individually instead of the unstable
+    // opRadio object (which is a fresh reference every render).
+    const { isConnected: opRadioIsConnected, disconnect: opRadioDisconnect, handlePTT: opRadioHandlePTT } = opRadio;
     const [isOpRadioOpen, setIsOpRadioOpen] = useState(false);
     const [opRadioBannerDismissed, setOpRadioBannerDismissed] = useState(false);
     const { isEnabled: isTacticalRadioEnabled, setIsEnabled: setTacticalRadioEnabled, disconnect: disconnectTacticalRadio } = useRadio();
 
-    // Disconnect tactical radio when op radio connects (prevent dual-transmit)
+    // Disconnect tactical radio when op radio connects (prevent dual-transmit).
+    // Edge-trigger on the op-radio connect transition (rising edge) via a prev-value
+    // ref, so re-runs caused by the conditional-only deps are no-ops — only an actual
+    // disconnected→connected transition acts.
+    const prevOpRadioConnectedRef = useRef(opRadioIsConnected);
     useEffect(() => {
-        if (opRadio.isConnected && isTacticalRadioEnabled) {
+        const justConnected = opRadioIsConnected && !prevOpRadioConnectedRef.current;
+        prevOpRadioConnectedRef.current = opRadioIsConnected;
+        if (justConnected && isTacticalRadioEnabled) {
             disconnectTacticalRadio();
             setTacticalRadioEnabled(false);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: trigger ONLY on opRadio.isConnected transitions; the other fields are read for the conditional, not as triggers.
-    }, [opRadio.isConnected]);
+    }, [opRadioIsConnected, isTacticalRadioEnabled, disconnectTacticalRadio, setTacticalRadioEnabled]);
 
     // Auto-disconnect op radio when operation leaves Active
     useEffect(() => {
-        if (operation.status !== OperationStatus.Active && opRadio.isConnected) {
-            opRadio.disconnect();
+        if (operation.status !== OperationStatus.Active && opRadioIsConnected) {
+            opRadioDisconnect();
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: trigger ONLY on operation.status; adding opRadio would re-fire on every PTT state change.
-    }, [operation.status]);
+    }, [operation.status, opRadioIsConnected, opRadioDisconnect]);
 
     const floatingPttRef = useRef<HTMLButtonElement>(null);
 
@@ -250,16 +267,15 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
     useEffect(() => {
         const btn = floatingPttRef.current;
         if (!btn) return;
-        const onTouchStart = (e: TouchEvent) => { e.preventDefault(); opRadio.handlePTT(true); };
-        const onTouchEnd = (e: TouchEvent) => { e.preventDefault(); opRadio.handlePTT(false); };
+        const onTouchStart = (e: TouchEvent) => { e.preventDefault(); opRadioHandlePTT(true); };
+        const onTouchEnd = (e: TouchEvent) => { e.preventDefault(); opRadioHandlePTT(false); };
         btn.addEventListener('touchstart', onTouchStart, { passive: false });
         btn.addEventListener('touchend', onTouchEnd, { passive: false });
         return () => {
             btn.removeEventListener('touchstart', onTouchStart);
             btn.removeEventListener('touchend', onTouchEnd);
         };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on opRadio.handlePTT identity (the only piece used at handler-creation time); adding the full opRadio object would re-bind the touch listeners on every PTT state change.
-    }, [opRadio.handlePTT]);
+    }, [opRadioHandlePTT]);
 
     const joinCodeRef = useRef('');
     const [alliedShips, setAlliedShips] = useState<UserShip[]>([]);
@@ -568,8 +584,8 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
                             onChange={(e) => setActiveSection(e.target.value as OpSection)}
                             className="w-full bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 text-sm font-bold text-white focus:ring-1 focus:ring-purple-500/50 focus:border-purple-500/40 outline-hidden appearance-none transition-all"
                         >
-                            {navGroups.map((group, idx) => (
-                                <optgroup key={idx} label={group.title} className="bg-slate-900 text-slate-400">
+                            {navGroups.map((group) => (
+                                <optgroup key={group.title} label={group.title} className="bg-slate-900 text-slate-400">
                                     {group.items.map(item => (
                                         <option key={item.id} value={item.id} className="text-white">{item.label}</option>
                                     ))}
@@ -584,8 +600,8 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
 
                 {/* Desktop sidebar */}
                 <div className="hidden lg:flex flex-col shrink-0 w-56 border-r border-slate-800/60 bg-slate-900/40 overflow-y-auto custom-scrollbar py-5 px-3 gap-5">
-                    {navGroups.map((group, idx) => (
-                        <div key={idx} className="space-y-0.5">
+                    {navGroups.map((group) => (
+                        <div key={group.title} className="space-y-0.5">
                             <p className="px-3 text-[9px] font-black text-slate-500 uppercase tracking-[0.2em] mb-1.5">{group.title}</p>
                             {group.items.map(item => {
                                 const active = activeSection === item.id;
@@ -739,11 +755,11 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
                                 <div className="px-3 py-2 border-b border-slate-800/50">
                                     <p className="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-1.5">{opRadio.participants.length} Connected</p>
                                     <div className="flex flex-wrap gap-1.5">
-                                        {opRadio.participants.map((name, i) => {
+                                        {opRadio.participants.map((name) => {
                                             const isSpeaking = opRadio.activeSpeakers.includes(name) || (name === opRadio.participants[0] && opRadio.isTransmitting);
                                             return (
                                                 <span
-                                                    key={i}
+                                                    key={name}
                                                     className={`text-[10px] px-2 py-0.5 rounded transition-all ${
                                                         isSpeaking
                                                             ? 'bg-amber-500/25 text-amber-300 ring-1 ring-amber-500/50 shadow-[0_0_6px_rgba(245,158,11,0.3)]'

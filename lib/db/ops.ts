@@ -2,7 +2,7 @@
 
 import { HydratedOperation, User, UserRole, OperationTemplatePayload } from '../../types.js';
 import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, broadcastToChannel } from './common.js';
-import { passesClearance, assertCanClassify, type ClearanceUser } from '../clearance.js';
+import { passesClearance, canViewAllClassifications, assertCanClassify, type ClearanceUser } from '../clearance.js';
 import { sendPushToUsers } from '../push.js';
 import { toHydratedOperation, minifyUser } from './mappers.js';
 import { getUserById } from './users.js';
@@ -173,10 +173,48 @@ export type OpViewer = { id?: number | string } & ClearanceUser;
 
 export function canUserSeeOpInList(
     user: OpViewer,
-    op: Pick<HydratedOperation, 'clearanceLevel'> & { ownerId?: number | null; limitingMarkers?: unknown[] },
+    op: Pick<HydratedOperation, 'clearanceLevel'> & {
+        ownerId?: number | null;
+        limitingMarkers?: unknown[];
+        // Special-operation participation gate. Optional so sibling
+        // callers that don't carry these fields (e.g. the intel dossier ops list)
+        // keep their clearance-only behavior — the gate only engages when
+        // `isSpecial` is explicitly present on the projection.
+        isSpecial?: boolean | null;
+        participants?: Array<{ userId?: number | null; timeLeft?: string | null }>;
+    },
 ): boolean {
-    return (op.ownerId != null && op.ownerId === user.id) ||
-        passesClearance(user, op.clearanceLevel, op.limitingMarkers, ['operations:manage']);
+    const isOwner = op.ownerId != null && op.ownerId === user.id;
+    // Clearance LEVEL + every limiting MARKER, with the operations:manage / Admin
+    // read-side bypass. Owners always pass.
+    if (!isOwner && !passesClearance(user, op.clearanceLevel, op.limitingMarkers, ['operations:manage'])) {
+        return false;
+    }
+    // Special operations are invite-only: visible ONLY to the owner,
+    // operations:manage holders (read-side bypass population), and ACTIVE
+    // participants — mirrors the client `hasAccess` gate (OperationDetailView),
+    // operation:get_details, and assertOpVisibleToUser so list/slice/detail/action
+    // cannot drift. A clearance-0 special op must NOT be readable by every member.
+    if (op.isSpecial && !isOwner && !canViewAllClassifications(user, ['operations:manage'])) {
+        const isActiveParticipant = (op.participants || []).some(
+            (p) => p.userId != null && p.userId === user.id && p.timeLeft == null,
+        );
+        if (!isActiveParticipant) return false;
+    }
+    return true;
+}
+
+/**
+ * The join PIN (`join_code`) gates joining a Special Operation; only the
+ * commander (owner) and operations:manage holders distribute it. Strip it from
+ * every other viewer's copy so the PIN never rides the operations list / slice /
+ * detail down to ordinary members. Mutates the freshly-mapped op in
+ * place (toHydratedOperation always returns new objects).
+ */
+function redactJoinCodeForViewer(op: HydratedOperation, user: OpViewer): void {
+    if (op.ownerId != null && op.ownerId === user.id) return;
+    if (canViewAllClassifications(user, ['operations:manage'])) return;
+    op.joinCode = undefined;
 }
 
 export async function getOperations(user?: User | null): Promise<HydratedOperation[]> {
@@ -208,6 +246,11 @@ export async function getOperations(user?: User | null): Promise<HydratedOperati
     if (before > 0 && ops.length === 0) {
         log.warn('getOperations all ops filtered out by clearance — likely a clearance config issue', { filteredCount: before, userId: user.id, clearanceLevel: user.clearanceLevel?.level || 0, canManage: (user.permissions || []).includes('operations:manage') });
     }
+
+    // Redact the join PIN for everyone but the owner / operations:manage holders
+    // — the PIN is the only barrier to joining a clearance-0 special
+    // op, so it must never ship to ordinary members on the operations subset.
+    for (const op of ops) redactJoinCodeForViewer(op, user);
 
     // Sort by created_at descending (since we merged two arrays)
     ops.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -241,18 +284,43 @@ export async function getOperations(user?: User | null): Promise<HydratedOperati
  * (canUserSeeOpInList) and detail (operation:get_details) reads apply. Light
  * select: no participant/log embeds.
  */
-export async function assertOpVisibleToUser(operationId: string, user?: OpViewer | null): Promise<void> {
+export async function assertOpVisibleToUser(
+    operationId: string,
+    user?: OpViewer | null,
+    // The join path passes { isJoinAttempt: true }: a first-time joiner is by
+    // definition not yet a participant, and the join PIN (verified in
+    // joinOperation) is the invite mechanism — so the special-op participation
+    // gate below must NOT block joining. The clearance gate still applies.
+    opts?: { isJoinAttempt?: boolean },
+): Promise<void> {
     if (!user) throw new Error('Authentication required.');
     const { data, error } = await supabase.from('operations')
-        .select('id, owner_id, clearance_level, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .select('id, owner_id, is_special, clearance_level, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .eq('id', operationId)
         .maybeSingle();
     handleSupabaseError({ error, message: 'Failed to verify operation access' });
     if (!data) throw new Error('Operation not found.');
     const markers = (data.limiting_markers || []).map((m: { marker?: unknown }) => m.marker).filter(Boolean);
-    const visible = data.owner_id === user.id
+    const isOwner = data.owner_id === user.id;
+    const canManage = canViewAllClassifications(user, ['operations:manage']);
+    const visible = isOwner
         || passesClearance(user, data.clearance_level || 0, markers, ['operations:manage']);
     if (!visible) throw new Error('Insufficient clearance to act on this operation.');
+
+    // Special-operation participation gate: outside the join path a
+    // non-owner / non-manager may act on an op's sub-resources only if they are an
+    // ACTIVE participant — mirrors canUserSeeOpInList (list/slice) and the
+    // operation:get_details deny so the gates can't drift. Lazy lookup: only the
+    // special-op, non-privileged case incurs the extra query.
+    if (!opts?.isJoinAttempt && data.is_special && !isOwner && !canManage) {
+        const { data: membership } = await supabase.from('operation_participants')
+            .select('user_id')
+            .eq('operation_id', operationId)
+            .eq('user_id', user.id)
+            .is('time_left', null)
+            .maybeSingle();
+        if (!membership) throw new Error('Insufficient access to act on this special operation.');
+    }
 }
 
 // The op's classification, read server-side. Used to stamp an extracted template
@@ -277,7 +345,11 @@ export async function getOperationByIdLite(operationId: string, user?: User | nu
     handleSupabaseError({ error, message: 'Failed to get operation slice' });
     if (!data) return null;
     const op = toHydratedOperation(data as unknown as Parameters<typeof toHydratedOperation>[0]);
-    return canUserSeeOpInList(user, op) ? op : null;
+    if (!canUserSeeOpInList(user, op)) return null;
+    // Strip the join PIN unless the viewer is the owner / an operations:manage
+    // holder — keep the slice path consistent with getOperations.
+    redactJoinCodeForViewer(op, user);
+    return op;
 }
 
 interface CreateOperationInput {

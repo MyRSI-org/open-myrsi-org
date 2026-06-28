@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { ExternalTool, UserRole } from '../../types';
 import { useConfig } from '../../contexts/ConfigContext';
 
@@ -31,26 +31,42 @@ const ExternalToolModal: React.FC<ExternalToolModalProps> = ({ isOpen, onClose, 
         [externalTools]
     );
 
-    useEffect(() => {
-        if (isOpen) {
-            if (tool) {
-                setTitle(tool.title);
-                setDescription(tool.description || '');
-                setUrl(tool.url || '');
-                setIcon(tool.icon || '');
-                setAudience(tool.audience || []);
-                setCategory(tool.category || '');
-            } else {
-                setTitle('');
-                setDescription('');
-                setUrl('');
-                setIcon('');
-                setAudience([UserRole.Member, UserRole.Dispatcher, UserRole.Admin]);
-                setCategory('');
-            }
-            setIsLoading(false);
+    // Reset editable form fields whenever the modal opens or the selected tool
+    // changes. The fields must remain user-editable afterwards, so they are
+    // seeded (not derived) using the React "adjust state during render" pattern
+    // with previous-value trackers. This re-renders before paint and is
+    // behavior-equivalent to the previous sync-with-prop effect, while running
+    // during render so no state is set inside an effect.
+    // prevIsOpen starts false so that a mount with isOpen already true seeds the
+    // fields exactly as the mount-time effect did (this modal is conditionally
+    // mounted, so it always mounts with isOpen === true).
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevTool, setPrevTool] = useState(tool);
+    if (isOpen && (isOpen !== prevIsOpen || tool !== prevTool)) {
+        setPrevIsOpen(isOpen);
+        setPrevTool(tool);
+        if (tool) {
+            setTitle(tool.title);
+            setDescription(tool.description || '');
+            setUrl(tool.url || '');
+            setIcon(tool.icon || '');
+            setAudience(tool.audience || []);
+            setCategory(tool.category || '');
+        } else {
+            setTitle('');
+            setDescription('');
+            setUrl('');
+            setIcon('');
+            setAudience([UserRole.Member, UserRole.Dispatcher, UserRole.Admin]);
+            setCategory('');
         }
-    }, [isOpen, tool]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || tool !== prevTool) {
+        // Keep trackers in sync even when the modal is closed so the next open
+        // (or a tool change while closed) is detected correctly.
+        setPrevIsOpen(isOpen);
+        setPrevTool(tool);
+    }
 
     const handleAudienceChange = (role: string) => {
         setAudience(prev =>

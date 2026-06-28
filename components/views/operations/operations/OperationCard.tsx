@@ -24,12 +24,14 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
     const { viewOperationDetails } = useNavigation();
     const { securityClearances } = useMembers();
     const fmt = useFormatDate();
-    const [, forceTick] = useState(0);
+    // `tick` only exists to force a re-render; the timer below bumps it so the
+    // scheduled-start countdown pill stays accurate.
+    const [tick, setTick] = useState(0);
 
     // Live-tick the countdown every 30s so the pill stays accurate.
     useEffect(() => {
         if (!operation.scheduledStart || operation.status !== OperationStatus.Scheduled) return;
-        const id = setInterval(() => forceTick(t => t + 1), 30_000);
+        const id = setInterval(() => setTick(t => t + 1), 30_000);
         return () => clearInterval(id);
     }, [operation.scheduledStart, operation.status]);
 

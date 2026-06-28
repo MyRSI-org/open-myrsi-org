@@ -15,10 +15,12 @@ interface Props {
  * emerald when >50% remaining, amber <50%, red once overdue. Ticks every 30s.
  */
 export default function SlaBadge({ createdAt, urgency, size = 'sm', className = '' }: Props) {
-    const [, forceTick] = useState(0);
+    // `tick` only exists to force a re-render; the timer below bumps it so the
+    // live SLA countdown re-evaluates every 30s.
+    const [tick, setTick] = useState(0);
 
     useEffect(() => {
-        const id = setInterval(() => forceTick(t => t + 1), 30_000);
+        const id = setInterval(() => setTick(t => t + 1), 30_000);
         return () => clearInterval(id);
     }, []);
 

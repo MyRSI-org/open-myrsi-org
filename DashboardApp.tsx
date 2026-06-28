@@ -372,8 +372,7 @@ const AppContent: React.FC = () => {
             // Role changed — redirect to dashboard to avoid showing views the user no longer has access to
             setActiveView('dashboard');
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on currentUser?.role only; whole-object dep would re-fire on every profile field change.
-    }, [currentUser?.role, setActiveView]);
+    }, [currentUser, setActiveView]);
 
     // --- PERSISTENT SIDEBAR LOGIC ---
     const compactViews = useMemo(() => ['hr', 'admin', 'wiki', 'security-vetting', 'case-file-detail', 'applicant-detail', 'internal-transfer-detail', 'internal-job-detail'], []);
@@ -532,7 +531,7 @@ const AppContent: React.FC = () => {
                     </button>
                 </div>
                 <div className="absolute bottom-8 text-[10px] text-slate-600 font-mono uppercase tracking-[0.3em]">
-                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.1.5-open
+                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.2.0-open
                 </div>
             </div>
         );

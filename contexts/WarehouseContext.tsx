@@ -19,7 +19,7 @@
 // field. Unlike HR (which nests under data.hr.*), the warehouse payload puts
 // these at the top level, so each setter keys off its own data-payload field.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     WarehouseCatalogItem, WarehouseStock, WarehouseRequest,
@@ -106,11 +106,11 @@ export const WarehouseProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         registerRefreshWarehouse,
     ]);
 
-    return <WarehouseContext.Provider value={value}>{children}</WarehouseContext.Provider>;
+    return <WarehouseContext value={value}>{children}</WarehouseContext>;
 };
 
 export const useWarehouse = (): WarehouseContextValue => {
-    const ctx = useContext(WarehouseContext);
+    const ctx = use(WarehouseContext);
     if (!ctx) throw new Error('useWarehouse must be used within a WarehouseProvider');
     return ctx;
 };

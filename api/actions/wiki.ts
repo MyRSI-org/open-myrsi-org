@@ -31,10 +31,16 @@ interface UpdateWikiPagePayload {
 
 interface DeleteWikiPagePayload {
     id: string;
+    // Dispatcher-injected actor — used for the per-page clearance check so a
+    // low-clearance wiki:delete_page holder cannot destroy classified pages.
+    user?: User;
 }
 
 interface ReorderWikiPagesPayload {
     pages: { id: string; sortOrder: number }[];
+    // Dispatcher-injected actor — used for the per-page clearance check so a
+    // low-clearance editor cannot relocate classified pages in the menu tree.
+    user?: User;
 }
 
 interface ImportWikiPagesPayload {
@@ -50,8 +56,8 @@ interface ImportWikiPagesPayload {
 export const wikiActions = {
     'wiki:create_page': ({ data, userId, user }: CreateWikiPagePayload) => db.createWikiPage(data, userId, user),
     'wiki:update_page': ({ id, data, userId, user }: UpdateWikiPagePayload) => db.updateWikiPage(id, data, userId, user),
-    'wiki:delete_page': ({ id }: DeleteWikiPagePayload) => db.deleteWikiPage(id),
-    'wiki:reorder_pages': ({ pages }: ReorderWikiPagesPayload) => db.reorderWikiPages(pages),
+    'wiki:delete_page': ({ id, user }: DeleteWikiPagePayload) => db.deleteWikiPage(id, user),
+    'wiki:reorder_pages': ({ pages, user }: ReorderWikiPagesPayload) => db.reorderWikiPages(pages, user),
     'wiki:export_pages': ({ user }: { user?: User }) => db.exportWikiPages(user),
     'wiki:import_pages': ({ bundle, mode, importHomeConfig, userId, user }: ImportWikiPagesPayload) =>
         db.importWikiPages(bundle, mode, !!importHomeConfig, userId, user),

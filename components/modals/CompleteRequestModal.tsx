@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { HydratedServiceRequest, ServiceRequestStatus } from '../../types';
 import { useAuth } from '../../contexts/AuthContext';
 import { useRequests } from '../../contexts/RequestsContext';
@@ -21,6 +21,26 @@ const outcomeOptions: ServiceRequestStatus[] = [
     ServiceRequestStatus.GameError,
 ];
 
+const RepButton: React.FC<{
+    value: number;
+    label: string;
+    icon: React.ReactNode;
+    activeClass: string;
+    repChange: number;
+    isLoading: boolean;
+    onSelect: (value: number) => void;
+}> = ({ value, label, icon, activeClass, repChange, isLoading, onSelect }) => (
+    <button
+        type="button"
+        onClick={() => onSelect(value)}
+        disabled={isLoading}
+        className={`flex-1 flex flex-col items-center justify-center p-3 rounded-xl border transition-all disabled:opacity-50 ${repChange === value ? activeClass : 'border-slate-700 bg-slate-900/50 text-slate-500 hover:border-slate-600 hover:text-slate-300'}`}
+    >
+        <div className={`text-xl mb-1 ${repChange === value ? 'text-white' : ''}`}>{icon}</div>
+        <span className="text-[10px] font-black uppercase tracking-wider">{label}</span>
+    </button>
+);
+
 const CompleteRequestModal: React.FC<CompleteRequestModalProps> = ({ isOpen, onClose, request }) => {
     const { currentUser } = useAuth();
     const { completeRequest } = useRequests();
@@ -34,18 +54,24 @@ const CompleteRequestModal: React.FC<CompleteRequestModalProps> = ({ isOpen, onC
     const [isLoading, setIsLoading] = useState(false);
     const [showIntelModal, setShowIntelModal] = useState(false);
 
-    useEffect(() => {
-        if (isOpen) {
-            setNotes('');
-            setUecEarned('');
-            setMedigelConsumed('');
-            setRepChange(0);
-            setOutcome(ServiceRequestStatus.Success);
-            setFileIntelReport(false);
-            setIsLoading(false);
-            setShowIntelModal(false);
-        }
-    }, [isOpen]);
+    // Reset the whole form to its initial state each time the modal transitions from
+    // closed to open. Using the React "adjust state during render" pattern (a previous-value
+    // tracker) instead of an effect: it runs during render and React re-renders before paint,
+    // so it is behaviour-equivalent to the old open-reset effect with no extra paint.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen && !prevIsOpen) {
+        setPrevIsOpen(isOpen);
+        setNotes('');
+        setUecEarned('');
+        setMedigelConsumed('');
+        setRepChange(0);
+        setOutcome(ServiceRequestStatus.Success);
+        setFileIntelReport(false);
+        setIsLoading(false);
+        setShowIntelModal(false);
+    } else if (!isOpen && prevIsOpen) {
+        setPrevIsOpen(isOpen);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();
@@ -79,18 +105,6 @@ const CompleteRequestModal: React.FC<CompleteRequestModalProps> = ({ isOpen, onC
 
     const inputClass = "w-full bg-slate-950/50 border border-slate-700 rounded-lg p-2.5 text-white text-sm focus:border-green-500 focus:ring-1 focus:ring-green-500/50 outline-hidden transition-all font-mono";
     const labelClass = "block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5";
-
-    const RepButton: React.FC<{ value: number, label: string, icon: React.ReactNode, activeClass: string }> = ({ value, label, icon, activeClass }) => (
-        <button
-            type="button"
-            onClick={() => setRepChange(value)}
-            disabled={isLoading}
-            className={`flex-1 flex flex-col items-center justify-center p-3 rounded-xl border transition-all disabled:opacity-50 ${repChange === value ? activeClass : 'border-slate-700 bg-slate-900/50 text-slate-500 hover:border-slate-600 hover:text-slate-300'}`}
-        >
-            <div className={`text-xl mb-1 ${repChange === value ? 'text-white' : ''}`}>{icon}</div>
-            <span className="text-[10px] font-black uppercase tracking-wider">{label}</span>
-        </button>
-    )
 
     const showIntelOption = outcome === ServiceRequestStatus.Failed || outcome === ServiceRequestStatus.Aborted || repChange < 0;
 
@@ -154,9 +168,9 @@ const CompleteRequestModal: React.FC<CompleteRequestModalProps> = ({ isOpen, onC
                         <div>
                             <label className={labelClass}>Client Conduct Assessment</label>
                             <div className="flex items-center space-x-3">
-                                <RepButton value={1} label="Positive" icon={<i className="fa-solid fa-thumbs-up" />} activeClass="bg-green-500/20 border-green-500 text-green-400 shadow-lg shadow-green-900/20" />
-                                <RepButton value={0} label="Neutral" icon={<span className="font-mono text-lg font-bold">-</span>} activeClass="bg-slate-700 border-slate-500 text-white" />
-                                <RepButton value={-1} label="Negative" icon={<i className="fa-solid fa-thumbs-down" />} activeClass="bg-red-500/20 border-red-500 text-red-400 shadow-lg shadow-red-900/20" />
+                                <RepButton value={1} label="Positive" icon={<i className="fa-solid fa-thumbs-up" />} activeClass="bg-green-500/20 border-green-500 text-green-400 shadow-lg shadow-green-900/20" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
+                                <RepButton value={0} label="Neutral" icon={<span className="font-mono text-lg font-bold">-</span>} activeClass="bg-slate-700 border-slate-500 text-white" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
+                                <RepButton value={-1} label="Negative" icon={<i className="fa-solid fa-thumbs-down" />} activeClass="bg-red-500/20 border-red-500 text-red-400 shadow-lg shadow-red-900/20" repChange={repChange} isLoading={isLoading} onSelect={setRepChange} />
                             </div>
                         </div>
 

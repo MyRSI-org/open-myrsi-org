@@ -473,9 +473,25 @@ export interface ExportLedgerOpts extends ListLedgerOpts {
     // Same filter shape as listLedgerEntries; exports up to 5000 rows.
 }
 
-function csvEscape(value: unknown): string {
+/**
+ * CSV cell escaper with spreadsheet formula-injection neutralization.
+ * Exported so the regression test can pin the behaviour directly.
+ *
+ * Two concerns, applied in order:
+ *  1. Formula injection (OWASP CSV-injection): a cell beginning with = + - @
+ *     (or a leading TAB/CR that some apps strip before evaluating the next
+ *     char) is auto-evaluated as a formula by Excel/LibreOffice/Sheets.
+ *     memo/counterparty_text/notes are attacker-controlled and stored verbatim
+ *     (submitDeposit/submitWithdrawal/recordAdjustment), so neutralize at the
+ *     output boundary by prefixing a single quote — apps then render the cell
+ *     as literal text and never execute it.
+ *  2. Quote-wrapping: preserve the existing RFC-4180 escaping for cells that
+ *     contain a delimiter/quote/newline.
+ */
+export function csvEscape(value: unknown): string {
     if (value === null || value === undefined) return '';
-    const str = String(value);
+    let str = String(value);
+    if (/^[=+\-@\t\r]/.test(str)) str = "'" + str;
     if (/[",\n\r]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
     return str;
 }

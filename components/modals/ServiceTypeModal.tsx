@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { ServiceTypeConfig } from '../../types';
 import { useConfig } from '../../contexts/ConfigContext';
 
@@ -25,7 +25,15 @@ const ServiceTypeModal: React.FC<ServiceTypeModalProps> = ({ isOpen, onClose, co
 
     const isEditing = !!config;
 
-    useEffect(() => {
+    // Seed/reset the editable form when the modal opens or the edited config
+    // changes while open. Adjusts state during render (React's documented
+    // pattern) instead of in an effect; the controlled fields must stay
+    // user-editable so they cannot be derived during render.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    const [prevConfig, setPrevConfig] = useState(config);
+    if (isOpen !== prevIsOpen || config !== prevConfig) {
+        setPrevIsOpen(isOpen);
+        setPrevConfig(config);
         if (isOpen) {
             if (config) {
                 setName(config.name);
@@ -44,7 +52,7 @@ const ServiceTypeModal: React.FC<ServiceTypeModalProps> = ({ isOpen, onClose, co
             }
             setIsLoading(false);
         }
-    }, [isOpen, config]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

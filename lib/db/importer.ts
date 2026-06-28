@@ -17,8 +17,14 @@
 // <Database> generic, so generic table-name-driven writes are already loose —
 // `sb` just makes that explicit and contained.
 
+import { randomBytes } from 'node:crypto';
 import { supabase } from './common.js';
 import { log as baseLog } from '../log.js';
+import { sanitizeImageUrl } from '../imageUrl.js';
+import { sanitizePublicLinkUrl } from '../linkUrl.js';
+import { stripHtml } from '../textSanitize.js';
+import { sanitizeTiptapJson, tryParseTiptapJson } from '../tiptapValidate.js';
+import { sanitizeRichHtml } from '../htmlSanitize.js';
 
 const log = baseLog.child({ module: 'db.importer' });
 
@@ -255,7 +261,7 @@ export function parseExport(ndjson: string): ParsedExport {
         if (!line) continue;
         let obj: Record<string, unknown>;
         try { obj = JSON.parse(line); }
-        catch (e) { throw new Error(`Invalid JSON on line ${i + 1}: ${(e as Error).message}`); }
+        catch (e) { throw new Error(`Invalid JSON on line ${i + 1}: ${(e as Error).message}`, { cause: e }); }
 
         if (obj.kind === 'header') {
             if (header) throw new Error('Multiple header lines in export.');
@@ -556,6 +562,121 @@ const SETTINGS_IMPORT_DENYLIST = new Set<string>([
     'platformSettings', 'orgFeatures', 'active_eam', 'allianceLocalPairingCode',
 ]);
 
+// ---------------------------------------------------------------------------
+// Write-boundary sanitizers for imported config settings.
+//
+// The admin-console config writers (lib/db/system.ts) run operator-supplied
+// config strings through the app's write-boundary sanitizers before persisting:
+// brandingConfig.termsOfService through sanitizeRichHtml, publicPageConfig.blurb
+// through sanitizeTiptapJson('minimal'), motto through stripHtml, image URLs
+// through sanitizeImageUrl, openGraph themeColor through a strict hex check, and
+// public links through sanitizePublicLinkUrl. The importer used to write `settings`
+// rows VERBATIM (only the denylist + secret-drop filters), so a crafted export
+// could seed raw HTML / event-handler attrs / javascript: URLs / tracking image
+// hosts that the normal write path would have stripped. Re-apply the SAME
+// sanitizers here so an imported value matches what the admin write path would have
+// stored. Resilient: invalid values are cleared/dropped (never thrown) so one bad
+// value can't abort the whole bootstrap import.
+// ---------------------------------------------------------------------------
+
+// Mirror of system.ts THEME_COLOR_RE / sanitizeThemeColor (local + not exported
+// there): #rgb / #rrggbb / #rrggbbaa only; anything else is dropped.
+const IMPORT_THEME_COLOR_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+function sanitizeThemeColorValue(raw: unknown): string | undefined {
+    if (typeof raw !== 'string') return undefined;
+    const trimmed = raw.trim();
+    return IMPORT_THEME_COLOR_RE.test(trimmed) ? trimmed : undefined;
+}
+
+// validateImageUrl in updatePublicPageConfig THROWS on an invalid URL; the import
+// path must stay resilient, so it follows the heroCard/openGraph silent-clear
+// contract instead (invalid → '').
+function importImageUrl(val: unknown): string {
+    if (val == null || val === '') return '';
+    return sanitizeImageUrl(val) || '';
+}
+
+const IMPORT_HTML_TAG_RE = /<[^>]*>/g;
+
+// Mirrors updateBrandingConfig: termsOfService is rich HTML rendered with
+// dangerouslySetInnerHTML → sanitizeRichHtml.
+function sanitizeBrandingConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    return typeof cfg.termsOfService === 'string'
+        ? { ...cfg, termsOfService: sanitizeRichHtml(cfg.termsOfService) }
+        : cfg;
+}
+
+// Mirrors updateHeroCardConfig: backgroundImageUrl → sanitizeImageUrl || ''.
+function sanitizeHeroCardConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    return 'backgroundImageUrl' in cfg
+        ? { ...cfg, backgroundImageUrl: importImageUrl(cfg.backgroundImageUrl) }
+        : cfg;
+}
+
+// Mirrors updateOpenGraphConfig: image fields → sanitizeImageUrl || ''; themeColor
+// → strict hex or dropped (feeds SSR <meta og:image>/<link icon>/<meta theme-color>).
+function sanitizeOpenGraphConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    const safe: Record<string, unknown> = { ...cfg };
+    if ('imageUrl' in safe) safe.imageUrl = importImageUrl(safe.imageUrl);
+    if ('faviconUrl' in safe) safe.faviconUrl = importImageUrl(safe.faviconUrl);
+    if ('pwaIconUrl' in safe) safe.pwaIconUrl = importImageUrl(safe.pwaIconUrl);
+    if ('themeColor' in safe) {
+        const color = sanitizeThemeColorValue(safe.themeColor);
+        if (color) safe.themeColor = color; else delete safe.themeColor;
+    }
+    return safe;
+}
+
+// Mirrors updatePublicPageConfig's field sanitizers (resilient variant — clears /
+// drops invalid input instead of throwing so the import never aborts).
+function sanitizePublicPageConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    const safe: Record<string, unknown> = { ...cfg };
+    if (typeof safe.motto === 'string') safe.motto = stripHtml(safe.motto, 120);
+    if (typeof safe.blurb === 'string') {
+        const parsed = tryParseTiptapJson(safe.blurb);
+        if (parsed) {
+            const serialized = JSON.stringify(sanitizeTiptapJson(parsed, 'minimal'));
+            safe.blurb = serialized.length > 8000 ? serialized.slice(0, 8000) : serialized;
+        } else {
+            safe.blurb = stripHtml(safe.blurb, 4000);
+        }
+    }
+    if ('heroImageUrl' in safe) safe.heroImageUrl = importImageUrl(safe.heroImageUrl);
+    if ('profileImageUrl' in safe) safe.profileImageUrl = importImageUrl(safe.profileImageUrl);
+    if (Array.isArray(safe.links)) {
+        const cleaned: Array<Record<string, unknown>> = [];
+        for (const rawLink of safe.links) {
+            if (!rawLink || typeof rawLink !== 'object') continue;
+            const l = rawLink as Record<string, unknown>;
+            const url = sanitizePublicLinkUrl(l.url);
+            if (!url) continue; // drop javascript:/private-host/non-https links outright
+            const label = stripHtml(l.label, 40);
+            if (!label) continue;
+            const id = typeof l.id === 'string' && l.id ? l.id.slice(0, 64) : `lnk_${randomBytes(6).toString('base64url')}`;
+            const icon = typeof l.icon === 'string' ? l.icon.replace(IMPORT_HTML_TAG_RE, '').slice(0, 40) : undefined;
+            cleaned.push(icon ? { id, label, url, icon } : { id, label, url });
+        }
+        safe.links = cleaned.slice(0, 10);
+    }
+    return safe;
+}
+
+/** Re-apply the admin-console write-boundary sanitizers to ONE imported settings
+ *  row's `value`, keyed by the settings key. Keys with no sanitizing write path
+ *  (and non-object values) pass through unchanged. */
+function sanitizeImportedSettingRow(row: Record<string, unknown>): Record<string, unknown> {
+    const value = row.value;
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) return row;
+    const cfg = value as Record<string, unknown>;
+    switch (row.key) {
+        case 'brandingConfig': return { ...row, value: sanitizeBrandingConfigValue(cfg) };
+        case 'publicPageConfig': return { ...row, value: sanitizePublicPageConfigValue(cfg) };
+        case 'openGraphConfig': return { ...row, value: sanitizeOpenGraphConfigValue(cfg) };
+        case 'heroCardConfig': return { ...row, value: sanitizeHeroCardConfigValue(cfg) };
+        default: return row;
+    }
+}
+
 // Tables NEVER imported even though the export carries them: deployment-LOCAL
 // federation state. alliance_peers holds this install's crypto material
 // (outbound_key_enc, inbound_key_id → api_keys [not imported], entered_peer_code_enc,
@@ -823,6 +944,12 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
                     await emit({ type: 'warning', message: msg });
                 }
                 if (rawRows.length === 0) continue;
+                // Re-apply the admin-console write-boundary sanitizers (sanitizeRichHtml /
+                // sanitizeTiptapJson / sanitizeImageUrl / sanitizePublicLinkUrl / stripHtml
+                // / theme-colour) the config writers run, so an imported config value can't
+                // seed raw HTML / javascript: URLs / tracking hosts the normal write path
+                // would have stripped. See the sanitizeImportedSettingRow note above.
+                rawRows = rawRows.map(sanitizeImportedSettingRow);
             }
 
             const warnStart = warnings.length;

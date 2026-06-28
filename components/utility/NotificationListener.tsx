@@ -36,14 +36,15 @@ const NotificationListener: React.FC = () => {
 
     // --- Window-event listeners for DataContext-relayed broadcasts ---
     useEffect(() => {
-        if (!currentUser) return;
+        if (!currentUser?.id) return;
 
-        const roleValue = String(currentUser.role);
+        const user0 = currentUserRef.current;
+        const roleValue = String(user0?.role);
         const isStaff = roleValue === UserRole.Member ||
             roleValue === UserRole.Dispatcher ||
             roleValue === UserRole.Admin;
 
-        debugLog("NotificationListener: Initializing for", currentUser.name, "isStaff:", isStaff);
+        debugLog("NotificationListener: Initializing for", user0?.name, "isStaff:", isStaff);
 
         const onNewRequest = (e: Event) => {
             const newRequest = (e as CustomEvent).detail;
@@ -153,7 +154,6 @@ const NotificationListener: React.FC = () => {
             window.removeEventListener('app:realtime:bulletin-update', onBulletinUpdate);
             window.removeEventListener('app:realtime:request-update', onRequestUpdate);
         };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on user id to scope listeners per session; whole-object dep would re-mount on every profile field change.
     }, [currentUser?.id]);
 
     // Responder change awareness for the request's client and for peer staff
@@ -166,7 +166,7 @@ const NotificationListener: React.FC = () => {
     // `responder_change` broadcast relayed by DataContext as a window event —
     // no extra channel subscription needed.
     useEffect(() => {
-        if (!currentUser) return;
+        if (!currentUser?.id) return;
 
         const onResponderChange = (e: Event) => {
             const detail = (e as CustomEvent).detail as { requestId?: string; userId?: number; action?: 'assigned' | 'unassigned' } | undefined;
@@ -206,7 +206,6 @@ const NotificationListener: React.FC = () => {
 
         window.addEventListener('app:realtime:responder-change', onResponderChange);
         return () => window.removeEventListener('app:realtime:responder-change', onResponderChange);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: same per-session-scoping pattern as the listener effect above.
     }, [currentUser?.id]);
 
     return null;

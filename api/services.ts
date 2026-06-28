@@ -157,7 +157,13 @@ export const fullPermissionMap: Record<string, string> = {
     'admin:update_intel_sharing_config': 'admin:config:api',
     'admin:update_hr_config': 'hr:admin',
     'admin:get_intel_sharing_config': 'admin:config:api',
-    'admin:update_radio_config': 'admin:config:branding',
+    // Voice-server (LiveKit) credentials — url/apiKey/apiSecret. These are
+    // secret-bearing voice INFRASTRUCTURE, not branding. Gate under the dedicated
+    // voice permission (same bar as add/update/delete_radio_channel + radio:reboot)
+    // so delegating admin:config:branding (a comms/PR role) cannot overwrite the
+    // org's voice URL + API key/secret. Mirrors the per-credential siloing of
+    // Discord (admin:config:discord) and Gemini (admin:config:ai).
+    'admin:update_radio_config': 'radio:manage',
     'admin:update_hero_config': 'admin:config:branding',
     'admin:update_opengraph_config': 'admin:config:metadata',
     'admin:update_ai_config': 'admin:config:ai',
@@ -322,10 +328,16 @@ export const fullPermissionMap: Record<string, string> = {
     'admin:delete_conduct_entry': 'user:manage:conduct_record',
     'admin:delete_request': 'request:delete',
 
-    // Database
-    'admin:db:check': 'admin:access',
-    'admin:db:repair': 'admin:access',
-    'admin:db:prune': 'admin:access',
+    // Database maintenance family. These are NOT scoped reads — admin:db:repair
+    // re-seeds RBAC / promotes an Admin, admin:db:prune issues raw mass DELETEs,
+    // and admin:db:check is a count oracle over read-gated domains (intel/hr).
+    // bare admin:access is seeded to the non-Admin Dispatcher, so gate the whole
+    // family at the high-bar admin:db:destroy perm (NOT seeded to Dispatcher) and
+    // additionally assert the genuine Admin role in each handler, mirroring the
+    // danger-zone (full_reset/full_wipe) and platform-lifecycle pattern.
+    'admin:db:check': 'admin:db:destroy',
+    'admin:db:repair': 'admin:db:destroy',
+    'admin:db:prune': 'admin:db:destroy',
     // Domain-scoped destructive resets require the domain's management perm, not
     // bare dashboard access (a finance-blind dashboard user must not erase the
     // treasury / quartermaster audit trail).
@@ -339,8 +351,14 @@ export const fullPermissionMap: Record<string, string> = {
     'admin:import_org': 'admin:access',
     'system:complete_setup': 'admin:access',
     'admin:get_platform_settings': 'admin:access',
-    'admin:update_platform_settings': 'admin:access',
-    'admin:force_logout_all': 'admin:access',
+    // Platform-lifecycle controls. Enabling maintenance mode (which locks out every
+    // non-Admin, including the actor, irreversibly without a true Admin) or advancing
+    // the force-logout watermark (which kills EVERY live session platform-wide) are
+    // apex actions: gate them at the high-bar admin:db:destroy perm (NOT seeded to
+    // Dispatcher) so the BOLA gate denies before the handler. The handlers ALSO assert
+    // the genuine Admin role (assertAdminRole), mirroring the assertDangerZone pattern.
+    'admin:update_platform_settings': 'admin:db:destroy',
+    'admin:force_logout_all': 'admin:db:destroy',
     'admin:revoke_user_sessions': 'admin:user:update_role',
     'admin:update_features': 'admin:config:features',
 
@@ -880,7 +898,13 @@ export default async function handler(req: Request, res: Response) {
 
     // --- PUBLIC ACTION HANDLER ---
     if (publicActions.includes(action)) {
-        if (typeof action !== 'string' || !actions[action]) {
+        // Own-property check, NOT truthiness: `actions` is a plain object literal so
+        // inherited Object.prototype members ("constructor", "valueOf", "toString",
+        // "hasOwnProperty", …) resolve to truthy functions. Dispatching one of those
+        // skips the BOLA/permission gate (none carry a protected prefix) and, for
+        // "constructor", returns the injected payload (incl. the caller's full user
+        // record) verbatim. Only ever dispatch a genuinely-registered action.
+        if (typeof action !== 'string' || !Object.prototype.hasOwnProperty.call(actions, action)) {
             log.error('invalid action', { action });
             return res.status(400).json({ message: `Invalid action: ${action}` });
         }
@@ -953,7 +977,11 @@ export default async function handler(req: Request, res: Response) {
         }
     }
 
-    if (typeof action !== 'string' || !actions[action]) {
+    // Own-property check, NOT truthiness (see public-branch note above): a
+    // prototype-inherited name like "constructor" would otherwise resolve to a
+    // truthy function, slip past this existence guard AND the prefix-based BOLA gate
+    // below (no protected prefix), and echo the caller's injected full user record.
+    if (typeof action !== 'string' || !Object.prototype.hasOwnProperty.call(actions, action)) {
         log.error('invalid action', { action });
         return res.status(400).json({ message: `Invalid action: ${action}` });
     }
@@ -984,10 +1012,20 @@ export default async function handler(req: Request, res: Response) {
                 // expensive getFullOperationDetails fetch is skipped on the common
                 // path. Excluded for finance/payout/alert/participant/status
                 // actions, which always require the real operations:manage perm.
+                // operation:update is owner-bypassable for ordinary edits
+                // (name/description/schedule), but a STATUS change carries the same
+                // command-and-control authority as operation:update_status — which is
+                // deliberately owner-bypass-EXCLUDED so it always needs the real
+                // operations:manage perm. Don't let a status change smuggled through
+                // operation:update ride the owner bypass; force it onto the manage path.
+                const isStatusChangingUpdate = action === 'operation:update'
+                    && payload?.updates && typeof payload.updates === 'object'
+                    && (payload.updates as { status?: unknown }).status !== undefined;
                 let isOpOwner = false;
                 if (!hasPerm
                     && action.startsWith('operation:')
                     && !OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS.has(action)
+                    && !isStatusChangingUpdate
                     && payload.operationId) {
                     isOpOwner = (await db.getFullOperationDetails(payload.operationId))?.ownerId === user?.id;
                 }
@@ -1015,6 +1053,21 @@ export default async function handler(req: Request, res: Response) {
                 }
             } else {
                 log.warn('permission denied — unmapped action', { action });
+                return res.status(403).json({ message: 'Insufficient permissions' });
+            }
+        }
+
+        // warrant:generate_report authors an intel report (intel:create gate above)
+        // FROM a warrant's caution-note text. Reading that warrant content is
+        // warrant:view-gated everywhere else (the warrants/warrant_slice read subsets,
+        // the intel dossier, getIntelStats). Require warrant:view (or Admin) in
+        // ADDITION to intel:create, so an intel:create-only holder can't launder
+        // warrant:view-gated caution text into a classification-0 report using a
+        // warrant id obtained from the id-only realtime broadcast.
+        if (action === 'warrant:generate_report') {
+            const canViewWarrants = user?.role === 'Admin' || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
+            if (!canViewWarrants) {
+                log.warn('permission denied', { userId: user?.id, action, requiredPerm: 'warrant:view' });
                 return res.status(403).json({ message: 'Insufficient permissions' });
             }
         }

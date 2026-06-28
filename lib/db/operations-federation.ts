@@ -98,13 +98,14 @@ export function projectOperationSnapshot(op: HydratedOperation, hasRestrictedMar
         // Recipient-aware. Each peer sees only the HOST + its OWN allied
         // org/members — never another ally's roster — and the host's INTERNAL
         // alliance_peers UUID (peerId) is neutralised (mirrors the ownerId:0
-        // pattern). When recipientPeerId is absent, peerId is still stripped but
-        // no per-peer filter is applied.
+        // pattern). FAIL CLOSED: when recipientPeerId is absent we drop EVERY
+        // allied entry rather than relay all allies' rosters to an unknown
+        // recipient — no caller should omit it, but the safe default is [].
         alliedOrgs: (op.alliedOrgs || [])
-            .filter((o) => !recipientPeerId || o.peerId === recipientPeerId)
+            .filter((o) => (recipientPeerId ? o.peerId === recipientPeerId : false))
             .map((o) => ({ ...o, peerId: '' })),
         alliedParticipants: (op.alliedParticipants || [])
-            .filter((p) => !recipientPeerId || p.peerId === recipientPeerId)
+            .filter((p) => (recipientPeerId ? p.peerId === recipientPeerId : false))
             .map((p) => ({ ...p, peerId: '' })),
 
         // Financials / internals: type requires the keys, so neutralise (never copy).
@@ -147,10 +148,15 @@ async function peerOperationsChannelEnabled(peerId: string): Promise<boolean> {
 }
 
 async function operationHasSyncRestrictedMarker(opId: string): Promise<boolean> {
-    const { data } = await supabase
+    const { data, error } = await supabase
         .from('operation_limiting_markers')
         .select('marker:security_limiting_markers!inner(sync_restricted)')
         .eq('operation_id', opId);
+    // Fail CLOSED: this is the PRIMARY "never federate this op" gate (independent
+    // of clearance). If marker status can't be confirmed, treat the op as
+    // restricted so buildOperationSnapshot/pushOperationToAllies withhold it,
+    // matching the deny-by-default posture.
+    if (error) return true;
     type MarkerEmbed = { sync_restricted?: boolean | null };
     const rows = (data ?? []) as unknown as Array<{ marker: MarkerEmbed | MarkerEmbed[] | null }>;
     return rows.some((r) => {
@@ -273,8 +279,8 @@ export async function pushOperationToAllies(opId: string, event: 'status_change'
     if (!allies || allies.length === 0) return;
     const peerIds = (allies as { peer_id: string }[]).map((a) => a.peer_id);
     const { data: healthRows } = await supabase.from('alliance_peers')
-        .select('id, sync_health, outbound_max_clearance').in('id', peerIds);
-    type PeerHealthRow = { id: string; sync_health: string | null; outbound_max_clearance: number | null };
+        .select('id, sync_health, outbound_max_clearance, channels').in('id', peerIds);
+    type PeerHealthRow = { id: string; sync_health: string | null; outbound_max_clearance: number | null; channels: { operations?: boolean } | null };
     const peerById = new Map(((healthRows ?? []) as PeerHealthRow[]).map((p) => [p.id, p]));
     const downPeers = new Set(((healthRows ?? []) as PeerHealthRow[])
         .filter((p) => p.sync_health === 'down').map((p) => p.id));
@@ -294,6 +300,12 @@ export async function pushOperationToAllies(opId: string, event: 'status_change'
     let budgetDeferred = false;
     await Promise.all(peerIds.map((peerId) => {
         if (downPeers.has(peerId)) return Promise.resolve();
+        // Per-peer egress gate: honor channels.operations exactly like the serve
+        // paths (getOperationSnapshotForPeer / getOperationManifestForPeer /
+        // acceptInviteForPeer). Fail CLOSED — a missing/false flag means the
+        // operator disabled "Joint Ops" for this peer, so the live-sync push must
+        // also stop crossing the org boundary even for already-accepted ops.
+        if (peerById.get(peerId)?.channels?.operations !== true) return Promise.resolve();
         if (!tryConsumeToken(peerId, { force: immediate })) { budgetDeferred = true; return Promise.resolve(); }
         const peerMax = peerById.get(peerId)?.outbound_max_clearance ?? 0;
         const overCeiling = !!fullOp && opClearance > Math.min(globalMax, peerMax);
@@ -418,6 +430,10 @@ export interface AlliedRsvpInput { remoteUserHandle: string; displayName?: strin
 export async function upsertAlliedParticipant(opId: string, peerId: string, p: AlliedRsvpInput): Promise<void> {
     const { data: ally } = await supabase.from('operation_allied_orgs').select('accepted').eq('operation_id', opId).eq('peer_id', peerId).maybeSingle();
     if (!ally?.accepted) throw new Error('forbidden');
+    // Re-check the operations channel at ingest, mirroring the serve paths — an
+    // accepted invite row alone is not enough. A peer whose "Joint Ops" was
+    // toggled off must not keep writing its members' RSVP rows into the host op.
+    if (!(await peerOperationsChannelEnabled(peerId))) throw new Error('forbidden');
     const handle = String(p.remoteUserHandle || '').slice(0, 120);
     if (!handle) throw new Error('malformed_request');
     // Bound how many participants a single peer can register for one op. A new
@@ -455,6 +471,9 @@ export async function upsertAlliedParticipant(opId: string, peerId: string, p: A
 export async function removeAlliedParticipant(opId: string, peerId: string, remoteUserHandle: string): Promise<void> {
     const { data: ally } = await supabase.from('operation_allied_orgs').select('accepted').eq('operation_id', opId).eq('peer_id', peerId).maybeSingle();
     if (!ally?.accepted) throw new Error('forbidden');
+    // Re-check the operations channel at ingest, mirroring upsertAlliedParticipant
+    // and the serve paths — a channel-disabled peer must not mutate host op rows.
+    if (!(await peerOperationsChannelEnabled(peerId))) throw new Error('forbidden');
     const handle = String(remoteUserHandle || '').slice(0, 120);
     if (!handle) throw new Error('malformed_request');
     const { error } = await supabase.from('operation_allied_participants').delete()
@@ -656,6 +675,9 @@ export async function removeMirroredRsvp(id: string, userId: number): Promise<vo
  * the bucket drains mid-way the remainder waits for the next recovery pass.
  */
 export async function pushLocalRsvpsForPeer(peerId: string): Promise<void> {
+    // Same opt-in as the other guest-side ops paths: stop re-pushing member RSVP
+    // PII to a peer the local org has toggled the operations channel off for.
+    if (!(await peerOperationsChannelEnabled(peerId))) return;
     const { data: mirrors } = await supabase.from('mirrored_operations')
         .select('id').eq('host_peer_id', peerId).eq('accepted', true).is('revoked_at', null);
     if (!mirrors || mirrors.length === 0) return;
@@ -734,7 +756,7 @@ export async function reconcileMirrorsWithPeer(peerId: string): Promise<MirrorRe
         log.warn('op-manifest fetch rejected', { peerId, status: res.status });
         return { ...NO_INFO, peerUp: true };                    // peer is up; "no information", never revoke
     }
-    let manifest: OperationManifest | null = null;
+    let manifest: OperationManifest | null;
     try { manifest = await res.json() as OperationManifest; } catch { manifest = null; }
     if (!manifest || manifest.v !== 1 || typeof manifest.accepted !== 'object' || manifest.accepted === null || !Array.isArray(manifest.invited)) {
         log.warn('op-manifest malformed', { peerId });

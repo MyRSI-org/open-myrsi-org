@@ -65,30 +65,44 @@ export default function IssueKitModal({
     // Server-side picker search — fetches inventory matching the query, capped
     // at 40 rows. Avoids holding the entire org inventory in memory.
     const [pickerResults, setPickerResults] = useState<QmInventoryItem[]>([]);
-    const [pickerLoading, setPickerLoading] = useState(false);
-    const pickerSeq = useRef(0);
+    // Loading starts true exactly when the picker starts open (no seedItem), so
+    // the very first fetch's loading state needs no synchronous effect-set.
+    const [pickerLoading, setPickerLoading] = useState(() => !seedItem);
+    const pickerSeqRef = useRef(0);
+
+    // Begin the loading state for a new picker fetch during render, on the same
+    // key that drives the fetch effect below (picker open + debounced query).
+    // Keeping it out of the effect avoids a synchronous set-state-in-effect; the
+    // effect still owns the async RPC and resolves loading to false. The mount
+    // case is covered by the lazy initial value above (so this tracker is inited
+    // to the current key and does not double-fire on first render).
+    const pickerFetchKey = pickerOpen ? debouncedPickerSearch : null;
+    const [prevPickerFetchKey, setPrevPickerFetchKey] = useState<string | null>(pickerFetchKey);
+    if (pickerFetchKey !== prevPickerFetchKey) {
+        setPrevPickerFetchKey(pickerFetchKey);
+        if (pickerOpen) setPickerLoading(true);
+    }
 
     useEffect(() => {
         if (!pickerOpen) return;
-        const seq = ++pickerSeq.current;
-        setPickerLoading(true);
+        const seq = ++pickerSeqRef.current;
         rpcAction('qm:list_inventory', {
             search: debouncedPickerSearch || undefined,
             includeArchived: false,
             limit: 40,
         })
             .then((rows: QmInventoryItem[] | undefined) => {
-                if (seq !== pickerSeq.current) return;
+                if (seq !== pickerSeqRef.current) return;
                 const list = Array.isArray(rows) ? rows : [];
                 setPickerResults(list);
                 rememberInventory(list);
             })
             .catch(() => {
-                if (seq !== pickerSeq.current) return;
+                if (seq !== pickerSeqRef.current) return;
                 setPickerResults([]);
             })
             .finally(() => {
-                if (seq === pickerSeq.current) setPickerLoading(false);
+                if (seq === pickerSeqRef.current) setPickerLoading(false);
             });
     }, [pickerOpen, debouncedPickerSearch, rpcAction, rememberInventory]);
 
@@ -245,7 +259,7 @@ export default function IssueKitModal({
                                 const overStock = !!inv && qty > inv.quantityOnHand;
                                 const invalid = overStock || !Number.isFinite(qty) || qty < 1;
                                 return (
-                                    <div key={`${line.inventoryId}-${idx}`} className={`flex items-center gap-2 bg-slate-900/60 border rounded-lg px-3 py-2 ${invalid ? 'border-rose-500/50' : 'border-white/10'}`}>
+                                    <div key={line.inventoryId} className={`flex items-center gap-2 bg-slate-900/60 border rounded-lg px-3 py-2 ${invalid ? 'border-rose-500/50' : 'border-white/10'}`}>
                                         <div className="flex-1 min-w-0">
                                             <div className="text-sm text-white truncate font-bold">{inv?.catalog?.name || inv?.customName || `Item #${line.inventoryId}`}</div>
                                             <div className="text-[10px] text-slate-500 font-mono truncate">

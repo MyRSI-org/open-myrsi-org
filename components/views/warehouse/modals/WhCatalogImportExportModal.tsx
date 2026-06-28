@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { useData } from '../../../../contexts/DataContext';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import { useWarehouse } from '../../../../contexts/WarehouseContext';
@@ -88,21 +88,33 @@ const WhCatalogImportExportModal: React.FC<WhCatalogImportExportModalProps> = ({
     const [importing, setImporting] = useState(false);
     const importCancelRef = useRef(false);
 
-    useEffect(() => {
-        if (!isOpen) return;
-        // If the user can't import, default to the only tab they can use.
-        setTab(canImport ? 'export' : 'export');
-        setItems(null);
-        setPreview(null);
-        setImportProgress(null);
-        setExportProgress(null);
-        setImporting(false);
-        setExporting(false);
-        setLoadingPreview(false);
-        setFileName(null);
-        exportCancelRef.current = false;
-        importCancelRef.current = false;
-    }, [isOpen, canImport]);
+    // Reset all modal form/progress state each time the modal opens (or the
+    // user's import permission changes while open). Adjusting state during
+    // render (React-documented pattern) is equivalent to the old reset effect
+    // keyed on [isOpen, canImport] but runs before paint without a synchronous
+    // effect setState. The reset only fires while open, matching the original
+    // effect's `if (!isOpen) return` guard.
+    const resetKey = `${isOpen}:${canImport}`;
+    const [prevResetKey, setPrevResetKey] = useState(resetKey);
+    if (resetKey !== prevResetKey) {
+        setPrevResetKey(resetKey);
+        if (isOpen) {
+            // If the user can't import, default to the only tab they can use.
+            setTab(canImport ? 'export' : 'export');
+            setItems(null);
+            setPreview(null);
+            setImportProgress(null);
+            setExportProgress(null);
+            setImporting(false);
+            setExporting(false);
+            setLoadingPreview(false);
+            setFileName(null);
+            // NOTE: the cancel refs are deterministically reset to false at the
+            // start of handleStartExport / handleStartImport (before any read),
+            // so they need no reset here — and refs must not be mutated during
+            // render. Resetting them on open would be a redundant no-op.
+        }
+    }
 
     // ---- Export ---------------------------------------------------------------
     const handleStartExport = async () => {
@@ -389,8 +401,8 @@ const WhCatalogImportExportModal: React.FC<WhCatalogImportExportModalProps> = ({
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">{preview.invalid.length} invalid row{preview.invalid.length === 1 ? '' : 's'} (will be skipped)</summary>
                                         <ul className="mt-2 space-y-1 max-h-40 overflow-y-auto custom-scrollbar text-slate-400">
-                                            {preview.invalid.map((bad, i) => (
-                                                <li key={i}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
+                                            {preview.invalid.map((bad) => (
+                                                <li key={bad.index}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
                                             ))}
                                         </ul>
                                     </details>
@@ -399,8 +411,8 @@ const WhCatalogImportExportModal: React.FC<WhCatalogImportExportModalProps> = ({
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">{preview.conflicts.length} change{preview.conflicts.length === 1 ? '' : 's'} to existing entries</summary>
                                         <ul className="mt-2 space-y-2 max-h-60 overflow-y-auto custom-scrollbar">
-                                            {preview.conflicts.map((c, i) => (
-                                                <li key={i} className="bg-slate-900/60 rounded-md p-2 border border-slate-700/30">
+                                            {preview.conflicts.map((c) => (
+                                                <li key={`${c.name}::${c.qualityLabel ?? ''}`} className="bg-slate-900/60 rounded-md p-2 border border-slate-700/30">
                                                     <p className="font-bold text-slate-200 mb-1">
                                                         {c.name}
                                                         {c.qualityLabel && <span className="ml-2 text-[10px] font-mono text-slate-500">· {c.qualityLabel}</span>}
@@ -436,8 +448,8 @@ const WhCatalogImportExportModal: React.FC<WhCatalogImportExportModalProps> = ({
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">View errors</summary>
                                         <ul className="mt-2 space-y-1 max-h-40 overflow-y-auto custom-scrollbar text-slate-400">
-                                            {importProgress.errors.map((bad, i) => (
-                                                <li key={i}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
+                                            {importProgress.errors.map((bad) => (
+                                                <li key={bad.index}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
                                             ))}
                                         </ul>
                                     </details>

@@ -17,9 +17,19 @@ const ReputationHistoryModal: React.FC<ReputationHistoryModalProps> = ({ isOpen,
     const [history, setHistory] = useState<HydratedReputationHistoryEntry[]>([]);
     const [isLoading, setIsLoading] = useState(true);
 
+    // Raise the loading flag synchronously during render whenever a fetch is
+    // about to be (re)triggered, so the spinner shows before the async fetch
+    // resolves. This mirrors the old in-effect setIsLoading(true) without a
+    // synchronous set-state inside the effect. The async fetch below clears it.
+    const fetchKey = isOpen ? `${user.id}` : null;
+    const [prevFetchKey, setPrevFetchKey] = useState(fetchKey);
+    if (fetchKey !== prevFetchKey) {
+        setPrevFetchKey(fetchKey);
+        if (fetchKey !== null) setIsLoading(true);
+    }
+
     useEffect(() => {
         if (isOpen) {
-            setIsLoading(true);
             getReputationHistory(user.id)
                 .then(setHistory)
                 .catch(err => console.error("Failed to fetch reputation history:", err))

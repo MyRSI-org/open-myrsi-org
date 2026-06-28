@@ -299,27 +299,27 @@ If a section has no entries, infer cautiously from the available information rat
         const status = extractedStatus || (typeof errStatus === 'string' ? errStatus : '');
 
         if (errStatus === 503 || status === 'UNAVAILABLE' || errMsg.includes('UNAVAILABLE') || errMsg.includes('overloaded')) {
-            throw new Error(`Gemini is temporarily overloaded for the configured model (${modelName}). This is usually a brief spike on Google's end — try again in a few minutes, or switch to a less-busy model (e.g. Gemini 2.5 Flash) in Admin → Integrations → AI Settings.`);
+            throw new Error(`Gemini is temporarily overloaded for the configured model (${modelName}). This is usually a brief spike on Google's end — try again in a few minutes, or switch to a less-busy model (e.g. Gemini 2.5 Flash) in Admin → Integrations → AI Settings.`, { cause: error });
         }
         if (errStatus === 429 || status === 'RESOURCE_EXHAUSTED' || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.toLowerCase().includes('quota')) {
-            throw new Error(`AI quota exceeded for the configured Gemini API key. Wait for the quota to reset (usually within an hour on the free tier) or upgrade the key in Admin → Integrations → AI Settings.`);
+            throw new Error(`AI quota exceeded for the configured Gemini API key. Wait for the quota to reset (usually within an hour on the free tier) or upgrade the key in Admin → Integrations → AI Settings.`, { cause: error });
         }
         if (errStatus === 404 || status === 'NOT_FOUND' || errMsg.includes('NOT_FOUND') || errMsg.includes('not found') || errMsg.includes('deprecated')) {
-            throw new Error(`AI model "${modelName}" was not found or has been retired by Google. Switch to a current model (e.g. Gemini 2.5 Flash) in Admin → Integrations → AI Settings.`);
+            throw new Error(`AI model "${modelName}" was not found or has been retired by Google. Switch to a current model (e.g. Gemini 2.5 Flash) in Admin → Integrations → AI Settings.`, { cause: error });
         }
         if (errStatus === 403 || status === 'PERMISSION_DENIED' || errMsg.includes('PERMISSION_DENIED')) {
-            throw new Error(`The configured Gemini API key does not have permission to use "${modelName}". Verify the key in Admin → Integrations → AI Settings has access to this model.`);
+            throw new Error(`The configured Gemini API key does not have permission to use "${modelName}". Verify the key in Admin → Integrations → AI Settings has access to this model.`, { cause: error });
         }
         if (status === 'INVALID_ARGUMENT' || errMsg.includes('API_KEY_INVALID')) {
-            throw new Error(`The configured Gemini API key is invalid. Update it in Admin → Integrations → AI Settings.`);
+            throw new Error(`The configured Gemini API key is invalid. Update it in Admin → Integrations → AI Settings.`, { cause: error });
         }
         if (errStatus === 500 || status === 'INTERNAL' || errMsg.includes('INTERNAL')) {
-            throw new Error(`Gemini returned an internal error. This is on Google's end — try again in a few minutes.`);
+            throw new Error(`Gemini returned an internal error. This is on Google's end — try again in a few minutes.`, { cause: error });
         }
         // The matched cases above return curated, actionable text. For anything
         // else, log the real error server-side and surface a generic message
         // rather than the raw third-party error string.
         log.error('draft failed', { message: extractedMessage || errMsg });
-        throw new Error('AI draft failed. Please try again later or verify the AI configuration.');
+        throw new Error('AI draft failed. Please try again later or verify the AI configuration.', { cause: error });
     }
 }

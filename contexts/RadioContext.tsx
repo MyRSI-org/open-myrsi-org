@@ -1,5 +1,5 @@
 
-import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
+import React, { createContext, use, useEffect, useState, useCallback, useRef } from 'react';
 import { Room, RoomEvent, Participant, Track, RemoteParticipant, RemoteTrack, LocalAudioTrack } from 'livekit-client';
 import { useAuth } from './AuthContext';
 import { useData } from './DataContext';
@@ -35,7 +35,7 @@ const RadioContext = createContext<RadioContextType | null>(null);
 export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { currentUser } = useAuth();
     const { brandingConfig, radioChannels, rpcAction } = useData();
-    const { isPTTActive } = useHIDPTT();
+    const { subscribePTT } = useHIDPTT();
 
     const [isEnabled, setIsEnabled] = useState(false);
     const [isConnected, setIsConnected] = useState(false);
@@ -55,7 +55,8 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const gainNodesRef = useRef<Map<string, GainNode>>(new Map());
     const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
     const volumeRef = useRef(volume); // Stable ref for use in connectToChannel without causing reconnects
-    volumeRef.current = volume;
+    // volumeRef is kept in sync with `volume` inside the volume effect below
+    // (refs must not be written during render).
 
     // Local mic level analyser — attached on PTT down, disposed on PTT up.
     // Polled via rAF (~30Hz) while transmitting so the TX meter reflects
@@ -96,7 +97,7 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     // Debounce for squelch to prevent triggering on micro-pauses in speech (VAD gaps)
     const squelchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const prevSpeakerCount = useRef(0);
+    const prevSpeakerCountRef = useRef(0);
 
     // Initialize AudioContext
     useEffect(() => {
@@ -124,7 +125,7 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const incomingCount = activeSpeakers.length;
 
         // Transition from Speaking -> Silence
-        if (prevSpeakerCount.current > 0 && incomingCount === 0) {
+        if (prevSpeakerCountRef.current > 0 && incomingCount === 0) {
             if (squelchDebounceRef.current) clearTimeout(squelchDebounceRef.current);
 
             // Increased to 1000ms to prevent squelch spam during breath pauses
@@ -139,7 +140,7 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             if (squelchDebounceRef.current) clearTimeout(squelchDebounceRef.current);
         }
 
-        prevSpeakerCount.current = incomingCount;
+        prevSpeakerCountRef.current = incomingCount;
     }, [activeSpeakers, brandingConfig.radioSquelchUrl, playSound]);
 
     const disconnect = useCallback(() => {
@@ -355,6 +356,7 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const channel = radioChannels.find(c => c.id === channelId) || { id: channelId, name: channelId, color: '#38bdf8' };
                 if (channel) {
                     debugLog(`[Radio] Syncing to remote channel: ${channel.name}`);
+                    // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronizes the LiveKit connection to remote DB-driven channel state; not derived render state, and the surrounding guards (room?.name check, isConnecting/error gates) prevent a reconnect loop.
                     connectToChannel(channel as RadioChannel);
                 }
             }
@@ -416,19 +418,33 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         };
     }, [isEnabled, handlePTT]);
 
-    // WebHID PTT — triggers handlePTT when external HID device button is pressed/released
-    const prevHIDPTT = useRef(false);
+    // WebHID/gamepad PTT — register a handler that runs on each external PTT
+    // button edge, mirroring the keyboard-PTT path above (setState lives in the
+    // subscription callback, not an effect body). Edge dedupe is in HIDPTTContext's
+    // setPTT; the isEnabled/isConnected gate matches the prior effect's inner gate.
+    const handlePTTRef = useRef(handlePTT);
     useEffect(() => {
-        if (isPTTActive !== prevHIDPTT.current) {
-            prevHIDPTT.current = isPTTActive;
+        handlePTTRef.current = handlePTT;
+    });
+    useEffect(() => {
+        return subscribePTT((active) => {
             if (isEnabled && isConnected) {
-                handlePTT(isPTTActive);
+                handlePTTRef.current(active);
             }
-        }
-    }, [isPTTActive, isEnabled, isConnected, handlePTT]);
+        });
+    }, [subscribePTT, isEnabled, isConnected]);
 
     useEffect(() => {
         if (!isEnabled) {
+            // Tears down the LiveKit connection (external system) and clears the
+            // selected channel when the radio feature is switched off. Kept as an
+            // effect (not a setter wrapper) because its `disconnect` dependency is
+            // re-created whenever `room` changes, so the effect re-runs and also
+            // tears down a room that arrives from an in-flight connectToChannel
+            // AFTER the radio was disabled — self-healing a connect/disable race
+            // that a one-shot setter wrapper cannot. Runs only on the isEnabled
+            // false-edge (or a late room), so no render loop.
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- teardown of external LiveKit connection on feature-disable, not derived render state
             disconnect();
             setCurrentChannel(null);
         }
@@ -436,6 +452,9 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     // Volume updates for Gain Nodes
     useEffect(() => {
+        // Keep the stable ref in sync so newly-subscribed tracks pick up the
+        // current volume without re-creating connectToChannel.
+        volumeRef.current = volume;
         gainNodesRef.current.forEach(gainNode => {
             gainNode.gain.value = (volume / 100) * 3;
         });
@@ -449,11 +468,11 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         volume, setVolume, isMuted, toggleMute, handlePTT, localAudioLevel
     };
 
-    return <RadioContext.Provider value={value}>{children}</RadioContext.Provider>;
+    return <RadioContext value={value}>{children}</RadioContext>;
 };
 
 export const useRadio = () => {
-    const context = useContext(RadioContext);
+    const context = use(RadioContext);
     if (!context) throw new Error('useRadio must be used within RadioProvider');
     return context;
 };

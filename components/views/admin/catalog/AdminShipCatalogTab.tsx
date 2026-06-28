@@ -15,6 +15,13 @@ const sizeOptions = ['Vehicle', 'Snub', 'Small', 'Medium', 'Large', 'Capital'];
 // onto the dashboard's addToast(message, icon, className, options) surface.
 type ToastFn = (message: string, type?: 'error' | 'success' | 'warning' | 'info') => void;
 
+type SortField = 'name' | 'manufacturer' | 'usageCount' | 'msrp';
+
+const SortIcon: React.FC<{ field: SortField; sortField: SortField; sortDir: 'asc' | 'desc' }> = ({ field, sortField, sortDir }) => {
+    if (sortField !== field) return <i className="fa-solid fa-sort text-slate-700 ml-1"></i>;
+    return <i className={`fa-solid fa-sort-${sortDir === 'asc' ? 'up' : 'down'} text-purple-400 ml-1`}></i>;
+};
+
 export default function AdminShipCatalogTab() {
     const { rpcAction } = useData();
     const { addToast, confirm } = useNotification();
@@ -31,7 +38,23 @@ export default function AdminShipCatalogTab() {
             toast(`Failed to load ships: ${e?.message || 'unknown'}`, 'error');
         }
     }, [rpcAction, toast]);
-    useEffect(() => { loadShips(); }, [loadShips]);
+    // Mount / dependency-change data fetch. The fetch is genuinely asynchronous: setShips
+    // only runs after the awaited RPC resolves. Inlining the async work directly in the
+    // effect (rather than calling loadShips) keeps the setState provably post-await, so the
+    // set-state-in-effect rule is satisfied without changing behavior. A cancelled flag
+    // drops a late resolution after unmount/re-run, which is strictly correct for a fetch.
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const rows = await rpcAction('catalog:list_ships', {});
+                if (!cancelled) setShips(Array.isArray(rows) ? rows : []);
+            } catch (e: any) {
+                if (!cancelled) toast(`Failed to load ships: ${e?.message || 'unknown'}`, 'error');
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [rpcAction, toast]);
 
     // Filter state
     const [search, setSearch] = useState('');
@@ -41,7 +64,7 @@ export default function AdminShipCatalogTab() {
     const [page, setPage] = useState(0);
 
     // Sort state
-    const [sortField, setSortField] = useState<'name' | 'manufacturer' | 'usageCount' | 'msrp'>('name');
+    const [sortField, setSortField] = useState<SortField>('name');
     const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
     // Edit modal state
@@ -247,11 +270,6 @@ export default function AdminShipCatalogTab() {
     const inputClass = 'w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:outline-hidden focus:border-purple-500 transition-all placeholder:text-slate-600';
     const labelClass = 'block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1';
 
-    const SortIcon: React.FC<{ field: typeof sortField }> = ({ field }) => {
-        if (sortField !== field) return <i className="fa-solid fa-sort text-slate-700 ml-1"></i>;
-        return <i className={`fa-solid fa-sort-${sortDir === 'asc' ? 'up' : 'down'} text-purple-400 ml-1`}></i>;
-    };
-
     return (
         <div className="animate-fade-in-up p-4 md:p-6">
             {/* Header */}
@@ -344,19 +362,19 @@ export default function AdminShipCatalogTab() {
                             <tr>
                                 <th className="p-3 w-14"></th>
                                 <th className="p-3 cursor-pointer hover:text-white" onClick={() => handleSort('name')}>
-                                    Name <SortIcon field="name" />
+                                    Name <SortIcon field="name" sortField={sortField} sortDir={sortDir} />
                                 </th>
                                 <th className="p-3 cursor-pointer hover:text-white" onClick={() => handleSort('manufacturer')}>
-                                    Manufacturer <SortIcon field="manufacturer" />
+                                    Manufacturer <SortIcon field="manufacturer" sortField={sortField} sortDir={sortDir} />
                                 </th>
                                 <th className="p-3">Size</th>
                                 <th className="p-3">Role</th>
                                 <th className="p-3">Status</th>
                                 <th className="p-3 cursor-pointer hover:text-white text-right" onClick={() => handleSort('msrp')}>
-                                    MSRP <SortIcon field="msrp" />
+                                    MSRP <SortIcon field="msrp" sortField={sortField} sortDir={sortDir} />
                                 </th>
                                 <th className="p-3 cursor-pointer hover:text-white text-center" onClick={() => handleSort('usageCount')}>
-                                    Usage <SortIcon field="usageCount" />
+                                    Usage <SortIcon field="usageCount" sortField={sortField} sortDir={sortDir} />
                                 </th>
                                 <th className="p-3 text-right">Actions</th>
                             </tr>

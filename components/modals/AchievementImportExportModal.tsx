@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
 import { useConfig } from '../../contexts/ConfigContext';
@@ -68,18 +68,6 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
     const [tab, setTab] = useState<'export' | 'import'>('export');
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // Reset transient state every time the modal opens/closes or kind changes.
-    useEffect(() => {
-        if (!isOpen) return;
-        setTab('export');
-        setItems(null);
-        setPreview(null);
-        setProgress(null);
-        setImporting(false);
-        setLoadingPreview(false);
-        setFileName(null);
-    }, [isOpen, kind]);
-
     // ---- Export ---------------------------------------------------------------
     // Serializes items already in client state — no RPC required. The export
     // shape strips server-managed fields so the file is portable across orgs.
@@ -124,6 +112,29 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
     const [importing, setImporting] = useState(false);
     const cancelRef = useRef(false);
 
+    // Reset transient state every time the modal opens or the kind changes,
+    // using React's "adjust state during render" pattern with previous-value
+    // trackers. This runs during render (before paint), so it is behaviourally
+    // equivalent to the old reset-in-effect: when isOpen flips true, or kind
+    // switches while open, the transient fields are re-seeded; a close (isOpen
+    // → false) only advances the trackers and resets nothing — matching the old
+    // effect's `if (!isOpen) return` guard.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    const [prevKind, setPrevKind] = useState(kind);
+    if (isOpen !== prevIsOpen || kind !== prevKind) {
+        setPrevIsOpen(isOpen);
+        setPrevKind(kind);
+        if (isOpen) {
+            setTab('export');
+            setItems(null);
+            setPreview(null);
+            setProgress(null);
+            setImporting(false);
+            setLoadingPreview(false);
+            setFileName(null);
+        }
+    }
+
     const loadPreview = useCallback(async (parsedItems: any[]) => {
         setLoadingPreview(true);
         try {
@@ -135,7 +146,7 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
         } finally {
             setLoadingPreview(false);
         }
-    }, [rpcAction, meta.previewAction, addToast]);
+    }, [rpcAction, meta.previewAction, addToast, setLoadingPreview, setPreview]);
 
     const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
@@ -307,8 +318,8 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">{preview.invalid.length} invalid row{preview.invalid.length === 1 ? '' : 's'} (will be skipped)</summary>
                                         <ul className="mt-2 space-y-1 max-h-40 overflow-y-auto custom-scrollbar text-slate-400">
-                                            {preview.invalid.map((bad, i) => (
-                                                <li key={i}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
+                                            {preview.invalid.map((bad) => (
+                                                <li key={bad.index}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
                                             ))}
                                         </ul>
                                     </details>
@@ -317,8 +328,8 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">{preview.conflicts.length} change{preview.conflicts.length === 1 ? '' : 's'} to existing entries</summary>
                                         <ul className="mt-2 space-y-2 max-h-60 overflow-y-auto custom-scrollbar">
-                                            {preview.conflicts.map((c, i) => (
-                                                <li key={i} className="bg-slate-900/60 rounded-md p-2 border border-slate-700/30">
+                                            {preview.conflicts.map((c) => (
+                                                <li key={c.name} className="bg-slate-900/60 rounded-md p-2 border border-slate-700/30">
                                                     <p className="font-bold text-slate-200 mb-1">{c.name}</p>
                                                     {Object.entries(c.changes).map(([field, change]) => (
                                                         <div key={field} className="text-[11px] text-slate-400">
@@ -354,8 +365,8 @@ const AchievementImportExportModal: React.FC<AchievementImportExportModalProps> 
                                     <details className="text-xs">
                                         <summary className="text-amber-400 cursor-pointer">View errors</summary>
                                         <ul className="mt-2 space-y-1 max-h-40 overflow-y-auto custom-scrollbar text-slate-400">
-                                            {progress.errors.map((bad, i) => (
-                                                <li key={i}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
+                                            {progress.errors.map((bad) => (
+                                                <li key={bad.index}>Row {bad.index + 1}{bad.name ? ` — ${bad.name}` : ''}: {bad.reason}</li>
                                             ))}
                                         </ul>
                                     </details>

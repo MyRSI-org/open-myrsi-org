@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { Location, LocationType } from '../../types';
 import { useConfig } from '../../contexts/ConfigContext';
 
@@ -21,20 +21,35 @@ const LocationModal: React.FC<LocationModalProps> = ({ isOpen, onClose, location
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!location;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (location) {
-                setName(location.name);
-                setType(location.type);
-                setParentId(location.parent_id?.toString() || '');
-            } else {
-                setName('');
-                setType(LocationType.System);
-                setParentId('');
-            }
-            setIsLoading(false);
+    // Seed/reset the user-editable form fields when the modal opens, or when the
+    // selected location changes while open. The fields are edited afterward, so
+    // they can't be derived during render — instead we re-seed during render via
+    // the React-documented "adjust state on prop change" pattern, tracking the
+    // previous (isOpen, location) pair. This fires on exactly the same
+    // transitions the old [isOpen, location] effect did (open, and selection
+    // change while open), and React re-renders before paint, so it is
+    // behavior-equivalent to the effect-based reset.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevLocation, setPrevLocation] = useState(location);
+    if (isOpen && (isOpen !== prevIsOpen || location !== prevLocation)) {
+        setPrevIsOpen(isOpen);
+        setPrevLocation(location);
+        if (location) {
+            setName(location.name);
+            setType(location.type);
+            setParentId(location.parent_id?.toString() || '');
+        } else {
+            setName('');
+            setType(LocationType.System);
+            setParentId('');
         }
-    }, [isOpen, location]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || location !== prevLocation) {
+        // Keep the trackers in sync on transitions that don't re-seed (e.g. the
+        // modal closing) so the next open is detected correctly.
+        setPrevIsOpen(isOpen);
+        setPrevLocation(location);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

@@ -13,7 +13,7 @@ export default function DashboardHero({ variant }: Props) {
     const { currentUser, toggleDutyStatus } = useAuth();
     const fmt = useFormatDate();
     const { isFetching } = useData();
-    const [now, setNow] = useState(new Date());
+    const [now, setNow] = useState(() => new Date());
     const [toggling, setToggling] = useState(false);
 
     useEffect(() => {

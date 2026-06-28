@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Certification } from '../../types';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -24,24 +24,34 @@ const CertificationModal: React.FC<CertificationModalProps> = ({ isOpen, onClose
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!certification;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (certification) {
-                setName(certification.name);
-                setDescription(certification.description || '');
-                setIcon(certification.icon || '');
-                setImageUrl(certification.imageUrl || '');
-                setIconMode(certification.imageUrl ? 'url' : 'fa');
-            } else {
-                setName('');
-                setDescription('');
-                setIcon('');
-                setImageUrl('');
-                setIconMode('fa');
-            }
-            setIsLoading(false);
+    // Re-seed the editable form when the modal opens or the selected certification changes
+    // (React's "adjust state during render" pattern). Tracking prevIsOpen/prevCert reproduces
+    // the old [isOpen, certification] effect: seed only while open, on open or cert change.
+    // Fields stay user-editable afterward, so they cannot be derived during render. React
+    // re-renders before paint, making this behavior-equivalent to the effect-reset.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevCert, setPrevCert] = useState(certification);
+    if (isOpen && (isOpen !== prevIsOpen || certification !== prevCert)) {
+        setPrevIsOpen(isOpen);
+        setPrevCert(certification);
+        if (certification) {
+            setName(certification.name);
+            setDescription(certification.description || '');
+            setIcon(certification.icon || '');
+            setImageUrl(certification.imageUrl || '');
+            setIconMode(certification.imageUrl ? 'url' : 'fa');
+        } else {
+            setName('');
+            setDescription('');
+            setIcon('');
+            setImageUrl('');
+            setIconMode('fa');
         }
-    }, [isOpen, certification]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen) {
+        // Keep the open-tracker in sync across a close so the next open re-seeds.
+        setPrevIsOpen(isOpen);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

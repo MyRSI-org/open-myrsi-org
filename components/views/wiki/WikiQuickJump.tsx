@@ -71,17 +71,32 @@ const WikiQuickJump: React.FC<Props> = ({ isOpen, onClose, pages, onSelect }) =>
         return scored.slice(0, MAX_RESULTS);
     }, [query, pages]);
 
+    // Treat an out-of-range active index (e.g. after the result set shrinks as
+    // the query changes) as the first row, derived during render instead of via
+    // a clamping effect.
+    const safeActiveIndex = activeIndex >= results.length ? 0 : activeIndex;
+
+    // Reset the query/selection on the palette's closed→open transition. Done
+    // during render via a prevIsOpen tracker (React re-renders before paint, so
+    // it is behavior-equivalent to the old open-reset effect) rather than a
+    // synchronous setState in an effect. The input focus is a genuine DOM side
+    // effect and stays in the effect below.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    if (isOpen && !prevIsOpen) {
+        setPrevIsOpen(true);
+        setQuery('');
+        setActiveIndex(0);
+    } else if (!isOpen && prevIsOpen) {
+        setPrevIsOpen(false);
+    }
+
     useEffect(() => {
         if (isOpen) {
-            setQuery('');
-            setActiveIndex(0);
+            // Focus the input when the palette opens (DOM side effect; the
+            // query/selection reset happens in the render-time tracker above).
             requestAnimationFrame(() => inputRef.current?.focus());
         }
     }, [isOpen]);
-
-    useEffect(() => {
-        if (activeIndex >= results.length) setActiveIndex(0);
-    }, [results.length, activeIndex]);
 
     useEffect(() => {
         if (!isOpen) return;
@@ -98,13 +113,13 @@ const WikiQuickJump: React.FC<Props> = ({ isOpen, onClose, pages, onSelect }) =>
             onClose();
         } else if (e.key === 'ArrowDown') {
             e.preventDefault();
-            setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+            setActiveIndex(Math.min(safeActiveIndex + 1, results.length - 1));
         } else if (e.key === 'ArrowUp') {
             e.preventDefault();
-            setActiveIndex((i) => Math.max(i - 1, 0));
+            setActiveIndex(Math.max(safeActiveIndex - 1, 0));
         } else if (e.key === 'Enter') {
             e.preventDefault();
-            const target = results[activeIndex];
+            const target = results[safeActiveIndex];
             if (target) {
                 onSelect(target.page);
                 onClose();
@@ -114,9 +129,9 @@ const WikiQuickJump: React.FC<Props> = ({ isOpen, onClose, pages, onSelect }) =>
 
     useEffect(() => {
         if (!listRef.current) return;
-        const item = listRef.current.querySelector<HTMLElement>(`[data-result-index="${activeIndex}"]`);
+        const item = listRef.current.querySelector<HTMLElement>(`[data-result-index="${safeActiveIndex}"]`);
         if (item) item.scrollIntoView({ block: 'nearest' });
-    }, [activeIndex]);
+    }, [safeActiveIndex]);
 
     if (!isOpen) return null;
 
@@ -157,7 +172,7 @@ const WikiQuickJump: React.FC<Props> = ({ isOpen, onClose, pages, onSelect }) =>
                         </div>
                     ) : (
                         results.map((r, idx) => {
-                            const isActive = idx === activeIndex;
+                            const isActive = idx === safeActiveIndex;
                             return (
                                 <button
                                     key={r.page.id}

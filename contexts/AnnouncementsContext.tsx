@@ -10,7 +10,7 @@
 // realtime resync. DataContext registers its refresh callback here at mount;
 // CRUD methods call it after their RPC completes.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import { Announcement } from '../types';
 
@@ -80,11 +80,11 @@ export const AnnouncementsProvider: React.FC<{ children: React.ReactNode }> = ({
         registerRefreshAnnouncements,
     ]);
 
-    return <AnnouncementsContext.Provider value={value}>{children}</AnnouncementsContext.Provider>;
+    return <AnnouncementsContext value={value}>{children}</AnnouncementsContext>;
 };
 
 export const useAnnouncements = (): AnnouncementsContextValue => {
-    const ctx = useContext(AnnouncementsContext);
+    const ctx = use(AnnouncementsContext);
     if (!ctx) throw new Error('useAnnouncements must be used within an AnnouncementsProvider');
     return ctx;
 };

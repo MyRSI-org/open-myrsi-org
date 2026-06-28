@@ -97,6 +97,11 @@ export async function ssrfSafeFetch(url: string, init?: SsrfSafeFetchInit): Prom
             // sockets quickly instead of hoarding keep-alive connections.
             keepAliveTimeout: 1000,
             keepAliveMaxTimeout: 1000,
+            // undici 8 flips allowH2 to true by default; keep this guard on
+            // HTTP/1.1 only. A hostile peer must not be able to ALPN-negotiate
+            // HTTP/2 on our credentialed outbound request — the IP-pin and
+            // redirect refusal below are written and tested against h1.
+            allowH2: false,
             // Central response-byte ceiling: undici aborts + errors once the
             // body exceeds this, so callers' downstream res.json()/res.text()
             // can never buffer a hostile peer's giant body.

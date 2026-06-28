@@ -4,7 +4,7 @@
 // manager (CRUD + restore-defaults for orgs that upgraded past first-boot).
 // All data flows through rpcAction → the permission-gated dispatcher; this view
 // renders only the projections the admin actions return.
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useFormatDate } from '../../../contexts/AuthContext';
 import { useNotification } from '../../../contexts/NotificationContext';
@@ -117,29 +117,55 @@ const MarketplaceAdminTab: React.FC = () => {
 
     const ok = (msg: string) => addToast(msg, <i className="fa-solid fa-check"></i>, 'bg-green-500/10 text-green-400 border-green-500/50');
     const fail = (e: any) => addToast('Action Failed', <i className="fa-solid fa-xmark"></i>, 'bg-red-500/10 text-red-400 border-red-500/50', { description: e?.message || 'Something went wrong.' });
+    // Latest-ref for `fail` so the data-fetch callbacks below can depend only on their real
+    // inputs (rpcAction / reportFilter) without listing the per-render `fail` closure. `fail`
+    // only fires in the async `.catch` after the awaited rpc settles — long after this effect
+    // has committed the current `fail` — so failRef.current is never stale at call time.
+    const failRef = useRef(fail);
+    useEffect(() => { failRef.current = fail; });
 
+    // Refetch the reports queue. The synchronous `setLoadingReports(true)` lives in the
+    // `loadReports` wrapper (for button/refresh re-invocations) and in the render-time
+    // filter-change tracker below — NOT in the effect — so the effect runs no sync setState.
+    const fetchReports = useCallback(async () => {
+        // 'open' tab shows the working queue (open + reviewing); send no status.
+        const status = reportFilter === 'open' ? undefined : reportFilter;
+        // Settle data/error/loading entirely on the async promise chain so the effect that
+        // calls this has no synchronously-reachable setState (no sync `catch` to flag).
+        await rpcAction('marketplace:admin:list_reports', status ? { status } : {})
+            .then((data) => { setReports(data || []); })
+            .catch((e) => { failRef.current(e); })
+            .finally(() => { setLoadingReports(false); });
+    }, [rpcAction, reportFilter]);
     const loadReports = useCallback(async () => {
         setLoadingReports(true);
-        try {
-            // 'open' tab shows the working queue (open + reviewing); send no status.
-            const status = reportFilter === 'open' ? undefined : reportFilter;
-            const data = await rpcAction('marketplace:admin:list_reports', status ? { status } : {});
-            setReports(data || []);
-        } catch (e) { fail(e); } finally { setLoadingReports(false); }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [rpcAction, reportFilter]);
+        await fetchReports();
+    }, [fetchReports]);
 
+    const fetchCategories = useCallback(async () => {
+        await rpcAction('marketplace:admin:list_categories', {})
+            .then((data) => { setCategories(data || []); })
+            .catch((e) => { failRef.current(e); })
+            .finally(() => { setLoadingCats(false); });
+    }, [rpcAction]);
     const loadCategories = useCallback(async () => {
         setLoadingCats(true);
-        try {
-            const data = await rpcAction('marketplace:admin:list_categories', {});
-            setCategories(data || []);
-        } catch (e) { fail(e); } finally { setLoadingCats(false); }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [rpcAction]);
+        await fetchCategories();
+    }, [fetchCategories]);
 
-    useEffect(() => { loadReports(); }, [loadReports]);
-    useEffect(() => { loadCategories(); }, [loadCategories]);
+    // Show the spinner the moment the report filter changes (adjust-state-during-render
+    // pattern). This replaces the in-effect setLoadingReports(true) so the effect performs
+    // only the async fetch. React re-renders before paint, so it is behavior-equivalent.
+    const [prevReportFilter, setPrevReportFilter] = useState(reportFilter);
+    if (reportFilter !== prevReportFilter) {
+        setPrevReportFilter(reportFilter);
+        setLoadingReports(true);
+    }
+
+    // Both loaders are async external-data fetches. loadingReports/loadingCats start `true`,
+    // and the effects below run only the async fetch (whose async setState is not flagged).
+    useEffect(() => { fetchReports(); }, [fetchReports]);
+    useEffect(() => { fetchCategories(); }, [fetchCategories]);
 
     const resolveReport = async (report: MarketplaceReport, decision: 'actioned' | 'dismissed') => {
         if (decision === 'actioned' && report.targetType === 'listing') {

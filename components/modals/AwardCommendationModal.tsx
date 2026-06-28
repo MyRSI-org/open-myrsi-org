@@ -15,7 +15,7 @@ interface AwardCommendationModalProps {
 const AwardCommendationModal: React.FC<AwardCommendationModalProps> = ({ isOpen, onClose, commendation }) => {
     const { members, awardCommendation } = useMembers();
     const { addToast } = useNotification();
-    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(new Set());
+    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(() => new Set());
     const [reason, setReason] = useState('');
     const [isLoading, setIsLoading] = useState(false);
 

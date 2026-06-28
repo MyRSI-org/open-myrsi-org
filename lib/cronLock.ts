@@ -29,7 +29,7 @@ const WORKER_ID = `${os.hostname()}:${process.pid}`;
  * can't lock the job out for long). Releases the lease when `fn` settles.
  */
 export async function withCronLease(jobName: string, holdSeconds: number, fn: () => Promise<void>, opts?: { failClosed?: boolean }): Promise<void> {
-    let acquired = false;
+    let acquired: boolean;
     try {
         const { data, error } = await supabase.rpc('try_acquire_cron_lock', {
             p_job_name: jobName,

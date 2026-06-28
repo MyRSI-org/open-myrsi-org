@@ -4,7 +4,7 @@
 // checkPushSubscription. Consumers: DashboardApp.tsx (PushNotificationBanner)
 // and components/views/personnel/ProfileView.tsx (diagnostics card).
 
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useState } from 'react';
 import apiService from '../services/apiService';
 import { urlBase64ToUint8Array } from '../utils/pushUtils';
 
@@ -70,9 +70,13 @@ export const PushNotificationProvider: React.FC<{ children: React.ReactNode }> =
         }
     }, []);
 
-    // Initial check on mount.
+    // Initial check on mount. checkPushSubscription only calls setIsPushActive
+    // after awaiting the ServiceWorker subscription read, so awaiting it here
+    // keeps that state update off the synchronous effect path.
     useEffect(() => {
-        void checkPushSubscription();
+        void (async () => {
+            await checkPushSubscription();
+        })();
     }, [checkPushSubscription]);
 
     const value: PushNotificationContextValue = {
@@ -81,11 +85,11 @@ export const PushNotificationProvider: React.FC<{ children: React.ReactNode }> =
         checkPushSubscription,
     };
 
-    return <PushNotificationContext.Provider value={value}>{children}</PushNotificationContext.Provider>;
+    return <PushNotificationContext value={value}>{children}</PushNotificationContext>;
 };
 
 export const usePushNotification = (): PushNotificationContextValue => {
-    const ctx = useContext(PushNotificationContext);
+    const ctx = use(PushNotificationContext);
     if (!ctx) throw new Error('usePushNotification must be used within a PushNotificationProvider');
     return ctx;
 };

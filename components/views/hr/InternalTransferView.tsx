@@ -6,16 +6,14 @@ import { useNavigation } from '../../../contexts/NavigationContext';
 
 const InternalTransferView: React.FC = () => {
     const { setActiveView } = useNavigation();
-    const [id, setId] = useState<string | null>(null);
+    // Read once at mount via lazy initializer so the value is available during render.
+    const [id] = useState<string | null>(() => localStorage.getItem('selected_transfer_id'));
 
     useEffect(() => {
-        const storedId = localStorage.getItem('selected_transfer_id');
-        if (storedId) {
-            setId(storedId);
-        } else {
+        if (!id) {
             setActiveView('hr');
         }
-    }, [setActiveView]);
+    }, [id, setActiveView]);
 
     if (!id) return null;
 

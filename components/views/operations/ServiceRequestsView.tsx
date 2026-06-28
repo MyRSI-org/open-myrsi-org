@@ -39,6 +39,9 @@ const ServiceRequestsView: React.FC<ServiceRequestsViewProps> = ({
     type Tab = 'pending' | 'unassigned' | 'in_progress' | 'mine' | 'resolved' | 'all';
     const [activeTab, setActiveTab] = useState<Tab>(isStaff ? 'pending' : 'all');
     const [itemHeight, setItemHeight] = useState(window.innerWidth < 768 ? 460 : 335);
+    // Snapshot the "resolved in last 7 days" cutoff once at mount so render stays pure
+    // (Date.now() must not be called during render).
+    const [sevenDaysAgo] = useState(() => Date.now() - 7 * 24 * 60 * 60 * 1000);
 
     useEffect(() => {
         const handleResize = () => setItemHeight(window.innerWidth < 768 ? 460 : 335);
@@ -48,7 +51,6 @@ const ServiceRequestsView: React.FC<ServiceRequestsViewProps> = ({
 
     const counts = useMemo(() => {
         const reqs = hydratedServiceRequests || [];
-        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
         return {
             submitted: reqs.filter(r => r.status === ServiceRequestStatus.Submitted).length,
             triaged: reqs.filter(r => r.status === ServiceRequestStatus.Triaged).length,
@@ -62,7 +64,7 @@ const ServiceRequestsView: React.FC<ServiceRequestsViewProps> = ({
                 new Date(r.createdAt).getTime() > sevenDaysAgo
             ).length,
         };
-    }, [hydratedServiceRequests, currentUser, isStaff]);
+    }, [hydratedServiceRequests, currentUser, isStaff, sevenDaysAgo]);
 
     const filteredRequests = useMemo(() => {
         if (!currentUser) return [];

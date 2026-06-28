@@ -43,7 +43,7 @@ export default function MissionLogTimeline({ entries, emptyMessage = 'No log ent
 
                 return (
                     <li
-                        key={idx}
+                        key={`${entry.updatedAt}-${entry.status}`}
                         className="relative flex gap-4 animate-fade-in"
                         style={{ animationDelay: `${Math.min(idx * 40, 400)}ms`, animationFillMode: 'backwards' }}
                     >

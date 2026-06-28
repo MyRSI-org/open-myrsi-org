@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useHR } from '../../../contexts/HRContext';
@@ -43,13 +43,30 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
         return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     };
 
-    useEffect(() => {
+    // Populate / reset the form each time the modal opens (or the source props
+    // change while open), depending on whether we're editing an existing
+    // interview or creating a new one. This is the React "adjust state during
+    // render" pattern with previous-value trackers: it reproduces the old
+    // effect's behavior (which depended on [isOpen, applicant, editingInterview]
+    // and re-seeded whenever any of those changed while open) without a
+    // synchronous set-in-effect. prevIsOpen starts at false so that a modal
+    // that mounts already-open (the parent mounts this component only when
+    // open) seeds on its first render, matching the old mount-time effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevApplicant, setPrevApplicant] = useState(applicant);
+    const [prevEditingInterview, setPrevEditingInterview] = useState(editingInterview);
+    if (isOpen !== prevIsOpen || applicant !== prevApplicant || editingInterview !== prevEditingInterview) {
+        setPrevIsOpen(isOpen);
+        setPrevApplicant(applicant);
+        setPrevEditingInterview(editingInterview);
         if (isOpen) {
             if (editingInterview) {
                 setTemplateId(String(editingInterview.template.id));
                 setInterviewerId(String(editingInterview.interviewerId));
                 setScheduledAt(editingInterview.scheduledAt ? toDatetimeLocal(editingInterview.scheduledAt) : '');
-                setPanelMemberIds((editingInterview.panelMembers || []).map(m => m.id));
+                // Defensive: never keep the lead interviewer in the panel list (mirrors
+                // the dedup the original seed effect applied on load).
+                setPanelMemberIds((editingInterview.panelMembers || []).map(m => m.id).filter(id => id !== editingInterview.interviewerId));
                 setSelectedApplicantId('');
                 setMode('existing');
             } else {
@@ -66,7 +83,7 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
             setAdHocContext('');
             setIsLoading(false);
         }
-    }, [isOpen, applicant, editingInterview]);
+    }
 
     const availableInterviewers = useMemo(() => {
         return members.filter(m => m.permissions.includes('hr:recruiter') || m.permissions.includes('hr:admin'));
@@ -88,13 +105,16 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
         setPanelMemberIds(prev => prev.filter(mid => mid !== id));
     };
 
-    // If lead interviewer changes, remove them from panel if present
-    useEffect(() => {
-        if (interviewerId) {
-            const leadId = parseInt(interviewerId);
+    // If the lead interviewer changes, drop them from the panel if present.
+    // Handled in the change handler (rather than an effect) so the state update
+    // happens at the point of user interaction, not as a synchronous set-in-effect.
+    const handleInterviewerChange = (value: string) => {
+        setInterviewerId(value);
+        if (value) {
+            const leadId = parseInt(value);
             setPanelMemberIds(prev => prev.filter(id => id !== leadId));
         }
-    }, [interviewerId]);
+    };
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -291,7 +311,7 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
                         <label className={labelClass}>Lead Interviewer</label>
                         <select
                             value={interviewerId}
-                            onChange={(e) => setInterviewerId(e.target.value)}
+                            onChange={(e) => handleInterviewerChange(e.target.value)}
                             className={inputClass}
                             required
                             disabled={isLoading}

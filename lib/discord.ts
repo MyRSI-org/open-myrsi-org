@@ -214,7 +214,7 @@ export async function getDiscordRoles(): Promise<DiscordRole[]> {
             headers: { Authorization: `Bot ${botToken}` },
         });
     } catch (e: any) {
-        throw new Error(`Could not reach Discord (${e?.message || 'network error'}). Try again shortly.`);
+        throw new Error(`Could not reach Discord (${e?.message || 'network error'}). Try again shortly.`, { cause: e });
     }
 
     if (!response.ok) {
@@ -248,7 +248,7 @@ export async function getDiscordRoles(): Promise<DiscordRole[]> {
     try {
         roles = await response.json();
     } catch (e: any) {
-        throw new Error(`Discord returned an unexpected response (${e?.message || 'invalid JSON'}). This often indicates a Cloudflare/edge error — try again shortly.`);
+        throw new Error(`Discord returned an unexpected response (${e?.message || 'invalid JSON'}). This often indicates a Cloudflare/edge error — try again shortly.`, { cause: e });
     }
     return roles
         .filter((role: any) => !role.managed && role.name !== '@everyone')

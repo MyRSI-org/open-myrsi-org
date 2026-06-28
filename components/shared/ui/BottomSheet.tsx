@@ -12,14 +12,24 @@ const DRAG_DISMISS_THRESHOLD = 100;
 
 export default function BottomSheet({ isOpen, onClose, title, maxHeight = '85vh', children }: Props) {
     const [dragOffset, setDragOffset] = useState(0);
-    const dragStartY = useRef<number | null>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const dragStartYRef = useRef<number | null>(null);
     const sheetRef = useRef<HTMLDivElement>(null);
 
-    useEffect(() => {
-        if (!isOpen) {
+    // Reset drag position so a subsequent open starts un-dragged. Done during
+    // render via a previous-value tracker (the React "adjust state during
+    // render" pattern) so the transient drag offset clears on the close
+    // transition without a synchronous set-in-effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
+        if (!isOpen && dragOffset !== 0) {
             setDragOffset(0);
-            return;
         }
+    }
+
+    useEffect(() => {
+        if (!isOpen) return;
         const previous = document.body.style.overflow;
         document.body.style.overflow = 'hidden';
         return () => {
@@ -37,20 +47,22 @@ export default function BottomSheet({ isOpen, onClose, title, maxHeight = '85vh'
     }, [isOpen, onClose]);
 
     const handlePointerDown = (e: React.PointerEvent) => {
-        dragStartY.current = e.clientY;
+        dragStartYRef.current = e.clientY;
+        setIsDragging(true);
         (e.target as HTMLElement).setPointerCapture(e.pointerId);
     };
 
     const handlePointerMove = (e: React.PointerEvent) => {
-        if (dragStartY.current == null) return;
-        const delta = e.clientY - dragStartY.current;
+        if (dragStartYRef.current == null) return;
+        const delta = e.clientY - dragStartYRef.current;
         if (delta > 0) setDragOffset(delta);
     };
 
     const handlePointerEnd = () => {
-        if (dragStartY.current == null) return;
+        if (dragStartYRef.current == null) return;
         const finalOffset = dragOffset;
-        dragStartY.current = null;
+        dragStartYRef.current = null;
+        setIsDragging(false);
         if (finalOffset > DRAG_DISMISS_THRESHOLD) {
             onClose();
         } else {
@@ -79,7 +91,7 @@ export default function BottomSheet({ isOpen, onClose, title, maxHeight = '85vh'
                 style={{
                     transform: isOpen ? `translateY(${dragOffset}px)` : 'translateY(100%)',
                     maxHeight,
-                    transition: dragStartY.current == null ? 'transform 200ms ease-out' : 'none',
+                    transition: isDragging ? 'none' : 'transform 200ms ease-out',
                 }}
                 className="absolute left-0 right-0 bottom-0 bg-slate-950/95 backdrop-blur-xl border-t border-white/10 rounded-t-2xl shadow-2xl flex flex-col"
             >

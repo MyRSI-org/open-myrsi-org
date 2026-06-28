@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useData } from '../../../../contexts/DataContext';
 import WindowFrame from '../../../layout/WindowFrame';
 import type { QmLocation } from '../../../../types';
@@ -20,7 +20,13 @@ export default function WhCreateLocationModal({ isOpen, locations, onClose, onSu
     const [description, setDescription] = useState('');
     const [submitting, setSubmitting] = useState(false);
 
-    useEffect(() => {
+    // Reset the editable form fields each time the modal transitions to open.
+    // Adjusting state during render (React-documented pattern) is equivalent to
+    // the old reset-on-open effect but runs before paint without a synchronous
+    // effect setState.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setName('');
             setType('station');
@@ -28,7 +34,7 @@ export default function WhCreateLocationModal({ isOpen, locations, onClose, onSu
             setDescription('');
             setSubmitting(false);
         }
-    }, [isOpen]);
+    }
 
     if (!isOpen) return null;
 

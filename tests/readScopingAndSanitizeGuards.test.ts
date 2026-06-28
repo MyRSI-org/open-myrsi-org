@@ -45,7 +45,7 @@ beforeEach(() => { h.calls = []; h.data = {}; h.captured = {}; });
 
 const lte = () => h.calls.filter(c => c.method === 'lte');
 
-describe('listIntelReports clearance-level ceiling (I1)', () => {
+describe('listIntelReports clearance-level ceiling', () => {
     it('applies classification_level <= viewer level for a non-manager', async () => {
         await listIntelReports({ viewer: { clearanceLevel: { level: 2 }, permissions: [], role: 'Member' } });
         const ceiling = lte().find(c => c.args[0] === 'classification_level');
@@ -62,7 +62,7 @@ describe('listIntelReports clearance-level ceiling (I1)', () => {
     });
 });
 
-describe('search builders route through safeSearchTerm (L8)', () => {
+describe('search builders route through safeSearchTerm', () => {
     it('a malicious term cannot inject .or() structure (no leaked .eq. operator)', async () => {
         await searchPlatformLocations({ query: 'a,is_internal.eq.true' });
         const orCall = h.calls.find(c => c.method === 'or');
@@ -76,10 +76,11 @@ describe('search builders route through safeSearchTerm (L8)', () => {
     });
 });
 
-describe('upsertAlliedParticipant sanitization (L9)', () => {
+describe('upsertAlliedParticipant sanitization', () => {
     it('nulls an unsafe avatar scheme and length-caps free text', async () => {
         h.data.operation_allied_orgs = { accepted: true };
         h.data.operations = { is_joint: false, joint_version: 0 };
+        h.data.alliance_peers = { channels: { operations: true } }; // ops channel must be enabled for the ingest to proceed
         await upsertAlliedParticipant('op1', 'peer1', {
             remoteUserHandle: 'ally-member',
             avatarUrl: 'javascript:alert(1)',
@@ -95,9 +96,20 @@ describe('upsertAlliedParticipant sanitization (L9)', () => {
         expect(String(v.role).length).toBe(120);
         expect(String(v.ship_text).length).toBe(200);
     });
+    it('rejects the RSVP ingest (writes nothing) when the peer\'s operations channel is disabled', async () => {
+        // Accepted invite alone is not enough — a peer whose "Joint Ops" channel was
+        // toggled off must not keep writing its members' RSVP rows into the host op.
+        h.data.operation_allied_orgs = { accepted: true };
+        h.data.alliance_peers = { channels: { operations: false } }; // Joint Ops disabled
+        await expect(upsertAlliedParticipant('op1', 'peer1', {
+            remoteUserHandle: 'ally-member',
+            rsvpStatus: 'going',
+        })).rejects.toThrow('forbidden');
+        expect(h.captured.operation_allied_participants).toBeUndefined(); // no write occurred
+    });
 });
 
-describe('listWarehouseMovements limit clamp (L14)', () => {
+describe('listWarehouseMovements limit clamp', () => {
     it('clamps an oversized client limit to 500 rows', async () => {
         await listWarehouseMovements({ limit: 100000 });
         const range = h.calls.find(c => c.method === 'range');

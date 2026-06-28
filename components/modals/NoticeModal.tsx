@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Announcement, AnnouncementType } from '../../types';
 import { useAnnouncements } from '../../contexts/AnnouncementsContext';
 
@@ -34,24 +34,36 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ isOpen, onClose, notice }) =>
 
     const isEditing = !!notice;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (notice) {
-                setTitle(notice.title);
-                setBody(notice.body);
-                setType(notice.type);
-                setAudience(notice.audience as AudienceOption[]);
-                setExpiryDate(notice.expiryDate || null);
-            } else {
-                setTitle('');
-                setBody('');
-                setType(AnnouncementType.Information);
-                setAudience([]);
-                setExpiryDate(null);
-            }
-            setIsLoading(false);
+    // Reset/seed the user-editable form fields when the dialog opens or the
+    // selected notice changes while open. Done during render via the React
+    // "adjust state during render" pattern (re-renders before paint), which is
+    // behaviour-equivalent to the previous open/selection-change reset effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevNotice, setPrevNotice] = useState(notice);
+    if (isOpen && (isOpen !== prevIsOpen || notice !== prevNotice)) {
+        setPrevIsOpen(isOpen);
+        setPrevNotice(notice);
+        if (notice) {
+            setTitle(notice.title);
+            setBody(notice.body);
+            setType(notice.type);
+            setAudience(notice.audience as AudienceOption[]);
+            setExpiryDate(notice.expiryDate || null);
+        } else {
+            setTitle('');
+            setBody('');
+            setType(AnnouncementType.Information);
+            setAudience([]);
+            setExpiryDate(null);
         }
-    }, [isOpen, notice]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || notice !== prevNotice) {
+        // Keep trackers in sync even when the dialog is closed, so the next
+        // open is detected correctly (mirrors the effect's dep array firing
+        // without performing the reset while closed).
+        setPrevIsOpen(isOpen);
+        setPrevNotice(notice);
+    }
 
     const handleAudienceChange = (role: AudienceOption) => {
         setAudience(prev =>

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useData } from '../../../../contexts/DataContext';
 import WindowFrame from '../../../layout/WindowFrame';
 import type { WarehouseStock, WarehouseMovementReason } from '../../../../types';
@@ -43,7 +43,15 @@ export default function WhAdjustStockDialog({ isOpen, stock, onClose, onSubmitte
 
     const reason = useMemo(() => REASON_OPTIONS.find((r) => r.key === reasonKey)!, [reasonKey]);
 
-    useEffect(() => {
+    // Reset the editable form fields when the dialog opens or the target stock
+    // row changes. Adjusting state during render (React-documented pattern) is
+    // equivalent to the old reset effect keyed on [isOpen, stock?.id] but runs
+    // before paint without a synchronous effect setState. The reset only fires
+    // while open, matching the original effect's `if (isOpen)` guard.
+    const resetKey = `${isOpen}:${stock?.id ?? ''}`;
+    const [prevResetKey, setPrevResetKey] = useState(resetKey);
+    if (resetKey !== prevResetKey) {
+        setPrevResetKey(resetKey);
         if (isOpen) {
             setMode('delta');
             setReasonKey('restock');
@@ -52,8 +60,7 @@ export default function WhAdjustStockDialog({ isOpen, stock, onClose, onSubmitte
             setNotes('');
             setSubmitting(false);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on isOpen / stock.id flip; same pattern as AdjustStockDialog.
-    }, [isOpen, stock?.id]);
+    }
 
     if (!isOpen || !stock) return null;
 

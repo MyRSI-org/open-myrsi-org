@@ -130,13 +130,13 @@ const IntelligenceReportCard: React.FC<Props> = ({
                 {/* Tags — single-row clip so many tags don't stack and push content */}
                 {tags.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 max-h-[26px] overflow-hidden shrink-0">
-                        {tags.map((tag, i) => {
+                        {tags.map((tag) => {
                             const t = s(tag);
                             if (!t) return null;
                             if (onTagClick) {
                                 return (
                                     <button
-                                        key={i}
+                                        key={t}
                                         onClick={(e) => { e.stopPropagation(); onTagClick(t); }}
                                         className="inline-flex items-center px-2 py-0.5 rounded-sm border font-mono text-[10px] uppercase tracking-wider bg-slate-900/60 border-white/10 text-slate-400 hover:bg-sky-500/10 hover:border-sky-500/30 hover:text-sky-300 transition-colors"
                                         title={`Filter by tag "${t}"`}
@@ -146,7 +146,7 @@ const IntelligenceReportCard: React.FC<Props> = ({
                                 );
                             }
                             return (
-                                <span key={i} className="inline-flex items-center px-2 py-0.5 rounded-sm border font-mono text-[10px] uppercase tracking-wider bg-slate-900/40 border-white/5 text-slate-500">
+                                <span key={t} className="inline-flex items-center px-2 py-0.5 rounded-sm border font-mono text-[10px] uppercase tracking-wider bg-slate-900/40 border-white/5 text-slate-500">
                                     <span className="opacity-60 mr-0.5">#</span>{t}
                                 </span>
                             );
@@ -163,9 +163,9 @@ const IntelligenceReportCard: React.FC<Props> = ({
                     {markers.length > 0 && (
                         <>
                             <span className="text-slate-600 uppercase font-black tracking-widest ml-1">MKR</span>
-                            {markers.map((m, idx) => (
+                            {markers.map((m) => (
                                 <span
-                                    key={typeof m?.id === 'number' ? m.id : idx}
+                                    key={typeof m?.id === 'number' ? m.id : s(m?.code)}
                                     className="px-1.5 py-0.5 rounded-sm bg-slate-950/60 text-sky-400 border border-sky-500/20 uppercase font-black tracking-wider"
                                     title={s((m as any)?.name) || s(m?.code)}
                                 >

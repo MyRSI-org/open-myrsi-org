@@ -1,6 +1,13 @@
 
 import * as db from '../../lib/db.js';
 import type { ApplicationStatus } from '../../types.js';
+import { assertSubmissionRateLimit } from '../../lib/submissionRateLimit.js';
+import { stripHtml } from '../../lib/textSanitize.js';
+
+// Free-text length cap for member-initiated submissions. Matches MAX_APPLICATION_TEXT
+// in lib/db/hr.ts (the application/job-statement cap) so the self-service transfer
+// reason can't park a multi-MB blob in hr_transfer_requests.
+const MAX_TRANSFER_REASON = 5000;
 
 // --- Payload shapes ---
 // Application/interview/job ids are uuid strings; user, recruiter, template
@@ -218,11 +225,20 @@ export const hrActions = {
     'hr:delete_job': ({ id }: DeleteJobPayload) => db.deleteJobPosting(id),
     'hr:apply_job': (payload: ApplyJobPayload) => db.applyForJob(payload),
     'hr:request_transfer': async (payload: RequestTransferPayload) => {
+        // Member-initiated self-service write: mirror user:submit_application /
+        // user:apply_job — throttle per authenticated user (each row surfaces in every
+        // HR manager's transfers view), and bound the free-text reason. Reject an
+        // over-long reason outright (no silent truncation), then strip HTML/control
+        // chars from the persisted string as defense-in-depth.
+        assertSubmissionRateLimit(payload.userId);
+        if (payload.reason && payload.reason.length > MAX_TRANSFER_REASON) {
+            throw new Error('Reason is too long.');
+        }
         await db.supabase.from('hr_transfer_requests').insert({
             user_id: payload.userId,
             current_unit_id: payload.currentUnitId,
             target_unit_id: payload.targetUnitId,
-            reason: payload.reason
+            reason: stripHtml(payload.reason, MAX_TRANSFER_REASON)
         });
     },
     'hr:process_transfer': ({ id, status, notes }: ProcessTransferPayload) => db.processTransferRequest(id, status, notes),

@@ -166,8 +166,8 @@ const ExternalToolsManagementTab: React.FC = () => {
                                     </div>
 
                                     <div className="w-48 hidden lg:flex flex-wrap gap-1">
-                                        {tool.audience.slice(0, 3).map((role, i) => (
-                                            <span key={i} className="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-sm border border-slate-700 uppercase font-bold">
+                                        {tool.audience.slice(0, 3).map((role) => (
+                                            <span key={role} className="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-sm border border-slate-700 uppercase font-bold">
                                                 {role}
                                             </span>
                                         ))}

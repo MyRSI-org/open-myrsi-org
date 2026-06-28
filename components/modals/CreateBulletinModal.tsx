@@ -33,14 +33,14 @@ const CreateBulletinModal: React.FC<CreateBulletinModalProps> = ({ isOpen, onClo
     const [location, setLocation] = useState('');
     const [duration, setDuration] = useState<BulletinDuration>(60);
     const [classificationLevel, setClassificationLevel] = useState('0');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set());
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set());
     const [sharedWithAllies, setSharedWithAllies] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
 
-    const wasOpen = useRef(false);
+    const wasOpenRef = useRef(false);
 
     useEffect(() => {
-        if (isOpen && !wasOpen.current) {
+        if (isOpen && !wasOpenRef.current) {
             setTitle('');
             setBody('');
             setThreatLevel(IntelThreatLevel.Medium);
@@ -51,7 +51,7 @@ const CreateBulletinModal: React.FC<CreateBulletinModalProps> = ({ isOpen, onClo
             setSharedWithAllies(false);
             setIsLoading(false);
         }
-        wasOpen.current = isOpen;
+        wasOpenRef.current = isOpen;
     }, [isOpen]);
 
     const handleToggleMarker = (id: number) => {

@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { PersonnelPosition } from '../../../types';
 import { useData } from '../../../contexts/DataContext';
 
@@ -21,7 +21,14 @@ const CreatePositionModal: React.FC<CreatePositionModalProps> = ({ isOpen, onClo
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!position;
 
-    useEffect(() => {
+    // Seed/reset the editable form when the modal opens or the edited position
+    // changes. React-documented "adjust state during render" pattern
+    // (previous-value tracker): behaviour-equivalent to the prior effect, which had
+    // deps [isOpen, position] and ran the same if/else seed whenever isOpen was true
+    // and either input changed.
+    const [prevSeedKey, setPrevSeedKey] = useState({ isOpen: false, position });
+    if (prevSeedKey.isOpen !== isOpen || prevSeedKey.position !== position) {
+        setPrevSeedKey({ isOpen, position });
         if (isOpen) {
             if (position) {
                 setName(position.name);
@@ -34,7 +41,7 @@ const CreatePositionModal: React.FC<CreatePositionModalProps> = ({ isOpen, onClo
             }
             setIsLoading(false);
         }
-    }, [isOpen, position]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

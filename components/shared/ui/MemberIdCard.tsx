@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { User } from '../../../types';
 import { ACCENTS, AccentKey } from './accents';
 
@@ -50,10 +50,16 @@ export default function MemberIdCard({ user, accent = 'emerald' }: Props) {
         }
     })();
 
+    // Snapshot "now" once at mount for the display-only "days since" tenure
+    // label. The tenure granularity is days/months/years, so a per-render live
+    // clock read isn't needed; a mount snapshot is the desired behavior (and
+    // keeps render pure).
+    const [now] = useState(() => Date.now());
+
     const tenureStartIso = user.tenureStartDate || user.createdAt;
     const memberSince = tenureStartIso ? new Date(tenureStartIso) : null;
     const tenureDays = memberSince
-        ? Math.max(0, Math.floor((Date.now() - memberSince.getTime()) / (1000 * 60 * 60 * 24)))
+        ? Math.max(0, Math.floor((now - memberSince.getTime()) / (1000 * 60 * 60 * 24)))
         : null;
     const tenureLabel = tenureDays === null
         ? null

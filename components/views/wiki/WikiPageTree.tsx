@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { WikiPage } from '../../../types';
 
 interface WikiPageTreeProps {
@@ -196,23 +196,35 @@ const WikiPageTree: React.FC<WikiPageTreeProps> = ({ pages, selectedPageId, onSe
 
     // Walk up parentPageId from the selected page and union its ancestors into
     // the expanded set so the path stays visible even with collapse-by-default.
-    useEffect(() => {
-        if (!selectedPageId) return;
-        const byId = new Map(pages.map(p => [p.id, p]));
-        const ancestors: string[] = [];
-        let cur = byId.get(selectedPageId);
-        while (cur && cur.parentPageId) {
-            ancestors.push(cur.parentPageId);
-            cur = byId.get(cur.parentPageId);
+    // This MERGES into user-mutable state (manual toggles must persist), so it
+    // is not pure derived state. Done during render via a previous-value tracker
+    // keyed on the same (selectedPageId, pages) the old effect depended on,
+    // instead of a synchronous setState in an effect. The functional updater
+    // returns the SAME set reference when nothing is added, so React bails out
+    // — no render loop — making this behavior-equivalent to the old effect.
+    const [prevSelectedPageId, setPrevSelectedPageId] = useState(selectedPageId);
+    const [prevPages, setPrevPages] = useState(pages);
+    if (selectedPageId !== prevSelectedPageId || pages !== prevPages) {
+        setPrevSelectedPageId(selectedPageId);
+        setPrevPages(pages);
+        if (selectedPageId) {
+            const byId = new Map(pages.map(p => [p.id, p]));
+            const ancestors: string[] = [];
+            let cur = byId.get(selectedPageId);
+            while (cur && cur.parentPageId) {
+                ancestors.push(cur.parentPageId);
+                cur = byId.get(cur.parentPageId);
+            }
+            if (ancestors.length > 0) {
+                setExpandedIds(prev => {
+                    const next = new Set(prev);
+                    let changed = false;
+                    for (const id of ancestors) if (!next.has(id)) { next.add(id); changed = true; }
+                    return changed ? next : prev;
+                });
+            }
         }
-        if (ancestors.length === 0) return;
-        setExpandedIds(prev => {
-            const next = new Set(prev);
-            let changed = false;
-            for (const id of ancestors) if (!next.has(id)) { next.add(id); changed = true; }
-            return changed ? next : prev;
-        });
-    }, [selectedPageId, pages]);
+    }
 
     const handleToggleExpanded = useCallback((id: string) => {
         setExpandedIds(prev => {

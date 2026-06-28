@@ -221,8 +221,8 @@ const WikiView: React.FC = () => {
                                     <div className="h-4 bg-slate-800/60 rounded-sm w-2/3" />
                                 </div>
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                    {[...Array(3)].map((_, i) => (
-                                        <div key={i} className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 space-y-3">
+                                    {['skeleton-a', 'skeleton-b', 'skeleton-c'].map((key) => (
+                                        <div key={key} className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 space-y-3">
                                             <div className="h-4 bg-slate-800 rounded-sm w-2/3" />
                                             <div className="h-3 bg-slate-800/60 rounded-sm w-full" />
                                             <div className="h-3 bg-slate-800/60 rounded-sm w-1/2" />

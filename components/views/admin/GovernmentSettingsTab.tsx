@@ -24,14 +24,16 @@ const GovernmentSettingsTab: React.FC = () => {
     } = useGovernment();
     const { addToast, confirm } = useNotification();
 
-    const [enabled, setEnabled] = useState(false);
+    const [enabled, setEnabled] = useState(governmentsFeatureConfig?.enabled || false);
     const [isSaving, setIsSaving] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
 
-    // Government identity/metadata
-    const [govName, setGovName] = useState('');
-    const [govDescription, setGovDescription] = useState('');
-    const [govType, setGovType] = useState<string>('custom');
+    // Government identity/metadata. Initialised from the current config so the
+    // form is correct on first render; kept in sync below via the previous-value
+    // pattern when the config changes.
+    const [govName, setGovName] = useState(governmentConfig?.name || '');
+    const [govDescription, setGovDescription] = useState(governmentConfig?.description || '');
+    const [govType, setGovType] = useState<string>(governmentConfig?.governmentType || 'custom');
     const [isEditingIdentity, setIsEditingIdentity] = useState(false);
 
     // Constitution editor
@@ -69,19 +71,32 @@ const GovernmentSettingsTab: React.FC = () => {
     const [posCanCallElections, setPosCanCallElections] = useState(false);
     const [posCanIssueOrders, setPosCanIssueOrders] = useState(false);
 
+    // Re-fetch government data on mount and whenever the feature toggle changes.
+    // This is an external-system sync (data fetch), so it stays in an effect.
     useEffect(() => {
-        setEnabled(governmentsFeatureConfig?.enabled || false);
         refreshGovernment();
     }, [governmentsFeatureConfig?.enabled, refreshGovernment]);
 
-    // Sync government config into local state
-    useEffect(() => {
+    // Sync the locally-editable `enabled` flag from the feature config during
+    // render (previous-value pattern) instead of in an effect, so we don't
+    // trigger an extra render. Behaviour matches the old `[...enabled]` dep.
+    const [prevFeatureEnabled, setPrevFeatureEnabled] = useState(governmentsFeatureConfig?.enabled);
+    if (prevFeatureEnabled !== governmentsFeatureConfig?.enabled) {
+        setPrevFeatureEnabled(governmentsFeatureConfig?.enabled);
+        setEnabled(governmentsFeatureConfig?.enabled || false);
+    }
+
+    // Sync government config into local editable form state when it changes.
+    // Done during render via the previous-value pattern to avoid an extra render.
+    const [prevGovernmentConfig, setPrevGovernmentConfig] = useState(governmentConfig);
+    if (prevGovernmentConfig !== governmentConfig) {
+        setPrevGovernmentConfig(governmentConfig);
         if (governmentConfig) {
             setGovName(governmentConfig.name || '');
             setGovDescription(governmentConfig.description || '');
             setGovType(governmentConfig.governmentType || 'custom');
         }
-    }, [governmentConfig]);
+    }
 
     const toggleFeature = async () => {
         const newEnabled = !enabled;
@@ -211,6 +226,13 @@ const GovernmentSettingsTab: React.FC = () => {
         const s = appointSearch.toLowerCase();
         return u.name.toLowerCase().includes(s) || (u.rsiHandle && u.rsiHandle.toLowerCase().includes(s));
     }).slice(0, 20);
+
+    // Position currently being appointed to (drives the modal subtitle and the
+    // per-user "already holds" check below).
+    const appointPosition = governmentPositions.find(p => p.id === appointPositionId);
+
+    // Independent positions (no branch) shown in their own section.
+    const independentPositions = governmentPositions.filter(p => !p.branchId);
 
     // Branch CRUD
     const openBranchForm = (branch?: GovernmentBranch) => {
@@ -593,10 +615,7 @@ const GovernmentSettingsTab: React.FC = () => {
                         </div>
 
                         {/* Independent Positions */}
-                        {(() => {
-                            const independentPositions = governmentPositions.filter(p => !p.branchId);
-                            if (independentPositions.length === 0) return null;
-                            return (
+                        {independentPositions.length > 0 && (
                                 <div className="bg-slate-800/40 border border-slate-700/50 rounded-lg overflow-hidden mb-3">
                                     <div className="flex items-center justify-between px-4 py-2.5 bg-slate-800/60">
                                         <div className="flex items-center gap-2">
@@ -665,8 +684,7 @@ const GovernmentSettingsTab: React.FC = () => {
                                         })}
                                     </div>
                                 </div>
-                            );
-                        })()}
+                        )}
 
                         {governmentBranches.length === 0 ? (
                             <div className="text-center py-8 bg-slate-800/30 border border-slate-700/50 rounded-lg">
@@ -915,7 +933,7 @@ const GovernmentSettingsTab: React.FC = () => {
                 isOpen={showAppointModal}
                 onClose={() => setShowAppointModal(false)}
                 title="Appoint Position Holder"
-                subtitle={(() => { const pos = governmentPositions.find(p => p.id === appointPositionId); return pos ? `Appointing to: ${pos.name}` : 'Select a member'; })()}
+                subtitle={appointPosition ? `Appointing to: ${appointPosition.name}` : 'Select a member'}
                 icon="fa-solid fa-user-plus"
                 color="indigo"
                 width="max-w-md"
@@ -938,10 +956,7 @@ const GovernmentSettingsTab: React.FC = () => {
                             ) : (
                                 filteredAppointUsers.map(user => {
                                     const isSelected = appointUserId === user.id;
-                                    const alreadyHolds = (() => {
-                                        const pos = governmentPositions.find(p => p.id === appointPositionId);
-                                        return pos?.currentHolders?.some(h => h.userId === user.id) || false;
-                                    })();
+                                    const alreadyHolds = appointPosition?.currentHolders?.some(h => h.userId === user.id) || false;
                                     return (
                                         <button
                                             key={user.id}

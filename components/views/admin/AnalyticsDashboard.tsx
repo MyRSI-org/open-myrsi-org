@@ -94,7 +94,7 @@ const AnalyticsDashboard: React.FC = () => {
             months.push({ name: d.toLocaleString('default', { month: 'short' }), count: 0 });
         }
         allUsers.forEach(u => {
-            const joined = new Date(u.createdAt || Date.now());
+            const joined = new Date(u.createdAt || now.getTime());
             const diffDays = Math.ceil(Math.abs(now.getTime() - joined.getTime()) / (1000 * 60 * 60 * 24));
             if (diffDays <= 180) {
                 const key = joined.toLocaleString('default', { month: 'short' });
@@ -166,8 +166,8 @@ const AnalyticsDashboard: React.FC = () => {
                                 dataKey="value"
                                 stroke="none"
                             >
-                                {stats.pieData.map((entry, index) => (
-                                    <Cell key={`cell-${index}`} fill={entry.color} />
+                                {stats.pieData.map((entry) => (
+                                    <Cell key={entry.name} fill={entry.color} />
                                 ))}
                                 <Label
                                     value={totalMissions}

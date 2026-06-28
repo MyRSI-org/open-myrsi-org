@@ -51,7 +51,10 @@ export default function AdminLocationCatalogTab() {
 
     // Data
     const [rows, setRows] = useState<PlatformLocation[]>([]);
-    const [loading, setLoading] = useState(false);
+    // Initialised to true: the mount-time fetch is already in flight on first render, so
+    // the table shows its loading row from the start (no flash of an empty/"no results"
+    // state before the first load). The effect's fetch flips it false when data arrives.
+    const [loading, setLoading] = useState(true);
     const [counts, setCounts] = useState<{ total: number; perKind: Record<string, number> }>({ total: 0, perKind: {} });
 
     // Star systems list for the cascading filter
@@ -89,20 +92,22 @@ export default function AdminLocationCatalogTab() {
     // Reset page whenever a filter (other than page itself) changes. The next
     // useEffect below sees the page change and fires exactly one load(), so we
     // never double-fetch on filter change.
-    const isFirstFilterChange = useRef(true);
+    const isFirstFilterChangeRef = useRef(true);
     useEffect(() => {
-        if (isFirstFilterChange.current) {
-            isFirstFilterChange.current = false;
+        if (isFirstFilterChangeRef.current) {
+            isFirstFilterChangeRef.current = false;
             return;
         }
         setPage(0);
     }, [filterKind, filterStarSystemId, includeInternal, includeHidden, includeDecommissioned, debouncedSearch]);
 
     // Cancel stale in-flight responses if the user changes filters mid-fetch.
-    const requestSeq = useRef(0);
-    const load = useCallback(async () => {
-        const seq = ++requestSeq.current;
-        setLoading(true);
+    const requestSeqRef = useRef(0);
+    // runLoad performs the seq-guarded fetch and the async result/loading-off sets, but does
+    // NOT set loading=true itself. The effect path raises the loading flag at render time (see
+    // the prev-key tracker below), so the synchronous set lives in render — not in the effect.
+    const runLoad = useCallback(async () => {
+        const seq = ++requestSeqRef.current;
         try {
             const r = await rpcAction('catalog:list_locations', {
                 kind: filterKind || undefined,
@@ -114,20 +119,50 @@ export default function AdminLocationCatalogTab() {
                 limit: PAGE_SIZE,
                 offset: page * PAGE_SIZE,
             });
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             setRows(Array.isArray(r) ? r : []);
         } catch (e: any) {
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             toast(`Failed to load locations: ${e?.message || 'unknown'}`, 'error');
         } finally {
-            if (seq === requestSeq.current) setLoading(false);
+            if (seq === requestSeqRef.current) setLoading(false);
         }
     }, [rpcAction, filterKind, filterStarSystemId, includeInternal, includeHidden, includeDecommissioned, debouncedSearch, page, toast]);
 
+    // Imperative wrapper for the event-handler call sites (sync / save / delete refreshes):
+    // they run outside an effect, so the synchronous setLoading(true) is fine here and the
+    // loading spinner behaviour at those sites is preserved exactly.
+    const load = useCallback(() => {
+        setLoading(true);
+        return runLoad();
+    }, [runLoad]);
+
     // Counts + star-system dropdown only need to load once per session. Sync
-    // refresh re-runs them explicitly.
-    useEffect(() => { loadCounts(); loadStarSystems(); }, [loadCounts, loadStarSystems]);
-    useEffect(() => { load(); }, [load]);
+    // refresh re-runs them explicitly. Wrapped in an async IIFE so the deferred
+    // (post-await) setState is explicit — the documented React async-effect pattern.
+    // Both still fire concurrently (not awaited sequentially), matching the old body.
+    // (loadCounts/loadStarSystems set state only after their awaited RPC, so there is no
+    // synchronous set to relocate here.)
+    useEffect(() => { void (async () => { await Promise.all([loadCounts(), loadStarSystems()]); })(); }, [loadCounts, loadStarSystems]);
+
+    // Raise the loading flag at render time whenever the filter/page/search key changes —
+    // the React "adjust state during render" prev-key tracker pattern. This replaces the
+    // synchronous setLoading(true) the old effect performed via load(), removing the
+    // set-state-in-effect while keeping identical timing (loading true for every refetch
+    // the user triggers). The key is built from the same serializable inputs that drive the
+    // fetch; the mount-time fetch needs no entry here because `loading` is initialised to true.
+    const loadKey = JSON.stringify([
+        filterKind, filterStarSystemId, includeInternal, includeHidden, includeDecommissioned,
+        debouncedSearch, page,
+    ]);
+    const [prevLoadKey, setPrevLoadKey] = useState(loadKey);
+    if (loadKey !== prevLoadKey) {
+        setPrevLoadKey(loadKey);
+        setLoading(true);
+    }
+    // The effect only performs the async fetch; setLoading(false) happens inside runLoad
+    // after the awaited RPC, so nothing synchronous is set in the effect body.
+    useEffect(() => { void (async () => { await runLoad(); })(); }, [runLoad]);
 
     const handleSync = useCallback(async () => {
         setSyncLoading(true);

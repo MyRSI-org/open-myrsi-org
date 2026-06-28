@@ -1,7 +1,7 @@
 
 import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, broadcastToChannel, getSystemRoles } from './common.js';
 import { cache } from '../cache.js';
-import { sendPushToAll } from '../push.js';
+import { sendPushToAll, sendPushToStaff, sendPushToPermission } from '../push.js';
 import { toUnitPost, toServiceTypeConfig } from './mappers.js';
 import type { Tables } from './rows.js';
 import type { AIConfig, Announcement, BrandingConfig, Certification, Commendation, DiscordConfig, ExternalTool, GovernmentsFeatureConfig, HeroCardConfig, HRConfig, IntelSharingConfig, Location, OpenGraphConfig, PublicPageConfig, RadioChannel, RadioConfig, Rank, Role, ServiceTypeConfig, SpecializationTag, SystemConfig, UnitPost, WikiHomeConfig } from '../../types.js';
@@ -1547,8 +1547,15 @@ export async function assertUnitAccess(unitId: number, viewerUserId: number): Pr
 }
 
 export async function getUnitFeed(unitId: number): Promise<UnitPost[]> {
+    // The embedded author is rendered as name + avatar only. Select ONLY
+    // roster-public identity columns — never HR/session-metadata PII
+    // (probation_*, tenure_start_date, job_title, voice_channel_name,
+    // rsi_verified, timezone, date_format). Those are withheld from non-HR
+    // viewers by stripSensitiveUserFields on the roster/profile paths and the
+    // unit-feed RPC result is returned without that pass, so over-selecting here
+    // would leak them to any member who can read a unit feed.
     const { data } = await supabase.from('unit_posts')
-        .select('id, unit_id, author_id, content, created_at, pinned, author:users(id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at, rsi_verified, job_title, voice_channel_name, timezone, date_format, probation_start, probation_end, tenure_start_date)')
+        .select('id, unit_id, author_id, content, created_at, pinned, author:users(id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at)')
         .eq('unit_id', unitId)
         .order('created_at', { ascending: false })
         .limit(50);
@@ -1560,7 +1567,9 @@ export async function createUnitPost(unitId: number, userId: number, content: st
         unit_id: unitId,
         author_id: userId,
         content
-    }).select('id, unit_id, author_id, content, created_at, pinned, author:users(id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at, rsi_verified, job_title, voice_channel_name, timezone, date_format, probation_start, probation_end, tenure_start_date)').single();
+    // Author embed is name + avatar only — mirror getUnitFeed and select ONLY
+    // roster-public identity columns, no HR/session-metadata PII.
+    }).select('id, unit_id, author_id, content, created_at, pinned, author:users(id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at)').single();
     handleSupabaseError({ error, message: 'Failed to post' });
     if (!data) throw new Error('Failed to post');
     return toUnitPost(data as unknown as Parameters<typeof toUnitPost>[0]);
@@ -1684,22 +1693,31 @@ export async function broadcastEAM(message: string) {
 
     // The realtime emit is a TRIGGER ONLY ({timestamp}, no message body).
     // Authorized clients pull the body via the permission-gated
-    // broadcast:get_active_eam RPC on receipt; push (encrypted, per-user) still
-    // carries the body for notification UX.
+    // broadcast:get_active_eam RPC on receipt.
+    //
+    // The push body carries the EAM directive, so its audience MUST mirror that
+    // read gate exactly — staff (any non-Client role) OR holders of
+    // user:receive:eam. NEVER sendPushToAll here: Web-Push encryption only
+    // protects transport to the vendor/device, not authorization, so an
+    // all-users push would leak the directive to Client-role users who are
+    // denied EAM access in-app. Overlap between the staff and permission sets is
+    // collapsed at the device by the shared `tag: 'eam'`.
+    const eamPushPayload = {
+        title: '🚨 EMERGENCY ACTION MESSAGE 🚨',
+        body: message,
+        tag: 'eam',
+        data: { type: 'eam' },
+        requireInteraction: true,
+        renotify: true,
+    };
     await Promise.all([
         broadcastToChannel(
             'auth-alerts',
             'eam_broadcast',
             { timestamp: eamData.timestamp }
         ),
-        sendPushToAll({
-            title: '🚨 EMERGENCY ACTION MESSAGE 🚨',
-            body: message,
-            tag: 'eam',
-            data: { type: 'eam' },
-            requireInteraction: true,
-            renotify: true,
-        }),
+        sendPushToStaff(eamPushPayload),
+        sendPushToPermission('user:receive:eam', eamPushPayload),
         notifyDiscordEam(message, eamData.timestamp),
     ]);
 }
@@ -2005,6 +2023,14 @@ export async function runDatabaseHealthCheck() {
 }
 
 export async function pruneDatabaseData(retentionDays: number, targets: string[]) {
+    // Fail closed on the retention window. The cutoff is `now - retentionDays`, so a
+    // value of 0 or negative (or a non-integer) pushes the cutoff to now/the future
+    // and the `.lt('created_at', cutoff)` deletes would wipe EVERY matching row
+    // (all service_requests / intel_reports / …). A "prune" must never become a
+    // full wipe — require a positive integer day count before issuing any DELETE.
+    if (!Number.isInteger(retentionDays) || retentionDays < 1) {
+        throw new Error('retentionDays must be a positive integer (>= 1).');
+    }
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
     const dateStr = cutoffDate.toISOString();

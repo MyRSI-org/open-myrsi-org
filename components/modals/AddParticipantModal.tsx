@@ -19,7 +19,7 @@ const AddParticipantModal: React.FC<AddParticipantModalProps> = ({ isOpen, onClo
     const { members } = useMembers();
     const { addOperationParticipant } = useOperations();
     const { addToast } = useNotification();
-    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(new Set());
+    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(() => new Set());
     const [isLoading, setIsLoading] = useState(false);
 
     const availableMembers = useMemo(() => {

@@ -110,8 +110,8 @@ const NoticesManagementTab: React.FC = () => {
                                 </div>
 
                                 <div className="w-48 hidden md:flex flex-wrap gap-1">
-                                    {notice.audience.slice(0, 3).map((aud, i) => (
-                                        <span key={i} className="text-[9px] bg-slate-800 text-slate-300 px-1.5 py-0.5 rounded-sm border border-slate-700 uppercase font-bold">
+                                    {notice.audience.slice(0, 3).map((aud) => (
+                                        <span key={aud} className="text-[9px] bg-slate-800 text-slate-300 px-1.5 py-0.5 rounded-sm border border-slate-700 uppercase font-bold">
                                             {AUDIENCE_LABELS[aud] || aud}
                                         </span>
                                     ))}

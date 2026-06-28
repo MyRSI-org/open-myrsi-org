@@ -1,5 +1,5 @@
 
-import React, { createContext, useState, useCallback, useContext, useMemo, useRef, useEffect } from 'react';
+import React, { createContext, use, useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import apiService from '../services/apiService';
 import { debugLog } from '../lib/debugLog';
 import { mergeUsersSlice, mergeRowSlice, byCreatedAtDesc } from '../lib/sliceMerge';
@@ -318,7 +318,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Debounce realtime-triggered fetches: if the same subset was fetched in the last 2 seconds, skip it.
     // This prevents the double-refresh caused by broadcast + postgres_changes both firing for the same mutation.
-    const recentFetches = useRef<Map<string, number>>(new Map());
+    const recentFetchesRef = useRef<Map<string, number>>(new Map());
 
     // --- Realtime slice-update machinery ---
     // Generation guards (lib/sliceCoalescer.ts makeGenGuard): full-subset
@@ -330,25 +330,25 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // applied first (stale full responses drop just their guarded key — the
     // slice setters guard by key, so the rest of the payload still lands).
     // One guard per slice-patched array.
-    const genGuardsRef = useRef<{
+    // Created exactly once via useState's lazy initializer — the guards object
+    // is a stable, never-reassigned reference for the provider's lifetime, so
+    // it is safe to use in the useCallback dependency arrays below. (Lazy ref
+    // init would do the same but reads/writes ref.current during render.)
+    const [guards] = useState<{
         users: GenGuard;
         operations: GenGuard;
         warrants: GenGuard;
         intelSummary: GenGuard;
         bulletins: GenGuard;
         wikiPages: GenGuard;
-    } | null>(null);
-    if (!genGuardsRef.current) {
-        genGuardsRef.current = {
-            users: makeGenGuard(),
-            operations: makeGenGuard(),
-            warrants: makeGenGuard(),
-            intelSummary: makeGenGuard(),
-            bulletins: makeGenGuard(),
-            wikiPages: makeGenGuard(),
-        };
-    }
-    const guards = genGuardsRef.current;
+    }>(() => ({
+        users: makeGenGuard(),
+        operations: makeGenGuard(),
+        warrants: makeGenGuard(),
+        intelSummary: makeGenGuard(),
+        bulletins: makeGenGuard(),
+        wikiPages: makeGenGuard(),
+    }));
     // Union-coalescers (lib/sliceCoalescer.ts): a burst of broadcasts
     // accumulates ids into a pending set while one drain-loop is in flight,
     // so N near-simultaneous events cost at most one in-flight fetch plus one
@@ -403,7 +403,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const isSliceSubset = ROW_SLICE_SUBSETS.has(subset);
         if (!isSliceSubset) {
             const now = Date.now();
-            const lastFetch = recentFetches.current.get(subset) || 0;
+            const lastFetch = recentFetchesRef.current.get(subset) || 0;
             // Skip the 2-second dedupe when the caller explicitly requests a
             // fresh fetch — typically a post-mutation refresh chained off an
             // RPC response. The dedupe is there to suppress the broadcast +
@@ -412,7 +412,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             // a stale UI (e.g. feature toggle "succeeded" but view didn't
             // update because something else fetched 'main' < 2s earlier).
             if (!options?.force && now - lastFetch < 2000) return;
-            recentFetches.current.set(subset, now);
+            recentFetchesRef.current.set(subset, now);
         }
 
         setIsFetching(prev => ({ ...prev, [subset]: true }));
@@ -930,11 +930,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isFetching, optimisticUpdate
     ]);
 
-    return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
+    return <DataContext value={value}>{children}</DataContext>;
 };
 
 export const useData = () => {
-    const context = useContext(DataContext);
+    const context = use(DataContext);
     if (!context) {
         throw new Error('useData must be used within a DataProvider');
     }

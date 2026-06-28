@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Commendation } from '../../types';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -24,24 +24,33 @@ const CommendationModal: React.FC<CommendationModalProps> = ({ isOpen, onClose, 
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!commendation;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (commendation) {
-                setName(commendation.name);
-                setDescription(commendation.description || '');
-                setIcon(commendation.icon || '');
-                setImageUrl(commendation.imageUrl || '');
-                setIconMode(commendation.imageUrl ? 'url' : 'fa');
-            } else {
-                setName('');
-                setDescription('');
-                setIcon('');
-                setImageUrl('');
-                setIconMode('fa');
-            }
-            setIsLoading(false);
+    // Seed/reset the editable form fields when the modal opens or the
+    // commendation being edited changes. Done during render via the React
+    // "adjust state during render" pattern (re-renders before paint), which is
+    // behaviour-equivalent to the previous open/selection-change reset effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevCommendation, setPrevCommendation] = useState(commendation);
+    if (isOpen && (isOpen !== prevIsOpen || commendation !== prevCommendation)) {
+        setPrevIsOpen(isOpen);
+        setPrevCommendation(commendation);
+        if (commendation) {
+            setName(commendation.name);
+            setDescription(commendation.description || '');
+            setIcon(commendation.icon || '');
+            setImageUrl(commendation.imageUrl || '');
+            setIconMode(commendation.imageUrl ? 'url' : 'fa');
+        } else {
+            setName('');
+            setDescription('');
+            setIcon('');
+            setImageUrl('');
+            setIconMode('fa');
         }
-    }, [isOpen, commendation]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || commendation !== prevCommendation) {
+        setPrevIsOpen(isOpen);
+        setPrevCommendation(commendation);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

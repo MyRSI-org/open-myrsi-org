@@ -41,14 +41,14 @@ const OpCommsTab: React.FC<OpCommsTabProps> = ({ operation, canManage, isPartici
     return (
         <div className="flex flex-col h-full">
             <div ref={timelineRef} className="flex-1 overflow-y-auto custom-scrollbar p-4 md:p-6 space-y-4">
-                {operation.log?.length > 0 ? operation.log.map((entry, i) => {
+                {operation.log?.length > 0 ? operation.log.map((entry) => {
                     const isNote = entry.entryType === 'NOTE';
                     const isMine = entry.author?.id === currentUser?.id;
 
                     if (!isNote) {
                         // System event — centered, muted
                         return (
-                            <div key={i} className="flex justify-center">
+                            <div key={entry.id} className="flex justify-center">
                                 <div className="bg-black/30 border border-slate-800 text-slate-500 text-[11px] italic px-4 py-1.5 rounded-full flex items-center gap-2">
                                     <i className={`fa-solid ${
                                         entry.entryType === 'JOIN' ? 'fa-right-to-bracket' :
@@ -68,7 +68,7 @@ const OpCommsTab: React.FC<OpCommsTabProps> = ({ operation, canManage, isPartici
                     }
 
                     return (
-                        <div key={i} className={`flex gap-3 ${isMine ? 'justify-end' : ''}`}>
+                        <div key={entry.id} className={`flex gap-3 ${isMine ? 'justify-end' : ''}`}>
                             {!isMine && (
                                 entry.author?.avatarUrl ?
                                     <img src={entry.author.avatarUrl} className="w-8 h-8 rounded-full shrink-0 border border-slate-600 self-end object-cover" /> :

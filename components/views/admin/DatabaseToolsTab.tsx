@@ -31,7 +31,7 @@ const DatabaseToolsTab: React.FC = () => {
 
     // Pruning State
     const [retentionDays, setRetentionDays] = useState(90);
-    const [selectedTargets, setSelectedTargets] = useState<Set<string>>(new Set(['requests']));
+    const [selectedTargets, setSelectedTargets] = useState<Set<string>>(() => new Set(['requests']));
     const [pruneResult, setPruneResult] = useState<Record<string, number> | null>(null);
 
     // Module reset state
@@ -368,8 +368,8 @@ const DatabaseToolsTab: React.FC = () => {
                     <p className="text-[11px] text-slate-500 mb-4"><i className="fa-solid fa-circle-info mr-1.5"></i>Seeing &quot;access denied&quot; on the Catalogs after an import? Click <span className="text-amber-300 font-semibold">Repair Database</span> — it re-grants the Admin role every permission.</p>
                     {healthReport.length > 0 ? (
                         <div className="space-y-3">
-                            {healthReport.map((item, i) => (
-                                <div key={i} className="flex items-center justify-between p-3 rounded-sm bg-slate-800/30 border border-slate-700/30">
+                            {healthReport.map((item) => (
+                                <div key={item.check} className="flex items-center justify-between p-3 rounded-sm bg-slate-800/30 border border-slate-700/30">
                                     <div>
                                         <p className="text-sm font-bold text-slate-200">{item.check}</p>
                                         <p className="text-xs text-slate-500">Records: {item.count}</p>

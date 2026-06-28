@@ -62,11 +62,11 @@ const postingAccent = (status: JobPostingStatus): AccentKey => {
 };
 
 const HrRowContent: React.FC<Props> = ({ subtype, data, onClick, isSelected }) => {
-    let accent: AccentKey = 'amber';
-    let title = '';
-    let timestamp = '';
-    let summary = '';
-    let statusLabel = '';
+    let accent: AccentKey;
+    let title: string;
+    let timestamp: string;
+    let summary: string;
+    let statusLabel: string;
     let statusAccentClasses = 'bg-slate-900/60 border-white/10 text-slate-400';
 
     if (subtype === 'application') {

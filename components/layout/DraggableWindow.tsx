@@ -15,19 +15,30 @@ interface DraggableWindowProps {
 const DraggableWindow: React.FC<DraggableWindowProps> = ({ id, title, initialX, initialY, zIndex, onClose, onFocus, children }) => {
     const [position, setPosition] = useState({ x: initialX, y: initialY });
     const [isDragging, setIsDragging] = useState(false);
-    const dragStart = useRef({ x: 0, y: 0 });
+    const dragStartRef = useRef({ x: 0, y: 0 });
     const windowRef = useRef<HTMLDivElement>(null);
 
-    // Ensure window stays within bounds on resize (basic check)
-    useEffect(() => {
-        if (position.x > window.innerWidth - 100) setPosition(p => ({ ...p, x: window.innerWidth - 320 }));
-        if (position.y > window.innerHeight - 100) setPosition(p => ({ ...p, y: window.innerHeight - 200 }));
-    }, [position.x, position.y]);
+    // Keep the window inside the viewport: if the stored position has drifted out of
+    // bounds, clamp it back. Implemented with React's "adjust state during render" pattern
+    // (a guarded, convergent setState during render) rather than an effect — React applies
+    // the clamp before paint, and because the snap target is strictly inside the trigger
+    // threshold (innerWidth-320 < innerWidth-100) it converges in one re-render with no
+    // loop. The drag math reads dragStartRef + the mouse event, never `position`, so
+    // clamping the stored position does not affect drag offsets.
+    if (typeof window !== 'undefined') {
+        const maxX = window.innerWidth - 100;
+        const maxY = window.innerHeight - 100;
+        const clampedX = position.x > maxX ? window.innerWidth - 320 : position.x;
+        const clampedY = position.y > maxY ? window.innerHeight - 200 : position.y;
+        if (clampedX !== position.x || clampedY !== position.y) {
+            setPosition({ x: clampedX, y: clampedY });
+        }
+    }
 
     const handleMouseDown = (e: React.MouseEvent) => {
         onFocus(id);
         setIsDragging(true);
-        dragStart.current = {
+        dragStartRef.current = {
             x: e.clientX - position.x,
             y: e.clientY - position.y
         };
@@ -37,8 +48,8 @@ const DraggableWindow: React.FC<DraggableWindowProps> = ({ id, title, initialX, 
         const handleMouseMove = (e: MouseEvent) => {
             if (!isDragging) return;
 
-            const newX = e.clientX - dragStart.current.x;
-            const newY = e.clientY - dragStart.current.y;
+            const newX = e.clientX - dragStartRef.current.x;
+            const newY = e.clientY - dragStartRef.current.y;
 
             // Simple boundaries
             // newX = Math.max(0, Math.min(newX, window.innerWidth - 300));

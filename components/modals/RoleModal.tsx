@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { Role } from '../../types';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -30,7 +30,15 @@ const RoleModal: React.FC<RoleModalProps> = ({ isOpen, onClose, role }) => {
         return first4Ids.includes(role.id);
     }, [isEditing, role, roles]);
 
-    useEffect(() => {
+    // Seed/reset the editable form when the modal opens or the selected role
+    // changes while open. Adjusts state during render (React's documented
+    // pattern) instead of in an effect; the fields must stay user-editable so
+    // they cannot be derived during render.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevRole, setPrevRole] = useState(role);
+    if (isOpen !== prevIsOpen || role !== prevRole) {
+        setPrevIsOpen(isOpen);
+        setPrevRole(role);
         if (isOpen) {
             if (role) {
                 setName(role.name);
@@ -41,7 +49,7 @@ const RoleModal: React.FC<RoleModalProps> = ({ isOpen, onClose, role }) => {
             }
             setIsLoading(false);
         }
-    }, [isOpen, role]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

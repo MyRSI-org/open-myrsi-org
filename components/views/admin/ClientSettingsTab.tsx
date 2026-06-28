@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
 
 import { HeroCardConfig } from '../../../types';
@@ -14,13 +14,26 @@ const ClientSettingsTab: React.FC = () => {
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
 
-    useEffect(() => {
+    // Re-seed the local editable form when the canonical config from context changes
+    // (e.g. after a save or an external update). config is user-editable local state, so
+    // it cannot be derived during render without discarding in-progress edits. Using the
+    // adjust-state-during-render pattern (previous-value tracker) rather than an effect:
+    // re-seeds on the exact same condition (heroCardConfig reference change) with no extra
+    // commit. (https://react.dev/reference/react/useState#storing-information-from-previous-renders)
+    const [prevHeroCardConfig, setPrevHeroCardConfig] = useState(heroCardConfig);
+    if (heroCardConfig !== prevHeroCardConfig) {
+        setPrevHeroCardConfig(heroCardConfig);
         setConfig(heroCardConfig);
-    }, [heroCardConfig]);
+    }
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
         setConfig(prev => ({...prev, [e.target.name]: e.target.value }));
     };
+
+    const sanitizedPreviewUrl = sanitizeImageUrl(config.backgroundImageUrl);
+    const previewStyle: React.CSSProperties | undefined = sanitizedPreviewUrl
+        ? { backgroundImage: `url("${sanitizedPreviewUrl.replace(/"/g, '%22')}")` }
+        : undefined;
 
     const handleSave = async () => {
         setIsSaving(true);
@@ -111,10 +124,7 @@ const ClientSettingsTab: React.FC = () => {
                         <label className="block text-sm font-medium text-slate-300 mb-2">Live Preview</label>
                         <div
                             className="w-full aspect-video min-h-[280px] rounded-lg border border-slate-700 bg-cover bg-center flex flex-col justify-between p-4 text-white relative overflow-hidden"
-                            style={(() => {
-                                const s = sanitizeImageUrl(config.backgroundImageUrl);
-                                return s ? { backgroundImage: `url("${s.replace(/"/g, '%22')}")` } : undefined;
-                            })()}
+                            style={previewStyle}
                         >
                             <div className="absolute inset-0 bg-slate-900/60"></div>
                             <div className="relative z-10">

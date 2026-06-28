@@ -31,35 +31,52 @@ export default function WhCatalogTab({ catalog, canAdmin, onEdit, onAdd, onCatal
 
     // Platform results — only fetched when checkbox is on AND query is non-empty.
     const debouncedSearch = useDebouncedValue(search.trim(), 300);
-    const [platformResults, setPlatformResults] = useState<WarehouseCatalogSearchResult[]>([]);
-    const [platformLoading, setPlatformLoading] = useState(false);
-    const [platformError, setPlatformError] = useState<string | null>(null);
-    const requestSeq = useRef(0);
+    const [platformResultsRaw, setPlatformResultsRaw] = useState<WarehouseCatalogSearchResult[]>([]);
+    const [platformLoadingRaw, setPlatformLoadingRaw] = useState(false);
+    const [platformErrorRaw, setPlatformErrorRaw] = useState<string | null>(null);
+    const requestSeqRef = useRef(0);
+
+    // The platform section is only active while the checkbox is on AND a query
+    // exists. Derive the displayed values from that condition during render so
+    // we never need a synchronous "reset" setState in the effect below.
+    const platformActive = includePlatform && !!debouncedSearch;
+    const platformResults = platformActive ? platformResultsRaw : [];
+    const platformLoading = platformActive ? platformLoadingRaw : false;
+    const platformError = platformActive ? platformErrorRaw : null;
+
+    // Flip the loading flag / clear the error at fetch start. This is the
+    // synchronous "we're about to fetch" transition: deriving it during render
+    // (React-documented adjust-state-during-render pattern) keyed on the active
+    // query is equivalent to setting it at the top of the effect, but keeps the
+    // effect free of synchronous setState. The async .then/.catch/.finally below
+    // owns the results/error and clears the flag when the request settles.
+    const fetchKey = platformActive ? debouncedSearch : null;
+    const [prevFetchKey, setPrevFetchKey] = useState<string | null>(fetchKey);
+    if (fetchKey !== prevFetchKey) {
+        setPrevFetchKey(fetchKey);
+        if (fetchKey !== null) {
+            setPlatformLoadingRaw(true);
+            setPlatformErrorRaw(null);
+        }
+    }
 
     useEffect(() => {
-        if (!includePlatform || !debouncedSearch) {
-            setPlatformResults([]);
-            setPlatformLoading(false);
-            setPlatformError(null);
-            return;
-        }
-        const seq = ++requestSeq.current;
-        setPlatformLoading(true);
-        setPlatformError(null);
+        if (!platformActive) return;
+        const seq = ++requestSeqRef.current;
         rpcAction('warehouse:search_catalog', { query: debouncedSearch, source: 'platform', limit: 100 })
             .then((rows: any) => {
-                if (seq !== requestSeq.current) return;
-                setPlatformResults(Array.isArray(rows) ? rows : []);
+                if (seq !== requestSeqRef.current) return;
+                setPlatformResultsRaw(Array.isArray(rows) ? rows : []);
             })
             .catch((err: any) => {
-                if (seq !== requestSeq.current) return;
-                setPlatformError(err?.message || 'Search failed');
-                setPlatformResults([]);
+                if (seq !== requestSeqRef.current) return;
+                setPlatformErrorRaw(err?.message || 'Search failed');
+                setPlatformResultsRaw([]);
             })
             .finally(() => {
-                if (seq === requestSeq.current) setPlatformLoading(false);
+                if (seq === requestSeqRef.current) setPlatformLoadingRaw(false);
             });
-    }, [debouncedSearch, includePlatform, rpcAction]);
+    }, [platformActive, debouncedSearch, rpcAction]);
 
     const filtered = useMemo(() => {
         const q = search.trim().toLowerCase();

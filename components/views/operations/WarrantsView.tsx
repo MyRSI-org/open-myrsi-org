@@ -14,6 +14,7 @@ import { ACCENTS } from '../../shared/ui/accents';
 import WarrantCard from './warrants/WarrantCard';
 import { useNotification } from '../../../contexts/NotificationContext';
 import { useNavigation } from '../../../contexts/NavigationContext';
+import { useNow } from '../../../hooks/useNow';
 import {
     warrantStatusAccent,
     warrantStatusLabel,
@@ -38,11 +39,12 @@ const WarrantsView: React.FC<WarrantsViewProps> = ({ openCreateModal, openUpdate
     const { hasPermission } = useAuth();
     const { confirm } = useNotification();
     const { setSelectedWarrant } = useNavigation();
+    const now = useNow();
     const canManageWarrants = hasPermission('warrant:manage');
     const [filter, setFilter] = useState<WarrantFilter>('active');
     const [searchTerm, setSearchTerm] = useState('');
     const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
-    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
 
     // Taller rows on mobile to prevent card cutoff.
     const [itemHeight, setItemHeight] = useState(window.innerWidth < 768 ? 480 : 380);
@@ -119,7 +121,7 @@ const WarrantsView: React.FC<WarrantsViewProps> = ({ openCreateModal, openUpdate
     };
 
     const heroCounts = useMemo(() => {
-        const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
         const active = warrants.filter(w => w.status === WarrantStatus.Active || w.status === WarrantStatus.Standing);
         return {
             active: active.length,
@@ -127,7 +129,7 @@ const WarrantsView: React.FC<WarrantsViewProps> = ({ openCreateModal, openUpdate
             claimed30d: warrants.filter(w => w.status === WarrantStatus.Claimed && new Date(w.issuedAt).getTime() > thirtyDaysAgo).length,
             closed30d: warrants.filter(w => [WarrantStatus.Cancelled, WarrantStatus.Claimed].includes(w.status) && new Date(w.issuedAt).getTime() > thirtyDaysAgo).length,
         };
-    }, [warrants]);
+    }, [warrants, now]);
 
     const tabs: { key: WarrantFilter; label: string; icon: string; badge?: number }[] = [
         { key: 'active', label: 'Active', icon: 'fa-bolt', badge: warrants.filter(w => warrantIsLive(w.status)).length || undefined },

@@ -21,7 +21,7 @@ const OrganisationView: React.FC = () => {
     const { addToast } = useNotification();
     const { viewUnitDetail } = useNavigation();
     const [search, setSearch] = useState('');
-    const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+    const [collapsed, setCollapsed] = useState<Set<number>>(() => new Set());
 
     const canViewAll = hasPermission('units:view_all');
     const myUnitId = currentUser?.unit?.id ?? null;

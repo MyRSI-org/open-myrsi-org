@@ -1134,6 +1134,11 @@ CREATE TABLE IF NOT EXISTS public.operation_participants (
     attendance_status text DEFAULT 'Pending'::text,
     is_ready          boolean DEFAULT false,
     joined_at         timestamptz NOT NULL DEFAULT now(),
+    -- Departure timestamp: NULL means the participant is still ACTIVE. The
+    -- special-op visibility gate (lib/db/ops.ts canUserSeeOpInList and the
+    -- rt_recv_op_board realtime RLS policy in §6b) treats time_left IS NULL as
+    -- "active participant"; lib/db/ops.ts stamps it on leave / reset-readiness.
+    time_left         timestamptz,
     ship_id           integer REFERENCES public.platform_ships(id) ON DELETE SET NULL,
     rsvp_status       text DEFAULT 'Pending'::text,
     rsvp_at           timestamptz,
@@ -1833,6 +1838,10 @@ CREATE INDEX IF NOT EXISTS idx_warehouse_stock_location ON public.warehouse_stoc
 -- contracts. The definition here is the warehouse-only base; the marketplace
 -- section's CREATE OR REPLACE supersedes it (it needs marketplace_contracts to
 -- exist first). Keep the two column lists identical.
+-- The on-hand / reserved SUM aggregates are cast to ::bigint (not ::integer) so a
+-- pathological pile-up of movements/requests can't overflow a 32-bit accumulator
+-- (integer-overflow DoS). NOTE: schema.sql is applied MANUALLY via the Supabase
+-- SQL editor — re-run this view definition there for the cast to take effect.
 CREATE OR REPLACE VIEW public.v_warehouse_stock_with_qty
 WITH (security_invoker = true) AS
 SELECT
@@ -1843,10 +1852,10 @@ SELECT
     s.created_at,
     s.updated_at,
     COALESCE((
-        SELECT SUM(m.delta)::integer FROM public.warehouse_movements m WHERE m.stock_id = s.id
+        SELECT SUM(m.delta)::bigint FROM public.warehouse_movements m WHERE m.stock_id = s.id
     ), 0) AS quantity_on_hand,
     COALESCE((
-        SELECT SUM(r.requested_quantity)::integer FROM public.warehouse_requests r
+        SELECT SUM(r.requested_quantity)::bigint FROM public.warehouse_requests r
          WHERE r.stock_id = s.id AND r.status IN ('pending', 'approved')
     ), 0) AS quantity_reserved
 FROM public.warehouse_stock s;
@@ -2006,6 +2015,9 @@ CREATE INDEX IF NOT EXISTS idx_warehouse_movements_contract ON public.warehouse_
 -- Re-create the stock-quantity view to ALSO reserve against accepted/in-progress
 -- marketplace SELL contracts (a member selling from real stock holds it until the
 -- contract completes/cancels). Column list identical to the warehouse-section base.
+-- SUM aggregates are cast to ::bigint to avoid a 32-bit integer-overflow DoS (see
+-- the base definition above). NOTE: schema.sql is applied MANUALLY via the Supabase
+-- SQL editor — re-run this definition there for the cast to take effect.
 CREATE OR REPLACE VIEW public.v_warehouse_stock_with_qty
 WITH (security_invoker = true) AS
 SELECT
@@ -2016,14 +2028,14 @@ SELECT
     s.created_at,
     s.updated_at,
     COALESCE((
-        SELECT SUM(m.delta)::integer FROM public.warehouse_movements m WHERE m.stock_id = s.id
+        SELECT SUM(m.delta)::bigint FROM public.warehouse_movements m WHERE m.stock_id = s.id
     ), 0) AS quantity_on_hand,
     COALESCE((
-        SELECT SUM(r.requested_quantity)::integer FROM public.warehouse_requests r
+        SELECT SUM(r.requested_quantity)::bigint FROM public.warehouse_requests r
          WHERE r.stock_id = s.id AND r.status IN ('pending', 'approved')
     ), 0)
     + COALESCE((
-        SELECT SUM(c.quantity)::integer
+        SELECT SUM(c.quantity)::bigint
           FROM public.marketplace_contracts c
           JOIN public.marketplace_listings l ON l.id = c.listing_id
          WHERE c.warehouse_stock_id = s.id
@@ -2348,15 +2360,29 @@ CREATE OR REPLACE FUNCTION public.qm_fulfil_issuance(p_issuance_id bigint, p_act
 RETURNS integer LANGUAGE plpgsql SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_inv_id bigint;
-    v_qty    integer;
-    v_rows   integer;
+    v_inv_id  bigint;
+    v_qty     integer;
+    v_rows    integer;
+    v_current integer;
 BEGIN
     SELECT inventory_id, quantity INTO v_inv_id, v_qty
       FROM public.quartermaster_issuances WHERE id = p_issuance_id;
     IF v_inv_id IS NULL THEN RETURN 0; END IF;
 
     PERFORM 1 FROM public.quartermaster_inventory WHERE id = v_inv_id FOR UPDATE;
+
+    -- Over-issue backstop: never let the negative 'issue' movement drive computed
+    -- on-hand (SUM of movement deltas) below zero. Mirrors warehouse_fulfil_request.
+    -- NOTE: schema.sql is applied MANUALLY via the Supabase SQL editor, so this is
+    -- the authoritative DB-level guard once applied; lib/db/quartermaster.ts carries
+    -- the in-code pre-check (assertSufficientOnHand) that guards the same condition
+    -- in the application layer. Checked under the FOR UPDATE row lock so concurrent
+    -- fulfils serialize.
+    SELECT COALESCE(SUM(delta), 0) INTO v_current
+      FROM public.quartermaster_inventory_movements WHERE inventory_id = v_inv_id;
+    IF v_current < v_qty THEN
+        RAISE EXCEPTION 'QM_INSUFFICIENT_STOCK: have %, need %', v_current, v_qty;
+    END IF;
 
     UPDATE public.quartermaster_issuances
        SET status = 'active', issued_by_user_id = p_actor_id, issued_at = now(), updated_at = now()
@@ -2377,8 +2403,9 @@ CREATE OR REPLACE FUNCTION public.qm_issue_direct(
 ) RETURNS bigint LANGUAGE plpgsql SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_exists     bigint;
+    v_exists      bigint;
     v_issuance_id bigint;
+    v_current     integer;
 BEGIN
     IF p_quantity IS NULL OR p_quantity <= 0 THEN
         RAISE EXCEPTION 'Quantity must be positive';
@@ -2386,6 +2413,19 @@ BEGIN
 
     SELECT id INTO v_exists FROM public.quartermaster_inventory WHERE id = p_inventory_id FOR UPDATE;
     IF v_exists IS NULL THEN RAISE EXCEPTION 'Inventory % not found', p_inventory_id; END IF;
+
+    -- Over-issue backstop: never let the negative 'issue' movement drive computed
+    -- on-hand (SUM of movement deltas) below zero. Mirrors warehouse_adjust_stock.
+    -- NOTE: schema.sql is applied MANUALLY via the Supabase SQL editor, so this is
+    -- the authoritative DB-level guard once applied; lib/db/quartermaster.ts carries
+    -- the in-code pre-check until then. The row is locked FOR UPDATE above, so the
+    -- bulk path's repeated calls for the SAME inventory row serialize and the
+    -- already-posted negative movement is visible to the next line's SUM.
+    SELECT COALESCE(SUM(delta), 0) INTO v_current
+      FROM public.quartermaster_inventory_movements WHERE inventory_id = p_inventory_id;
+    IF v_current < p_quantity THEN
+        RAISE EXCEPTION 'QM_INSUFFICIENT_STOCK: have %, need %', v_current, p_quantity;
+    END IF;
 
     INSERT INTO public.quartermaster_issuances
         (inventory_id, issued_to_user_id, quantity, status,
@@ -2497,6 +2537,12 @@ END;
 $$;
 
 -- Bulk variants delegate to the single-item functions (no org references).
+-- Over-issue safety: each per-line qm_issue_direct call re-checks on-hand WITHIN
+-- this transaction (its prior negative movement is already visible under the
+-- FOR UPDATE row lock), so cumulative over-issue across lines for the same
+-- inventory row raises QM_INSUFFICIENT_STOCK and rolls back the WHOLE batch.
+-- schema.sql is applied MANUALLY via the Supabase SQL editor (authoritative
+-- backstop once applied); lib/db/quartermaster.ts carries the in-code pre-check.
 CREATE OR REPLACE FUNCTION public.qm_issue_bulk(
     p_issued_to integer, p_due_back_at timestamptz, p_actor_id integer,
     p_notes text, p_operation_id bigint, p_lines jsonb
@@ -3184,17 +3230,30 @@ CREATE POLICY rt_recv_org_channels ON realtime.messages
         )
     );
 
--- Tactical board channels: deltas carry full element content, so receipt is
--- gated on the SAME operation-visibility predicate the app enforces on its
--- read paths (lib/db/ops.ts canUserSeeOpInList / assertOpVisibleToUser):
--- owner, OR operations:manage holder, OR clearance level met AND every
--- limiting marker on the op held. Topic format: 'op-board-<operation uuid>'.
--- The topic regex guard rejects malformed topics up front (a non-UUID tail
--- would never match o.id anyway — the EXISTS fails closed — but the guard
--- makes the contract explicit and avoids a needless scan). NULL user
--- clearance is treated as level 0, identical to the app's passesClearance
--- (lib/clearance.ts): an unclassified op (clearance_level 0, no markers) is
--- therefore visible to any member, by design.
+-- Tactical board channels: deltas carry full element content (broadcastBoardAdd
+-- emits the `element` object and broadcastBoardUpdate the `changes` object —
+-- lib/db/ops.ts), so receipt is gated on the SAME operation-visibility predicate
+-- the app enforces on its read paths (lib/db/ops.ts canUserSeeOpInList /
+-- assertOpVisibleToUser):
+--   owner, OR operations:manage holder, OR
+--   (clearance level met AND every limiting marker held
+--    AND — for SPECIAL operations — caller is an ACTIVE participant).
+-- Special operations are invite-only: a clearance-0 (or otherwise clearance-met,
+-- unmarked) special op must NOT be readable by every member — only the owner,
+-- operations:manage holders, and ACTIVE participants (operation_participants rows
+-- with time_left IS NULL) may receive its live board. Without this branch a
+-- non-participant could subscribe to op-board-<id> directly via supabase-js and
+-- read the special op's tactical board content. This mirrors the special-op gate
+-- the TS read/list/detail/action paths enforce so the realtime channel cannot
+-- drift from them. Topic format: 'op-board-<operation uuid>'; the regex guard
+-- rejects malformed topics up front (a non-UUID tail never matches o.id — the
+-- EXISTS fails closed — but the guard makes the contract explicit and avoids a
+-- needless scan). NULL user clearance is treated as level 0, identical to the
+-- app's passesClearance (lib/clearance.ts).
+--
+-- MANUAL APPLY: schema.sql is applied by hand via the Supabase SQL editor, not via
+-- migrations. After editing this policy you MUST re-run this DROP/CREATE POLICY
+-- block against the live database for the change to take effect.
 DROP POLICY IF EXISTS rt_recv_op_board ON realtime.messages;
 CREATE POLICY rt_recv_op_board ON realtime.messages
     FOR SELECT TO authenticated
@@ -3219,7 +3278,19 @@ CREATE POLICY rt_recv_op_board ON realtime.messages
                         WHERE rp.role_id = u.role_id AND p.name = 'operations:manage'
                     )
                     OR (
-                        COALESCE(o.clearance_level, 0) <= COALESCE(sc.level, 0)
+                        -- Special-op participation gate: a special op is visible
+                        -- through clearance ONLY to ACTIVE participants (time_left
+                        -- IS NULL). Non-special ops keep clearance-only behavior.
+                        (
+                            NOT COALESCE(o.is_special, false)
+                            OR EXISTS (
+                                SELECT 1 FROM public.operation_participants opp
+                                WHERE opp.operation_id = o.id
+                                  AND opp.user_id = u.id
+                                  AND opp.time_left IS NULL
+                            )
+                        )
+                        AND COALESCE(o.clearance_level, 0) <= COALESCE(sc.level, 0)
                         AND NOT EXISTS (
                             SELECT 1 FROM public.operation_limiting_markers olm
                             WHERE olm.operation_id = o.id
@@ -3377,7 +3448,7 @@ ON CONFLICT (name) DO NOTHING;
 -- JSON string. BUMP this whenever you change the schema (see AMENDMENT RULES at top);
 -- keep it aligned with the app version where practical.
 INSERT INTO public.settings (key, value)
-VALUES ('schema_version', '"15.1.5-open"'::jsonb)
+VALUES ('schema_version', '"15.2.0-open"'::jsonb)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Refresh PostgREST schema cache.

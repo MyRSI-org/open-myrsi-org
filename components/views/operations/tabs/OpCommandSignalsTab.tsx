@@ -119,10 +119,13 @@ const CommsPlanSection: React.FC<{ operation: HydratedOperation; canManage: bool
         }
     }, [rpcAction]);
 
-    // Read-view: fetch only if there's actually a Discord row to resolve.
+    // Read-view: fetch only if there's actually a Discord row to resolve. The
+    // fetch runs inside an async IIFE so the loading flag is set as part of the
+    // asynchronous data-sync (loadGuildChannels) rather than as a synchronous
+    // setState in the effect body — same fetch, same flag timing as before.
     useEffect(() => {
         if (hasDiscordRow && guildChannels.length === 0 && !guildError && !guildLoading) {
-            loadGuildChannels();
+            void (async () => { await loadGuildChannels(); })();
         }
     }, [hasDiscordRow, guildChannels.length, guildError, guildLoading, loadGuildChannels]);
 
@@ -132,9 +135,27 @@ const CommsPlanSection: React.FC<{ operation: HydratedOperation; canManage: bool
         return map;
     }, [guildChannels]);
 
+    // Stable React keys for the read-only plan. Provider-typed rows carry an `id`;
+    // legacy rows predate id assignment, so we derive a deterministic content-based
+    // key for them (with an occurrence suffix to disambiguate identical rows). The
+    // list is never reordered/filtered in the read view, so these keys are stable
+    // across renders — equivalent to the previous `entry.id || index` keying.
+    const keyedEntries = useMemo(() => {
+        const seen = new Map<string, number>();
+        return entries.map(entry => {
+            const base = entry.id
+                ?? `legacy:${entry.purpose || ''}|${entry.channel || ''}|${entry.frequency || ''}|${entry.callsign || ''}|${entry.notes || ''}`;
+            const occurrence = seen.get(base) ?? 0;
+            seen.set(base, occurrence + 1);
+            return { key: occurrence === 0 ? base : `${base}#${occurrence}`, entry };
+        });
+    }, [entries]);
+
     const openEditor = () => {
+        // Assign a stable id to any legacy row up front (these are minted on save
+        // anyway) so every editable row has a unique React key.
         const seed: CommsPlanEntry[] = entries.length > 0
-            ? entries.map(e => ({ ...e }))
+            ? entries.map(e => ({ ...e, id: e.id || cryptoUuid() }))
             : [{ id: cryptoUuid(), purpose: '', provider: 'discord_voice' }];
         setEditEntries(seed);
         setIsEditing(true);
@@ -230,9 +251,9 @@ const CommsPlanSection: React.FC<{ operation: HydratedOperation; canManage: bool
                 />
             ) : entries.length > 0 ? (
                 <div className="space-y-2">
-                    {entries.map((entry, i) => (
+                    {keyedEntries.map(({ key, entry }) => (
                         <CommsPlanRow
-                            key={entry.id || i}
+                            key={key}
                             entry={entry}
                             channelById={channelById}
                             guildId={guildId}
@@ -403,7 +424,7 @@ const CommsPlanEditor: React.FC<{
                     const provider: CommsProvider = entry.provider || 'other';
                     const meta = PROVIDER_META[provider];
                     return (
-                        <div key={entry.id || i} className={`rounded-lg border ${meta.accent} p-3 space-y-2.5`}>
+                        <div key={entry.id} className={`rounded-lg border ${meta.accent} p-3 space-y-2.5`}>
                             <div className="flex items-center gap-2">
                                 <div className="w-8 h-8 rounded-lg bg-slate-900/60 border border-slate-700/40 flex items-center justify-center shrink-0">
                                     <i className={`${meta.icon} ${meta.color} text-sm`}></i>
@@ -658,25 +679,28 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
     const transformerRef = useRef<Konva.Transformer>(null);
     const [stageSize, setStageSize] = useState({ width: 800, height: 600 });
 
-    // Pan/zoom state (refs kept in sync for stable callback access)
-    const [stagePos, setStagePosState] = useState({ x: 0, y: 0 });
-    const [zoom, setZoomState] = useState(1.0);
+    // Pan/zoom state (refs kept in sync for stable callback access). The raw
+    // useState setters take the canonical names; the `commit*` wrappers below
+    // additionally mirror each value into a ref so pointer/wheel handlers can
+    // read the latest value synchronously without re-binding.
+    const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+    const [zoom, setZoom] = useState(1.0);
     const stagePosRef = useRef({ x: 0, y: 0 });
     const zoomRef = useRef(1.0);
-    const setStagePos = useCallback((pos: { x: number; y: number }) => {
+    const commitStagePos = useCallback((pos: { x: number; y: number }) => {
         stagePosRef.current = pos;
-        setStagePosState(pos);
+        setStagePos(pos);
     }, []);
-    const setZoom = useCallback((val: number | ((prev: number) => number)) => {
+    const commitZoom = useCallback((val: number | ((prev: number) => number)) => {
         if (typeof val === 'function') {
-            setZoomState(prev => {
+            setZoom(prev => {
                 const next = val(prev);
                 zoomRef.current = next;
                 return next;
             });
         } else {
             zoomRef.current = val;
-            setZoomState(val);
+            setZoom(val);
         }
     }, []);
 
@@ -701,7 +725,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
     // Multi-select state — shift-click toggles, drag-box rubber-bands. The
     // properties panel only exposes inline edits when exactly one element is
     // selected (label/color editing is per-element, not batch-friendly).
-    const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+    const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
 
     // Inline edit for single-selected element
     const [editLabel, setEditLabel] = useState('');
@@ -714,31 +738,37 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
     const drawingPointsRef = useRef<number[]>([]);
     const drawingFrameRef = useRef(0);
 
-    // Drag-to-create state (zones, lines)
+    // Drag-to-create state (zones, lines). `sx`/`sy` carry the drag start point
+    // so the line preview can be drawn purely from this state without reading
+    // drawStartRef during render.
     const drawStartRef = useRef<{ x: number; y: number } | null>(null);
     const isDraggingShapeRef = useRef(false);
-    const [drawPreview, setDrawPreview] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+    const [drawPreview, setDrawPreview] = useState<{ x: number; y: number; w: number; h: number; sx: number; sy: number } | null>(null);
 
     // Rubber-band (drag-box) selection state — activated by shift+drag on empty stage.
     const rubberStartRef = useRef<{ x: number; y: number } | null>(null);
     const [rubberRect, setRubberRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+    // Mirror of rubberRect so the pointer-up handler can read the latest rect
+    // without taking rubberRect as a dep (which would re-bind it on every
+    // mouse-move during a marquee). Kept in sync next to every setRubberRect call.
+    const rubberRectRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
 
     // Optimistic elements (shown immediately before server confirmation)
     const [optimisticElements, setOptimisticElements] = useState<OperationBoardElement[]>([]);
-    const nextOptimisticId = useRef(-1);
+    const nextOptimisticIdRef = useRef(-1);
 
     // Realtime delta state. Board mutations from other tabs land on `op-board-{operationId}`
     // and merge into liveElements / deletedIds before the next full detail refetch. The
     // originating tab calls onRefresh() for itself; remote tabs apply the delta directly.
-    const [liveElements, setLiveElements] = useState<Map<number, OperationBoardElement>>(new Map());
-    const [deletedIds, setDeletedIds] = useState<Set<number>>(new Set());
+    const [liveElements, setLiveElements] = useState<Map<number, OperationBoardElement>>(() => new Map());
+    const [deletedIds, setDeletedIds] = useState<Set<number>>(() => new Set());
     // IDs the local user is mid-drag on — remote `update` deltas for these
     // are dropped so the element doesn't yank out from under the cursor.
-    const localDraggingIds = useRef<Set<number>>(new Set());
+    const localDraggingIdsRef = useRef<Set<number>>(new Set());
     // clientNonce → optimistic id mapping. When the broadcast for our own add
     // returns with the matching nonce, we retire the placeholder so the real
     // server-assigned row replaces it without flicker.
-    const pendingNonces = useRef<Map<string, number>>(new Map());
+    const pendingNoncesRef = useRef<Map<string, number>>(new Map());
 
     // Stable ref so the channel handler (which captures it once) sees the
     // latest baseElements without forcing a re-subscribe on every prop change.
@@ -764,12 +794,20 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
 
     // When a fresh server baseline lands (full op-detail refetch), it supersedes
     // everything we've been carrying locally — optimistics, live deltas, and
-    // tombstones. Also prune selection / history of IDs no longer present.
-    useEffect(() => {
+    // tombstones. Also prune selection of IDs no longer present.
+    //
+    // The state resets run as a render-time adjust keyed on the baseElements
+    // reference (React's "adjust state during render" pattern) rather than in an
+    // effect: React re-renders before paint, so the cleared local state lands with
+    // the same timing as the old effect — without the synchronous setState-in-effect.
+    // The block runs at most once per baseline change (the tracker update
+    // short-circuits the immediate re-render), matching the old [baseElements] dep.
+    const [prevBaseElements, setPrevBaseElements] = useState(baseElements);
+    if (baseElements !== prevBaseElements) {
+        setPrevBaseElements(baseElements);
         setOptimisticElements([]);
         setLiveElements(new Map());
         setDeletedIds(new Set());
-        pendingNonces.current.clear();
         const liveIds = new Set(baseElements.map(e => e.id));
         setSelectedIds(prev => {
             let changed = false;
@@ -779,6 +817,15 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
             }
             return changed ? next : prev;
         });
+    }
+
+    // Ref bookkeeping for the same baseline change — kept in an effect because
+    // refs must not be mutated during render. These are not render state: the
+    // nonce map and undo/redo stacks are only read from event handlers, so
+    // clearing/pruning them post-commit is equivalent to the old combined effect.
+    useEffect(() => {
+        pendingNoncesRef.current.clear();
+        const liveIds = new Set(baseElements.map(e => e.id));
         historyRef.current = historyRef.current.filter(h => liveIds.has(h.elementId));
         futureRef.current = futureRef.current.filter(h => liveIds.has(h.elementId));
     }, [baseElements]);
@@ -807,6 +854,12 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
     const elementCountRef = useRef(elements.length);
     useEffect(() => { elementCountRef.current = elements.length; }, [elements.length]);
 
+    // Stable ref to the merged element list so the pointer-up handler's
+    // marquee hit-test can read the latest elements without taking `elements`
+    // as a dep (the handler already recreates on placeElement→getAutoName).
+    const elementsRef = useRef(elements);
+    useEffect(() => { elementsRef.current = elements; }, [elements]);
+
     // Subscribe to per-op board deltas. Channel name and event match the
     // server-side helpers in lib/db/ops.ts (broadcastBoard{Add,Update,Delete}).
     useEffect(() => {
@@ -825,9 +878,9 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
             };
             if (d.op === 'add' && d.element) {
                 const element = d.element;
-                if (d.clientNonce && pendingNonces.current.has(d.clientNonce)) {
-                    const optId = pendingNonces.current.get(d.clientNonce)!;
-                    pendingNonces.current.delete(d.clientNonce);
+                if (d.clientNonce && pendingNoncesRef.current.has(d.clientNonce)) {
+                    const optId = pendingNoncesRef.current.get(d.clientNonce)!;
+                    pendingNoncesRef.current.delete(d.clientNonce);
                     setOptimisticElements(prev => prev.filter(el => el.id !== optId));
                 }
                 setLiveElements(prev => {
@@ -838,7 +891,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
                 });
             } else if (d.op === 'update' && typeof d.elementId === 'number' && d.changes) {
                 const id = d.elementId;
-                if (localDraggingIds.current.has(id)) return;
+                if (localDraggingIdsRef.current.has(id)) return;
                 const changes = d.changes;
                 setLiveElements(prev => {
                     const existing = prev.get(id) ?? baseElementsRef.current.find(b => b.id === id);
@@ -913,9 +966,9 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         const posY = Math.round(isFreehand ? canvasY : snap(canvasY));
 
         // Add optimistic element for instant feedback
-        const optimisticId = nextOptimisticId.current--;
+        const optimisticId = nextOptimisticIdRef.current--;
         const clientNonce = cryptoUuid();
-        pendingNonces.current.set(clientNonce, optimisticId);
+        pendingNoncesRef.current.set(clientNonce, optimisticId);
         setOptimisticElements(prev => [...prev, {
             id: optimisticId,
             operationId: operation.id,
@@ -955,7 +1008,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         } catch {
             // RPC failed — drop the placeholder and the dangling nonce so the
             // user isn't left with a phantom element.
-            pendingNonces.current.delete(clientNonce);
+            pendingNoncesRef.current.delete(clientNonce);
             setOptimisticElements(prev => prev.filter(el => el.id !== optimisticId));
         } finally {
             setSaving(false);
@@ -1171,9 +1224,9 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         const delta = e.evt.deltaY > 0 ? 0.9 : 1.1;
         const newZoom = Math.min(Math.max(oldZoom * delta, 0.2), 3.0);
         const mousePointTo = { x: (pointer.x - pos.x) / oldZoom, y: (pointer.y - pos.y) / oldZoom };
-        setZoom(newZoom);
-        setStagePos({ x: pointer.x - mousePointTo.x * newZoom, y: pointer.y - mousePointTo.y * newZoom });
-    }, [setZoom, setStagePos]);
+        commitZoom(newZoom);
+        commitStagePos({ x: pointer.x - mousePointTo.x * newZoom, y: pointer.y - mousePointTo.y * newZoom });
+    }, [commitZoom, commitStagePos]);
 
     const handleStageClick = useCallback((e: Konva.KonvaEventObject<MouseEvent>) => {
         // If clicked on empty area of stage
@@ -1211,6 +1264,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         // canManage since selection itself is read-only.
         if (e.evt.shiftKey && !activeTool) {
             rubberStartRef.current = { x, y };
+            rubberRectRef.current = { x, y, w: 0, h: 0 };
             setRubberRect({ x, y, w: 0, h: 0 });
             return;
         }
@@ -1241,12 +1295,14 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         // Rubber-band rectangle update
         if (rubberStartRef.current) {
             const start = rubberStartRef.current;
-            setRubberRect({
+            const nextRect = {
                 x: Math.min(start.x, x),
                 y: Math.min(start.y, y),
                 w: Math.abs(x - start.x),
                 h: Math.abs(y - start.y),
-            });
+            };
+            rubberRectRef.current = nextRect;
+            setRubberRect(nextRect);
             return;
         }
 
@@ -1270,6 +1326,8 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
                 y: Math.min(drawStartRef.current.y, y),
                 w: dx,
                 h: dy,
+                sx: drawStartRef.current.x,
+                sy: drawStartRef.current.y,
             });
         }
     }, [activeTool]);
@@ -1277,12 +1335,13 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
     const handleStageMouseUp = useCallback(async (e: Konva.KonvaEventObject<MouseEvent>) => {
         // Rubber-band end — collect elements whose bounding box intersects the rect
         if (rubberStartRef.current) {
-            const rect = rubberRect;
+            const rect = rubberRectRef.current;
             rubberStartRef.current = null;
+            rubberRectRef.current = null;
             setRubberRect(null);
             if (rect && (rect.w > 3 || rect.h > 3)) {
                 const hits = new Set<number>();
-                for (const el of elements) {
+                for (const el of elementsRef.current) {
                     const elW = el.width ?? 30;
                     const elH = el.height ?? 30;
                     // For point-style elements (unit/waypoint/ship/icon/text) use a small
@@ -1357,14 +1416,13 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
                 placeElement('line', start.x, start.y, { points: [0, 0, dx, dy] });
             }
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: pointerUp handler keyed on tool + placeElement; elements / rubberRect are read for the marquee-select branch via the latest state in scope at call time, and adding them would re-bind the pointer handler on every elements-array or rubber-rect change (which fires on every mouse-move during a marquee).
     }, [placeElement, activeTool]);
 
     // Mark id as locally-controlled so remote `update` deltas mid-drag are
     // dropped instead of yanking the element away from the user's cursor.
     const handleDragStart = useCallback((elId: number) => {
         if (!canManage) return;
-        localDraggingIds.current.add(elId);
+        localDraggingIdsRef.current.add(elId);
     }, [canManage]);
 
     const handleDragEnd = useCallback((e: Konva.KonvaEventObject<DragEvent>, elId: number) => {
@@ -1377,7 +1435,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
         if (snapEnabled && (nx !== node.x() || ny !== node.y())) {
             node.position({ x: nx, y: ny });
         }
-        localDraggingIds.current.delete(elId);
+        localDraggingIdsRef.current.delete(elId);
         handleMoveElement(elId, nx, ny);
     }, [canManage, handleMoveElement, snap, snapEnabled]);
 
@@ -1400,6 +1458,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
             isDraggingShapeRef.current = false;
             setDrawPreview(null);
             rubberStartRef.current = null;
+            rubberRectRef.current = null;
             setRubberRect(null);
             return;
         }
@@ -1576,7 +1635,7 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
                         }}
                         onDragEnd={(e) => {
                             if (e.target === stageRef.current) {
-                                setStagePos({ x: e.target.x(), y: e.target.y() });
+                                commitStagePos({ x: e.target.x(), y: e.target.y() });
                             }
                         }}
                         onWheel={handleWheel}
@@ -1757,9 +1816,9 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
                                     cornerRadius={8}
                                     opacity={0.8} />
                             )}
-                            {drawPreview && activeTool === 'line' && drawStartRef.current && (
+                            {drawPreview && activeTool === 'line' && (
                                 <Line
-                                    points={[drawStartRef.current.x, drawStartRef.current.y, drawStartRef.current.x + drawPreview.w, drawStartRef.current.y + drawPreview.h]}
+                                    points={[drawPreview.sx, drawPreview.sy, drawPreview.sx + drawPreview.w, drawPreview.sy + drawPreview.h]}
                                     stroke={toolColor}
                                     strokeWidth={2}
                                     dash={[8, 4]}
@@ -1804,14 +1863,14 @@ const TacticalBoard: React.FC<{ operation: HydratedOperation; canManage: boolean
 
                     {/* Zoom Controls */}
                     <div className="absolute bottom-3 right-3 bg-slate-900/90 border border-slate-700/50 rounded-lg backdrop-blur-xs p-1 flex flex-col gap-1 z-10">
-                        <button onClick={() => setZoom(z => Math.min(z * 1.2, 3.0))} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Zoom In">
+                        <button onClick={() => commitZoom(z => Math.min(z * 1.2, 3.0))} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Zoom In">
                             <i className="fa-solid fa-plus"></i>
                         </button>
-                        <button onClick={() => setZoom(z => Math.max(z * 0.8, 0.2))} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Zoom Out">
+                        <button onClick={() => commitZoom(z => Math.max(z * 0.8, 0.2))} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Zoom Out">
                             <i className="fa-solid fa-minus"></i>
                         </button>
                         <div className="border-t border-slate-700/50 my-0.5"></div>
-                        <button onClick={() => { setStagePos({ x: 0, y: 0 }); setZoom(1.0); }} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Reset View">
+                        <button onClick={() => { commitStagePos({ x: 0, y: 0 }); commitZoom(1.0); }} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 rounded-sm transition-colors text-sm" title="Reset View">
                             <i className="fa-solid fa-expand"></i>
                         </button>
                     </div>

@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
 import { User } from '../../types';
@@ -14,7 +14,11 @@ const SyncUsersModal: React.FC<SyncUsersModalProps> = ({ isOpen, onClose }) => {
     const { rpcAction } = useData();
     const { allUsers } = useMembers();
     const [isRunning, setIsRunning] = useState(false);
-    const [logs, setLogs] = useState<string[]>([]);
+    // Append-only log lines. Each carries a monotonically-increasing `id`
+    // (minted at append time) so React has a stable, unique key without falling
+    // back to the array index.
+    const [logs, setLogs] = useState<{ id: number; text: string }[]>([]);
+    const logIdRef = useRef(0);
     const [currentIndex, setCurrentIndex] = useState(0);
     const [completedCount, setCompletedCount] = useState(0);
 
@@ -29,13 +33,28 @@ const SyncUsersModal: React.FC<SyncUsersModalProps> = ({ isOpen, onClose }) => {
     // If running, iterate over the stable snapshot. Otherwise, show live data count.
     const usersToSync = isRunning ? snapshot : allUsers;
 
-    useEffect(() => {
+    // Reset the sync run state each time the modal transitions to open, using
+    // the React "adjust state during render" pattern (a previous-value tracker)
+    // instead of an effect. This runs during render — React re-renders before
+    // paint, so it is behaviour-equivalent to the old on-open reset effect, with
+    // no synchronous setState in an effect body.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setLogs([]);
             setCurrentIndex(0);
             setCompletedCount(0);
             setIsRunning(false);
             setSnapshot([]); // Clear snapshot on open
+        }
+    }
+
+    // The processing flag is a ref (not render state), so its on-open reset stays
+    // in an effect — refs may only be mutated outside render. Mirrors the
+    // render-time state reset above and fires on the same open transition.
+    useEffect(() => {
+        if (isOpen) {
             isProcessingRef.current = false;
         }
     }, [isOpen]);
@@ -46,12 +65,13 @@ const SyncUsersModal: React.FC<SyncUsersModalProps> = ({ isOpen, onClose }) => {
         }
     }, [logs]);
 
-    const addLog = (message: string) => {
+    const addLog = useCallback((message: string) => {
         const timestamp = new Date().toLocaleTimeString();
-        setLogs(prev => [...prev, `[${timestamp}] ${message}`]);
-    };
+        const id = logIdRef.current++;
+        setLogs(prev => [...prev, { id, text: `[${timestamp}] ${message}` }]);
+    }, []);
 
-    const processNextUser = async () => {
+    const processNextUser = useCallback(async () => {
         if (currentIndex >= usersToSync.length) {
             setIsRunning(false);
             addLog("--- SYNC COMPLETE ---");
@@ -76,14 +96,13 @@ const SyncUsersModal: React.FC<SyncUsersModalProps> = ({ isOpen, onClose }) => {
             setCurrentIndex(prev => prev + 1);
             isProcessingRef.current = false;
         }, 1500);
-    };
+    }, [currentIndex, usersToSync, rpcAction, addLog]);
 
     useEffect(() => {
         if (isRunning && !isProcessingRef.current) {
             processNextUser();
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: drives the recursive iteration via [isRunning, currentIndex] only; processNextUser is recreated each render and closes over current state.
-    }, [isRunning, currentIndex]);
+    }, [isRunning, processNextUser]);
 
     const handleStart = () => {
         // Freeze the user list so live updates don't shift indices
@@ -127,9 +146,9 @@ const SyncUsersModal: React.FC<SyncUsersModalProps> = ({ isOpen, onClose }) => {
                         {logs.length === 0 ? (
                             <span className="text-slate-600 italic">Ready to start. Click 'Start Sync' to begin.</span>
                         ) : (
-                            logs.map((log, i) => (
-                                <div key={i} className="text-emerald-400 border-b border-white/5 pb-0.5 mb-0.5 last:border-0 wrap-break-word">
-                                    {log}
+                            logs.map((log) => (
+                                <div key={log.id} className="text-emerald-400 border-b border-white/5 pb-0.5 mb-0.5 last:border-0 wrap-break-word">
+                                    {log.text}
                                 </div>
                             ))
                         )}

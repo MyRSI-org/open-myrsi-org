@@ -189,14 +189,14 @@ const MirroredOperationDetailView: React.FC<Props> = ({ mirror: initialMirror, o
 
             <Section title="Participants" icon="fa-users">
                 <div className="space-y-1.5">
-                    {(op.participants || []).map((p, i) => (
-                        <div key={`h-${i}`} className="flex items-center justify-between text-sm">
+                    {(op.participants || []).map(p => (
+                        <div key={`h-${p.userId}`} className="flex items-center justify-between text-sm">
                             <span className="text-slate-200">{p.user?.name || 'Member'}{p.roleRequested ? <span className="text-slate-500"> · {p.roleRequested}</span> : null}</span>
                             <span className="text-[10px] text-slate-500 uppercase">{p.rsvpStatus || (p.isReady ? 'Ready' : '')}</span>
                         </div>
                     ))}
-                    {(op.alliedParticipants || []).map((p, i) => (
-                        <div key={`a-${i}`} className="flex items-center justify-between text-sm">
+                    {(op.alliedParticipants || []).map(p => (
+                        <div key={`a-${p.peerId}-${p.remoteUserHandle}`} className="flex items-center justify-between text-sm">
                             <span className="text-cyan-300">{p.displayName || p.remoteUserHandle}<span className="text-slate-500"> · ally</span></span>
                             <span className="text-[10px] text-slate-500 uppercase">{p.rsvpStatus}</span>
                         </div>

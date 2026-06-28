@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useData } from '../../../../contexts/DataContext';
 import { useWarehouse } from '../../../../contexts/WarehouseContext';
 import WindowFrame from '../../../layout/WindowFrame';
@@ -37,24 +37,32 @@ export default function WhCatalogEditDialog({ isOpen, target, onClose, onSubmitt
     const isNew = target === 'new';
     const existing = !isNew && target ? target : null;
 
-    useEffect(() => {
-        if (!isOpen) return;
-        if (existing) {
-            setName(existing.name);
-            setCategory(existing.category);
-            setQualityLabel(existing.qualityLabel || '');
-            setUnit(existing.unit);
-            setDescription(existing.description || '');
-        } else {
-            setName('');
-            setCategory('ore');
-            setQualityLabel('');
-            setUnit('SCU');
-            setDescription('');
+    // Seed the editable form fields when the dialog opens or the target item
+    // changes. Adjusting state during render (React-documented pattern) is
+    // equivalent to the old seed effect keyed on [isOpen, target] but runs
+    // before paint without a synchronous effect setState. Keyed on the `target`
+    // reference exactly like the original deps, so it does NOT re-fire (and
+    // clobber in-progress edits) on unrelated catalog data updates.
+    const [prevSeedKey, setPrevSeedKey] = useState<{ isOpen: boolean; target: typeof target }>({ isOpen, target });
+    if (prevSeedKey.isOpen !== isOpen || prevSeedKey.target !== target) {
+        setPrevSeedKey({ isOpen, target });
+        if (isOpen) {
+            if (existing) {
+                setName(existing.name);
+                setCategory(existing.category);
+                setQualityLabel(existing.qualityLabel || '');
+                setUnit(existing.unit);
+                setDescription(existing.description || '');
+            } else {
+                setName('');
+                setCategory('ore');
+                setQualityLabel('');
+                setUnit('SCU');
+                setDescription('');
+            }
+            setSubmitting(false);
         }
-        setSubmitting(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on isOpen / target flip; `existing` is derived from props inside the body and adding it would re-fire on any catalog data update mid-edit.
-    }, [isOpen, target]);
+    }
 
     if (!isOpen || !target) return null;
 

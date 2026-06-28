@@ -15,7 +15,7 @@
 // refreshDiscord are defined in DataContext and registered here via register*
 // callbacks so CRUD can refresh without depending on useData() (would cycle).
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     User, UserRole, Rank, OrganizationalUnit, Role,
@@ -374,11 +374,11 @@ export const MembersProvider: React.FC<{ children: React.ReactNode }> = ({ child
         registerRefreshMainState, registerRefreshDiscord,
     ]);
 
-    return <MembersContext.Provider value={value}>{children}</MembersContext.Provider>;
+    return <MembersContext value={value}>{children}</MembersContext>;
 };
 
 export const useMembers = (): MembersContextValue => {
-    const ctx = useContext(MembersContext);
+    const ctx = use(MembersContext);
     if (!ctx) throw new Error('useMembers must be used within a MembersProvider');
     return ctx;
 };

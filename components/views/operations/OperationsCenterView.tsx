@@ -55,7 +55,11 @@ const OperationsCenterView: React.FC = () => {
             setMirrors(data || []);
         } catch { setMirrors([]); }
     }, [rpcAction, canManageAlliance]);
-    useEffect(() => { loadMirrors(); }, [loadMirrors]);
+    // Fetch mirrors on mount / when the gated action changes. loadMirrors only
+    // setStates after its awaited RPC, so awaiting it from an async IIFE keeps
+    // every update on the post-await path (no synchronous set-in-effect) — same
+    // timing as a bare loadMirrors() call.
+    useEffect(() => { void (async () => { await loadMirrors(); })(); }, [loadMirrors]);
     const acceptedMirrors = useMemo(() => mirrors.filter(m => m.accepted), [mirrors]);
     const pendingMirrors = useMemo(() => mirrors.filter(m => !m.accepted), [mirrors]);
     const handleMirrorAccept = async (id: string) => {

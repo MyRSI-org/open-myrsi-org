@@ -54,7 +54,12 @@ const UnitFeed: React.FC<{ unitId: number }> = ({ unitId }) => {
     }, [unitId, rpcAction]);
 
     useEffect(() => {
-        fetchFeed();
+        // Mount-time feed fetch (state is set after the awaited RPC, not derived
+        // from props/state) plus the realtime subscription that re-fetches on
+        // unit_posts changes. Both are external-system synchronization. The fetch
+        // is wrapped in an async IIFE so the deferred (post-await) setState is
+        // explicit — this is the documented React async-effect pattern.
+        void (async () => { await fetchFeed(); })();
 
         const supabase = getSupabase();
         if (!supabase) return;
@@ -112,6 +117,15 @@ const UnitFeed: React.FC<{ unitId: number }> = ({ unitId }) => {
                         const urls = post.content.match(/(https?:\/\/[^\s]+)/g);
                         const text = post.content.replace(/(https?:\/\/[^\s]+)/g, '');
                         const isAuthor = post.authorId === currentUser?.id;
+                        // Mint a stable, content-derived key per URL occurrence. post.content is
+                        // immutable and the embed list never reorders, so post id + URL + a
+                        // per-URL occurrence counter is unique even when a URL repeats — no need
+                        // for the bare array index as the React key.
+                        const seenUrlCounts: Record<string, number> = {};
+                        const embeds = (urls || []).map(url => {
+                            const n = seenUrlCounts[url] = (seenUrlCounts[url] || 0) + 1;
+                            return { key: `${post.id}:${url}:${n}`, url };
+                        });
 
                         return (
                             <div key={post.id} className={`flex gap-3 group ${isAuthor ? 'flex-row-reverse' : ''}`}>
@@ -122,7 +136,7 @@ const UnitFeed: React.FC<{ unitId: number }> = ({ unitId }) => {
                                         <span className={isAuthor ? 'text-emerald-100' : 'text-slate-500'}>{fmt.time(post.createdAt)}</span>
                                     </div>
                                     <p className="whitespace-pre-wrap leading-relaxed">{text}</p>
-                                    {urls && urls.map((url, i) => <MediaEmbed key={i} url={url} />)}
+                                    {embeds.map(({ key, url }) => <MediaEmbed key={key} url={url} />)}
                                     {isAuthor && (
                                         <button
                                             onClick={() => handleDelete(post.id)}

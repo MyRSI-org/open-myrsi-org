@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { OrganizationalUnit } from '../../types';
 import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
@@ -35,7 +35,15 @@ const UnitModal: React.FC<UnitModalProps> = ({ isOpen, onClose, unit }) => {
     // Only admins can change structure. Unit leaders can only edit details.
     const canManageStructure = hasPermission('admin:config:units');
 
-    useEffect(() => {
+    // Seed/reset the editable form when the modal opens or the edited unit
+    // changes while open. Adjusts state during render (React's documented
+    // pattern) instead of in an effect; the controlled fields must stay
+    // user-editable so they cannot be derived during render.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevUnit, setPrevUnit] = useState(unit);
+    if (isOpen !== prevIsOpen || unit !== prevUnit) {
+        setPrevIsOpen(isOpen);
+        setPrevUnit(unit);
         if (isOpen) {
             if (unit) {
                 setName(unit.name);
@@ -62,7 +70,7 @@ const UnitModal: React.FC<UnitModalProps> = ({ isOpen, onClose, unit }) => {
             }
             setIsLoading(false);
         }
-    }, [isOpen, unit]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

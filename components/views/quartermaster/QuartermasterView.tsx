@@ -52,6 +52,12 @@ const TABS: readonly { key: Tab; label: string; icon: string; permission?: strin
     { key: 'settings',  label: 'Settings',  icon: 'fa-gear', permission: 'qm:manage' },
 ];
 
+// Stable keys for the fixed-length loading-skeleton placeholders. The lists are
+// static (never reordered/filtered/inserted), so these module-scope identifiers
+// give each placeholder a stable, unique key without leaning on the array index.
+const SKELETON_CARD_KEYS = ['sk-card-0', 'sk-card-1', 'sk-card-2', 'sk-card-3'] as const;
+const SKELETON_ROW_KEYS = ['sk-row-0', 'sk-row-1', 'sk-row-2', 'sk-row-3'] as const;
+
 export default function QuartermasterView() {
     const { rpcAction } = useData();
     const { allUsers } = useMembers();
@@ -168,14 +174,14 @@ export default function QuartermasterView() {
 
     // Tab-aware lazy load for issuances. Inventory is self-fetched by
     // QmArmoryTab (and IssueKitModal) so the parent never holds it.
-    const loadedSlices = useRef<{ issuances: boolean; memberRecords: boolean }>({
+    const loadedSlicesRef = useRef<{ issuances: boolean; memberRecords: boolean }>({
         issuances: false, memberRecords: false,
     });
     useEffect(() => {
         if (!canView) return;
         if (tab === 'issuances') {
-            if (!loadedSlices.current.issuances) { loadedSlices.current.issuances = true; refreshIssuances(); }
-            if (!loadedSlices.current.memberRecords) { loadedSlices.current.memberRecords = true; refreshMemberRecords(); }
+            if (!loadedSlicesRef.current.issuances) { loadedSlicesRef.current.issuances = true; refreshIssuances(); }
+            if (!loadedSlicesRef.current.memberRecords) { loadedSlicesRef.current.memberRecords = true; refreshMemberRecords(); }
         }
     }, [tab, canView, refreshIssuances, refreshMemberRecords]);
 
@@ -332,8 +338,8 @@ export default function QuartermasterView() {
                     // page layout doesn't jump when data lands.
                     <div className="space-y-8" aria-busy="true" aria-live="polite">
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                            {Array.from({ length: 4 }).map((_, i) => (
-                                <div key={i} className="rounded-xl border border-white/5 bg-slate-900/40 p-5 space-y-3 animate-pulse">
+                            {SKELETON_CARD_KEYS.map((k) => (
+                                <div key={k} className="rounded-xl border border-white/5 bg-slate-900/40 p-5 space-y-3 animate-pulse">
                                     <Skeleton className="h-3 w-16" />
                                     <Skeleton className="h-8 w-24" />
                                     <Skeleton className="h-3 w-32" />
@@ -341,8 +347,8 @@ export default function QuartermasterView() {
                             ))}
                         </div>
                         <div className="space-y-2">
-                            {Array.from({ length: 4 }).map((_, i) => (
-                                <Skeleton key={i} className="h-12 w-full" />
+                            {SKELETON_ROW_KEYS.map((k) => (
+                                <Skeleton key={k} className="h-12 w-full" />
                             ))}
                         </div>
                     </div>

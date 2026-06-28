@@ -170,6 +170,37 @@ export async function updateElection(electionId: number, updates: Partial<Govern
     broadcastGovernmentUpdate('elections');
 }
 
+// ---------------------------------------------------------------------------
+// Electorate snapshot (turnout-quorum denominator)
+// ---------------------------------------------------------------------------
+
+// Count the eligible electorate: every non-deleted member whose role grants
+// gov:participate (the permission gating gov:cast_election_vote in
+// api/services.ts). Snapshotted into government_elections.eligible_voter_count
+// when voting opens so concludeElection's min_voter_turnout_pct quorum has a
+// denominator (c7 — previously the column was never populated, so the quorum
+// branch was dead code). Returns 0 if the permission/role lookup yields nothing;
+// the caller persists that and concludeElection fails the quorum CLOSED on a 0.
+async function countEligibleVoters(): Promise<number> {
+    const { data: perm } = await supabase.from('permissions')
+        .select('id')
+        .eq('name', 'gov:participate')
+        .maybeSingle();
+    if (!perm) return 0;
+
+    const { data: rolePerms } = await supabase.from('role_permissions')
+        .select('role_id')
+        .eq('permission_id', perm.id);
+    const roleIds = (rolePerms || []).map((r: { role_id: number }) => r.role_id);
+    if (roleIds.length === 0) return 0;
+
+    const { count } = await supabase.from('users')
+        .select('id', { count: 'exact', head: true })
+        .in('role_id', roleIds)
+        .is('deleted_at', null);
+    return count || 0;
+}
+
 export async function advanceElection(electionId: number) {
     const { data: election, error: fetchErr } = await supabase.from('government_elections')
         .select('id, status, candidacy_start, candidacy_end, voting_start, min_candidates, candidates:government_election_candidates(id, withdrawn_at)')
@@ -195,11 +226,17 @@ export async function advanceElection(electionId: number) {
         if (activeCandidates.length < election.min_candidates) {
             throw new Error(`Need at least ${election.min_candidates} candidate(s), currently ${activeCandidates.length}`);
         }
+        // Snapshot the electorate size at the moment voting opens so the
+        // min_voter_turnout_pct quorum in concludeElection becomes enforceable
+        // (c7 fix). Without this denominator a 1-voter election would auto-appoint
+        // its winner into a veto-capable apex office despite a configured quorum.
+        const eligibleVoterCount = await countEligibleVoters();
         const { error } = await supabase.from('government_elections')
             .update({
                 status: 'Voting',
                 candidacy_end: election.candidacy_end || now,
                 voting_start: election.voting_start || now,
+                eligible_voter_count: eligibleVoterCount,
                 updated_at: now
             })
             .eq('id', electionId);
@@ -429,12 +466,26 @@ export async function concludeElection(electionId: number) {
     let conclusionReason = 'Election concluded normally';
     let status: string = 'Concluded';
 
-    if (election.min_voter_turnout_pct && election.eligible_voter_count) {
-        const turnoutPct = (voterCount / election.eligible_voter_count) * 100;
-        if (turnoutPct < parseFloat(election.min_voter_turnout_pct)) {
+    // Turnout quorum (c7). A min_voter_turnout_pct of 0/unset means no quorum is
+    // required — skip the gate and conclude normally. When a quorum IS required we
+    // MUST have the electorate snapshot taken at the Candidacy->Voting transition
+    // to compute turnout; a missing/zero eligible_voter_count makes the quorum
+    // unverifiable, so fail CLOSED (treat as not met) rather than silently
+    // auto-appointing the winner into a possibly veto-capable apex office.
+    const requiredTurnoutPct = election.min_voter_turnout_pct ? parseFloat(election.min_voter_turnout_pct) : 0;
+    if (requiredTurnoutPct > 0) {
+        const eligible = election.eligible_voter_count || 0;
+        if (eligible <= 0) {
             status = 'Cancelled';
-            conclusionReason = `Insufficient voter turnout (${turnoutPct.toFixed(1)}% < ${election.min_voter_turnout_pct}% required)`;
+            conclusionReason = `Turnout quorum of ${requiredTurnoutPct}% required but the electorate size is unknown — quorum not met`;
             result.isConclusive = false;
+        } else {
+            const turnoutPct = (voterCount / eligible) * 100;
+            if (turnoutPct < requiredTurnoutPct) {
+                status = 'Cancelled';
+                conclusionReason = `Insufficient voter turnout (${turnoutPct.toFixed(1)}% < ${requiredTurnoutPct}% required)`;
+                result.isConclusive = false;
+            }
         }
     }
 

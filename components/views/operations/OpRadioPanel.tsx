@@ -86,9 +86,9 @@ const OpRadioPanel: React.FC<OpRadioPanelProps> = ({ radio, compact }) => {
 
             {isConnected && participants.length > 0 && !compact && (
                 <div className="flex flex-wrap gap-1">
-                    {participants.map((name, i) => (
+                    {participants.map((name) => (
                         <span
-                            key={i}
+                            key={name}
                             className={`text-[10px] px-1.5 py-0.5 rounded uppercase font-bold tracking-wide border transition-all ${
                                 activeSpeakers.includes(name)
                                     ? 'bg-amber-500/20 text-amber-200 border-amber-500/40 shadow-[0_0_6px_rgba(245,158,11,0.4)]'

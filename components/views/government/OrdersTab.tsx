@@ -54,8 +54,11 @@ const OrdersTab: React.FC = () => {
     const [showCreate, setShowCreate] = useState(false);
     const [editing, setEditing] = useState<Order | null>(null);
 
-    const load = useCallback(async () => {
-        setLoading(true);
+    // Pure fetch: every setState runs after the awaited RPCs (or in finally), so
+    // this is safe to call directly from the mount effect without a synchronous
+    // set-in-effect. `loading` already initialises to true, so the spinner shows
+    // on mount with no extra render pass.
+    const fetchOrders = useCallback(async () => {
         try {
             const [rows, positions] = await Promise.all([
                 rpcAction('gov:list_orders', {}),
@@ -70,7 +73,18 @@ const OrdersTab: React.FC = () => {
         }
     }, [rpcAction]);
 
-    useEffect(() => { load(); }, [load]);
+    // Imperative reload for handlers (save/revoke/delete): flips the spinner back
+    // on before refetching. Invoked from event handlers only, never an effect, so
+    // the synchronous setLoading(true) here is not a set-in-effect.
+    const load = useCallback(async () => {
+        setLoading(true);
+        await fetchOrders();
+    }, [fetchOrders]);
+
+    // Await the fetch inside an async IIFE so every state update stays on the
+    // post-await path the rule recognises (fetchOrders sets state only after the
+    // awaited RPCs) — same timing as a bare call.
+    useEffect(() => { void (async () => { await fetchOrders(); })(); }, [fetchOrders]);
 
     const canIssue = myPositions.length > 0;
 

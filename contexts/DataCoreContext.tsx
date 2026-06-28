@@ -13,7 +13,7 @@
 // optimisticUpdate, and every domain's state slice; it registers its
 // fetchDataSubset (and current feature-flag values) with DataCore at mount.
 
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { getSupabase } from '../lib/supabaseClient';
 // Realtime broadcast handlers below log their (own-org) payloads for debugging.
@@ -179,6 +179,14 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const idleDisconnectTimerRef = useRef<number | null>(null);
     const idleDisconnectedRef = useRef<boolean>(false);
 
+    // Holds the latest notifyDbConnected so its own rebuild paths (the
+    // not-ready retry and the settings/features rebuild handlers) can re-invoke
+    // it without an in-body self-reference. The callback is memoized on the
+    // stable callFetcher, so the ref target is effectively constant; routing the
+    // recursion through it keeps the behavior identical while avoiding the
+    // compiler's access-before-declaration mis-read of the self-reference.
+    const notifyDbConnectedRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
     const rpcAction = useCallback(async (action: string, payload: any = {}) => {
         try {
             const res = await apiService.rpc(action, payload);
@@ -245,7 +253,7 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             console.warn('[DataCore] Supabase client not ready yet. Realtime subscription delayed.');
             setTimeout(() => {
                 const retrySupabase = getSupabase();
-                if (retrySupabase && !realtimeConnectedRef.current) void notifyDbConnected();
+                if (retrySupabase && !realtimeConnectedRef.current) void notifyDbConnectedRef.current();
             }, 1000);
             return;
         }
@@ -493,7 +501,7 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 // Rebuild after that so the new .on(...) gating sees current
                 // values.
                 setTimeout(() => {
-                    void notifyDbConnected();
+                    void notifyDbConnectedRef.current();
                 }, 0);
             })
             .on('broadcast', { event: 'features_update' }, async () => {
@@ -514,7 +522,7 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 const fn = fetcherRef.current;
                 if (fn) await fn('main');
                 setTimeout(() => {
-                    void notifyDbConnected();
+                    void notifyDbConnectedRef.current();
                 }, 0);
             })
             .on('broadcast', { event: 'external_tools_update' }, () => {
@@ -751,14 +759,28 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         currentChannelCleanupRef.current = cleanup;
     }, [callFetcher]);
 
+    // Keep the latest notifyDbConnected reachable from its own async rebuild
+    // paths (see notifyDbConnectedRef above). Read only inside setTimeout
+    // callbacks, never during render, so it always resolves to the current
+    // memoized callback. Synced via an effect (not a render-time ref write).
+    useEffect(() => {
+        notifyDbConnectedRef.current = notifyDbConnected;
+    }, [notifyDbConnected]);
+
     // Tab-visibility resync. Supabase Realtime terminates at Supabase, not at
     // our app, so a backend redeploy doesn't trigger a WS reconnect — meaning
     // the "wasDisconnected" branch above never fires after a Coolify rolling
     // update. To recover stale state in that case (and for tab-suspend /
     // laptop-sleep), when the tab regains visibility after >30s away,
     // re-fetch the hot subsets.
-    const lastVisibleAtRef = useRef<number>(Date.now());
+    const lastVisibleAtRef = useRef<number>(0);
     useEffect(() => {
+        // Seed the baseline at mount (in the effect, not during render, so the
+        // impure Date.now() call stays out of the render path). No
+        // visibilitychange listener exists before this runs, so the handler
+        // below can never read the ref before it is seeded — identical timing
+        // to the previous render-time initialization.
+        lastVisibleAtRef.current = Date.now();
         const RESYNC_THRESHOLD_MS = 30_000;
         const onVisibility = () => {
             if (document.visibilityState !== 'visible') {
@@ -895,11 +917,11 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         registerTableHandler,
     };
 
-    return <DataCoreContext.Provider value={value}>{children}</DataCoreContext.Provider>;
+    return <DataCoreContext value={value}>{children}</DataCoreContext>;
 };
 
 export const useDataCore = (): DataCoreContextValue => {
-    const ctx = useContext(DataCoreContext);
+    const ctx = use(DataCoreContext);
     if (!ctx) throw new Error('useDataCore must be used within a DataCoreProvider');
     return ctx;
 };

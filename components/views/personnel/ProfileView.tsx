@@ -46,27 +46,51 @@ const ProfileView: React.FC = () => {
     const [tzDraft, setTzDraft] = useState<string>(currentUser?.timezone || browserTz);
     const [formatDraft, setFormatDraft] = useState<DateFormatPreset>(currentUser?.dateFormat || 'compact_12h');
     const [isSavingPrefs, setIsSavingPrefs] = useState(false);
-    const previewIso = useMemo(
-        () => new Date().toISOString(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: deps re-stamp the preview "now" whenever prefs/drafts change so the formatted-preview box reflects the new selection against a fresh timestamp.
-        [currentUser?.timezone, currentUser?.dateFormat, tzDraft, formatDraft]);
+    const previewKey = [currentUser?.timezone, currentUser?.dateFormat, tzDraft, formatDraft].join(String.fromCharCode(31));
+    const [prevPreviewKey, setPrevPreviewKey] = useState(previewKey);
+    const [previewIso, setPreviewIso] = useState(() => new Date().toISOString());
+    if (previewKey !== prevPreviewKey) {
+        setPrevPreviewKey(previewKey);
+        setPreviewIso(new Date().toISOString());
+    }
 
     // Diagnostic State
     const [diagStep, setDiagStep] = useState(0); // 0: Idle, 1: Browser, 2: Permission, 3: SW, 4: Server
-    const [diagLog, setDiagLog] = useState<string[]>([]);
+    // Append-only diagnostic log. Each line carries a stable, monotonically
+    // minted id so duplicate text still keys uniquely (the list is only ever
+    // appended to or cleared, never reordered).
+    const [diagLog, setDiagLog] = useState<{ id: number; text: string }[]>([]);
     const [isDiagnosing, setIsDiagnosing] = useState(false);
 
     const cooldownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const diagLineSeqRef = useRef(0);
 
-    useEffect(() => {
+    // Hydrate the user-editable form drafts when the profile (or the specific
+    // mirrored subfields) changes. These fields are edited afterward, so they
+    // can't be derived during render — instead we re-seed during render using
+    // the React-documented "adjust state on prop change" pattern with a
+    // previous-key tracker. The composite key mirrors EXACTLY the subfields the
+    // form depends on, so an unrelated profile field update won't clobber a
+    // user's in-progress draft. React applies these sets and re-renders before
+    // paint, so this is behavior-equivalent to the old hydrate effect.
+    const draftsKey = [
+        currentUser?.id,
+        currentUser?.rsiHandle,
+        currentUser?.displayName,
+        currentUser?.timezone,
+        currentUser?.dateFormat,
+        browserTz,
+    ].join(String.fromCharCode(31)); // unit-separator delimiter avoids field-boundary collisions
+    const [prevDraftsKey, setPrevDraftsKey] = useState(draftsKey);
+    if (draftsKey !== prevDraftsKey) {
+        setPrevDraftsKey(draftsKey);
         if (currentUser) {
             setRsiHandle(currentUser.rsiHandle);
             setDisplayNameDraft(currentUser.displayName || '');
             setTzDraft(currentUser.timezone || browserTz);
             setFormatDraft(currentUser.dateFormat || 'compact_12h');
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed on the specific currentUser subfields the form mirrors; a whole-object dep would re-fire on any other profile field update and clobber the user's in-progress drafts.
-    }, [currentUser?.id, currentUser?.rsiHandle, currentUser?.displayName, currentUser?.timezone, currentUser?.dateFormat, browserTz]);
+    }
 
     // Cleanup the cooldown interval on unmount. Hoisted above the early return
     // below so hook order stays stable across renders.
@@ -233,7 +257,7 @@ const ProfileView: React.FC = () => {
         setDiagLog([]);
         setDiagStep(1);
 
-        const addLog = (msg: string) => setDiagLog(prev => [...prev, msg]);
+        const addLog = (msg: string) => setDiagLog(prev => [...prev, { id: diagLineSeqRef.current++, text: msg }]);
 
         try {
             // Step 1: Browser Support
@@ -554,9 +578,9 @@ const ProfileView: React.FC = () => {
 
                             {diagLog.length > 0 && (
                                 <div className="bg-black/40 rounded-lg border border-slate-800 p-3 h-32 overflow-y-auto custom-scrollbar font-mono text-[10px]">
-                                    {diagLog.map((log, i) => (
-                                        <div key={i} className={`mb-1 ${log.includes('ERROR') || log.includes('Failed') ? 'text-red-400' : log.includes('✅') ? 'text-green-400' : 'text-slate-300'}`}>
-                                            {log}
+                                    {diagLog.map((log) => (
+                                        <div key={log.id} className={`mb-1 ${log.text.includes('ERROR') || log.text.includes('Failed') ? 'text-red-400' : log.text.includes('✅') ? 'text-green-400' : 'text-slate-300'}`}>
+                                            {log.text}
                                         </div>
                                     ))}
                                     {isDiagnosing && <div className="text-sky-300 animate-pulse">_ Checking protocols...</div>}

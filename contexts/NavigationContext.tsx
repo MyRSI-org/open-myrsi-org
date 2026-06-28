@@ -1,4 +1,4 @@
-import React, { createContext, useState, useCallback, useContext } from 'react';
+import React, { createContext, useState, useCallback, use } from 'react';
 import {
     User,
     HydratedServiceRequest,
@@ -221,11 +221,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         viewDossier,
     };
 
-    return <NavigationContext.Provider value={value}>{children}</NavigationContext.Provider>;
+    return <NavigationContext value={value}>{children}</NavigationContext>;
 };
 
 export const useNavigation = () => {
-    const context = useContext(NavigationContext);
+    const context = use(NavigationContext);
     if (!context) {
         throw new Error('useNavigation must be used within a NavigationProvider');
     }

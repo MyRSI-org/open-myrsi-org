@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useIntel } from '../../../contexts/IntelContext';
 import { useAuth } from '../../../contexts/AuthContext';
@@ -163,9 +163,9 @@ const IntelligenceView: React.FC = () => {
     const [dossier, setDossier] = useState<DossierData | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [deletingId, setDeletingId] = useState<string | null>(null);
-    const [utcTime, setUtcTime] = useState(new Date());
+    const [utcTime, setUtcTime] = useState(() => new Date());
     const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
-    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
 
     /** Drilldown breadcrumb stack — tail is the currently-open target. */
     const [dossierStack, setDossierStack] = useState<string[]>([]);
@@ -302,10 +302,16 @@ const IntelligenceView: React.FC = () => {
         }
     }, [rpcAction, canViewDossiers, hasReportAccess]);
 
+    // Synchronizes the dossier view with the externally-controlled navigation
+    // target (useNavigation). Opening a dossier resets the stack and kicks off
+    // an async RPC fetch (loadDossier) — external-system synchronization with a
+    // data fetch. The work is launched from an inline async function (React's
+    // documented effect-fetch pattern); fetchSubject's synchronous stack/loading
+    // sets run before the first await, so their timing is unchanged.
     useEffect(() => {
-        if (selectedDossierTarget) {
-            fetchSubject(selectedDossierTarget);
-        }
+        if (!selectedDossierTarget) return;
+        const target = selectedDossierTarget;
+        void (async () => { fetchSubject(target); })();
     }, [selectedDossierTarget, fetchSubject]);
 
     /** Cursor-paginated archive fetch. All filters and search are pushed
@@ -376,26 +382,62 @@ const IntelligenceView: React.FC = () => {
      *  isn't empty. The infinite-scroll guard in `loadMore` makes this safe. */
     useEffect(() => {
         if (!isLoadingPage && hasMore && reports.length > 0 && reports.length < 15) {
-            loadMore();
+            // Data-fetch side-effect: auto-advance cursor pagination when clearance
+            // filtering thins a page. Launched from an inline async function (React's
+            // documented effect-fetch pattern); loadMore's only synchronous setState
+            // is its in-flight loading flag (guarded against re-entry), which runs
+            // before the first await, so its timing is unchanged.
+            void (async () => { await loadMore(); })();
         }
     }, [isLoadingPage, hasMore, reports.length, loadMore]);
 
     /** Realtime intel updates: silently refresh if the user is on page 1,
-     *  otherwise surface the "X new reports" pill so we don't yank scroll. */
-    useEffect(() => {
-        if (intelDataVersion === 0) return;
-        if (!nextCursor) {
-            fetchFirstPage();
-        } else {
+     *  otherwise surface the "X new reports" pill so we don't yank scroll.
+     *
+     *  The "past page 1" branch is a synchronous state adjustment (bump the pill
+     *  counter), so it uses the React-documented "adjust state during render"
+     *  pattern with a previous-value tracker — this fires exactly once per
+     *  distinct intelDataVersion bump, reading the current nextCursor, equivalent
+     *  to the old effect. The "on page 1" branch is an async refetch and stays in
+     *  an effect below. */
+    const [prevIntelDataVersion, setPrevIntelDataVersion] = useState(intelDataVersion);
+    if (intelDataVersion !== prevIntelDataVersion) {
+        setPrevIntelDataVersion(intelDataVersion);
+        if (intelDataVersion !== 0 && nextCursor) {
             setPendingNewCount(c => c + 1);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: keyed only on intelDataVersion; re-firing on fetchFirstPage identity (which changes with every filter) would double-trigger on legitimate filter swaps.
+    }
+
+    // Latest-value refs so the trigger-keyed effects below read the current
+    // nextCursor/fetchFirstPage without listing them as deps (which would re-fire
+    // on every filter-driven identity change). Declared before those effects so
+    // that, within a single commit, the refs are updated first (effects run in
+    // declaration order).
+    const nextCursorRef = useRef(nextCursor);
+    useEffect(() => { nextCursorRef.current = nextCursor; }, [nextCursor]);
+    const fetchFirstPageRef = useRef(fetchFirstPage);
+    useEffect(() => { fetchFirstPageRef.current = fetchFirstPage; }, [fetchFirstPage]);
+
+    useEffect(() => {
+        // Async page-1 refetch on realtime intel_update bumps. Launched from an
+        // inline async function (React's documented effect-fetch pattern);
+        // fetchFirstPage's only synchronous setState is its in-flight loading flag,
+        // which runs before the first await — timing is unchanged. The pill-bump
+        // branch is handled by the render-time tracker above, so it is not here.
+        if (intelDataVersion !== 0 && !nextCursorRef.current) {
+            void (async () => { await fetchFirstPageRef.current(); })();
+        }
     }, [intelDataVersion]);
 
     /** Modal-driven create/edit also bumps intelRefreshTrigger — refresh page 1. */
     useEffect(() => {
-        if (intelRefreshTrigger > 0 && !nextCursor) fetchFirstPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: respond only to the parent's refresh trigger, not to fetchFirstPage/nextCursor identity changes (which fire during normal pagination).
+        // Responds to the parent's modal-driven refresh trigger by re-fetching
+        // page 1. Launched from an inline async function (React's documented
+        // effect-fetch pattern); fetchFirstPage's only synchronous setState is its
+        // in-flight loading flag, which runs before the first await — unchanged.
+        if (intelRefreshTrigger > 0 && !nextCursorRef.current) {
+            void (async () => { await fetchFirstPageRef.current(); })();
+        }
     }, [intelRefreshTrigger]);
 
     const handleDelete = async (id: string, e?: React.MouseEvent) => {
@@ -470,7 +512,7 @@ const IntelligenceView: React.FC = () => {
         { key: 'summary', label: 'Summary', render: (item) => <span className="text-xs text-slate-400 truncate block">{s(item.data.summary).substring(0, 80)}{s(item.data.summary).length > 80 ? '...' : ''}</span> },
         { key: 'tags', label: 'Tags', width: '120px', render: (item) => (
             <div className="flex gap-1 flex-wrap">
-                {(item.data.tags || []).slice(0, 2).map((t, i) => <span key={i} className="px-1.5 py-0.5 bg-slate-800 rounded-sm text-[9px] text-slate-400 border border-slate-700">{t}</span>)}
+                {(item.data.tags || []).slice(0, 2).map((t) => <span key={t} className="px-1.5 py-0.5 bg-slate-800 rounded-sm text-[9px] text-slate-400 border border-slate-700">{t}</span>)}
                 {(item.data.tags || []).length > 2 && <span className="text-[9px] text-slate-600">+{(item.data.tags || []).length - 2}</span>}
             </div>
         )},

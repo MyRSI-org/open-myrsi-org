@@ -72,7 +72,7 @@ beforeEach(() => {
     h.rpcReturn = [];
 });
 
-describe('qm:issue_bulk array cap (ratelimit#3)', () => {
+describe('qm:issue_bulk array cap', () => {
     it('rejects an oversized lines[] array before any DB read/write', async () => {
         const oversized = Array.from({ length: 5000 }, (_, i) => ({ inventoryId: i + 1, quantity: 1 }));
         await expect(issueDirectBulk(ACTOR, { issuedToUserId: 1, lines: oversized }))
@@ -86,6 +86,12 @@ describe('qm:issue_bulk array cap (ratelimit#3)', () => {
     it('lets a normal-size batch proceed (scope check + RPC fire)', async () => {
         // Seed the inventory rows so the tenant-scope gate passes.
         h.tables.quartermaster_inventory = [{ id: 1 }, { id: 2 }];
+        // Seed on-hand movements so the over-issue pre-check (getInventoryOnHandMap)
+        // sees sufficient stock and lets this legitimate batch reach the RPC.
+        h.tables.quartermaster_inventory_movements = [
+            { inventory_id: 1, delta: 50 },
+            { inventory_id: 2, delta: 50 },
+        ];
         h.rpcReturn = [101, 102];
 
         const ids = await issueDirectBulk(ACTOR, {
@@ -98,7 +104,7 @@ describe('qm:issue_bulk array cap (ratelimit#3)', () => {
     });
 });
 
-describe('qm:return_bulk array cap (ratelimit#4)', () => {
+describe('qm:return_bulk array cap', () => {
     it('rejects an oversized lines[] array before any DB read/write', async () => {
         const oversized = Array.from({ length: 5000 }, (_, i) => ({
             issuanceId: i + 1, returnedQuantity: 1, outcome: 'returned_on_time' as const,

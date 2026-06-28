@@ -143,7 +143,7 @@ export async function getHRApplications(): Promise<HydratedHRApplication[]> {
     let query = supabase.from('hr_applications')
         .select(`
             id, applicant_name, applicant_discord_id, rsi_handle, status, referral_source, notes, assigned_recruiter_id, linked_user_id, created_at, vetting_data,
-            assignedRecruiter:users!hr_applications_assigned_recruiter_id_fkey(id, name, avatar_url, role_id, discord_id, rsi_handle)
+            assignedRecruiter:users!hr_applications_assigned_recruiter_id_fkey(id, name, avatar_url, role_id, rsi_handle)
         `);
 
     query = query.order('created_at', { ascending: false }).limit(200);
@@ -173,7 +173,7 @@ async function fetchPanelMembers(interviewIds: string[]): Promise<Map<string, Pa
     if (interviewIds.length === 0 || _panelTableMissing) return panelMap;
     try {
         const { data: panelData, error } = await supabase.from('hr_interview_panel')
-            .select('interview_id, user:users(id, name, avatar_url, role_id, discord_id, rsi_handle)')
+            .select('interview_id, user:users(id, name, avatar_url, role_id, rsi_handle)')
             .in('interview_id', interviewIds);
         if (error) throw error;
         for (const p of ((panelData || []) as unknown as Array<PanelMember & { interview_id: string }>)) {
@@ -215,7 +215,7 @@ export async function getAllHRInterviews(): Promise<HydratedHRInterview[]> {
         .select(`
             id, application_id, template_id, interviewer_id, scheduled_at, completed_at, overall_notes, final_score, status, is_recommended,
             template:hr_interview_templates!hr_interviews_template_id_fkey(id, name, description),
-            interviewer:users!hr_interviews_interviewer_id_fkey(id, name, avatar_url, role_id, discord_id, rsi_handle),
+            interviewer:users!hr_interviews_interviewer_id_fkey(id, name, avatar_url, role_id, rsi_handle),
             responses:hr_interview_responses(question_id, response_body, score),
             ${applicationJoin}
         `);
@@ -239,7 +239,7 @@ export async function getAllHRInterviews(): Promise<HydratedHRInterview[]> {
 
 export async function getHRApplicationLogs(applicationId: string) {
     const logsQuery = supabase.from('hr_application_logs')
-        .select('id, application_id, user_id, action_type, message, created_at, user:users(id, name, avatar_url, role_id, discord_id, rsi_handle)')
+        .select('id, application_id, user_id, action_type, message, created_at, user:users(id, name, avatar_url, role_id, rsi_handle)')
         .eq('application_id', applicationId)
         .order('created_at', { ascending: false });
 
@@ -680,7 +680,7 @@ export async function getMyInterviews(userId: number): Promise<HydratedHRIntervi
     const selectFields = `
         id, application_id, template_id, interviewer_id, scheduled_at, completed_at, overall_notes, final_score, status, is_recommended,
         template:hr_interview_templates!hr_interviews_template_id_fkey(id, name, description),
-        interviewer:users!hr_interviews_interviewer_id_fkey(id, name, avatar_url, role_id, discord_id, rsi_handle),
+        interviewer:users!hr_interviews_interviewer_id_fkey(id, name, avatar_url, role_id, rsi_handle),
         responses:hr_interview_responses(question_id, response_body, score),
         application:hr_applications!hr_interviews_application_id_fkey(applicant_name)
     `;
@@ -1078,7 +1078,7 @@ export function redactTransfersForViewer<T extends { reason?: string; adminNotes
 /** Transfers array producer — shared by getHRState and the hr_transfers
  *  realtime slice subset. */
 export async function getTransferRequests() {
-    const transferQuery = supabase.from('hr_transfer_requests').select('id, user_id, current_unit_id, target_unit_id, reason, status, admin_notes, created_at, updated_at, user:users!hr_transfer_requests_user_id_fkey(id, name, avatar_url, role_id, discord_id, rsi_handle), targetUnit:units!hr_transfer_requests_target_unit_id_fkey(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted)').order('created_at', { ascending: false }).limit(100);
+    const transferQuery = supabase.from('hr_transfer_requests').select('id, user_id, current_unit_id, target_unit_id, reason, status, admin_notes, created_at, updated_at, user:users!hr_transfer_requests_user_id_fkey(id, name, avatar_url, role_id, rsi_handle), targetUnit:units!hr_transfer_requests_target_unit_id_fkey(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted)').order('created_at', { ascending: false }).limit(100);
     type TransferRow = Parameters<typeof toTransferRequest>[0];
     const transfers = await safeFetch<TransferRow[]>(
         transferQuery as unknown as PromiseLike<{ data: TransferRow[] | null; error: { code?: string; message?: string; hint?: string; details?: string } | null }>,

@@ -14,7 +14,7 @@ interface AwardCertificationModalProps {
 const AwardCertificationModal: React.FC<AwardCertificationModalProps> = ({ isOpen, onClose, certification }) => {
     const { members, awardCertification } = useMembers();
     const { addToast } = useNotification();
-    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(new Set());
+    const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(() => new Set());
     const [isLoading, setIsLoading] = useState(false);
 
     const membersWithoutCert = useMemo(() => {

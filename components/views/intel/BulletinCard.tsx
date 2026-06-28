@@ -62,7 +62,7 @@ const BulletinCard: React.FC<BulletinCardProps> = ({ bulletin, onDelete, isDelet
     const { securityClearances } = useMembers();
 
     const isIndefinite = bulletin.durationMinutes === 0;
-    const [countdown, setCountdown] = useState(formatCountdown(bulletin.expiresAt, bulletin.durationMinutes));
+    const [countdown, setCountdown] = useState(() => formatCountdown(bulletin.expiresAt, bulletin.durationMinutes));
     const [isExpired, setIsExpired] = useState(false);
 
     useEffect(() => {
@@ -160,9 +160,9 @@ const BulletinCard: React.FC<BulletinCardProps> = ({ bulletin, onDelete, isDelet
                     {reportMarkers.length > 0 && (
                         <>
                             <span className="text-slate-600 uppercase font-black tracking-widest ml-1">MKR</span>
-                            {reportMarkers.map((m, idx) => (
+                            {reportMarkers.map((m) => (
                                 <span
-                                    key={typeof m?.id === 'number' ? m.id : idx}
+                                    key={typeof m?.id === 'number' ? m.id : safe(m?.code)}
                                     className="px-1.5 py-0.5 rounded-sm bg-slate-950/60 text-sky-400 border border-sky-500/20 uppercase font-black tracking-wider"
                                     title={String(safe((m as any)?.name) || safe(m?.code) || '')}
                                 >

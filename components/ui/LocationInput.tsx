@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import apiService from '../../services/apiService';
-import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import type { PlatformLocation } from '../../types';
 
 interface LocationInputProps {
@@ -19,17 +18,23 @@ const LocationInput: React.FC<LocationInputProps> = ({ value, onChange, disabled
     const [showSuggestions, setShowSuggestions] = useState(false);
     const [loading, setLoading] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
     // Skip the next debounced search after the user clicks a suggestion —
     // setting inputValue programmatically would otherwise re-fire the search
     // and reopen the dropdown.
     const skipNextSearchRef = useRef(false);
 
-    const debouncedQuery = useDebouncedValue(inputValue, DEBOUNCE_MS);
-
-    useEffect(() => {
+    // Sync the local typeahead buffer when the controlled `value` prop changes
+    // externally (e.g. parent resets the form). `inputValue` diverges from
+    // `value` while the user types, so it cannot be derived during render; this
+    // is the React "adjust state during render" pattern (prev-value tracker),
+    // behaviour-equivalent to a prop->state sync effect but without the extra
+    // commit-and-effect round-trip.
+    const [prevValue, setPrevValue] = useState(value);
+    if (value !== prevValue) {
+        setPrevValue(value);
         setInputValue(value);
-    }, [value]);
+    }
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -41,41 +46,52 @@ const LocationInput: React.FC<LocationInputProps> = ({ value, onChange, disabled
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
 
+    // Debounced location search. The debounce timer lives inside the effect so
+    // the fetch-start loading signal and the result/clear setState calls all run
+    // in the setTimeout callback (an async boundary) rather than synchronously in
+    // the effect body. skipNextSearchRef is read inside the timer (not during
+    // render), so a programmatic setInputValue from a suggestion click neither
+    // fires a search nor raises a spinner.
     useEffect(() => {
-        if (skipNextSearchRef.current) {
-            skipNextSearchRef.current = false;
-            return;
-        }
-        const q = debouncedQuery.trim();
-        if (q.length < MIN_QUERY_LEN) {
-            setSuggestions([]);
-            setLoading(false);
-            return;
-        }
-        const seq = ++requestSeq.current;
-        setLoading(true);
-        // Search via the standard authenticated RPC endpoint
-        // (apiService.rpc -> /api/services).
-        apiService.rpc('system:search_locations', { query: q, limit: MAX_SUGGESTIONS })
-            .then((res: { data?: PlatformLocation[] } | PlatformLocation[] | undefined) => {
-                // /api/services wraps the handler return as { success, data: ... }.
-                const rows = Array.isArray(res) ? res : (res?.data ?? []);
-                if (seq !== requestSeq.current) return;
-                const labels = (rows || [])
-                    .map((r) => (r.path && r.path.length > 0 ? r.path : r.name))
-                    .filter((s): s is string => !!s);
-                // Dedupe — different rows can share a path string in edge cases.
-                setSuggestions(Array.from(new Set(labels)).slice(0, MAX_SUGGESTIONS));
-            })
-            .catch((err) => {
-                if (seq !== requestSeq.current) return;
-                console.warn('[LocationInput] search failed:', err?.message);
+        const q = inputValue.trim();
+        const tooShort = q.length < MIN_QUERY_LEN;
+        const timer = setTimeout(() => {
+            if (tooShort) {
+                // Below the minimum length — clear any prior results + spinner.
                 setSuggestions([]);
-            })
-            .finally(() => {
-                if (seq === requestSeq.current) setLoading(false);
-            });
-    }, [debouncedQuery]);
+                setLoading(false);
+            }
+            if (skipNextSearchRef.current) {
+                skipNextSearchRef.current = false;
+                return;
+            }
+            if (tooShort) return;
+            const seq = ++requestSeqRef.current;
+            setLoading(true);
+            // Search via the standard authenticated RPC endpoint
+            // (apiService.rpc -> /api/services).
+            apiService.rpc('system:search_locations', { query: q, limit: MAX_SUGGESTIONS })
+                .then((res: { data?: PlatformLocation[] } | PlatformLocation[] | undefined) => {
+                    // /api/services wraps the handler return as { success, data: ... }.
+                    const rows = Array.isArray(res) ? res : (res?.data ?? []);
+                    if (seq !== requestSeqRef.current) return;
+                    const labels = (rows || [])
+                        .map((r) => (r.path && r.path.length > 0 ? r.path : r.name))
+                        .filter((s): s is string => !!s);
+                    // Dedupe — different rows can share a path string in edge cases.
+                    setSuggestions(Array.from(new Set(labels)).slice(0, MAX_SUGGESTIONS));
+                })
+                .catch((err) => {
+                    if (seq !== requestSeqRef.current) return;
+                    console.warn('[LocationInput] search failed:', err?.message);
+                    setSuggestions([]);
+                })
+                .finally(() => {
+                    if (seq === requestSeqRef.current) setLoading(false);
+                });
+        }, DEBOUNCE_MS);
+        return () => clearTimeout(timer);
+    }, [inputValue]);
 
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const text = e.target.value;
@@ -114,9 +130,9 @@ const LocationInput: React.FC<LocationInputProps> = ({ value, onChange, disabled
                             <i className="fa-solid fa-spinner fa-spin mr-2" /> Searching…
                         </li>
                     )}
-                    {suggestions.map((suggestion, index) => (
+                    {suggestions.map((suggestion) => (
                         <li
-                            key={index}
+                            key={suggestion}
                             onClick={() => handleSuggestionClick(suggestion)}
                             className="px-4 py-2 text-sm text-slate-300 hover:bg-sky-500/10 hover:text-white cursor-pointer"
                         >

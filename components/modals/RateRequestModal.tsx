@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { HydratedServiceRequest } from '../../types';
 import { useRequests } from '../../contexts/RequestsContext';
 import { useConfig } from '../../contexts/ConfigContext';
@@ -45,13 +45,18 @@ const RateRequestModal: React.FC<RateRequestModalProps> = ({ isOpen, onClose, re
     const [feedback, setFeedback] = useState('');
     const [isLoading, setIsLoading] = useState(false);
 
-    useEffect(() => {
+    // Reset the rating form whenever the modal transitions to open. Adjusts state
+    // during render (React's documented pattern) instead of in an effect; the
+    // fields must remain user-editable so they cannot be derived during render.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setRating(0);
             setFeedback('');
             setIsLoading(false);
         }
-    }, [isOpen]);
+    }
 
     const handleSubmit = useCallback(async () => {
         if (rating === 0) return;

@@ -15,7 +15,7 @@ const RoleDetailView: React.FC<RoleDetailViewProps> = ({ roleId, onBack }) => {
     const { addToast } = useNotification();
     const [role, setRole] = useState<Role | null>(null);
     const [allPermissions, setAllPermissions] = useState<any[]>([]);
-    const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(new Set());
+    const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(() => new Set());
     const [isLoading, setIsLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');

@@ -56,9 +56,16 @@ const OpAARTab: React.FC<OpAARTabProps> = ({ operation, canManage, isParticipant
     const [lastGeneratedAt, setLastGeneratedAt] = useState<string | undefined>(operation.aarAiGeneratedAt);
     const [now, setNow] = useState(() => Date.now());
 
-    useEffect(() => {
+    // Re-sync the cooldown anchor whenever the server-provided timestamp changes
+    // (e.g. after onRefresh brings fresh data), while still allowing the local
+    // optimistic updates in handleGenerateDraft. Done during render — React's
+    // recommended replacement for a setState-in-effect prop sync — so there is
+    // no extra commit/paint.
+    const [prevAiGeneratedAt, setPrevAiGeneratedAt] = useState(operation.aarAiGeneratedAt);
+    if (operation.aarAiGeneratedAt !== prevAiGeneratedAt) {
+        setPrevAiGeneratedAt(operation.aarAiGeneratedAt);
         setLastGeneratedAt(operation.aarAiGeneratedAt);
-    }, [operation.aarAiGeneratedAt]);
+    }
 
     useEffect(() => {
         if (!lastGeneratedAt) return;

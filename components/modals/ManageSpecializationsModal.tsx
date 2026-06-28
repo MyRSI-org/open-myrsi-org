@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useMembers } from '../../contexts/MembersContext';
 
@@ -16,14 +16,26 @@ const ManageSpecializationsModal: React.FC<ManageSpecializationsModalProps> = ({
     const { currentUser, updateUserSpecializations } = useAuth();
     const { specializationTags } = useMembers();
     const { addToast } = useNotification();
-    const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+    const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
     const [isLoading, setIsLoading] = useState(false);
 
-    useEffect(() => {
-        if (isOpen && currentUser?.specializations) {
-            setSelectedIds(new Set(currentUser.specializations.map(s => s.id)));
+    // Seed the editable selection from the user's saved specializations each
+    // time the modal opens (or the saved set changes while open). Adjusting
+    // state during render with previous-value trackers is the React-documented
+    // equivalent of the old open-reset effect: it fires on the same
+    // (isOpen, specializations) transitions and re-renders before paint.
+    // prevIsOpen seeds to false so a mount with isOpen=true registers as an
+    // open transition, matching the old effect which ran (and seeded) on mount.
+    const savedSpecializations = currentUser?.specializations;
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    const [prevSavedSpecializations, setPrevSavedSpecializations] = useState(savedSpecializations);
+    if (isOpen !== prevIsOpen || savedSpecializations !== prevSavedSpecializations) {
+        setPrevIsOpen(isOpen);
+        setPrevSavedSpecializations(savedSpecializations);
+        if (isOpen && savedSpecializations) {
+            setSelectedIds(new Set(savedSpecializations.map(s => s.id)));
         }
-    }, [isOpen, currentUser?.specializations]);
+    }
 
     const handleToggle = (tagId: number) => {
         setSelectedIds(prev => {

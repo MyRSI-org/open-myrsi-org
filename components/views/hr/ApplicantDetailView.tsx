@@ -6,17 +6,15 @@ import { useNavigation } from '../../../contexts/NavigationContext';
 
 const ApplicantDetailView: React.FC = () => {
     const { setActiveView } = useNavigation();
-    const [id, setId] = useState<string | null>(null);
+    // Fallback to legacy local storage method if no selectedCaseFile in context.
+    // Read once at mount via lazy initializer so the value is available during render.
+    const [id] = useState<string | null>(() => localStorage.getItem('selected_applicant_id'));
 
     useEffect(() => {
-        // Fallback to legacy local storage method if no selectedCaseFile in context
-        const storedId = localStorage.getItem('selected_applicant_id');
-        if (storedId) {
-            setId(storedId);
-        } else {
+        if (!id) {
             setActiveView('hr');
         }
-    }, [setActiveView]);
+    }, [id, setActiveView]);
 
     if (!id) return null;
 

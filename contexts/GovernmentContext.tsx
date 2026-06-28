@@ -21,7 +21,7 @@
 // registerFeatureFlags; the realtime government_update handler is gated on that
 // flag in DataCoreContext.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     GovernmentConfig, GovernmentBranch, GovernmentPosition, GovernmentPositionHolder,
@@ -156,11 +156,11 @@ export const GovernmentProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         registerRefreshGovernment,
     ]);
 
-    return <GovernmentContext.Provider value={value}>{children}</GovernmentContext.Provider>;
+    return <GovernmentContext value={value}>{children}</GovernmentContext>;
 };
 
 export const useGovernment = (): GovernmentContextValue => {
-    const ctx = useContext(GovernmentContext);
+    const ctx = use(GovernmentContext);
     if (!ctx) throw new Error('useGovernment must be used within a GovernmentProvider');
     return ctx;
 };

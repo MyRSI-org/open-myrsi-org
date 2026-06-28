@@ -14,6 +14,7 @@ import EmptyState from '../../shared/ui/EmptyState';
 import MDTPanel from './dispatch/MDTPanel';
 import { useNavigation } from '../../../contexts/NavigationContext';
 import { useModalRegistry } from '../../../contexts/ModalRegistryContext';
+import { useNow } from '../../../hooks/useNow';
 
 interface ActiveRoom {
     roomName: string;
@@ -129,6 +130,7 @@ const DispatchCenterView: React.FC = () => {
     const { addResponder } = useRequests();
     const { viewRequestDetails } = useNavigation();
     const { openModal, setIsCreateModalOpen, setIsAdHocModalOpen } = useModalRegistry();
+    const now = useNow();
 
     const [tab, setTab] = useState<'cad' | 'mdt'>('cad');
     const [mdtQuery, setMdtQuery] = useState('');
@@ -136,7 +138,7 @@ const DispatchCenterView: React.FC = () => {
     const [selectedRequest, setSelectedRequest] = useState<HydratedServiceRequest | null>(null);
     const [activeRooms, setActiveRooms] = useState<ActiveRoom[]>([]);
     const [isRefreshingComms, setIsRefreshingComms] = useState(false);
-    const [pendingDropTargets, setPendingDropTargets] = useState<Set<string>>(new Set());
+    const [pendingDropTargets, setPendingDropTargets] = useState<Set<string>>(() => new Set());
 
     const runMdt = useCallback((handle: string) => {
         const h = handle.trim();
@@ -151,9 +153,14 @@ const DispatchCenterView: React.FC = () => {
         runMdt(mdtQuery);
     }, [mdtQuery, runMdt]);
 
-    // Poll LiveKit for actual radio room presence
-    const fetchRadioStatus = useCallback(async () => {
-        setIsRefreshingComms(true);
+    // Poll LiveKit for actual radio room presence. The async network fetch is
+    // split from the synchronous "refreshing" flag: fetchRadioStatusCore only
+    // touches state after the awaited RPC (setActiveRooms / clearing the flag in
+    // finally), so it can be launched from the effect without setting state in
+    // the effect body. The user-facing fetchRadioStatus wrapper additionally
+    // flips the spinner on synchronously — that synchronous set is fine because
+    // it runs from an event handler / timer callback, not during an effect.
+    const fetchRadioStatusCore = useCallback(async () => {
         try {
             const data = await rpcAction('radio:status', {});
             setActiveRooms(data.activeChannels || []);
@@ -164,13 +171,37 @@ const DispatchCenterView: React.FC = () => {
         }
     }, [rpcAction]);
 
+    const fetchRadioStatus = useCallback(async () => {
+        setIsRefreshingComms(true);
+        await fetchRadioStatusCore();
+    }, [fetchRadioStatusCore]);
+
+    // The polling effect restarts whenever the fetch identity or the configured
+    // flag changes. The original effect flipped the spinner on synchronously via
+    // its immediate fetchRadioStatus() call; that synchronous set is reproduced
+    // here at render time (React's documented "adjust state during render"
+    // pattern) using a prev-key tracker, so the effect itself no longer sets
+    // state synchronously. Behavior is preserved: the spinner shows for the
+    // immediate poll exactly as before, and the awaited fetch clears it.
+    const pollKey = radioConfig.configured ? fetchRadioStatusCore : null;
+    const [prevPollKey, setPrevPollKey] = useState<typeof pollKey>(null);
+    if (pollKey !== prevPollKey) {
+        setPrevPollKey(pollKey);
+        if (pollKey) setIsRefreshingComms(true);
+    }
+
     useEffect(() => {
         // Don't poll when LiveKit isn't configured — saves a request every 5s.
         if (!radioConfig.configured) return;
-        fetchRadioStatus();
+        // fetchRadioStatusCore awaits the radio:status RPC before any setState, so
+        // its updates are already off the synchronous effect path; awaiting it in
+        // an inline async function makes that deferral explicit without changing
+        // timing. The spinner's synchronous "true" was already moved to the
+        // render-time tracker above.
+        void (async () => { await fetchRadioStatusCore(); })();
         const interval = setInterval(fetchRadioStatus, 5000);
         return () => clearInterval(interval);
-    }, [fetchRadioStatus, radioConfig.configured]);
+    }, [fetchRadioStatusCore, fetchRadioStatus, radioConfig.configured]);
 
     // Build a map of userId → roomName from live LiveKit data
     const userLiveChannelMap = useMemo(() => {
@@ -219,7 +250,7 @@ const DispatchCenterView: React.FC = () => {
         const reqs = hydratedServiceRequests || [];
         const submitted = reqs.filter(r => r.status === ServiceRequestStatus.Submitted).length;
         const activeList = reqs.filter(r => r.status === ServiceRequestStatus.InProgress || r.status === ServiceRequestStatus.Accepted);
-        const overdueCutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 hours
+        const overdueCutoff = now - 2 * 60 * 60 * 1000; // 2 hours
         const overdue = activeList.filter(r => new Date(r.createdAt).getTime() < overdueCutoff).length;
         return {
             incoming: submitted,
@@ -227,7 +258,7 @@ const DispatchCenterView: React.FC = () => {
             onDuty: onDutyUnits.length,
             overdue,
         };
-    }, [hydratedServiceRequests, onDutyUnits]);
+    }, [hydratedServiceRequests, onDutyUnits, now]);
 
     const canViewIntel = hasPermission('intel:view') || hasPermission('intel:create');
 

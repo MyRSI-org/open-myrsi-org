@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useAuth } from '../../../contexts/AuthContext';
@@ -25,8 +25,12 @@ const AddProspectModal: React.FC<AddProspectModalProps> = ({ isOpen, onClose }) 
     const [isLoading, setIsLoading] = useState(false);
     const [linkedUser, setLinkedUser] = useState<any>(null);
 
-    // Reset form on open
-    useEffect(() => {
+    // Reset form on open. React-documented "adjust state during render" pattern
+    // (previous-value tracker): behaviour-equivalent to the prior effect (deps
+    // [isOpen]) which cleared the fields on the closed -> open transition.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setRsiHandle('');
             setApplicantName('');
@@ -35,7 +39,7 @@ const AddProspectModal: React.FC<AddProspectModalProps> = ({ isOpen, onClose }) 
             setLinkedUser(null);
             setIsLoading(false);
         }
-    }, [isOpen]);
+    }
 
     const handleRsiChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setRsiHandle(e.target.value);

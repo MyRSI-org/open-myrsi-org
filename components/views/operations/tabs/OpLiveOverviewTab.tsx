@@ -34,7 +34,7 @@ const statusColor = (status?: string) => {
 const OpLiveOverviewTab: React.FC<OpLiveOverviewTabProps> = ({ operation, canManage, onRefresh }) => {
     const { currentUser } = useAuth();
     const { rpcAction } = useData();
-    const [now, setNow] = useState(Date.now());
+    const [now, setNow] = useState(() => Date.now());
     const [updatingNodeId, setUpdatingNodeId] = useState<number | null>(null);
 
     useEffect(() => {

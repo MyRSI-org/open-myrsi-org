@@ -74,7 +74,20 @@ export default function AdjustStockDialog({ isOpen, inventory, onClose, onSubmit
 
     const reason = useMemo(() => REASON_OPTIONS.find((r) => r.key === reasonKey)!, [reasonKey]);
 
-    useEffect(() => {
+    // Reset the editable form fields when the dialog opens or the target item
+    // changes. We do this during render with a previous-key tracker (the
+    // React-documented "adjust state during render" pattern) instead of an
+    // effect: React re-renders before paint, so it is equivalent to the old
+    // effect-reset but the rule does not fire. The seed reads
+    // inventory?.quantityOnHand at the moment of open / id-change only — it is
+    // intentionally NOT part of the key, so a later realtime quantity update on
+    // the same item does NOT re-trigger the reset and clobber the user's typed
+    // delta (this preserves the old exhaustive-deps exclusion). The null sentinel
+    // makes the very first render seed the form when the dialog is mounted open.
+    const resetKey = `${isOpen ? '1' : '0'}|${inventory?.id ?? ''}`;
+    const [prevResetKey, setPrevResetKey] = useState<string | null>(null);
+    if (resetKey !== prevResetKey) {
+        setPrevResetKey(resetKey);
         if (isOpen) {
             setMode('delta');
             setReasonKey('restock');
@@ -83,8 +96,7 @@ export default function AdjustStockDialog({ isOpen, inventory, onClose, onSubmit
             setNotes('');
             setSubmitting(false);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional form-reset on isOpen / inventory.id flip; adding inventory?.quantityOnHand would clobber the user's typed delta on realtime stock updates.
-    }, [isOpen, inventory?.id]);
+    }
 
     useEffect(() => {
         if (!isOpen) return;

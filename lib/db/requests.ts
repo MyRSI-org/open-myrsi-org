@@ -8,6 +8,30 @@ import { adminAdjustUserReputation } from './users.js';
 import { sendPushToStaff, sendPushToUsers } from '../push.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 
+type FeedbackViewer = { id?: number; role?: string; permissions?: string[] } | null | undefined;
+
+/**
+ * The free-text `clientFeedback` is gated behind the dedicated `request:view:feedback`
+ * permission (held only by Dispatcher/Admin tiers — a plain Member does NOT hold it).
+ * The UI honours this (ServiceRequestDetailView only renders the feedback block for
+ * holders), but the data must be stripped SERVER-side too — client-side filters are
+ * cosmetic, never security (Security rule 2). The numeric `clientRating` is left
+ * intact (the UI shows it to everyone); only the candid free-text is redacted.
+ *
+ * "May see" = Admin OR holder of `request:view:feedback` OR the owning client who
+ * authored it. Pure / dependency-free so it unit-tests cleanly under both tsconfigs
+ * and so list / detail / aggregate paths cannot drift.
+ */
+export function redactRequestFeedbackForViewer<T extends { clientFeedback?: string | null; clientId?: number | null }>(req: T, viewer: FeedbackViewer): T {
+    if (!req.clientFeedback) return req;
+    const perms = Array.isArray(viewer?.permissions) ? viewer!.permissions! : [];
+    const maySee = viewer?.role === 'Admin'
+        || perms.includes('request:view:feedback')
+        || (viewer?.id != null && viewer.id === req.clientId);
+    if (maySee) return req;
+    return { ...req, clientFeedback: null } as T;
+}
+
 // Completion report passed to completeRequest. Mirrors the RPC payload shape in
 // api/actions/requests.ts (lib/db cannot import from the action layer — wrong
 // dependency direction), and is a superset of updateRequestStatus's report arg.
@@ -228,9 +252,20 @@ export async function acceptRequest(requestId: string, memberId: number, userId:
     // in-progress request back to 'Accepted' and fire a stray "Mission Assignment"
     // notification. Read the status and bail if it's past the acceptable point.
     // (This read also serves as the existence check the responder insert can't do.)
-    const { data: req } = await supabase.from('service_requests').select('status').eq('id', requestId).maybeSingle();
+    const { data: req } = await supabase.from('service_requests').select('status, client_id').eq('id', requestId).maybeSingle();
     if (!req) throw new Error("Request not found or access denied.");
     if (!ACCEPTABLE_FOR_ACCEPT.includes(req.status)) throw new Error('Request can no longer be accepted.');
+
+    // Self-service block (public-stats integrity): a member must not become the
+    // responder on their OWN request. The full member chain (create→accept→start→
+    // complete→rate) otherwise lets one account manufacture rated 'Success' rows,
+    // which feed the UNAUTHENTICATED public org stats (public_stats_for_org) with
+    // no curation — inflating/defacing the average and response-time metrics. A
+    // member-client's request must be serviced by a DIFFERENT responder; only a
+    // real dispatch-duty holder may self-assign (e.g. logging a solo run).
+    if (req.client_id != null && req.client_id === memberId && !hasRequestDuty(actor)) {
+        throw new Error('Forbidden: you cannot respond to your own request.');
+    }
 
     const { error } = await supabase.from('request_responders').insert({ request_id: requestId, user_id: memberId });
     if (!error) {

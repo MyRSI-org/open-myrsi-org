@@ -207,6 +207,33 @@ function computeLayout(groups: FleetGroup[], expandedGroupIds: Set<number>): { n
     return { nodes, edges };
 }
 
+// Ship-count badge on a group node: a plain count when within the visible
+// budget, or a toggle button when the group's ship grid overflows. Hoisted to
+// module scope (was an in-JSX IIFE the React Compiler can't optimize).
+const ShipCountBadge: React.FC<{
+    group: FleetGroup;
+    isExpanded: boolean;
+    onToggle: (groupId: number) => void;
+}> = ({ group, isExpanded, onToggle }) => {
+    const shipCount = group.assignedShips?.length || 0;
+    if (shipCount === 0) return null;
+    const isOverflowed = shipCount > COLLAPSED_VISIBLE;
+    if (!isOverflowed) {
+        return <span><i className="fa-solid fa-rocket mr-1 text-slate-600"></i>{shipCount}</span>;
+    }
+    return (
+        <button
+            onClick={(e) => { e.stopPropagation(); onToggle(group.id); }}
+            className="inline-flex items-center gap-1 text-orange-300/80 hover:text-orange-200 transition-colors"
+            title={isExpanded ? 'Collapse ship list' : 'Expand all ships'}
+        >
+            <i className="fa-solid fa-rocket text-slate-600"></i>
+            <span>{shipCount}</span>
+            <i className={`fa-solid ${isExpanded ? 'fa-chevron-up' : 'fa-chevron-down'} text-[8px]`}></i>
+        </button>
+    );
+};
+
 const FleetOrgChart: React.FC<FleetOrgChartProps> = ({
     groups, allShips, canManage, onEditGroup, onDeleteGroup, onAssignGroup, onUnassignShip,
     onReorderGroups, onReparentGroup, onReorderGroupShips, onMoveShipToGroup,
@@ -478,11 +505,11 @@ const FleetOrgChart: React.FC<FleetOrgChartProps> = ({
                             overflow: 'visible',
                         }}
                     >
-                        {edges.map((edge, i) => {
+                        {edges.map((edge) => {
                             const offset = Math.abs(edge.y2 - edge.y1) * 0.5;
                             return (
                                 <path
-                                    key={i}
+                                    key={`${edge.type}:${edge.x1},${edge.y1}-${edge.x2},${edge.y2}`}
                                     d={`M ${edge.x1},${edge.y1} C ${edge.x1},${edge.y1 + offset} ${edge.x2},${edge.y2 - offset} ${edge.x2},${edge.y2}`}
                                     fill="none"
                                     stroke={edge.type === 'group-group' ? 'rgb(249,115,22)' : 'rgb(100,116,139)'}
@@ -537,26 +564,11 @@ const FleetOrgChart: React.FC<FleetOrgChartProps> = ({
                                             {n.group!.commander && (
                                                 <span className="truncate"><i className="fa-solid fa-user-shield mr-1 text-amber-400"></i>{n.group!.commander.name}</span>
                                             )}
-                                            {(() => {
-                                                const shipCount = n.group!.assignedShips?.length || 0;
-                                                if (shipCount === 0) return null;
-                                                const isOverflowed = shipCount > COLLAPSED_VISIBLE;
-                                                const isExpanded = expandedGroupIds.has(n.group!.id);
-                                                if (!isOverflowed) {
-                                                    return <span><i className="fa-solid fa-rocket mr-1 text-slate-600"></i>{shipCount}</span>;
-                                                }
-                                                return (
-                                                    <button
-                                                        onClick={(e) => { e.stopPropagation(); toggleExpanded(n.group!.id); }}
-                                                        className="inline-flex items-center gap-1 text-orange-300/80 hover:text-orange-200 transition-colors"
-                                                        title={isExpanded ? 'Collapse ship list' : 'Expand all ships'}
-                                                    >
-                                                        <i className="fa-solid fa-rocket text-slate-600"></i>
-                                                        <span>{shipCount}</span>
-                                                        <i className={`fa-solid ${isExpanded ? 'fa-chevron-up' : 'fa-chevron-down'} text-[8px]`}></i>
-                                                    </button>
-                                                );
-                                            })()}
+                                            <ShipCountBadge
+                                                group={n.group!}
+                                                isExpanded={expandedGroupIds.has(n.group!.id)}
+                                                onToggle={toggleExpanded}
+                                            />
                                         </div>
                                     </div>
                                 </div>

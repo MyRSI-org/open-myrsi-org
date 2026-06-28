@@ -348,6 +348,16 @@ function deriveParties(listingType: string, ownerId: number, proposerId: number)
     return { sellerId: proposerId, buyerId: ownerId };
 }
 
+// The non-terminal (live) contract statuses — every state an open commitment can
+// occupy before it reaches a terminal 'completed'/'cancelled'. Keep this in
+// lockstep with the lifecycle state machine (proposed → accepted → in_progress →
+// delivered → completed/cancelled) so the propose-dedup live-status set can't
+// drift from the states a contract actually passes through. Omitting 'in_progress'
+// here previously let a proposer hold two concurrent live contracts on one listing
+// (a milestone toggle advances accepted → in_progress, hiding the first contract
+// from the dedup query).
+const NON_TERMINAL_CONTRACT_STATUSES: string[] = ['proposed', 'accepted', 'in_progress', 'delivered'];
+
 export interface ProposeContractInput { listingId: string; quantity?: number | null; agreedPriceUec?: number | null; termsNote?: string; milestones?: { title: string; description?: string }[] }
 export async function proposeMarketplaceContract(input: ProposeContractInput, userId: number): Promise<MarketplaceContract> {
     const { data: l } = await supabase.from('marketplace_listings')
@@ -358,10 +368,13 @@ export async function proposeMarketplaceContract(input: ProposeContractInput, us
 
     // Dedup: a proposer may hold only ONE live (non-terminal) contract per listing.
     // Without this, proposed contracts don't reserve quantity, so the over-claim
-    // guard never trips and one member can flood a seller / bloat the table.
+    // guard never trips and one member can flood a seller / bloat the table. The
+    // live-status set is the shared NON_TERMINAL_CONTRACT_STATUSES so it cannot
+    // drift from the lifecycle state machine (e.g. 'in_progress' must be included,
+    // or a contract that advanced past accept escapes the dedup).
     const { data: liveContract } = await supabase.from('marketplace_contracts')
         .select('id').eq('listing_id', listing.id).eq('proposed_by_id', userId)
-        .in('status', ['proposed', 'accepted', 'delivered']).maybeSingle();
+        .in('status', NON_TERMINAL_CONTRACT_STATUSES).maybeSingle();
     if (liveContract) throw new Error('You already have an active contract on this listing.');
 
     const isItem = listing.kind === 'item';
@@ -455,7 +468,20 @@ export async function markMarketplaceDelivered(id: string, userId: number, actor
     // own the delivered transition.
     if (c.kind === 'item' && c.warehouse_stock_id) {
         const { error: rpcErr } = await supabase.rpc('warehouse_marketplace_deliver', { p_contract_id: id, p_actor_id: userId });
-        if (rpcErr) throw new Error(`Stock movement failed: ${rpcErr.message}`);
+        if (rpcErr) {
+            // The stock movement failed (e.g. WAREHOUSE_INSUFFICIENT_STOCK). We
+            // already flipped the contract to 'delivered', so a buyer could now
+            // confirm a completed sale whose warehouse stock was never decremented
+            // — an inventory-accounting desync. Compensate by rolling the status
+            // back to its pre-call value before throwing. The optimistic guard
+            // above means THIS call owns the delivered transition, so the revert
+            // (guarded on status='delivered') can only undo our own flip — fail
+            // closed: no completable contract survives a failed stock movement.
+            await supabase.from('marketplace_contracts').update({
+                status: fromStatus, delivered_at: null, updated_at: nowIso(),
+            }).eq('id', id).eq('status', 'delivered');
+            throw new Error(`Stock movement failed: ${rpcErr.message}`);
+        }
         broadcastToOrg('warehouse:stock_update', {});
     }
     emit({ contractId: id });
@@ -466,6 +492,19 @@ export async function confirmMarketplaceReceived(id: string, userId: number): Pr
     if (!c) throw new Error(ERR_CONTRACT);
     if (userId !== c.buyer_id) throw new Error(ERR_CONTRACT);                  // buyer only
     if (c.status !== 'delivered') throw new Error('This contract is not awaiting confirmation.');
+    // Defense-in-depth (mirrors markMarketplaceDelivered's revert): an item
+    // contract linked to warehouse stock must have a recorded delivery movement
+    // before it can be completed. If the deliver RPC failed after the status flip
+    // (and the compensating revert lost a race, or a future caller skips it), this
+    // refuses to finalize a sale whose shared stock was never decremented — the
+    // marketplace ledger must not diverge from the warehouse ledger. Fail closed.
+    if (c.kind === 'item' && c.warehouse_stock_id) {
+        const { data: movement } = await supabase.from('warehouse_movements')
+            .select('id').eq('related_contract_id', id)
+            .in('reason', ['withdraw_sale', 'restock']).is('related_movement_id', null)
+            .limit(1).maybeSingle();
+        if (!movement) throw new Error('Delivery has not been recorded for this contract yet.');
+    }
     // Optimistic status guard — a raced cancel that already moved the contract off
     // 'delivered' makes this affect 0 rows, so we fail closed instead of
     // overwriting a terminal state from a stale read.
@@ -611,6 +650,11 @@ export async function deleteMarketplaceMilestone(milestoneId: number, userId: nu
     const row = m as unknown as { id: number; contract_id: string } | null;
     if (!row) throw new Error(ERR_CONTRACT);
     const c = await assertContractParty(row.contract_id, userId);
+    // Only the SELLER may delete deliverables. Milestones are the seller's
+    // service-deliverable records (defined by the proposer at propose time), so
+    // deletion is the seller's scope to manage — mirroring toggleMarketplaceMilestone's
+    // seller-only gate. The buyer's recourse to disputed scope is cancelMarketplaceContract.
+    if (userId !== c.seller_id) throw new Error(ERR_CONTRACT);
     if (!['proposed', 'accepted'].includes(c.status)) throw new Error('Milestones are locked once work is underway.');
     await supabase.from('marketplace_contract_milestones').delete().eq('id', milestoneId);
     emit({ contractId: row.contract_id });

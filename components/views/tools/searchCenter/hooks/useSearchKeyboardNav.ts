@@ -24,14 +24,18 @@ export const useSearchKeyboardNav = ({
     scrollContainerRef,
     rowHeight,
 }: Params): KeyboardNavApi => {
-    const [selectedIndex, setSelectedIndexState] = useState(-1);
+    const [rawSelectedIndex, setSelectedIndexState] = useState(-1);
     const itemCountRef = useRef(itemCount);
-    itemCountRef.current = itemCount;
 
-    // Reset out-of-range selection when results shrink.
+    // Keep the latest itemCount available to the keydown handler without
+    // re-subscribing the listener. Updated in an effect (not during render).
     useEffect(() => {
-        if (selectedIndex >= itemCount) setSelectedIndexState(-1);
-    }, [itemCount, selectedIndex]);
+        itemCountRef.current = itemCount;
+    }, [itemCount]);
+
+    // Treat an out-of-range selection (e.g. after results shrink) as "none"
+    // by deriving the exposed index during render instead of in an effect.
+    const selectedIndex = rawSelectedIndex >= itemCount ? -1 : rawSelectedIndex;
 
     const scrollIntoView = useCallback((idx: number) => {
         const sc = scrollContainerRef.current;
@@ -66,22 +70,28 @@ export const useSearchKeyboardNav = ({
             if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable) {
                 return;
             }
+            // Out-of-range selections are exposed as "none" during render, so
+            // normalize the stored value the same way here before navigating.
+            const normalize = (prev: number) => (prev >= total ? -1 : prev);
             if (e.key === 'ArrowDown') {
                 e.preventDefault();
-                setSelectedIndexState(prev => {
+                setSelectedIndexState(raw => {
+                    const prev = normalize(raw);
                     const next = prev < 0 ? 0 : Math.min(total - 1, prev + 1);
                     scrollIntoView(next);
                     return next;
                 });
             } else if (e.key === 'ArrowUp') {
                 e.preventDefault();
-                setSelectedIndexState(prev => {
+                setSelectedIndexState(raw => {
+                    const prev = normalize(raw);
                     const next = prev <= 0 ? 0 : prev - 1;
                     scrollIntoView(next);
                     return next;
                 });
             } else if (e.key === 'Enter') {
-                setSelectedIndexState(prev => {
+                setSelectedIndexState(raw => {
+                    const prev = normalize(raw);
                     if (prev >= 0 && prev < itemCountRef.current) {
                         e.preventDefault();
                         onActivate(prev);
@@ -89,7 +99,8 @@ export const useSearchKeyboardNav = ({
                     return prev;
                 });
             } else if (e.key === 'Escape') {
-                setSelectedIndexState(prev => {
+                setSelectedIndexState(raw => {
+                    const prev = normalize(raw);
                     if (prev >= 0) {
                         e.preventDefault();
                         return -1;

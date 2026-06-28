@@ -35,7 +35,11 @@ export default function MDTPanel({ target, canViewIntel, onOpenRequest, onChange
     const { openIntelReportWindow } = useModalRegistry();
 
     const [dossier, setDossier] = useState<DossierData | null>(null);
-    const [loading, setLoading] = useState(false);
+    // Lazy-init to the mount-time fetch decision so a valid target shows the
+    // loading spinner from the first paint (the fetch effect below resolves it),
+    // matching the old effect that set loading true at its head. On later target
+    // changes the render-time tracker re-primes this.
+    const [loading, setLoading] = useState(() => !!target && canViewIntel);
     const [error, setError] = useState<string | null>(null);
     const [rapTab, setRapTab] = useState<RapTab>('overview');
     const [formQuery, setFormQuery] = useState('');
@@ -49,26 +53,43 @@ export default function MDTPanel({ target, canViewIntel, onOpenRequest, onChange
         return allUsers.find(u => (u.rsiHandle || '').toLowerCase() === h);
     }, [target, allUsers]);
 
-    // Fetch dossier when target changes. Only runs for users with intel view;
-    // otherwise the panel renders the permission-denied placeholder below.
-    useEffect(() => {
-        if (!target || !canViewIntel) {
-            setDossier(null);
-            return;
-        }
-        let cancelled = false;
-        setLoading(true);
+    // Reset-on-change tracker. We re-seed the editable view state during render
+    // (React's "adjust state during render" pattern) so it never lags a frame
+    // behind the effect.
+    //   * rapTab -> 'overview' when the subject handle changes, so the operator
+    //     sees the overview first rather than lingering on Requests from the
+    //     last query (was a [target]-only effect, so it is gated on target).
+    //   * dossier/error cleared and loading primed when target OR canViewIntel
+    //     changes (matching the old fetch effect's [target, canViewIntel] deps)
+    //     so the previous subject's RAP sheet can't flash while the new fetch
+    //     (below) is pending. When the subject is absent or intel access is
+    //     denied there is nothing to fetch, so loading stays false; otherwise it
+    //     is primed true to match the old synchronous setLoading(true) at the
+    //     head of the fetch effect.
+    const [prevTarget, setPrevTarget] = useState(target);
+    const [prevCanViewIntel, setPrevCanViewIntel] = useState(canViewIntel);
+    if (target !== prevTarget || canViewIntel !== prevCanViewIntel) {
+        if (target !== prevTarget) setRapTab('overview');
+        setPrevTarget(target);
+        setPrevCanViewIntel(canViewIntel);
+        setDossier(null);
         setError(null);
+        setLoading(!!target && canViewIntel);
+    }
+
+    // Fetch dossier when target changes. Only runs for users with intel view;
+    // otherwise the panel renders the permission-denied placeholder below. The
+    // synchronous resets/priming above are handled in the render-time tracker;
+    // this effect performs ONLY the async fetch and its async state writes.
+    useEffect(() => {
+        if (!target || !canViewIntel) return;
+        let cancelled = false;
         rpcAction('intel:get_dossier', { targetId: target })
             .then((data: any) => { if (!cancelled) setDossier(data || null); })
             .catch((err: any) => { if (!cancelled) setError(err?.message || 'Failed to load dossier.'); })
             .finally(() => { if (!cancelled) setLoading(false); });
         return () => { cancelled = true; };
     }, [target, canViewIntel, rpcAction]);
-
-    // Reset the inner tab each time a new subject loads so the operator sees
-    // the overview first rather than lingering on Requests from the last query.
-    useEffect(() => { setRapTab('overview'); }, [target]);
 
     // Highest-severity threat in the dossier. Computed above any conditional returns so the
     // hook count stays stable across the empty/permission-denied/loaded states.

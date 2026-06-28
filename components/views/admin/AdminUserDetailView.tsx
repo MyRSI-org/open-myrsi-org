@@ -99,9 +99,16 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
     );
     const [fullUser, setFullUser] = useState<User | null>(null);
 
-    useEffect(() => {
+    // Reset the lazily-fetched detail when a different user is selected so the
+    // view falls back to the lite cache immediately instead of showing the
+    // previous user's hydrated record while the new fetch is in flight. Done via
+    // the React "adjust state during render" pattern (prev-id tracker) so the
+    // reset is applied before paint, equivalent to the old reset effect.
+    const [prevUserId, setPrevUserId] = useState(user.id);
+    if (user.id !== prevUserId) {
+        setPrevUserId(user.id);
         setFullUser(null);
-    }, [user.id]);
+    }
 
     useEffect(() => {
         let cancelled = false;
@@ -119,7 +126,7 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
     const [positionId, setPositionId] = useState<string>(userToDisplay.position?.id.toString() || '');
     const [secondaryPositionId, setSecondaryPositionId] = useState<string>(userToDisplay.secondaryPosition?.id.toString() || '');
     const [clearanceLevelId, setClearanceLevelId] = useState<string>(userToDisplay.clearanceLevel?.id.toString() || '');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set(userToDisplay.limitingMarkers?.map(m => m.id)));
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set(userToDisplay.limitingMarkers?.map(m => m.id)));
     const [adminNotes, setAdminNotes] = useState<string>(userToDisplay.adminNotes || '');
     const [personnelNotes, setPersonnelNotes] = useState<string>(userToDisplay.personnelNotes || '');
     const [roleId, setRoleId] = useState<string>(userToDisplay.roleId.toString());
@@ -129,7 +136,17 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
     const [isSaved, setIsSaved] = useState(false);
     const [activeTab, setActiveTab] = useState<Tab>('profile');
 
-    useEffect(() => {
+    // Resync the editable admin form to the displayed record when a different
+    // user is shown (or the lite cache is replaced by the hydrated detail).
+    // These are user-editable inputs, not render-derived values, so they must be
+    // re-seeded on the source change; the actual persistence (incl. clearance/
+    // markers via updateUserClearance) happens only in handleSave. Done via the
+    // React "adjust state during render" pattern (prev-value tracker) keyed on the
+    // displayed record reference — behaviour-equivalent to the old reset effect
+    // (same fields, same values), applied before paint.
+    const [prevUserToDisplay, setPrevUserToDisplay] = useState(userToDisplay);
+    if (userToDisplay !== prevUserToDisplay) {
+        setPrevUserToDisplay(userToDisplay);
         setRankId(userToDisplay.rank?.id.toString() || '');
         setUnitId(userToDisplay.unit?.id.toString() || '');
         setPositionId(userToDisplay.position?.id.toString() || '');
@@ -140,7 +157,7 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
         setRoleId(userToDisplay.roleId.toString());
         setSelectedMarkers(new Set(userToDisplay.limitingMarkers?.map(m => m.id)));
         setTenureStartDate(userToDisplay.tenureStartDate ? userToDisplay.tenureStartDate.substring(0, 10) : '');
-    }, [userToDisplay]);
+    }
 
     const linkedHRFiles = useMemo(() => {
         return hrApplicants.filter(app => app.linkedUserId === userToDisplay.id)

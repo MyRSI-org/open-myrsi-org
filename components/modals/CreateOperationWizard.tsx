@@ -12,6 +12,7 @@ import Switch from '../ui/Switch';
 import LocationInput from '../ui/LocationInput';
 import { useNotification } from '../../contexts/NotificationContext';
 import { useNavigation } from '../../contexts/NavigationContext';
+import { useNow } from '../../hooks/useNow';
 
 interface CreateOperationWizardProps {
     isOpen: boolean;
@@ -24,9 +25,25 @@ interface CreateOperationWizardProps {
 // only bits (additionalLocationIds, phases tree).
 // ---------------------------------------------------------------------------
 
-interface WizardPhaseDraft extends OperationTemplatePhase {
-    // Wizard-side row id for stable React keys; not sent to the server.
+// Wizard-side row drafts carry a `_key` for stable React keys; it is never
+// sent to the server (the submit payload re-maps to the bare template shape).
+interface WizardMilestoneDraft extends OperationTemplateMilestone {
     _key: string;
+}
+
+interface WizardTaskDraft extends OperationTemplateTask {
+    _key: string;
+}
+
+interface WizardPhaseDraft extends Omit<OperationTemplatePhase, 'milestones' | 'tasks'> {
+    _key: string;
+    milestones: WizardMilestoneDraft[];
+    tasks: WizardTaskDraft[];
+}
+
+interface AdditionalLocationDraft {
+    _key: string;
+    text: string;
 }
 
 interface WizardState {
@@ -42,7 +59,10 @@ interface WizardState {
     joinCode: string;
     // Step 2 — free-text platform-location strings (LocationInput → platform_locations search)
     locationText: string;             // primary
-    additionalLocationTexts: string[]; // secondaries
+    // Secondaries. Each carries a wizard-only `_key` for stable React keys
+    // (rows can be removed/promoted, which shifts array indices); only `.text`
+    // is sent to the server.
+    additionalLocations: AdditionalLocationDraft[];
     // Step 3
     templateId: number | null;
     phases: WizardPhaseDraft[];
@@ -69,7 +89,7 @@ type Action =
     | { type: 'promote_additional_to_primary'; index: number }
     | { type: 'apply_template'; templateId: number | null; payload: OperationTemplatePayload | null }
     | { type: 'add_phase' }
-    | { type: 'update_phase'; key: string; patch: Partial<OperationTemplatePhase> }
+    | { type: 'update_phase'; key: string; patch: Partial<Omit<OperationTemplatePhase, 'milestones' | 'tasks'>> }
     | { type: 'remove_phase'; key: string }
     | { type: 'add_milestone'; phaseKey: string }
     | { type: 'update_milestone'; phaseKey: string; index: number; patch: Partial<OperationTemplateMilestone> }
@@ -86,8 +106,8 @@ const phaseFromTemplate = (p: OperationTemplatePhase): WizardPhaseDraft => ({
     description: p.description,
     phaseType: p.phaseType || 'sequential',
     color: p.color,
-    milestones: p.milestones?.map(m => ({ ...m })) || [],
-    tasks: p.tasks?.map(t => ({ ...t })) || [],
+    milestones: p.milestones?.map(m => ({ ...m, _key: newKey() })) || [],
+    tasks: p.tasks?.map(t => ({ ...t, _key: newKey() })) || [],
 });
 
 const initialState: WizardState = {
@@ -101,7 +121,7 @@ const initialState: WizardState = {
     isSpecial: false,
     joinCode: '',
     locationText: '',
-    additionalLocationTexts: [],
+    additionalLocations: [],
     templateId: null,
     phases: [],
     clearanceLevel: '0',
@@ -124,23 +144,23 @@ function reducer(state: WizardState, action: Action): WizardState {
             return { ...state, selectedMarkers: Array.from(set) };
         }
         case 'set_additional_location': {
-            const next = [...state.additionalLocationTexts];
-            next[action.index] = action.value;
-            return { ...state, additionalLocationTexts: next };
+            const next = [...state.additionalLocations];
+            next[action.index] = { ...next[action.index], text: action.value };
+            return { ...state, additionalLocations: next };
         }
         case 'add_additional_location':
-            return { ...state, additionalLocationTexts: [...state.additionalLocationTexts, ''] };
+            return { ...state, additionalLocations: [...state.additionalLocations, { _key: newKey(), text: '' }] };
         case 'remove_additional_location':
-            return { ...state, additionalLocationTexts: state.additionalLocationTexts.filter((_, i) => i !== action.index) };
+            return { ...state, additionalLocations: state.additionalLocations.filter((_, i) => i !== action.index) };
         case 'promote_additional_to_primary': {
             // Promote one of the secondaries to primary; demote the existing
             // primary into its slot (or drop it if blank).
-            const promoted = state.additionalLocationTexts[action.index] || '';
+            const promoted = state.additionalLocations[action.index]?.text || '';
             if (!promoted) return state;
-            const next = [...state.additionalLocationTexts];
+            const next = [...state.additionalLocations];
             next.splice(action.index, 1);
-            if (state.locationText.trim()) next.unshift(state.locationText);
-            return { ...state, locationText: promoted, additionalLocationTexts: next };
+            if (state.locationText.trim()) next.unshift({ _key: newKey(), text: state.locationText });
+            return { ...state, locationText: promoted, additionalLocations: next };
         }
         case 'apply_template':
             return {
@@ -161,7 +181,7 @@ function reducer(state: WizardState, action: Action): WizardState {
             return {
                 ...state,
                 phases: state.phases.map(p => p._key === action.phaseKey
-                    ? { ...p, milestones: [...(p.milestones || []), { label: '' }] }
+                    ? { ...p, milestones: [...(p.milestones || []), { _key: newKey(), label: '' }] }
                     : p),
             };
         case 'update_milestone':
@@ -182,7 +202,7 @@ function reducer(state: WizardState, action: Action): WizardState {
             return {
                 ...state,
                 phases: state.phases.map(p => p._key === action.phaseKey
-                    ? { ...p, tasks: [...(p.tasks || []), { title: '', priority: TaskPriority.Normal }] }
+                    ? { ...p, tasks: [...(p.tasks || []), { _key: newKey(), title: '', priority: TaskPriority.Normal }] }
                     : p),
             };
         case 'update_task':
@@ -230,15 +250,15 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
     const [state, dispatch] = useReducer(reducer, initialState);
     const [stepKey, setStepKey] = useState<StepKey>('basics');
     const [isLoading, setIsLoading] = useState(false);
+    const now = useNow();
 
-    // Reset everything when the modal closes so a re-open starts fresh.
-    useEffect(() => {
-        if (!isOpen) {
-            setStepKey('basics');
-            // Reducer state isn't reset by the parent, so dispatch field-by-field
-            // would be noisy. Trigger a remount by reading isOpen on key.
-        }
-    }, [isOpen]);
+    // Reset the wizard to the first step when the modal is closed so a re-open
+    // starts fresh. Done during render (with a guard to avoid a render loop)
+    // instead of in an effect — same end state, no extra render. Reducer state
+    // isn't reset here; the WindowFrame remounts its own subtree via its key.
+    if (!isOpen && stepKey !== 'basics') {
+        setStepKey('basics');
+    }
 
     // ---- Validation per step ----
     const stepIndex = STEPS.findIndex(s => s.key === stepKey);
@@ -258,7 +278,7 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
         if (state.createDiscordEvent && state.scheduledStart && state.scheduledEnd) {
             const startMs = new Date(state.scheduledStart).getTime();
             const endMs = new Date(state.scheduledEnd).getTime();
-            if (Number.isFinite(startMs) && startMs <= Date.now()) {
+            if (Number.isFinite(startMs) && startMs <= now) {
                 v.security = 'Discord events need a start time in the future.';
             } else if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs <= startMs) {
                 v.security = 'Discord event end time must be after the start time.';
@@ -267,7 +287,7 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
         if (state.postDiscordAnnouncement && !state.discordAnnouncementChannelId) v.security = 'Pick a Discord channel for the announcement embed.';
 
         return v;
-    }, [state]);
+    }, [state, now]);
 
     const canAdvance = !validation[stepKey];
     const isLastStep = stepIndex === STEPS.length - 1;
@@ -326,7 +346,7 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
                 // The legacy locationId/additionalLocationIds fields are no longer sent —
                 // the server writes location_text + additional_location_texts instead.
                 locationText: state.locationText.trim() || undefined,
-                additionalLocationTexts: state.additionalLocationTexts.map(s => s.trim()).filter(Boolean),
+                additionalLocationTexts: state.additionalLocations.map(l => l.text.trim()).filter(Boolean),
                 maxParticipants: state.maxParticipants ? parseInt(state.maxParticipants) : undefined,
                 createDiscordEvent: state.createDiscordEvent,
                 postDiscordAnnouncement: state.postDiscordAnnouncement,
@@ -554,15 +574,15 @@ const LocationsStep: React.FC<{
                         <i className="fa-solid fa-plus mr-1"></i> Add Location
                     </button>
                 </div>
-                {state.additionalLocationTexts.length === 0 ? (
+                {state.additionalLocations.length === 0 ? (
                     <p className="text-[11px] text-slate-600 italic">None — this op happens at the primary location only.</p>
                 ) : (
                     <ul className="space-y-2">
-                        {state.additionalLocationTexts.map((value, idx) => (
-                            <li key={idx} className="flex items-start gap-2">
+                        {state.additionalLocations.map((loc, idx) => (
+                            <li key={loc._key} className="flex items-start gap-2">
                                 <div className="flex-1 min-w-0">
                                     <LocationInput
-                                        value={value}
+                                        value={loc.text}
                                         onChange={(v) => dispatch({ type: 'set_additional_location', index: idx, value: v })}
                                         disabled={disabled}
                                     />
@@ -571,7 +591,7 @@ const LocationsStep: React.FC<{
                                     onClick={() => dispatch({ type: 'promote_additional_to_primary', index: idx })}
                                     className="shrink-0 mt-1.5 text-[10px] text-amber-400 hover:text-amber-300 px-2 py-1.5 rounded-sm hover:bg-slate-800 uppercase tracking-wider font-bold disabled:opacity-30 disabled:cursor-not-allowed"
                                     title="Promote this location to primary"
-                                    disabled={disabled || !value.trim()}>
+                                    disabled={disabled || !loc.text.trim()}>
                                     <i className="fa-solid fa-star"></i>
                                 </button>
                                 <button type="button"
@@ -679,7 +699,7 @@ const PhasesStep: React.FC<{
                                 ) : (
                                     <ul className="space-y-1.5">
                                         {(phase.milestones || []).map((m, i) => (
-                                            <li key={i} className="flex items-center gap-2 bg-slate-900/40 rounded-sm p-2 border border-slate-800">
+                                            <li key={m._key} className="flex items-center gap-2 bg-slate-900/40 rounded-sm p-2 border border-slate-800">
                                                 <input type="text" value={m.label}
                                                     onChange={e => dispatch({ type: 'update_milestone', phaseKey: phase._key, index: i, patch: { label: e.target.value } })}
                                                     placeholder="Milestone label"
@@ -716,7 +736,7 @@ const PhasesStep: React.FC<{
                                 ) : (
                                     <ul className="space-y-1.5">
                                         {(phase.tasks || []).map((t, i) => (
-                                            <li key={i} className="flex items-center gap-2 bg-slate-900/40 rounded-sm p-2 border border-slate-800">
+                                            <li key={t._key} className="flex items-center gap-2 bg-slate-900/40 rounded-sm p-2 border border-slate-800">
                                                 <input type="text" value={t.title}
                                                     onChange={e => dispatch({ type: 'update_task', phaseKey: phase._key, index: i, patch: { title: e.target.value } })}
                                                     placeholder="Task title"
@@ -765,9 +785,12 @@ const SecurityStep: React.FC<{
     const [channelsLoading, setChannelsLoading] = useState(false);
     const [channelsError, setChannelsError] = useState<string | null>(null);
 
-    const loadChannels = useCallback(async (forceRefresh = false) => {
-        setChannelsLoading(true);
-        setChannelsError(null);
+    // Async core of the channel fetch. Performs no *synchronous* setState: the
+    // loading flag is raised by the caller (event handler, or the render-time
+    // seed below) before this runs, so the only setState calls here happen
+    // after the `await` boundary. That keeps the lazy-load effect free of the
+    // synchronous-set-in-effect anti-pattern.
+    const fetchChannels = useCallback(async (forceRefresh: boolean) => {
         try {
             const result = await rpcAction('discord:list_guild_channels', { forceRefresh });
             // Keep text (0) and announcement (5) channels — voice/stage aren't usable
@@ -783,18 +806,44 @@ const SecurityStep: React.FC<{
         }
     }, [rpcAction]);
 
-    // Load channels lazily on first toggle-on, and pre-select the org default
-    // when nothing is picked yet. Re-toggling off doesn't clear the channel —
-    // a user who toggles back on within the same wizard keeps their pick.
+    // Manual (button) trigger: raise the loading flag synchronously — fine in an
+    // event handler — then run the async fetch.
+    const loadChannels = useCallback((forceRefresh = false) => {
+        setChannelsLoading(true);
+        setChannelsError(null);
+        void fetchChannels(forceRefresh);
+    }, [fetchChannels]);
+
+    // Lazy initial load: when the announcement panel needs channels and none are
+    // loaded yet, seed the loading flag DURING render (the React "adjust state
+    // during render" pattern — re-renders before paint, so no extra paint and no
+    // loading flash) and arm the fetch. The effect below then performs only the
+    // async request, with no synchronous setState in its body.
+    const needsChannelLoad = state.postDiscordAnnouncement && channels.length === 0 && !channelsError && !channelsLoading;
+    const [channelFetchArmed, setChannelFetchArmed] = useState(false);
+    if (needsChannelLoad && !channelFetchArmed) {
+        setChannelFetchArmed(true);
+        setChannelsLoading(true);
+    }
+
+    // Pre-select the org default channel when nothing is picked yet, and run the
+    // armed async fetch. Re-toggling the panel off doesn't clear the channel — a
+    // user who toggles back on within the same wizard keeps their pick.
     useEffect(() => {
-        if (!state.postDiscordAnnouncement) return;
-        if (channels.length === 0 && !channelsError && !channelsLoading) {
-            loadChannels();
-        }
-        if (!state.discordAnnouncementChannelId && defaultAnnounceChannelId) {
+        if (state.postDiscordAnnouncement && !state.discordAnnouncementChannelId && defaultAnnounceChannelId) {
             dispatch({ type: 'set', key: 'discordAnnouncementChannelId', value: defaultAnnounceChannelId });
         }
-    }, [state.postDiscordAnnouncement, state.discordAnnouncementChannelId, channels.length, channelsError, channelsLoading, defaultAnnounceChannelId, loadChannels, dispatch]);
+    }, [state.postDiscordAnnouncement, state.discordAnnouncementChannelId, defaultAnnounceChannelId, dispatch]);
+
+    useEffect(() => {
+        if (!channelFetchArmed) return;
+        let cancelled = false;
+        void (async () => {
+            await fetchChannels(false);
+            if (!cancelled) setChannelFetchArmed(false);
+        })();
+        return () => { cancelled = true; };
+    }, [channelFetchArmed, fetchChannels]);
 
     return (
     <div className="space-y-5">
@@ -946,7 +995,7 @@ const ReviewStep: React.FC<{
 }> = ({ state, units, securityClearances, limitingMarkers, validation, setStepKey }) => {
     const unit = units.find(u => String(u.id) === state.unitId);
     const primaryLocationLabel = state.locationText.trim() || 'Unknown';
-    const additionalLocationLabels = state.additionalLocationTexts.map(s => s.trim()).filter(Boolean);
+    const additionalLocationLabels = state.additionalLocations.map(l => l.text.trim()).filter(Boolean);
     const clearance = securityClearances.find(c => String(c.level) === state.clearanceLevel);
     const markers = state.selectedMarkers.map(id => limitingMarkers.find(m => m.id === id)).filter(Boolean);
 

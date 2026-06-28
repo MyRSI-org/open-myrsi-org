@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useData } from '../../../../contexts/DataContext';
 import WindowFrame from '../../../layout/WindowFrame';
 import type { WarehouseStock, WarehouseReasonCategory } from '../../../../types';
@@ -27,14 +27,22 @@ export default function WhWithdrawalRequestDialog({ isOpen, stock, onClose, onSu
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
 
-    useEffect(() => {
+    // Reset the editable form fields when the dialog opens or the target stock
+    // changes, mirroring the old [isOpen, stock?.id] effect. Done during render
+    // via a previous-value tracker (React re-renders before paint, so this is
+    // behavior-equivalent to the effect-reset): the reset fires on any change to
+    // the (isOpen, stock?.id) tuple that lands with the dialog open.
+    const openKey = `${isOpen ? 1 : 0}:${stock?.id ?? ''}`;
+    const [prevOpenKey, setPrevOpenKey] = useState(openKey);
+    if (openKey !== prevOpenKey) {
+        setPrevOpenKey(openKey);
         if (isOpen) {
             setQuantity('');
             setReason('sale');
             setNotes('');
             setSubmitting(false);
         }
-    }, [isOpen, stock?.id]);
+    }
 
     if (!isOpen || !stock) return null;
 

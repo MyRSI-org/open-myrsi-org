@@ -63,13 +63,13 @@ const MemberPicker: React.FC<MemberPickerProps> = ({
     const { addToast } = useNotification();
 
     const [searchTerm, setSearchTerm] = useState('');
-    const [unitFilter, setUnitFilter] = useState<Set<number>>(new Set());
-    const [rankFilter, setRankFilter] = useState<Set<number>>(new Set());
+    const [unitFilter, setUnitFilter] = useState<Set<number>>(() => new Set());
+    const [rankFilter, setRankFilter] = useState<Set<number>>(() => new Set());
     const [showOffDuty, setShowOffDuty] = useState(showOffDutyDefault);
     const [hasUserToggledOffDuty, setHasUserToggledOffDuty] = useState(false);
     const [sortMode, setSortMode] = useState<SortMode>(matchKeyword ? 'match' : 'rank');
-    const [pendingToggle, setPendingToggle] = useState<Set<number>>(new Set());
-    const [pendingDuty, setPendingDuty] = useState<Set<number>>(new Set());
+    const [pendingToggle, setPendingToggle] = useState<Set<number>>(() => new Set());
+    const [pendingDuty, setPendingDuty] = useState<Set<number>>(() => new Set());
     const searchRef = useRef<HTMLInputElement>(null);
     const debouncedSearch = useDebouncedValue(searchTerm, 200);
 
@@ -186,11 +186,15 @@ const MemberPicker: React.FC<MemberPickerProps> = ({
     // hit the "no on-duty members match" empty state and have to discover
     // the off-duty toggle themselves. We only auto-expand once: if the
     // user has manually toggled the section, their preference sticks.
-    useEffect(() => {
-        if (!hasUserToggledOffDuty && onDutyMembers.length === 0 && offDutyMembers.length > 0 && !showOffDuty) {
-            setShowOffDuty(true);
-        }
-    }, [onDutyMembers.length, offDutyMembers.length, showOffDuty, hasUserToggledOffDuty]);
+    //
+    // Adjusted during render (React's "adjust state during render" pattern)
+    // rather than in an effect: showOffDuty stays user-controllable, and the
+    // hasUserToggledOffDuty + !showOffDuty guards make this a self-terminating
+    // one-shot (no render loop). onDutyMembers/offDutyMembers are the memoized
+    // lists computed above, so they're available here during render.
+    if (!hasUserToggledOffDuty && onDutyMembers.length === 0 && offDutyMembers.length > 0 && !showOffDuty) {
+        setShowOffDuty(true);
+    }
 
     // -- Keyboard nav: '/' focuses search, 'Esc' clears search and blurs --
     useEffect(() => {

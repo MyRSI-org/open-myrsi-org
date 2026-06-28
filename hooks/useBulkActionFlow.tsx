@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useData } from '../contexts/DataContext';
 import type { BulkResult, BulkState } from './useBulkProgress';
 import { useNotification } from '../contexts/NotificationContext';
@@ -26,8 +26,14 @@ export function useBulkActionFlow({ state, aggregate, total, onClose, successVer
     const { refreshMainState } = useData();
     const { addToast } = useNotification();
 
+    const latestRef = useRef({ aggregate, total, successVerb, onClose, addToast, refreshMainState });
+    useEffect(() => {
+        latestRef.current = { aggregate, total, successVerb, onClose, addToast, refreshMainState };
+    });
+
     useEffect(() => {
         if (state !== 'done' && state !== 'cancelled') return;
+        const { aggregate, total, successVerb, onClose, addToast, refreshMainState } = latestRef.current;
         const wasCancelled = state === 'cancelled';
         const parts: string[] = [`${successVerb} ${aggregate.updated}`];
         if (aggregate.skipped > 0) parts.push(`${aggregate.skipped} skipped`);
@@ -44,6 +50,5 @@ export function useBulkActionFlow({ state, aggregate, total, onClose, successVer
         refreshMainState();
         const id = window.setTimeout(onClose, 1500);
         return () => window.clearTimeout(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional state-only dep: aggregate / total / etc. capture the snapshot at the moment the run completes; including them would refire the effect on every chunk update mid-batch.
     }, [state]);
 }

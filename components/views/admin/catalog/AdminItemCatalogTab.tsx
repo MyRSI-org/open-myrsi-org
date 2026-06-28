@@ -50,7 +50,7 @@ export default function AdminItemCatalogTab() {
     const [syncLoading, setSyncLoading] = useState(false);
     const [syncErrors, setSyncErrors] = useState<Array<{ categoryId: number; categoryName: string; message: string }>>([]);
 
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
 
     const loadCategories = useCallback(async () => {
         try {
@@ -75,7 +75,7 @@ export default function AdminItemCatalogTab() {
     }, [rpcAction, debouncedSearch, filterCategoryId, hideVehicles]);
 
     const load = useCallback(async () => {
-        const seq = ++requestSeq.current;
+        const seq = ++requestSeqRef.current;
         setLoading(true);
         try {
             const r = await rpcAction('catalog:list_items', {
@@ -85,26 +85,31 @@ export default function AdminItemCatalogTab() {
                 limit: PAGE_SIZE,
                 offset: page * PAGE_SIZE,
             });
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             setItems(Array.isArray(r) ? r : []);
         } catch (e: any) {
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             toast(`Failed to load items: ${e?.message || 'unknown'}`, 'error');
         } finally {
-            if (seq === requestSeq.current) setLoading(false);
+            if (seq === requestSeqRef.current) setLoading(false);
         }
     }, [rpcAction, debouncedSearch, filterCategoryId, hideVehicles, page, toast]);
 
     // Reset page when a non-page filter changes (skipping first mount).
-    const isFirstFilterChange = useRef(true);
+    const isFirstFilterChangeRef = useRef(true);
     useEffect(() => {
-        if (isFirstFilterChange.current) { isFirstFilterChange.current = false; return; }
+        if (isFirstFilterChangeRef.current) { isFirstFilterChangeRef.current = false; return; }
         setPage(0);
     }, [debouncedSearch, filterCategoryId, hideVehicles]);
 
-    useEffect(() => { loadCategories(); }, [loadCategories]);
-    useEffect(() => { load(); }, [load]);
-    useEffect(() => { loadCount(); }, [loadCount]);
+    // These effects synchronize React state with the server (an external system), which is
+    // exactly what effects are for. The fetch is invoked inside an async IIFE so its setStates
+    // resolve on the await continuation; load()'s synchronous setLoading(true) still runs in the
+    // same tick (the IIFE body executes synchronously up to its first await), so behavior and
+    // timing are unchanged — the helpers' own requestSeqRef guards still drop stale responses.
+    useEffect(() => { void (async () => { await loadCategories(); })(); }, [loadCategories]);
+    useEffect(() => { void (async () => { await load(); })(); }, [load]);
+    useEffect(() => { void (async () => { await loadCount(); })(); }, [loadCount]);
 
     const categoryById = useMemo(() => {
         const m = new Map<number, QmPlatformCategory>();

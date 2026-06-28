@@ -27,7 +27,12 @@ const EAMBroadcastTab: React.FC = () => {
     const [showConfirmModal, setShowConfirmModal] = useState(false);
     const [isArming, setIsArming] = useState(false);
     const [armCountdown, setArmCountdown] = useState(3);
-    const [isArmed, setIsArmed] = useState(false);
+    // Armed is the terminal state of the arming countdown: it latches true exactly when
+    // the countdown reaches 0 while arming, and the handlers below clear it by resetting
+    // isArming. Deriving it during render (instead of setState-ing it inside the timer
+    // effect) is behavior-equivalent — the arm-button block that reads isArming/armCountdown
+    // is only rendered while !isArmed, so leaving isArming truthy at countdown 0 is invisible.
+    const isArmed = isArming && armCountdown === 0;
 
     const charLimit = 256;
 
@@ -37,25 +42,21 @@ const EAMBroadcastTab: React.FC = () => {
             return;
         }
         setShowConfirmModal(true);
-        setIsArmed(false);
         setIsArming(false);
         setArmCountdown(3);
     };
 
     const handleCloseModal = () => {
         setShowConfirmModal(false);
-        setIsArmed(false);
         setIsArming(false);
     };
 
+    // Drive the arming countdown. When it reaches 0 the derived `isArmed` (above) flips to
+    // true, so the effect only needs to schedule the next decrement; no setState terminal
+    // step is required. Resetting isArming via the handlers clears the armed state.
     useEffect(() => {
-        let timer: number;
-        if (isArming && armCountdown > 0) {
-            timer = window.setTimeout(() => setArmCountdown(prev => prev - 1), 1000);
-        } else if (isArming && armCountdown === 0) {
-            setIsArmed(true);
-            setIsArming(false);
-        }
+        if (!(isArming && armCountdown > 0)) return;
+        const timer = window.setTimeout(() => setArmCountdown(prev => prev - 1), 1000);
         return () => clearTimeout(timer);
     }, [isArming, armCountdown]);
 

@@ -154,19 +154,51 @@ const MyServiceRecordView: React.FC<MyServiceRecordViewProps> = ({ user: propUse
         return allUsers.find(u => u.id === targetId) || propUser || currentUser;
     }, [propUser, currentUser, allUsers, targetId]);
 
+    // Whether the current target needs a cross-user detail fetch. Self-view and
+    // the no-target case carry their heavy fields already (or have nothing to
+    // fetch), so they never hydrate.
+    const needsDetailFetch = !!targetId && !(currentUser && targetId === currentUser.id);
+
     const [fullUser, setFullUser] = useState<User | null>(null);
     // Tracks whether we're awaiting a cross-user detail fetch. Self-view
     // never hydrates because `currentUser` already carries the heavy fields.
     // The flag drives skeleton placeholders for sections whose data only
     // arrives after hydration (certifications, commendations, clearance,
     // limiting markers, conduct) so the view doesn't visibly "pop" when
-    // those fields land a moment after the lite roster row.
-    const [isHydrating, setIsHydrating] = useState(false);
+    // those fields land a moment after the lite roster row. Lazy-initialised to
+    // the mount-time fetch decision so a cross-user view shows skeletons from
+    // the first paint (the effect's fetch resolves them) instead of flashing
+    // lite data first.
+    const [isHydrating, setIsHydrating] = useState(needsDetailFetch);
+
+    // Identity-change tracker. When the viewed identity changes we re-seed the
+    // hydration state during render (React's "adjust state during render"
+    // pattern) instead of in the effect, so it lands on the same frame the
+    // effect would have committed. The async fetch itself stays in the effect
+    // below. We key on the same trigger the old effect used
+    // ([targetId, currentUser]) and reproduce its three synchronous branches
+    // exactly:
+    //   * no target OR self-view -> clear fullUser, drop isHydrating (nothing to
+    //     fetch; currentUser already carries the heavy fields for self-view).
+    //   * cross-user -> prime isHydrating only, WITHOUT clearing fullUser, so
+    //     the prior record stays put until the new fetch resolves (matching the
+    //     old effect, which never reset fullUser on the fetch path).
+    const [prevDetailKey, setPrevDetailKey] = useState<{ targetId: number | undefined; currentUser: User | null }>(
+        () => ({ targetId, currentUser }),
+    );
+    if (targetId !== prevDetailKey.targetId || currentUser !== prevDetailKey.currentUser) {
+        setPrevDetailKey({ targetId, currentUser });
+        if (needsDetailFetch) {
+            setIsHydrating(true);
+        } else {
+            setFullUser(null);
+            setIsHydrating(false);
+        }
+    }
+
     useEffect(() => {
-        if (!targetId) { setFullUser(null); setIsHydrating(false); return; }
-        if (currentUser && targetId === currentUser.id) { setFullUser(null); setIsHydrating(false); return; }
+        if (!needsDetailFetch || !targetId) return;
         let cancelled = false;
-        setIsHydrating(true);
         (async () => {
             try {
                 const full = await fetchUserDetail(targetId);
@@ -176,15 +208,27 @@ const MyServiceRecordView: React.FC<MyServiceRecordViewProps> = ({ user: propUse
             }
         })();
         return () => { cancelled = true; };
-    }, [targetId, currentUser, fetchUserDetail]);
+    }, [targetId, currentUser, needsDetailFetch, fetchUserDetail]);
 
     const user = fullUser || cachedUser;
 
     // Position history (HR + Government, unified) — lazy-fetched per target.
     // Failures degrade silently; the section just shows an empty state.
     const [positionHistory, setPositionHistory] = useState<PositionHistoryEntry[] | null>(null);
+    // Clear the lazily-fetched rows during render when the target goes away, so
+    // a stale list can't show with no target. This reproduces the OLD effect's
+    // ONLY synchronous branch (`if (!targetId) setPositionHistory(null)`): on a
+    // target-to-target change the old effect did NOT reset, it just refetched
+    // and let the prior rows linger until the new ones arrived, so we must not
+    // reset in that case either. Keyed on targetId, matching the old [targetId]
+    // dependency.
+    const [prevHistoryTargetId, setPrevHistoryTargetId] = useState<number | undefined>(targetId);
+    if (targetId !== prevHistoryTargetId) {
+        setPrevHistoryTargetId(targetId);
+        if (!targetId) setPositionHistory(null);
+    }
     useEffect(() => {
-        if (!targetId) { setPositionHistory(null); return; }
+        if (!targetId) return;
         let cancelled = false;
         (async () => {
             try {
@@ -196,6 +240,16 @@ const MyServiceRecordView: React.FC<MyServiceRecordViewProps> = ({ user: propUse
         })();
         return () => { cancelled = true; };
     }, [targetId, getPositionHistory]);
+
+    // Position-history summary counts, lifted out of JSX so the render path
+    // contains no IIFE (which the React Compiler cannot optimise).
+    const positionHistoryCounts = useMemo(() => {
+        return (positionHistory || []).reduce((acc, e) => {
+            if (!e.endedAt) acc.current++;
+            if (e.kind === 'hr') acc.hr++; else acc.gov++;
+            return acc;
+        }, { current: 0, hr: 0, gov: 0 });
+    }, [positionHistory]);
 
     // Merged timeline drawing from four sources. Awards (cert/commend) join
     // operations + service requests so the timeline reads as a true career
@@ -645,26 +699,20 @@ const MyServiceRecordView: React.FC<MyServiceRecordViewProps> = ({ user: propUse
                                     description="HR and government position assignments will appear here as they accumulate. Talk to your command if you expect to see entries here."
                                     compact
                                 />
-                            ) : (() => {
-                                const counts = positionHistory.reduce((acc, e) => {
-                                    if (!e.endedAt) acc.current++;
-                                    if (e.kind === 'hr') acc.hr++; else acc.gov++;
-                                    return acc;
-                                }, { current: 0, hr: 0, gov: 0 });
-                                return (
+                            ) : (
                                     <>
                                         <div className="grid grid-cols-3 gap-3 mb-5">
                                             <div className="bg-slate-950/40 border border-slate-800 rounded-lg p-3 text-center">
                                                 <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">Current</div>
-                                                <div className="mt-1 text-lg font-black text-emerald-300 tabular-nums">{counts.current}</div>
+                                                <div className="mt-1 text-lg font-black text-emerald-300 tabular-nums">{positionHistoryCounts.current}</div>
                                             </div>
                                             <div className="bg-slate-950/40 border border-slate-800 rounded-lg p-3 text-center">
                                                 <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">HR</div>
-                                                <div className="mt-1 text-lg font-black text-sky-300 tabular-nums">{counts.hr}</div>
+                                                <div className="mt-1 text-lg font-black text-sky-300 tabular-nums">{positionHistoryCounts.hr}</div>
                                             </div>
                                             <div className="bg-slate-950/40 border border-slate-800 rounded-lg p-3 text-center">
                                                 <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">Government</div>
-                                                <div className="mt-1 text-lg font-black text-amber-300 tabular-nums">{counts.gov}</div>
+                                                <div className="mt-1 text-lg font-black text-amber-300 tabular-nums">{positionHistoryCounts.gov}</div>
                                             </div>
                                         </div>
 
@@ -715,8 +763,7 @@ const MyServiceRecordView: React.FC<MyServiceRecordViewProps> = ({ user: propUse
                                             })}
                                         </ol>
                                     </>
-                                );
-                            })()}
+                            )}
                         </SectionCard>
                     </div>
                 )}

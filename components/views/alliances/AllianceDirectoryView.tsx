@@ -58,7 +58,26 @@ const AllianceDirectoryView: React.FC = () => {
         }
     }, [rpcAction]);
 
-    useEffect(() => { load(); }, [load]);
+    // Mount-time data fetch. `loading` already initializes to true, so the mount path
+    // needs no synchronous setLoading(true) — we inline the async fetch directly in the
+    // effect so the only setState calls (setEntries / setLoading(false)) are provably
+    // post-await, satisfying the set-state-in-effect rule with no behavior change. The
+    // shared `load` callback (used by the Refresh button, which does flip loading on
+    // click) is unchanged. A cancelled flag drops a late resolution after unmount.
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const data = await rpcAction('alliance:get_directory', {});
+                if (!cancelled) setEntries(data || []);
+            } catch {
+                if (!cancelled) setEntries([]);
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [rpcAction]);
 
     const filtered = useMemo(() => entries.filter(e =>
         (statusFilter === 'All' || e.status === statusFilter) &&
@@ -189,8 +208,8 @@ const AllianceDirectoryView: React.FC = () => {
                                             </div>
                                             {fleet.groups.length > 0 && (
                                                 <div className="space-y-1.5">
-                                                    {fleet.groups.map((g, i) => (
-                                                        <div key={i} className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-800/30 border border-slate-700/30">
+                                                    {fleet.groups.map(g => (
+                                                        <div key={`${g.name}-${g.type}`} className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-800/30 border border-slate-700/30">
                                                             <span className="text-slate-200">{g.name} <span className="text-slate-500">· {g.type}</span></span>
                                                             <span className="text-slate-500">{g.totalShips} ship{g.totalShips === 1 ? '' : 's'}</span>
                                                         </div>

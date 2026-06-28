@@ -28,17 +28,17 @@ const CreateIntelReportModal: React.FC<CreateIntelReportModalProps> = ({ isOpen,
     const [affiliatedOrg, setAffiliatedOrg] = useState('');
     const [threatLevel, setThreatLevel] = useState<IntelThreatLevel>(IntelThreatLevel.None);
     const [classificationLevel, setClassificationLevel] = useState('0');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set());
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set());
     const [summary, setSummary] = useState('');
     const [tagsInput, setTagsInput] = useState('');
     const [evidenceInput, setEvidenceInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
 
     // Track previous open state to prevent resets on parent re-renders
-    const wasOpen = useRef(false);
+    const wasOpenRef = useRef(false);
 
     useEffect(() => {
-        if (isOpen && !wasOpen.current) {
+        if (isOpen && !wasOpenRef.current) {
             setTargetId(initialData?.targetId || '');
             setSubjectType(IntelSubjectType.Person);
             setAffiliatedOrg('');
@@ -50,7 +50,7 @@ const CreateIntelReportModal: React.FC<CreateIntelReportModalProps> = ({ isOpen,
             setEvidenceInput('');
             setIsLoading(false);
         }
-        wasOpen.current = isOpen;
+        wasOpenRef.current = isOpen;
     }, [isOpen, initialData]);
 
     const handleToggleMarker = (id: number) => {

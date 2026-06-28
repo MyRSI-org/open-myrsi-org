@@ -1,4 +1,4 @@
-import React, { createContext, useState, useCallback, useContext } from 'react';
+import React, { createContext, useState, useCallback, use } from 'react';
 import {
     User,
     OrganizationalUnit,
@@ -482,11 +482,11 @@ export const ModalRegistryProvider: React.FC<{ children: React.ReactNode }> = ({
         closeMinimizedWindow,
     };
 
-    return <ModalRegistryContext.Provider value={value}>{children}</ModalRegistryContext.Provider>;
+    return <ModalRegistryContext value={value}>{children}</ModalRegistryContext>;
 };
 
 export const useModalRegistry = () => {
-    const context = useContext(ModalRegistryContext);
+    const context = use(ModalRegistryContext);
     if (!context) {
         throw new Error('useModalRegistry must be used within a ModalRegistryProvider');
     }

@@ -38,6 +38,26 @@ interface StockExportRow {
     notes: string;
 }
 
+/** Reserved-quantity badge with a breakdown tooltip (requests vs. open contracts). */
+function ReservedBadge({ quantityReserved, fromRequests }: { quantityReserved: number; fromRequests: number }) {
+    const fromContracts = Math.max(0, quantityReserved - fromRequests);
+    const tooltip = fromRequests > 0 && fromContracts > 0
+        ? `${fromRequests} from withdrawal requests · ${fromContracts} from open contracts`
+        : fromRequests > 0
+            ? `${fromRequests} from withdrawal requests`
+            : fromContracts > 0
+                ? `${fromContracts} from open marketplace contracts`
+                : undefined;
+    return (
+        <div title={tooltip}>
+            <div className="text-lg font-bold font-mono text-amber-300 cursor-help underline decoration-dotted decoration-amber-500/40 underline-offset-2">
+                {quantityReserved}
+            </div>
+            <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500">Reserved</div>
+        </div>
+    );
+}
+
 interface Props {
     locations: QmLocation[];
     canManage: boolean;
@@ -74,7 +94,7 @@ export default function WhStockTab({ locations, canManage, canRequest, canAdmin,
     const [csvProgress, setCsvProgress] = useState<{ fetched: number; total: number } | null>(null);
     const csvCancelRef = useRef(false);
 
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
 
     // Server filter — only locationId is a column on warehouse_stock; category
     // and search hit catalog joins, so we filter those over the visible page.
@@ -89,34 +109,57 @@ export default function WhStockTab({ locations, canManage, canRequest, canAdmin,
         } catch { /* non-fatal */ }
     }, [rpcAction, filterPayload]);
 
+    // Async fetch only — the loading flag is raised by the render-time tracker
+    // below (on a refetch trigger) or by the initial useState(true), so this
+    // sets state only after its awaited RPC and runs cleanly inside the effect.
     const load = useCallback(async () => {
-        const seq = ++requestSeq.current;
-        setLoading(true);
+        const seq = ++requestSeqRef.current;
         try {
             const r = await rpcAction('warehouse:list_stock', {
                 ...filterPayload,
                 limit: PAGE_SIZE,
                 offset: page * PAGE_SIZE,
             });
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             setStock(Array.isArray(r) ? r : []);
             setHasLoadedOnce(true);
         } catch (err: any) {
-            if (seq !== requestSeq.current) return;
+            if (seq !== requestSeqRef.current) return;
             addToast('Failed to load stock', <i className="fa-solid fa-xmark" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: err?.message });
         } finally {
-            if (seq === requestSeq.current) setLoading(false);
+            if (seq === requestSeqRef.current) setLoading(false);
         }
     }, [rpcAction, filterPayload, page, addToast]);
 
-    const isFirstFilterChange = useRef(true);
+    const isFirstFilterChangeRef = useRef(true);
     useEffect(() => {
-        if (isFirstFilterChange.current) { isFirstFilterChange.current = false; return; }
+        if (isFirstFilterChangeRef.current) { isFirstFilterChangeRef.current = false; return; }
         setPage(0);
     }, [filterPayload]);
 
-    useEffect(() => { load(); }, [load, refreshKey]);
-    useEffect(() => { loadCount(); }, [loadCount, refreshKey]);
+    // Raise the loading flag during render whenever a refetch is about to run:
+    // the filter (filterPayload), the page, or the parent refreshKey changed.
+    // These are exactly the inputs that change load()'s identity and re-trigger
+    // the fetch effect below. React re-renders before paint, so this is
+    // behavior-equivalent to the old synchronous setLoading(true) at the top of
+    // load(); the initial load is already covered by useState(true). The async
+    // fetch then only resolves the result and clears the flag.
+    const [prevFetchKey, setPrevFetchKey] = useState({ filterPayload, page, refreshKey });
+    if (
+        prevFetchKey.filterPayload !== filterPayload ||
+        prevFetchKey.page !== page ||
+        prevFetchKey.refreshKey !== refreshKey
+    ) {
+        setPrevFetchKey({ filterPayload, page, refreshKey });
+        setLoading(true);
+    }
+
+    useEffect(() => {
+        void (async () => { await load(); })();
+    }, [load, refreshKey]);
+    useEffect(() => {
+        void (async () => { await loadCount(); })();
+    }, [loadCount, refreshKey]);
 
     const handleStartCsvExport = useCallback(async () => {
         setCsvExporting(true);
@@ -341,25 +384,12 @@ export default function WhStockTab({ locations, canManage, canRequest, canAdmin,
                                                             On hand · {s.catalog?.unit || 'units'}
                                                         </div>
                                                     </div>
-                                                    {reserved && (() => {
-                                                        const fromRequests = requestReservedByStock.get(s.id) || 0;
-                                                        const fromContracts = Math.max(0, s.quantityReserved - fromRequests);
-                                                        const tooltip = fromRequests > 0 && fromContracts > 0
-                                                            ? `${fromRequests} from withdrawal requests · ${fromContracts} from open contracts`
-                                                            : fromRequests > 0
-                                                                ? `${fromRequests} from withdrawal requests`
-                                                                : fromContracts > 0
-                                                                    ? `${fromContracts} from open marketplace contracts`
-                                                                    : undefined;
-                                                        return (
-                                                            <div title={tooltip}>
-                                                                <div className="text-lg font-bold font-mono text-amber-300 cursor-help underline decoration-dotted decoration-amber-500/40 underline-offset-2">
-                                                                    {s.quantityReserved}
-                                                                </div>
-                                                                <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500">Reserved</div>
-                                                            </div>
-                                                        );
-                                                    })()}
+                                                    {reserved && (
+                                                        <ReservedBadge
+                                                            quantityReserved={s.quantityReserved}
+                                                            fromRequests={requestReservedByStock.get(s.id) || 0}
+                                                        />
+                                                    )}
                                                 </div>
                                                 <div className="flex-1" />
                                                 <div className="flex items-center gap-3 pt-3 mt-3 border-t border-white/5 flex-wrap">

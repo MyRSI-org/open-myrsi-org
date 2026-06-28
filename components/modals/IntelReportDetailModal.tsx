@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { HydratedIntelligenceReport, IntelThreatLevel, IntelSubjectType } from '../../types';
 import { useAuth, useFormatDate } from '../../contexts/AuthContext';
 import { useData } from '../../contexts/DataContext';
@@ -64,7 +64,7 @@ const IntelReportDetailModal: React.FC<IntelReportDetailModalProps> = ({ isOpen,
     const [summary, setSummary] = useState('');
     const [threatLevel, setThreatLevel] = useState<IntelThreatLevel>(IntelThreatLevel.None);
     const [classificationLevel, setClassificationLevel] = useState('0');
-    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(new Set());
+    const [selectedMarkers, setSelectedMarkers] = useState<Set<number>>(() => new Set());
     const [tagsInput, setTagsInput] = useState('');
     const [evidenceInput, setEvidenceInput] = useState('');
     const [affiliatedOrg, setAffiliatedOrg] = useState('');
@@ -83,18 +83,54 @@ const IntelReportDetailModal: React.FC<IntelReportDetailModalProps> = ({ isOpen,
     const reportTags = useMemo(() => Array.isArray(report.tags) ? report.tags : [], [report.tags]);
     const reportEvidence = useMemo(() => Array.isArray(report.evidenceUrls) ? report.evidenceUrls : [], [report.evidenceUrls]);
 
-    useEffect(() => {
-        if (isOpen && report) {
-            setSummary(s(report.summary));
-            setThreatLevel((s(report.threatLevel) as IntelThreatLevel) || IntelThreatLevel.None);
-            setClassificationLevel(String(typeof report.classificationLevel === 'number' ? report.classificationLevel : 0));
-            setSelectedMarkers(new Set(reportMarkers.map(m => typeof m?.id === 'number' ? m.id : 0).filter(Boolean)));
-            setTagsInput(reportTags.map(t => s(t)).join(', '));
-            setEvidenceInput(reportEvidence.map(u => s(u)).join('\n'));
-            setAffiliatedOrg(s(report.affiliatedOrg));
-            setIsEditing(false);
-        }
-    }, [isOpen, report, reportEvidence, reportMarkers, reportTags]);
+    // Build collision-safe React keys for the read-only free-text lists (tags,
+    // evidence URLs). The list value is the primary identity; an occurrence
+    // suffix disambiguates empty/duplicate strings so we never fall back to the
+    // bare array index. These keys are render-only and never reach the server —
+    // the save path serialises tagsInput/evidenceInput, not these objects.
+    const keyedTags = useMemo(() => {
+        const seen = new Map<string, number>();
+        return reportTags.map(tag => {
+            const value = s(tag);
+            const n = seen.get(value) ?? 0;
+            seen.set(value, n + 1);
+            return { value, key: `${value}#${n}` };
+        });
+    }, [reportTags]);
+    const keyedEvidence = useMemo(() => {
+        const seen = new Map<string, number>();
+        return reportEvidence.map(url => {
+            const value = s(url);
+            const n = seen.get(value) ?? 0;
+            seen.set(value, n + 1);
+            return { value, key: `${value}#${n}` };
+        });
+    }, [reportEvidence]);
+
+    // Hydrate the edit form from the selected report whenever the modal opens or
+    // the report changes. Done with render-time previous-value trackers (React's
+    // "adjust state during render" pattern) instead of an effect: the seed runs
+    // before paint, which is behaviour-equivalent to the previous open/report-change
+    // effect — same fields, same values, same `isOpen && report` guard. prevIsOpen
+    // starts false so an already-open mount (the multi-window usage) still seeds.
+    const [prevReportSeedIsOpen, setPrevReportSeedIsOpen] = useState(false);
+    const [prevReportSeedReport, setPrevReportSeedReport] = useState(report);
+    if (isOpen && report && (!prevReportSeedIsOpen || report !== prevReportSeedReport)) {
+        setPrevReportSeedIsOpen(isOpen);
+        setPrevReportSeedReport(report);
+        setSummary(s(report.summary));
+        setThreatLevel((s(report.threatLevel) as IntelThreatLevel) || IntelThreatLevel.None);
+        setClassificationLevel(String(typeof report.classificationLevel === 'number' ? report.classificationLevel : 0));
+        setSelectedMarkers(new Set(reportMarkers.map(m => typeof m?.id === 'number' ? m.id : 0).filter(Boolean)));
+        setTagsInput(reportTags.map(t => s(t)).join(', '));
+        setEvidenceInput(reportEvidence.map(u => s(u)).join('\n'));
+        setAffiliatedOrg(s(report.affiliatedOrg));
+        setIsEditing(false);
+    } else if (!isOpen && prevReportSeedIsOpen) {
+        // Track close transitions so the next open re-seeds even if the report ref
+        // is unchanged — mirrors the effect firing on every isOpen false->true edge.
+        setPrevReportSeedIsOpen(false);
+    }
 
     const handleToggleMarker = (id: number) => {
         setSelectedMarkers(prev => {
@@ -198,8 +234,8 @@ const IntelReportDetailModal: React.FC<IntelReportDetailModalProps> = ({ isOpen,
                                         ))
                                     ) : (
                                         reportMarkers.length > 0
-                                            ? reportMarkers.map((m, idx) => (
-                                                <span key={typeof m?.id === 'number' ? m.id : idx} className="bg-slate-800 text-slate-400 px-2 py-0.5 rounded-sm text-[9px] font-black uppercase border border-slate-700">
+                                            ? reportMarkers.map(m => (
+                                                <span key={typeof m?.id === 'number' ? m.id : s(m?.code)} className="bg-slate-800 text-slate-400 px-2 py-0.5 rounded-sm text-[9px] font-black uppercase border border-slate-700">
                                                     {s(m?.code)}
                                                 </span>
                                             ))
@@ -254,16 +290,13 @@ const IntelReportDetailModal: React.FC<IntelReportDetailModalProps> = ({ isOpen,
                                 <textarea value={evidenceInput} onChange={(e) => setEvidenceInput(e.target.value)} rows={3} placeholder="https://..." className={`${inputClass} resize-none font-mono text-[10px]`} />
                             ) : (
                                 <div className="space-y-2">
-                                    {reportEvidence.map((url, i) => {
-                                        const urlStr = s(url);
-                                        return (
-                                            <a key={i} href={urlStr || '#'} target="_blank" rel="noopener noreferrer" className="flex items-center gap-3 bg-slate-800/30 p-3 rounded-lg border border-slate-700/50 hover:border-sky-500/30 transition-all group">
-                                                <i className="fa-solid fa-link text-slate-600 group-hover:text-sky-400"></i>
-                                                <span className="text-xs text-sky-400 font-mono truncate flex-1">{urlStr}</span>
-                                                <i className="fa-solid fa-arrow-up-right-from-square text-slate-700 text-xs group-hover:text-white"></i>
-                                            </a>
-                                        );
-                                    })}
+                                    {keyedEvidence.map(({ value: urlStr, key }) => (
+                                        <a key={key} href={urlStr || '#'} target="_blank" rel="noopener noreferrer" className="flex items-center gap-3 bg-slate-800/30 p-3 rounded-lg border border-slate-700/50 hover:border-sky-500/30 transition-all group">
+                                            <i className="fa-solid fa-link text-slate-600 group-hover:text-sky-400"></i>
+                                            <span className="text-xs text-sky-400 font-mono truncate flex-1">{urlStr}</span>
+                                            <i className="fa-solid fa-arrow-up-right-from-square text-slate-700 text-xs group-hover:text-white"></i>
+                                        </a>
+                                    ))}
                                 </div>
                             )}
                         </div>
@@ -275,9 +308,9 @@ const IntelReportDetailModal: React.FC<IntelReportDetailModalProps> = ({ isOpen,
                             <input type="text" value={tagsInput} onChange={(e) => setTagsInput(e.target.value)} className={inputClass} placeholder="Tag1, Tag2..." />
                         ) : (
                             <div className="flex flex-wrap gap-2">
-                                {reportTags.map((tag, i) => (
-                                    <span key={i} className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-sm border border-slate-700 uppercase font-black tracking-tighter">
-                                        {s(tag)}
+                                {keyedTags.map(({ value: tag, key }) => (
+                                    <span key={key} className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-sm border border-slate-700 uppercase font-black tracking-tighter">
+                                        {tag}
                                     </span>
                                 ))}
                             </div>

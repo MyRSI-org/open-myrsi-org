@@ -18,7 +18,7 @@
 // that write through setHrApplicants/setHrInterviews exposed here; setHrJobs is
 // likewise forwarded on the useData() value per DataContextType.
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDataCore } from './DataCoreContext';
 import {
     HydratedHRApplication, HydratedHRInterview, JobPosting,
@@ -116,11 +116,11 @@ export const HRProvider: React.FC<{ children: React.ReactNode }> = ({ children }
         registerRefreshHR,
     ]);
 
-    return <HRContext.Provider value={value}>{children}</HRContext.Provider>;
+    return <HRContext value={value}>{children}</HRContext>;
 };
 
 export const useHR = (): HRContextValue => {
-    const ctx = useContext(HRContext);
+    const ctx = use(HRContext);
     if (!ctx) throw new Error('useHR must be used within an HRProvider');
     return ctx;
 };

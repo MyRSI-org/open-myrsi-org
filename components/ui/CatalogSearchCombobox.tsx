@@ -76,7 +76,7 @@ export default function CatalogSearchCombobox<T extends ComboboxItem>({
     const debouncedQuery = useDebouncedValue(query.trim(), 300);
     const containerRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
-    const requestSeq = useRef(0);
+    const requestSeqRef = useRef(0);
 
     // Click-outside to close.
     useEffect(() => {
@@ -89,31 +89,57 @@ export default function CatalogSearchCombobox<T extends ComboboxItem>({
         return () => document.removeEventListener('mousedown', onDoc);
     }, [open]);
 
-    // Fire the search whenever the debounced query or scope changes.
-    useEffect(() => {
-        if (!open) return;
-        if (!debouncedQuery) {
-            setResults([]);
-            setError(null);
-            setLoading(false);
-            return;
+    // Drive the synchronous search-lifecycle state (results/error/loading) at
+    // render time via the React "adjust state during render" pattern instead
+    // of synchronously inside the search effect. The old effect, on every fire
+    // (deps: open / debouncedQuery / scope), either cleared these when the
+    // query was empty or set loading=true + error=null before kicking off the
+    // async request. We reproduce that exactly by tracking the same trigger
+    // values and reacting only when one of them changes — so the only work
+    // left in the effect is the async fetch and its (already-unflagged) async
+    // sets. Value guards keep each branch self-terminating (no render loop).
+    const [prevOpen, setPrevOpen] = useState(open);
+    const [prevDebouncedQuery, setPrevDebouncedQuery] = useState(debouncedQuery);
+    const [prevScope, setPrevScope] = useState(scope);
+    if (open !== prevOpen || debouncedQuery !== prevDebouncedQuery || scope !== prevScope) {
+        setPrevOpen(open);
+        setPrevDebouncedQuery(debouncedQuery);
+        setPrevScope(scope);
+        if (open) {
+            if (!debouncedQuery) {
+                // Query cleared: reset the lifecycle state (matches the old
+                // effect's clear branch).
+                if (results.length > 0) setResults([]);
+                if (error !== null) setError(null);
+                if (loading) setLoading(false);
+            } else {
+                // New/changed search: show loading and clear any prior error
+                // (matches the old effect's synchronous setLoading(true) /
+                // setError(null) before the async request).
+                if (!loading) setLoading(true);
+                if (error !== null) setError(null);
+            }
         }
-        const seq = ++requestSeq.current;
-        setLoading(true);
-        setError(null);
+    }
+
+    // Fire the search whenever the debounced query or scope changes. Only the
+    // async request + its async result/error/loading sets live here now.
+    useEffect(() => {
+        if (!open || !debouncedQuery) return;
+        const seq = ++requestSeqRef.current;
         rpcAction(rpcName, { query: debouncedQuery, source: scope, limit })
             .then((rows: any) => {
-                if (seq !== requestSeq.current) return; // stale
+                if (seq !== requestSeqRef.current) return; // stale
                 setResults(Array.isArray(rows) ? rows : []);
                 setHighlight(0);
             })
             .catch((err: any) => {
-                if (seq !== requestSeq.current) return;
+                if (seq !== requestSeqRef.current) return;
                 setError(err?.message || 'Search failed');
                 setResults([]);
             })
             .finally(() => {
-                if (seq === requestSeq.current) setLoading(false);
+                if (seq === requestSeqRef.current) setLoading(false);
             });
     }, [debouncedQuery, scope, open, rpcAction, rpcName, limit]);
 

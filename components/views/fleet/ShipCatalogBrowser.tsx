@@ -18,7 +18,7 @@ const ShipCatalogBrowser: React.FC<ShipCatalogBrowserProps> = ({ isOpen, onSelec
     const [filterManufacturer, setFilterManufacturer] = useState('');
     const [filterSize, setFilterSize] = useState('');
     const [filterRole, setFilterRole] = useState('');
-    const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+    const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
 
     const manufacturers = useMemo(() => {
         const set = new Set(shipCatalog.map(s => s.manufacturer));

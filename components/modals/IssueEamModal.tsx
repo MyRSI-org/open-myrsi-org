@@ -21,7 +21,14 @@ const IssueEamModal: React.FC<IssueEamModalProps> = ({ isOpen, onClose }) => {
     const [isArmed, setIsArmed] = useState(false);
     const [isTransmitting, setIsTransmitting] = useState(false);
 
-    useEffect(() => {
+    // Reset the arming state machine each time the modal transitions closed ->
+    // open. Done during render via React's "adjust state during render" pattern
+    // (a prevIsOpen tracker) so the form is already cleared on the open frame
+    // rather than a frame later from an effect. Same fields, same values, same
+    // open-edge condition as the previous effect.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setMessage('');
             setIsArming(false);
@@ -29,16 +36,21 @@ const IssueEamModal: React.FC<IssueEamModalProps> = ({ isOpen, onClose }) => {
             setIsArmed(false);
             setIsTransmitting(false);
         }
-    }, [isOpen]);
+    }
 
     useEffect(() => {
-        let timer: number;
-        if (isArming && armCountdown > 0) {
-            timer = window.setTimeout(() => setArmCountdown(prev => prev - 1), 1000);
-        } else if (isArming && armCountdown === 0) {
-            setIsArmed(true);
-            setIsArming(false);
-        }
+        if (!isArming) return;
+        // Tick the countdown once per second. On the final tick (1 -> 0) we also
+        // flip to "armed" from inside the timeout callback rather than
+        // synchronously in the effect body, preserving the exact 3s cadence and
+        // the original "armed immediately when the count reaches 0" behavior.
+        const timer = window.setTimeout(() => {
+            setArmCountdown(prev => prev - 1);
+            if (armCountdown <= 1) {
+                setIsArmed(true);
+                setIsArming(false);
+            }
+        }, 1000);
         return () => clearTimeout(timer);
     }, [isArming, armCountdown]);
 

@@ -27,6 +27,8 @@ const ConductInterviewModal: React.FC<ConductInterviewModalProps> = ({ isOpen, o
     const [activeQuestionId, setActiveQuestionId] = useState<number | null>(null);
     const [questions, setQuestions] = useState<HRInterviewQuestion[]>([]);
     const noteAreaRef = useRef<HTMLTextAreaElement>(null);
+    const onCloseRef = useRef(onClose);
+    useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
     const isCompleted = interview.status === 'Completed';
 
@@ -34,6 +36,25 @@ const ConductInterviewModal: React.FC<ConductInterviewModalProps> = ({ isOpen, o
         const applicant = hrApplicants.find(a => a.id === interview.applicationId);
         return applicant ? applicant.applicantName : 'Unknown Applicant';
     }, [hrApplicants, interview.applicationId]);
+
+    // Reset the submit-loading flag on the same trigger that (re)loads the template:
+    // when the modal opens or the interview / isCompleted / rpcAction inputs change.
+    // React-documented "adjust state during render" pattern (previous-value tracker):
+    // the prior code set this flag false synchronously inside the load effect; here it
+    // is reset during render on the identical input set, while the async template load
+    // (whose setState all happen behind an await) stays in the effect below.
+    const [prevLoadKey, setPrevLoadKey] = useState({ isOpen, interview, isCompleted, rpcAction });
+    if (
+        prevLoadKey.isOpen !== isOpen ||
+        prevLoadKey.interview !== interview ||
+        prevLoadKey.isCompleted !== isCompleted ||
+        prevLoadKey.rpcAction !== rpcAction
+    ) {
+        setPrevLoadKey({ isOpen, interview, isCompleted, rpcAction });
+        if (isOpen) {
+            setIsLoading(false);
+        }
+    }
 
     useEffect(() => {
         if (isOpen) {
@@ -58,12 +79,10 @@ const ConductInterviewModal: React.FC<ConductInterviewModalProps> = ({ isOpen, o
                     setOverallNotes(interview.overallNotes || '');
                     setIsRecommended(interview.isRecommended || false);
                     setActiveQuestionId(loadedQuestions.length > 0 ? loadedQuestions[0].id : null);
-                } catch (err) { console.error(err); onClose(); } finally { setIsFetchingTemplate(false); }
+                } catch (err) { console.error(err); onCloseRef.current(); } finally { setIsFetchingTemplate(false); }
             };
             fetchTemplate();
-            setIsLoading(false);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: onClose is called only in the catch path and parents pass it as an inline arrow; adding it would tear down and refetch the template on every parent re-render.
     }, [isOpen, interview, isCompleted, rpcAction]);
 
     const handleResponseChange = (qId: number, field: 'text' | 'score', value: string | number) => {

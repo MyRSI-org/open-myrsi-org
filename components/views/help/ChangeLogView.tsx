@@ -6,6 +6,15 @@ interface ChangeLogViewProps {
     onBack: () => void;
 }
 
+// Deterministic, render-pure pseudo-random archive id derived from the (unique, stable) version string.
+const archiveId = (version: string): string => {
+    let hash = 0;
+    for (let i = 0; i < version.length; i++) {
+        hash = (Math.imul(31, hash) + version.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(36).padStart(8, '0').slice(0, 8).toUpperCase();
+};
+
 const VersionCard: React.FC<{ version: string; title: string; children: React.ReactNode; isLatest?: boolean }> = ({ version, title, children, isLatest }) => (
     <section className={`bg-slate-900/80 backdrop-blur-md border rounded-xl p-5 sm:p-6 space-y-4 shadow-lg transition-all ${isLatest ? 'border-sky-500/50 shadow-sky-900/20' : 'border-slate-700/50 hover:border-slate-600'}`}>
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 border-b border-white/5 pb-3">
@@ -16,7 +25,7 @@ const VersionCard: React.FC<{ version: string; title: string; children: React.Re
                 </div>
                 <p className="text-[10px] text-sky-300 font-black uppercase tracking-widest mt-1">{title}</p>
             </div>
-            <p className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Archive ID: {Math.random().toString(36).substring(2, 10).toUpperCase()}</p>
+            <p className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Archive ID: {archiveId(version)}</p>
         </div>
         <ul className="list-none space-y-3 text-slate-300 text-sm">
             {children}
@@ -55,11 +64,10 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
 
             <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full space-y-6">
 
-                <VersionCard version="15.1.5-open" title="Privacy & Access Hardening" isLatest>
-                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">This one was about privacy and keeping authority where it belongs.</strong> A restricted unit's voice room is now as private as its text channel, so only its members can drop in and listen. Added additional verification backstop before RSI handle is stamped as verified. Running the government can no longer be turned into a way to quietly hand yourself one of the top seats, only an admin can fill those. Nothing looks different in daily use, and I wired in tests to keep it that way.</li>
-                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Tighter internal data handling.</strong> I brought the data layer in line with the hosted version. Every database read now asks for exactly the fields it needs instead of pulling whole rows. This is the gate and scope work done for the hosted version, and in this case is defence in depth downstream. This ensures that a column added to the database later can't quietly flow somewhere it should not.</li>
-                    <li><strong className="font-semibold text-slate-100">Application spam is capped.</strong> Recruitment and job applications now have a sensible per-person limit, the same job can't be applied to twice, and a flood of them can no longer bury the HR team in notifications.</li>
-                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> There are database changes in this release, so re-run schema.sql in your Supabase SQL editor once you have updated. It is safe to run more than once.</li>
+                <VersionCard version="15.2.0-open" title="Dependencies & Hardening" isLatest>
+                    <li><strong className="text-sky-400">[Maintenance]</strong> <strong className="font-semibold text-slate-100">Fresh foundations.</strong> I updated the underlying libraries the platform is built on to their current, best-supported versions, and reworked the parts of the code that needed it so everything fits the newer versions cleanly. None of this changes what you see or do day to day — it keeps the foundation current and secure, and makes the project easier to look after going forward.</li>
+                    <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Another security pass, layer by layer.</strong> I went back through the platform once more as a defence-in-depth review and tightened a broad set of access, validation, and data-handling checks. As with the passes before it, almost none of this is visible in everyday use — the point is simply that information and actions stay with the people they are meant for. Tests were added to keep it that way.</li>
+                    <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> This release touches the database. After updating, re-run schema.sql in your Supabase SQL editor to pick up the changes. It is idempotent, so it is safe to run more than once.</li>
                 </VersionCard>
 
                 <div className="space-y-6">
@@ -68,6 +76,13 @@ const ChangeLogView: React.FC<ChangeLogViewProps> = ({ onBack }) => {
                         Version History
                         <span className="h-px bg-slate-700 grow ml-4"></span>
                     </h3>
+
+                    <VersionCard version="15.1.5-open" title="Privacy & Access Hardening">
+                        <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">This one was about privacy and keeping authority where it belongs.</strong> A restricted unit's voice room is now as private as its text channel, so only its members can drop in and listen. Added additional verification backstop before RSI handle is stamped as verified. Running the government can no longer be turned into a way to quietly hand yourself one of the top seats, only an admin can fill those. Nothing looks different in daily use, and I wired in tests to keep it that way.</li>
+                        <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Tighter internal data handling.</strong> I brought the data layer in line with the hosted version. Every database read now asks for exactly the fields it needs instead of pulling whole rows. This is the gate and scope work done for the hosted version, and in this case is defence in depth downstream. This ensures that a column added to the database later can't quietly flow somewhere it should not.</li>
+                        <li><strong className="font-semibold text-slate-100">Application spam is capped.</strong> Recruitment and job applications now have a sensible per-person limit, the same job can't be applied to twice, and a flood of them can no longer bury the HR team in notifications.</li>
+                        <li><strong className="font-semibold text-slate-100">For self-hosters.</strong> There are database changes in this release, so re-run schema.sql in your Supabase SQL editor once you have updated. It is safe to run more than once.</li>
+                    </VersionCard>
 
                     <VersionCard version="15.1.4-open" title="Security Hardening">
                         <li><strong className="text-sky-400">[Security]</strong> <strong className="font-semibold text-slate-100">Another security pass, and a review that went looking for ways to break in.</strong> A few things came up and I fixed them. A partnered org can no longer take over a joint operation you are sharing with them. The RSI handle check can no longer be fooled into linking a handle you do not own. Starting or cancelling a service request now stays with the people actually on it. And a sign-in now stays valid for about a day instead of a week, so a stolen session stops working much sooner. None of this changes how the app works from day to day. I added tests so it stays that way.</li>

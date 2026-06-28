@@ -29,13 +29,13 @@ function makeRow(extra: Record<string, unknown> = {}): RosterRowArg {
 
 describe('toAllyRosterMember (ally roster PII guard)', () => {
     it('emits only safe fields — no PII / secrets in the output', () => {
-        const blob = JSON.stringify(toAllyRosterMember(makeRow()));
+        const blob = JSON.stringify(toAllyRosterMember(makeRow(), 1));
         expect(blob).not.toContain('discord-secret-123');
         expect(blob).not.toContain('flagged for vetting');
         expect(blob).not.toContain('internal hr note');
         expect(blob).not.toContain('secret@org.test');
         expect(blob).not.toContain('admin:access');
-        const out = toAllyRosterMember(makeRow()) as unknown as Record<string, unknown>;
+        const out = toAllyRosterMember(makeRow(), 1) as unknown as Record<string, unknown>;
         expect(out.discordId).toBeUndefined();
         expect(out.adminNotes).toBeUndefined();
         expect(out.clearanceLevelId).toBeUndefined();
@@ -44,7 +44,7 @@ describe('toAllyRosterMember (ally roster PII guard)', () => {
     });
 
     it('maps the safe fields correctly', () => {
-        const out = toAllyRosterMember(makeRow());
+        const out = toAllyRosterMember(makeRow(), 1);
         expect(out.rsiHandle).toBe('PilotHandle');
         expect(out.rankName).toBe('Captain');
         expect(out.unitName).toBe('Alpha Squadron');
@@ -53,7 +53,7 @@ describe('toAllyRosterMember (ally roster PII guard)', () => {
     });
 
     it('caps specializations at 3', () => {
-        expect(toAllyRosterMember(makeRow()).specializations).toHaveLength(3);
+        expect(toAllyRosterMember(makeRow(), 1).specializations).toHaveLength(3);
     });
 
     it('handles array-shaped to-one embeds (PostgREST type inference)', () => {
@@ -61,7 +61,7 @@ describe('toAllyRosterMember (ally roster PII guard)', () => {
             rank: [{ name: 'Major', icon_url: 'x' }],
             unit: [{ id: 1, name: 'HQ' }],
             role: [{ name: 'Dispatcher' }],
-        }));
+        }), 1);
         expect(out.rankName).toBe('Major');
         expect(out.unitName).toBe('HQ');
         expect(out.roleName).toBe('Dispatcher');

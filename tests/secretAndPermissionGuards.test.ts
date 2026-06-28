@@ -6,11 +6,11 @@ import { encryptSecret, decryptSecret } from '../lib/crypto';
 import { actions, fullPermissionMap } from '../api/services';
 import type { User } from '../types';
 
-// Regression guards for the data-exposure audit remediation. These cover the
-// pure, server-side decision logic for the highest-impact fixes.
+// Regression guards for data-exposure protections. These cover the pure,
+// server-side decision logic behind the highest-impact cases.
 
-// --- C1: unauthenticated Admin takeover via finalize_setup -----------------
-describe('admin-setup grant (C1)', () => {
+// --- unauthenticated Admin takeover via finalize_setup ---------------------
+describe('admin-setup grant', () => {
     it('round-trips a grant bound to the discord id', () => {
         const token = signAdminSetupGrant('discord-123');
         expect(verifyAdminSetupGrant(token)).toEqual({ discordId: 'discord-123' });
@@ -34,8 +34,8 @@ describe('admin-setup grant (C1)', () => {
     });
 });
 
-// --- H3: server-side clearance / limiting-marker filtering -----------------
-describe('clearance filter (H3)', () => {
+// --- server-side clearance / limiting-marker filtering ---------------------
+describe('clearance filter', () => {
     const item = (classificationLevel: number, limitingMarkers: unknown[] = []) => ({ classificationLevel, limitingMarkers });
 
     it('drops items above the viewer clearance level', () => {
@@ -55,8 +55,8 @@ describe('clearance filter (H3)', () => {
     it('enforces compartmentation with OBJECT-shaped markers (the real runtime shape) — holding one marker must NOT grant others', () => {
         // Markers are the embedded security_limiting_markers row on BOTH sides
         // (marker:security_limiting_markers(*)). A naive String(m) comparison
-        // collapses every object to '[object Object]' and over-grants — this test
-        // pins the id-keyed comparison.
+        // collapses every object to '[object Object]' and over-grants — the
+        // comparison must be id-keyed instead.
         const noforn = { id: 1, code: 'NOFORN', name: 'No Foreign' };
         const eyesOnly = { id: 2, code: 'EYES-ONLY', name: 'Eyes Only' };
         const viewer = { clearanceLevel: { level: 5 }, limitingMarkers: [noforn], permissions: [], role: 'Member' };
@@ -83,8 +83,8 @@ describe('clearance filter (H3)', () => {
     });
 });
 
-// --- M1 / M5: per-user PII stripping ---------------------------------------
-describe('stripSensitiveUserFields (M1/M5)', () => {
+// --- per-user PII stripping ------------------------------------------------
+describe('stripSensitiveUserFields', () => {
     const base = {
         id: 7,
         discordId: '999000111',
@@ -140,7 +140,7 @@ describe('stripSensitiveUserFields (M1/M5)', () => {
         expect(out.conductRecord).toEqual([]);
     });
 
-    it('drops HR/session metadata for a non-self viewer via the allow-list (G3)', () => {
+    it('drops HR/session metadata for a non-self viewer via the allow-list', () => {
         const rich = {
             ...base,
             jobTitle: 'Quartermaster',
@@ -171,7 +171,7 @@ describe('stripSensitiveUserFields (M1/M5)', () => {
         expect(out.tenureStartDate).toBe('2025-01-01');
     });
 
-    it('restores HR personnel metadata for an HR-capable (non-Admin) viewer like a Dispatcher (G3 regression guard)', () => {
+    it('restores HR personnel metadata for an HR-capable (non-Admin) viewer like a Dispatcher', () => {
         const rich = {
             ...base, jobTitle: 'Quartermaster', rsiVerified: true,
             probationStart: '2026-01-01', probationEnd: '2026-02-01', tenureStartDate: '2025-01-01',
@@ -218,11 +218,11 @@ describe('dead system:global_search action removed', () => {
     });
 });
 
-// --- security-review gate values (drift guard) ------------------------------
+// --- permission gate values (drift guard) -----------------------------------
 // permissionMapCoverage asserts an entry EXISTS; these pin the VALUE so a
 // silent downgrade (e.g. back to a weaker permission) fails CI.
-describe('security-review permission gates (M9/H4/M1)', () => {
-    it('intel:generate_summary is gated at intel:manage (M9 — writes the manager-only AI cache)', () => {
+describe('permission gate values', () => {
+    it('intel:generate_summary is gated at intel:manage (writes the manager-only AI cache)', () => {
         expect(fullPermissionMap['intel:generate_summary']).toBe('intel:manage');
     });
 });

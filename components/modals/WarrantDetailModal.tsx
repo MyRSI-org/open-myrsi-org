@@ -69,13 +69,21 @@ const WarrantDetailModal: React.FC<WarrantDetailModalProps> = ({ isOpen, onClose
     // while the thread loads and as a fallback for pre-migration deployments
     // that don't have a warrant_notes table populated yet.
     const [notes, setNotes] = useState<WarrantNote[]>([]);
-    const [loadingNotes, setLoadingNotes] = useState(false);
+    // Lazy-init to true when the modal mounts already-open with a valid warrant: the
+    // mount-time fetch effect below runs immediately, so the spinner must be showing
+    // from the first paint (the prior code achieved this by raising the flag inside
+    // the mount effect's loadNotes() call). Otherwise start false.
+    const [loadingNotes, setLoadingNotes] = useState(() => isOpen && !!warrant?.id);
     const [draft, setDraft] = useState('');
     const [posting, setPosting] = useState(false);
 
-    const loadNotes = useCallback(async () => {
+    // Pure async fetch: awaits the RPC and writes the result, but does NOT flip the
+    // loading flag on at the start. The loading flag is raised by the callers
+    // (loadNotes for the event/manual paths; the render-time tracker below for the
+    // open/refetch path) so the effect that runs this never has to call setState
+    // synchronously.
+    const fetchNotes = useCallback(async () => {
         if (!warrant?.id) return;
-        setLoadingNotes(true);
         try {
             const result: WarrantNote[] = await rpcAction('warrant:get_notes', { warrantId: warrant.id });
             setNotes(Array.isArray(result) ? result : []);
@@ -87,12 +95,44 @@ const WarrantDetailModal: React.FC<WarrantDetailModalProps> = ({ isOpen, onClose
         } finally {
             setLoadingNotes(false);
         }
-    }, [rpcAction, warrant?.id]);
+    }, [rpcAction, warrant.id]);
+
+    // Event/manual entry point (realtime refresh + post-note). These run inside an
+    // event handler / async callback, so raising the loading flag here is allowed.
+    const loadNotes = useCallback(async () => {
+        if (!warrant?.id) return;
+        setLoadingNotes(true);
+        await fetchNotes();
+    }, [warrant.id, fetchNotes]);
+
+    // Fetch the notes thread when the modal opens / the warrant changes. Equivalent
+    // to the prior effect (deps [isOpen, loadNotes], guarded by isOpen && warrant.id),
+    // but the synchronous loading-flag raise is moved out of the effect into this
+    // render-time previous-value tracker (React-documented "adjust state during
+    // render" pattern), keyed on the same inputs that drove the refetch. The effect
+    // below then only performs the async fetch, so it no longer calls setState
+    // synchronously.
+    const [prevFetchKey, setPrevFetchKey] = useState({ isOpen, fetchNotes });
+    if (prevFetchKey.isOpen !== isOpen || prevFetchKey.fetchNotes !== fetchNotes) {
+        setPrevFetchKey({ isOpen, fetchNotes });
+        if (isOpen && warrant?.id) {
+            setLoadingNotes(true);
+        }
+    }
 
     useEffect(() => {
         if (!isOpen) return;
-        loadNotes();
-    }, [isOpen, loadNotes]);
+        // External-system synchronization: pull the notes thread from the server.
+        // The loading flag is already raised before this runs (at mount via the lazy
+        // initial state, and on warrant change via the render-time tracker above), so
+        // the effect performs ONLY the async fetch. fetchNotes writes its results
+        // exclusively behind an await (success/soft-fail/finally), never synchronously.
+        // Defining the runner inline (canonical React data-fetch effect shape) keeps
+        // those writes in an async continuation. void marks the promise as
+        // intentionally unawaited.
+        async function run() { await fetchNotes(); }
+        void run();
+    }, [isOpen, fetchNotes]);
 
     // Realtime: refresh thread when the warrant_update broadcast fires.
     // DataContext rebroadcasts on the org channel; we re-listen here to catch

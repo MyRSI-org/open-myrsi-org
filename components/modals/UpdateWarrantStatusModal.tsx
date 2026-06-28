@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { HydratedWarrant, WarrantStatus, WarrantAction } from '../../types';
 import { useOperations } from '../../contexts/OperationsContext';
 
@@ -23,7 +23,14 @@ const UpdateWarrantModal: React.FC<UpdateWarrantModalProps> = ({ isOpen, onClose
     const [status, setStatus] = useState<WarrantStatus>(warrant.status);
     const [isLoading, setIsLoading] = useState(false);
 
-    useEffect(() => {
+    // Seed/reset the editable form from props when the modal opens or the edited
+    // warrant changes. React-documented "adjust state during render" pattern
+    // (previous-value tracker): behaviour-equivalent to the prior effect, which had
+    // deps [isOpen, warrant] and re-seeded whenever isOpen was true and either input
+    // changed. We re-seed during render on the same input changes, only when isOpen.
+    const [prevSeedKey, setPrevSeedKey] = useState({ isOpen, warrant });
+    if (prevSeedKey.isOpen !== isOpen || prevSeedKey.warrant !== warrant) {
+        setPrevSeedKey({ isOpen, warrant });
         if (isOpen) {
             setTargetRsiHandle(warrant.targetRsiHandle);
             setReason(warrant.reason);
@@ -32,7 +39,7 @@ const UpdateWarrantModal: React.FC<UpdateWarrantModalProps> = ({ isOpen, onClose
             setStatus(warrant.status);
             setIsLoading(false);
         }
-    }, [isOpen, warrant]);
+    }
 
     const handleSubmit = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();

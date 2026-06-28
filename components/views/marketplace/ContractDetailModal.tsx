@@ -42,7 +42,11 @@ const ContractDetailModal: React.FC<{
         }
     }, [rpcAction, contract.id, contract.status]);
 
-    useEffect(() => { loadExtras(); }, [loadExtras]);
+    // Load milestones/ratings on mount and when the contract id/status changes.
+    // loadExtras setStates only after its awaited fetches, so awaiting it from an
+    // async IIFE keeps every update on the post-await path (no synchronous
+    // set-in-effect) — identical timing to a bare loadExtras() call.
+    useEffect(() => { void (async () => { await loadExtras(); })(); }, [loadExtras]);
 
     const act = async (action: string, payload: Record<string, unknown>, okMsg: string) => {
         setBusy(true);

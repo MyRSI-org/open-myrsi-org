@@ -7,29 +7,14 @@ import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
 import { HydratedHRInterview } from '../../../types';
 import { useModalRegistry } from '../../../contexts/ModalRegistryContext';
 
-const MyInterviewsTab: React.FC = () => {
-    const { refreshHR } = useData();
-    const { hrInterviews } = useHR();
-    const { currentUser } = useAuth();
-    const fmt = useFormatDate();
-    const { openConductInterviewModal, openScheduleInterviewModal, openEditInterviewModal } = useModalRegistry();
-    
-    // Ensure we have fresh data
-    useEffect(() => {
-        refreshHR();
-    }, [refreshHR]);
+interface InterviewTableProps {
+    interviews: (HydratedHRInterview & { applicantName?: string })[];
+    fmt: (value: string | null | undefined) => string;
+    openEditInterviewModal: (interview: HydratedHRInterview) => void;
+    openConductInterviewModal: (interview: HydratedHRInterview) => void;
+}
 
-    const myInterviews = useMemo(() => {
-        if (!currentUser) return [];
-        return hrInterviews
-            .filter(int => int.interviewerId === currentUser.id)
-            .sort((a, b) => new Date(a.scheduledAt || 0).getTime() - new Date(b.scheduledAt || 0).getTime());
-    }, [hrInterviews, currentUser]);
-
-    const upcoming = myInterviews.filter(i => i.status !== 'Completed');
-    const past = myInterviews.filter(i => i.status === 'Completed');
-
-    const InterviewTable: React.FC<{ interviews: (HydratedHRInterview & { applicantName?: string })[] }> = ({ interviews }) => (
+const InterviewTable: React.FC<InterviewTableProps> = ({ interviews, fmt, openEditInterviewModal, openConductInterviewModal }) => (
         <div className="bg-slate-900/60 backdrop-blur-md rounded-xl border border-slate-700/50 overflow-hidden">
             <table className="w-full text-left hidden md:table">
                 <thead>
@@ -152,6 +137,28 @@ const MyInterviewsTab: React.FC = () => {
         </div>
     );
 
+const MyInterviewsTab: React.FC = () => {
+    const { refreshHR } = useData();
+    const { hrInterviews } = useHR();
+    const { currentUser } = useAuth();
+    const fmt = useFormatDate();
+    const { openConductInterviewModal, openScheduleInterviewModal, openEditInterviewModal } = useModalRegistry();
+
+    // Ensure we have fresh data
+    useEffect(() => {
+        refreshHR();
+    }, [refreshHR]);
+
+    const myInterviews = useMemo(() => {
+        if (!currentUser) return [];
+        return hrInterviews
+            .filter(int => int.interviewerId === currentUser.id)
+            .sort((a, b) => new Date(a.scheduledAt || 0).getTime() - new Date(b.scheduledAt || 0).getTime());
+    }, [hrInterviews, currentUser]);
+
+    const upcoming = myInterviews.filter(i => i.status !== 'Completed');
+    const past = myInterviews.filter(i => i.status === 'Completed');
+
     return (
         <div className="space-y-6 animate-fade-in">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -172,12 +179,12 @@ const MyInterviewsTab: React.FC = () => {
 
             <div className="space-y-3">
                 <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-1">Upcoming</h3>
-                <InterviewTable interviews={upcoming as any} />
+                <InterviewTable interviews={upcoming as any} fmt={fmt} openEditInterviewModal={openEditInterviewModal} openConductInterviewModal={openConductInterviewModal} />
             </div>
 
             <div className="space-y-3">
                 <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-1">Completed History</h3>
-                <InterviewTable interviews={past as any} />
+                <InterviewTable interviews={past as any} fmt={fmt} openEditInterviewModal={openEditInterviewModal} openConductInterviewModal={openConductInterviewModal} />
             </div>
         </div>
     );

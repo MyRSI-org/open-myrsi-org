@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
 
 import { OpenGraphConfig } from '../../../types';
@@ -12,25 +12,25 @@ const SiteMetadataTab: React.FC = () => {
     const [config, setConfig] = useState<OpenGraphConfig>(openGraphConfig);
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
-    const [imageError, setImageError] = useState(false);
-    const [faviconError, setFaviconError] = useState(false);
-    const [pwaIconError, setPwaIconError] = useState(false);
+    // Track which URL most recently failed to load instead of a plain boolean so
+    // that changing the URL automatically clears the error (no effect needed):
+    // the stored URL no longer matches the current one, so the image re-attempts.
+    const [erroredImageUrl, setErroredImageUrl] = useState<string | null>(null);
+    const [erroredFaviconUrl, setErroredFaviconUrl] = useState<string | null>(null);
+    const [erroredPwaIconUrl, setErroredPwaIconUrl] = useState<string | null>(null);
 
-    useEffect(() => {
+    // Re-sync the editable form when the source-of-truth config changes (e.g.
+    // after a save elsewhere). Done during render via the previous-value pattern
+    // instead of an effect to avoid the extra render the effect would cause.
+    const [prevOpenGraphConfig, setPrevOpenGraphConfig] = useState(openGraphConfig);
+    if (prevOpenGraphConfig !== openGraphConfig) {
+        setPrevOpenGraphConfig(openGraphConfig);
         setConfig(openGraphConfig);
-    }, [openGraphConfig]);
+    }
 
-    useEffect(() => {
-        setImageError(false);
-    }, [config.imageUrl]);
-
-    useEffect(() => {
-        setFaviconError(false);
-    }, [config.faviconUrl]);
-
-    useEffect(() => {
-        setPwaIconError(false);
-    }, [config.pwaIconUrl]);
+    const imageError = erroredImageUrl === config.imageUrl;
+    const faviconError = erroredFaviconUrl === config.faviconUrl;
+    const pwaIconError = erroredPwaIconUrl === config.pwaIconUrl;
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
         setConfig(prev => ({ ...prev, [e.target.name]: e.target.value }));
@@ -154,7 +154,7 @@ const SiteMetadataTab: React.FC = () => {
                                             src={config.faviconUrl} 
                                             alt="Favicon" 
                                             className="max-w-full max-h-full"
-                                            onError={() => setFaviconError(true)} 
+                                            onError={() => setErroredFaviconUrl(config.faviconUrl || null)}
                                         />
                                     ) : (
                                         <i className="fa-solid fa-globe text-slate-500"></i>
@@ -181,7 +181,7 @@ const SiteMetadataTab: React.FC = () => {
                                             src={config.pwaIconUrl} 
                                             alt="App Icon" 
                                             className="w-full h-full object-cover"
-                                            onError={() => setPwaIconError(true)} 
+                                            onError={() => setErroredPwaIconUrl(config.pwaIconUrl || null)}
                                         />
                                     ) : (
                                         <i className="fa-solid fa-mobile-screen text-slate-500 text-lg"></i>
@@ -213,7 +213,7 @@ const SiteMetadataTab: React.FC = () => {
                                    src={config.imageUrl} 
                                    alt="Open Graph Image Preview" 
                                    className="w-full h-full object-cover" 
-                                   onError={() => setImageError(true)}
+                                   onError={() => setErroredImageUrl(config.imageUrl || null)}
                                />
                            ) : (
                                <div className="text-center p-4">

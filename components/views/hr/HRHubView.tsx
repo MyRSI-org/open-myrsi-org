@@ -4,6 +4,7 @@ import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useHR } from '../../../contexts/HRContext';
 import { useAuth } from '../../../contexts/AuthContext';
+import { useNow } from '../../../hooks/useNow';
 import { ApplicationStatus, JobPostingStatus } from '../../../types';
 import HeroShell from '../../shared/ui/HeroShell';
 import HeroStat from '../../shared/ui/HeroStat';
@@ -65,6 +66,7 @@ const HRHubView: React.FC = () => {
     const { refreshHR, isFetching } = useData();
     const { members } = useMembers();
     const { hrApplicants, hrInterviews, hrJobs } = useHR();
+    const now = useNow();
 
     useEffect(() => {
         refreshHR();
@@ -131,12 +133,11 @@ const HRHubView: React.FC = () => {
             ApplicationStatus.Offered,
         ]);
         const openCases = hrApplicants.filter(a => inFlightStatuses.has(a.status as ApplicationStatus)).length;
-        const now = Date.now();
         const pendingInterviews = hrInterviews.filter(i => i.scheduledAt && new Date(i.scheduledAt).getTime() > now && i.status !== 'Completed').length;
         const openVacancies = hrJobs.filter(j => (j.status as JobPostingStatus) === JobPostingStatus.Open).length;
         const probationTracked = members.filter((m: any) => m.probationEnd).length;
         return { openCases, pendingInterviews, openVacancies, probationTracked };
-    }, [hrApplicants, hrInterviews, hrJobs, members]);
+    }, [hrApplicants, hrInterviews, hrJobs, members, now]);
 
     const navGroups = useMemo(() => {
         type NavItem = { id: HRTab; label: string; icon: string; badge?: number; urgent?: boolean };
@@ -229,8 +230,8 @@ const HRHubView: React.FC = () => {
                             onChange={(e) => handleNavTo(e.target.value as HRTab)}
                             className="w-full bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 text-sm font-bold text-white focus:ring-1 focus:ring-emerald-500/50 focus:border-emerald-500/40 outline-hidden appearance-none transition-all"
                         >
-                            {navGroups.map((group, idx) => (
-                                <optgroup key={idx} label={group.title} className="bg-slate-900 text-slate-400">
+                            {navGroups.map((group) => (
+                                <optgroup key={group.title} label={group.title} className="bg-slate-900 text-slate-400">
                                     {group.items.map(item => (
                                         <option key={item.id} value={item.id} className="text-white">{item.label}</option>
                                     ))}
@@ -245,8 +246,8 @@ const HRHubView: React.FC = () => {
 
                 {/* Desktop sidebar */}
                 <div className="hidden lg:flex flex-col shrink-0 w-60 border-r border-slate-800/60 bg-slate-900/40 overflow-y-auto custom-scrollbar py-5 px-3 gap-5">
-                    {navGroups.map((group, idx) => (
-                        <div key={idx} className="space-y-0.5">
+                    {navGroups.map((group) => (
+                        <div key={group.title} className="space-y-0.5">
                             <p className="px-3 text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] mb-1.5">{group.title}</p>
                             {group.items.map(item => (
                                 <NavigationItem

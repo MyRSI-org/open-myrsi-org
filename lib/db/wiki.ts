@@ -256,7 +256,26 @@ export async function updateWikiPage(id: string, payload: WikiPagePayload, userI
     broadcastWikiUpdate(id);
 }
 
-export async function deleteWikiPage(id: string) {
+export async function deleteWikiPage(id: string, actor?: ClearanceUser | null) {
+    // The deleter must be cleared to SEE a page before destroying it — mirrors
+    // updateWikiPage's live-visibility guard. The dispatcher gate is only the
+    // wiki:delete_page permission (held by the default non-Admin Dispatcher
+    // role) with NO per-page clearance, so a clearance-0 holder who learns a
+    // classified page's id (e.g. via the id-only wiki_update broadcast) could
+    // otherwise permanently delete a Level-N / compartmented page they cannot
+    // read. Fetch the LIVE classification + markers and require visibility;
+    // Admins bypass (canViewAllClassifications). Fail closed.
+    const { data: live } = await supabase.from('wiki_pages')
+        .select('classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .eq('id', id)
+        .maybeSingle();
+    if (live) {
+        const liveMarkers = ((live as { wiki_page_limiting_markers?: { marker?: unknown }[] }).wiki_page_limiting_markers || [])
+            .map((m) => m.marker).filter(Boolean);
+        if (!passesClearance(actor, live.classification_level ?? 0, liveMarkers)) {
+            throw new Error('You are not cleared to delete this page.');
+        }
+    }
     // wiki_pages.parent_page_id is ON DELETE SET NULL — deleting a parent
     // re-roots every child ROW. A single-row slice refetch would remove the
     // parent but leave remote clients' children pointing at it (orphaned out
@@ -274,8 +293,30 @@ export async function deleteWikiPage(id: string) {
     broadcastWikiUpdate(childCount && childCount > 0 ? undefined : id);
 }
 
-export async function reorderWikiPages(pages: { id: string; sortOrder: number }[]) {
+export async function reorderWikiPages(pages: { id: string; sortOrder: number }[], actor?: ClearanceUser | null) {
+    // Mirror the per-page clearance guard the other wiki write paths enforce.
+    // The dispatcher gate is wiki:edit_page (held by the default non-Admin
+    // Dispatcher role) with NO per-page clearance, so a clearance-0 editor who
+    // learns classified page ids could otherwise reshuffle/relocate pages they
+    // cannot read. Fetch the LIVE classification + markers for every supplied id
+    // in ONE query and skip any page the actor isn't cleared to see (Admins
+    // bypass via canViewAllClassifications). Fail closed: an id with no fetched
+    // row is treated as not visible. Visible pages reorder exactly as before.
+    const ids = pages.map((p) => p.id);
+    if (ids.length === 0) return;
+    const { data: liveRows } = await supabase.from('wiki_pages')
+        .select('id, classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .in('id', ids);
+    const visibility = new Map<string, { level: number; markers: unknown[] }>();
+    for (const row of (liveRows || []) as Array<{ id: string; classification_level: number | null; wiki_page_limiting_markers?: { marker?: unknown }[] }>) {
+        visibility.set(row.id, {
+            level: row.classification_level ?? 0,
+            markers: (row.wiki_page_limiting_markers || []).map((m) => m.marker).filter(Boolean),
+        });
+    }
     for (const p of pages) {
+        const v = visibility.get(p.id);
+        if (!v || !passesClearance(actor, v.level, v.markers)) continue;
         const query = supabase.from('wiki_pages').update({ sort_order: p.sortOrder }).eq('id', p.id);
         await query;
     }

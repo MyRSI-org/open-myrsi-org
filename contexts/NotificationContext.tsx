@@ -1,4 +1,4 @@
-import React, { createContext, useState, useCallback, useContext, useEffect } from 'react';
+import React, { createContext, useState, useCallback, use, useEffect } from 'react';
 import { ToastVariant } from '../types';
 import { playCachedSound } from '../lib/audioCache';
 
@@ -96,15 +96,11 @@ export interface NotificationContextType {
 const NotificationContext = createContext<NotificationContextType | null>(null);
 
 export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-    const [volume, setVolume] = useState(50);
-    const [toasts, setToasts] = useState<Toast[]>([]);
-
-    useEffect(() => {
+    const [volume, setVolume] = useState(() => {
         const storedVolume = localStorage.getItem('myrsi_volume');
-        if (storedVolume) {
-            setVolume(parseInt(storedVolume, 10));
-        }
-    }, []);
+        return storedVolume ? parseInt(storedVolume, 10) : 50;
+    });
+    const [toasts, setToasts] = useState<Toast[]>([]);
 
     useEffect(() => {
         localStorage.setItem('myrsi_volume', volume.toString());
@@ -201,11 +197,11 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
         closeConfirm,
     };
 
-    return <NotificationContext.Provider value={value}>{children}</NotificationContext.Provider>;
+    return <NotificationContext value={value}>{children}</NotificationContext>;
 };
 
 export const useNotification = () => {
-    const context = useContext(NotificationContext);
+    const context = use(NotificationContext);
     if (!context) {
         throw new Error('useNotification must be used within a NotificationProvider');
     }

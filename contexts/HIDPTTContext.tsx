@@ -1,5 +1,5 @@
 
-import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
+import React, { createContext, use, useState, useCallback, useEffect, useRef } from 'react';
 import { debugLog } from '../lib/debugLog';
 
 // ── Types ──
@@ -35,6 +35,7 @@ interface DevicePTTContextType {
     bindHID: () => Promise<void>;
     cancelBinding: () => void;
     unpair: () => void;
+    subscribePTT: (cb: (active: boolean) => void) => () => void;
 }
 
 const STORAGE_KEY = 'devicePTTBinding';
@@ -79,8 +80,32 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const isSupported = hasGamepadAPI || hasWebHID;
 
     const [isPTTActive, setIsPTTActive] = useState(false);
-    const [pairedDeviceName, setPairedDeviceName] = useState<string | null>(null);
-    const [boundButtonLabel, setBoundButtonLabel] = useState<string | null>(null);
+    // PTT edge pub/sub: consumers register a handler that runs on each press/
+    // release EDGE, instead of watching isPTTActive in an effect (which would be
+    // a set-state-in-effect). The isPTTActive STATE is retained for render
+    // consumers (e.g. RadioWidget ACTIVE/IDLE dot). The edge dedupe here
+    // replaces each consumer's former prevHIDPTTRef guard.
+    const pttSubscribersRef = useRef(new Set<(active: boolean) => void>());
+    const lastPTTRef = useRef(false);
+    const setPTT = useCallback((active: boolean) => {
+        if (lastPTTRef.current === active) return; // edge dedupe
+        lastPTTRef.current = active;
+        setIsPTTActive(active);
+        pttSubscribersRef.current.forEach(cb => cb(active));
+    }, []);
+    const subscribePTT = useCallback((cb: (active: boolean) => void) => {
+        pttSubscribersRef.current.add(cb);
+        return () => { pttSubscribersRef.current.delete(cb); };
+    }, []);
+    const [pairedDeviceName, setPairedDeviceName] = useState<string | null>(() => {
+        const b = loadBinding();
+        if (!b) return null;
+        return b.type === 'gamepad' ? b.gamepadId : b.type === 'hid' ? (b.deviceName || null) : null;
+    });
+    const [boundButtonLabel, setBoundButtonLabel] = useState<string | null>(() => {
+        const b = loadBinding();
+        return b ? formatBindingLabel(b) : null;
+    });
     const [isBinding, setIsBinding] = useState(false);
     const [bindingPrompt, setBindingPrompt] = useState<string | null>(null);
     const [bindingError, setBindingError] = useState<string | null>(null);
@@ -112,10 +137,10 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const gamepads = navigator.getGamepads();
             const gp = gamepads[binding.gamepadIndex];
             if (gp && gp.buttons[binding.buttonIndex]) {
-                setIsPTTActive(gp.buttons[binding.buttonIndex].pressed);
+                setPTT(gp.buttons[binding.buttonIndex].pressed);
             }
         }, GAMEPAD_POLL_MS);
-    }, [stopGamepadPoll]);
+    }, [stopGamepadPoll, setPTT]);
 
     // Start binding-mode gamepad polling: detect which button is pressed
     const startGamepadBindingPoll = useCallback(() => {
@@ -244,9 +269,9 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
         if (data.length > binding.byteIndex) {
             const pressed = (data[binding.byteIndex] & binding.bitMask) !== 0;
-            setIsPTTActive(pressed);
+            setPTT(pressed);
         }
-    }, []);
+    }, [setPTT]);
 
     const cleanupHIDDevice = useCallback(() => {
         if (hidDeviceRef.current) {
@@ -373,11 +398,6 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const binding = loadBinding();
         if (!binding) return;
 
-        setPairedDeviceName(
-            binding.type === 'gamepad' ? binding.gamepadId :
-            binding.type === 'hid' ? (binding.deviceName || null) : null
-        );
-        setBoundButtonLabel(formatBindingLabel(binding));
         bindingRef.current = binding;
 
         if (binding.type === 'gamepad' && hasGamepadAPI) {
@@ -435,7 +455,7 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             if (hidDeviceRef.current && event.device === hidDeviceRef.current) {
                 hidDeviceRef.current = null;
                 setPairedDeviceName(prev => prev ? `${prev} (disconnected)` : null);
-                setIsPTTActive(false);
+                setPTT(false);
             }
         };
 
@@ -455,7 +475,7 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             navigator.hid.removeEventListener('connect', onConnect);
             navigator.hid.removeEventListener('disconnect', onDisconnect);
         };
-    }, [hasWebHID, openHIDDevice]);
+    }, [hasWebHID, openHIDDevice, setPTT]);
 
     // ── Shared actions ──
     const cancelBinding = useCallback(() => {
@@ -485,11 +505,11 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         clearBinding();
         setPairedDeviceName(null);
         setBoundButtonLabel(null);
-        setIsPTTActive(false);
+        setPTT(false);
         setIsBinding(false);
         setBindingPrompt(null);
         setBindingError(null);
-    }, [stopGamepadPoll, cleanupHIDDevice]);
+    }, [stopGamepadPoll, cleanupHIDDevice, setPTT]);
 
     const value: DevicePTTContextType = {
         isSupported,
@@ -503,13 +523,14 @@ export const HIDPTTProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         bindHID,
         cancelBinding,
         unpair,
+        subscribePTT,
     };
 
-    return <HIDPTTContext.Provider value={value}>{children}</HIDPTTContext.Provider>;
+    return <HIDPTTContext value={value}>{children}</HIDPTTContext>;
 };
 
 export const useHIDPTT = () => {
-    const context = useContext(HIDPTTContext);
+    const context = use(HIDPTTContext);
     if (!context) throw new Error('useHIDPTT must be used within HIDPTTProvider');
     return context;
 };

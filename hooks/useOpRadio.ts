@@ -30,7 +30,7 @@ export function useOpRadio(operationId: string): UseOpRadioReturn {
     const { currentUser } = useAuth();
     const { rpcAction } = useData();
     const { brandingConfig } = useConfig();
-    const { isPTTActive } = useHIDPTT();
+    const { subscribePTT } = useHIDPTT();
 
     const [isConnected, setIsConnected] = useState(false);
     const [isConnecting, setIsConnecting] = useState(false);
@@ -47,7 +47,12 @@ export function useOpRadio(operationId: string): UseOpRadioReturn {
     const gainNodesRef = useRef<Map<string, GainNode>>(new Map());
     const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
     const volumeRef = useRef(volume);
-    volumeRef.current = volume;
+    // Keep the ref in sync with volume so async LiveKit event handlers (e.g.
+    // TrackSubscribed) read the latest value without re-subscribing. Synced in
+    // an effect rather than during render so we don't write a ref while rendering.
+    useEffect(() => {
+        volumeRef.current = volume;
+    }, [volume]);
     const squelchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const prevSpeakerCount = useRef(0);
 
@@ -265,16 +270,19 @@ export function useOpRadio(operationId: string): UseOpRadioReturn {
         }
     }, [isConnected, isMuted, isTransmitting, brandingConfig.radioMicCueUrl, brandingConfig.radioSquelchUrl, playSound, startMicMeter, stopMicMeter]);
 
-    // WebHID PTT — triggers handlePTT when external HID device button is pressed/released
-    const prevHIDPTT = useRef(false);
+    // WebHID/gamepad PTT — register a handler on each external PTT edge; setState
+    // lives in the subscription callback (like the keyboard path), not an effect.
+    const handlePTTRef = useRef(handlePTT);
     useEffect(() => {
-        if (isPTTActive !== prevHIDPTT.current) {
-            prevHIDPTT.current = isPTTActive;
+        handlePTTRef.current = handlePTT;
+    });
+    useEffect(() => {
+        return subscribePTT((active) => {
             if (isConnected) {
-                handlePTT(isPTTActive);
+                handlePTTRef.current(active);
             }
-        }
-    }, [isPTTActive, isConnected, handlePTT]);
+        });
+    }, [subscribePTT, isConnected]);
 
     // Volume updates for gain nodes
     useEffect(() => {
@@ -285,6 +293,8 @@ export function useOpRadio(operationId: string): UseOpRadioReturn {
 
     // Auto-disconnect on unmount
     useEffect(() => {
+        const gainNodes = gainNodesRef.current;
+        const audioElements = audioElementsRef.current;
         return () => {
             const room = roomRef.current;
             if (room) {
@@ -299,12 +309,10 @@ export function useOpRadio(operationId: string): UseOpRadioReturn {
                 micMeterRef.current.dispose();
                 micMeterRef.current = null;
             }
-            gainNodesRef.current.forEach(node => node.disconnect());
-            // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: cleanup reads the live ref at unmount, which is the exact set of nodes still alive at teardown; the linter's "copy to local var" suggestion would freeze an early snapshot.
-            gainNodesRef.current.clear();
-            audioElementsRef.current.forEach(el => { el.pause(); el.remove(); });
-            // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: same live-ref-at-unmount rationale as gainNodesRef above.
-            audioElementsRef.current.clear();
+            gainNodes.forEach(node => node.disconnect());
+            gainNodes.clear();
+            audioElements.forEach(el => { el.pause(); el.remove(); });
+            audioElements.clear();
         };
     }, []);
 

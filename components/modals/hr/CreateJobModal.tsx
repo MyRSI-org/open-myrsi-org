@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useId, useRef, useState, useCallback } from 'react';
 import { JobPosting, JobPostingStatus } from '../../../types';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
@@ -15,44 +15,79 @@ interface CreateJobModalProps {
     job?: JobPosting;
 }
 
+// Requirements are stored as a plain string[] on the wire. Internally we wrap
+// each in a stable client-only id so the editable chip list has a key that does
+// not change when items are inserted/removed (an array index would). The id is
+// never sent to the server — handleSubmit maps back to string[].
+interface DraftRequirement {
+    id: string;
+    value: string;
+}
+
 const CreateJobModal: React.FC<CreateJobModalProps> = ({ isOpen, onClose, job }) => {
     const { rpcAction } = useData();
     const { units } = useMembers();
     const { hrPositions, setHrJobs } = useHR();
     const { currentUser } = useAuth();
     const { addToast } = useNotification();
-    const [title, setTitle] = useState('');
-    const [department, setDepartment] = useState('');
-    const [description, setDescription] = useState('');
+
+    // Stable per-mount prefix for requirement keys (pure to read during render).
+    const reqKeyBaseId = useId();
+    // Seeded items get a deterministic id from their position in the seed list
+    // (pure — no ref/random during render). Runtime-added items get a unique id
+    // from a counter read only inside event handlers (ref access is allowed there).
+    const runtimeReqCounterRef = useRef(0);
+    const wrapRequirements = (reqs: string[]): DraftRequirement[] =>
+        reqs.map((value, index) => ({ id: `${reqKeyBaseId}-s${index}`, value }));
+    const mintRuntimeReqId = () => `${reqKeyBaseId}-r${runtimeReqCounterRef.current++}`;
+
+    // Form state seeded from the job prop (edit) or empty (create). The modal is
+    // mounted fresh each time it opens (parent gates it with `isOpen &&`), so the
+    // lazy initializers below run once per open — equivalent to the old on-open
+    // effect. The render-time re-seed (prevIsOpen/prevJob) below preserves the
+    // old effect's behavior should isOpen/job change while mounted.
+    const [title, setTitle] = useState(() => (job ? job.title : ''));
+    const [department, setDepartment] = useState(() => (job ? job.department : ''));
+    const [description, setDescription] = useState(() => (job ? job.description : ''));
     const [reqInput, setReqInput] = useState('');
-    const [requirements, setRequirements] = useState<string[]>([]);
-    const [positionId, setPositionId] = useState<string>('');
+    const [requirements, setRequirements] = useState<DraftRequirement[]>(() => (job ? wrapRequirements(job.requirements) : []));
+    const [positionId, setPositionId] = useState<string>(() => (job ? job.positionId?.toString() || '' : ''));
     const [isLoading, setIsLoading] = useState(false);
     const isEditing = !!job;
 
-    useEffect(() => {
-        if (isOpen) {
-            if (job) {
-                setTitle(job.title);
-                setDepartment(job.department);
-                setDescription(job.description);
-                setRequirements(job.requirements);
-                setPositionId(job.positionId?.toString() || '');
-            } else {
-                setTitle('');
-                setDepartment('');
-                setDescription('');
-                setRequirements([]);
-                setPositionId('');
-            }
-            setIsLoading(false);
+    // Adjust-state-during-render replacement for the old on-open (re)initialization
+    // effect. Re-seeds the form when the modal transitions to open or the job prop
+    // changes while open — same fields, values and guard (isOpen) as before.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    const [prevJob, setPrevJob] = useState(job);
+    if (isOpen && (isOpen !== prevIsOpen || job !== prevJob)) {
+        setPrevIsOpen(isOpen);
+        setPrevJob(job);
+        if (job) {
+            setTitle(job.title);
+            setDepartment(job.department);
+            setDescription(job.description);
+            setRequirements(wrapRequirements(job.requirements));
+            setPositionId(job.positionId?.toString() || '');
+        } else {
+            setTitle('');
+            setDepartment('');
+            setDescription('');
+            setRequirements([]);
+            setPositionId('');
         }
-    }, [isOpen, job]);
+        setIsLoading(false);
+    } else if (isOpen !== prevIsOpen || job !== prevJob) {
+        // isOpen is falsy: track the prop change without re-seeding, matching the
+        // old effect which only ran its body when isOpen was truthy.
+        setPrevIsOpen(isOpen);
+        setPrevJob(job);
+    }
 
     const handleAddReq = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter' && reqInput.trim()) {
             e.preventDefault();
-            setRequirements([...requirements, reqInput.trim()]);
+            setRequirements([...requirements, { id: mintRuntimeReqId(), value: reqInput.trim() }]);
             setReqInput('');
         }
     };
@@ -83,7 +118,7 @@ const CreateJobModal: React.FC<CreateJobModalProps> = ({ isOpen, onClose, job })
             title: title.trim(),
             department: department.trim(),
             description: description.trim(),
-            requirements,
+            requirements: requirements.map(r => r.value),
             status: job?.status || JobPostingStatus.Open,
             userId: currentUser?.id,
             positionId: positionId ? parseInt(positionId) : undefined
@@ -188,12 +223,12 @@ const CreateJobModal: React.FC<CreateJobModalProps> = ({ isOpen, onClose, job })
                                 className={inputClass}
                                 disabled={isLoading}
                             />
-                            <button type="button" onClick={() => { if (reqInput.trim()) { setRequirements([...requirements, reqInput.trim()]); setReqInput(''); } }} className="px-4 bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 rounded-lg hover:bg-emerald-500/20 transition-colors"><i className="fa-solid fa-plus"></i></button>
+                            <button type="button" onClick={() => { if (reqInput.trim()) { setRequirements([...requirements, { id: mintRuntimeReqId(), value: reqInput.trim() }]); setReqInput(''); } }} className="px-4 bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 rounded-lg hover:bg-emerald-500/20 transition-colors"><i className="fa-solid fa-plus"></i></button>
                         </div>
                         <div className="flex flex-wrap gap-2">
                             {requirements.map((req, i) => (
-                                <span key={i} className="bg-slate-900 text-slate-300 text-[10px] font-bold px-3 py-1 rounded-sm border border-slate-700 flex items-center">
-                                    {req}
+                                <span key={req.id} className="bg-slate-900 text-slate-300 text-[10px] font-bold px-3 py-1 rounded-sm border border-slate-700 flex items-center">
+                                    {req.value}
                                     <button type="button" onClick={() => removeReq(i)} className="ml-2 text-slate-500 hover:text-red-400 transition-colors"><i className="fa-solid fa-xmark"></i></button>
                                 </span>
                             ))}

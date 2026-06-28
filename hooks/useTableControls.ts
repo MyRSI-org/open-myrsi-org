@@ -46,7 +46,7 @@ export const useTableControls = <T extends Record<string, any>>(
             if (aValue === null || aValue === undefined) return 1;
             if (bValue === null || bValue === undefined) return -1;
             
-            let comparison = 0;
+            let comparison: number;
             if (typeof aValue === 'number' && typeof bValue === 'number') {
                 comparison = aValue - bValue;
             } else if (typeof aValue === 'object' && aValue !== null && 'name' in aValue) {

@@ -2,6 +2,7 @@
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import DOMPurify from 'dompurify';
+import parse from 'html-react-parser';
 import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
 import { useRequests } from '../../../contexts/RequestsContext';
 import { useData } from '../../../contexts/DataContext';
@@ -39,6 +40,27 @@ const DashboardCard: React.FC<{ children: React.ReactNode, className?: string, t
         <div className="p-5 grow overflow-y-auto custom-scrollbar relative">
             {children}
         </div>
+    </div>
+);
+
+const SectionHeader: React.FC<{ title: string; icon: string; count?: number; viewAllTarget?: string; onViewAll?: (view: string) => void }> = ({ title, icon, count, viewAllTarget, onViewAll }) => (
+    <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center">
+                <i className={`${icon} text-sm text-slate-400`}></i>
+            </div>
+            <h3 className="font-bold text-white text-sm uppercase tracking-wider">{title}</h3>
+            {count !== undefined && count > 0 && (
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-sky-500/20 text-sky-400 border border-sky-500/30">
+                    {count}
+                </span>
+            )}
+        </div>
+        {viewAllTarget && onViewAll && (
+            <button onClick={() => onViewAll(viewAllTarget)} className="text-[10px] font-bold text-slate-500 hover:text-sky-400 uppercase tracking-wider transition-colors">
+                View All <i className="fa-solid fa-arrow-right ml-1"></i>
+            </button>
+        )}
     </div>
 );
 
@@ -239,12 +261,15 @@ const QuickRequestForm: React.FC = () => {
         refreshRequests();
     }, [refreshMainState, refreshRequests]);
 
-    // Reset to a valid service type when the loaded types change.
-    useEffect(() => {
-        if (activeServiceTypes.length > 0 && !activeServiceTypes.find(t => t.name === serviceType)) {
-            setServiceType(activeServiceTypes[0].name);
-        }
-    }, [activeServiceTypes, serviceType]);
+    // Clamp the user-selected service type to a valid option when the loaded
+    // list changes. serviceType is editable state used by handleSubmit, so it
+    // cannot be purely derived. Adjusting it during render (React's documented
+    // pattern) is behavior-equivalent to the old effect: the guard only fires
+    // when the current selection is invalid, and re-seeding it to a member of
+    // the list makes the guard false on the next render, so this terminates.
+    if (activeServiceTypes.length > 0 && !activeServiceTypes.find(t => t.name === serviceType)) {
+        setServiceType(activeServiceTypes[0].name);
+    }
 
     const onDutyCount = useMemo(() => members.filter(m => m.isDuty).length, [members]);
 
@@ -371,8 +396,11 @@ const QuickRequestForm: React.FC = () => {
                                 className="prose prose-invert prose-sm max-w-none 
                                 prose-headings:text-sky-300 prose-headings:uppercase prose-headings:font-bold
                                 prose-p:text-slate-300 prose-li:text-slate-300"
-                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(brandingConfig.termsOfService || '<p>Terms of Service not configured.</p>') }}
-                            />
+                            >
+                                {/* DOMPurify-sanitized, then rendered to React elements via
+                                    html-react-parser — no raw HTML injection. */}
+                                {parse(DOMPurify.sanitize(brandingConfig.termsOfService || '<p>Terms of Service not configured.</p>'))}
+                            </div>
                         </div>
                         <div className="p-5 border-t border-slate-700 bg-slate-900/50 rounded-b-xl flex justify-end">
                             <button
@@ -441,27 +469,6 @@ const StaffDashboard: React.FC<{
         hasPermission('warrant:create') && { label: 'Caution', icon: 'fa-triangle-exclamation', accent: 'rose' as const, onClick: () => openCreateWarrantModal() },
     ].filter(Boolean) as QuickAction[]), [hasPermission, setIsCreateModalOpen, setIsAdHocModalOpen, openCreateIntelWindow, setShowCreateBulletinModal, openCreateWarrantModal]);
 
-    const SectionHeader: React.FC<{ title: string; icon: string; count?: number; viewAllTarget?: string }> = ({ title, icon, count, viewAllTarget }) => (
-        <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center">
-                    <i className={`${icon} text-sm text-slate-400`}></i>
-                </div>
-                <h3 className="font-bold text-white text-sm uppercase tracking-wider">{title}</h3>
-                {count !== undefined && count > 0 && (
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-sky-500/20 text-sky-400 border border-sky-500/30">
-                        {count}
-                    </span>
-                )}
-            </div>
-            {viewAllTarget && (
-                <button onClick={() => setActiveView(viewAllTarget)} className="text-[10px] font-bold text-slate-500 hover:text-sky-400 uppercase tracking-wider transition-colors">
-                    View All <i className="fa-solid fa-arrow-right ml-1"></i>
-                </button>
-            )}
-        </div>
-    );
-
     return (
         <div className="space-y-6">
             {/* Hides itself when nothing pending */}
@@ -483,7 +490,7 @@ const DashboardView: React.FC<{ openRateRequestModal: (req: HydratedServiceReque
     const { hrApplicants } = useHR();
     const { activeBulletins, deleteBulletin } = useIntel();
     const { setActiveView } = useNavigation();
-    const [currentTime, setCurrentTime] = useState(new Date());
+    const [currentTime, setCurrentTime] = useState(() => new Date());
     const [isApplyModalOpen, setIsApplyModalOpen] = useState(false);
 
     useEffect(() => {

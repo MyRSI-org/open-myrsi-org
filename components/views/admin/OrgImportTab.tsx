@@ -1,5 +1,5 @@
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { useNotification } from '../../../contexts/NotificationContext';
 import { TabPageHeader } from '../../shared/ui';
 import apiService from '../../../services/apiService';
@@ -57,7 +57,11 @@ const OrgImportTab: React.FC = () => {
     const [users, setUsers] = useState<ImportUserOption[]>([]);
     const [mergeUserId, setMergeUserId] = useState<number | null>(null);
     const [pct, setPct] = useState(0);
-    const [logLines, setLogLines] = useState<string[]>([]);
+    // Append-only progress log. Each line gets a stable client-only id minted on append
+    // (lines are never reordered/removed and can repeat), so we never key on the array index.
+    // The id is display-only and is never part of any request payload.
+    const [logLines, setLogLines] = useState<{ id: number; text: string }[]>([]);
+    const logIdRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Light client-side sniff: read ONLY the first line for the header preview.
@@ -101,6 +105,14 @@ const OrgImportTab: React.FC = () => {
         ? header.tableOrder.filter((t) => (header.manifest[t] || 0) > 0)
         : [];
 
+    // Server-provided warnings are display-only and set once per import; mint a stable
+    // client-only id per row (recomputed only when `result` changes) so the list isn't keyed
+    // by array index. These ids never touch the wire shape — `result.warnings` is untouched.
+    const warningRows = useMemo(
+        () => (result ? result.warnings.slice(0, 50).map((text) => ({ id: crypto.randomUUID(), text })) : []),
+        [result],
+    );
+
     const handleImport = async () => {
         if (!ndjson || !header) return;
         const confirmed = await confirm({
@@ -116,7 +128,7 @@ const OrgImportTab: React.FC = () => {
         if (!confirmed) return;
 
         setIsImporting(true); setResult(null); setPct(0); setLogLines([]);
-        const pushLog = (line: string) => setLogLines((l) => [...l, line]);
+        const pushLog = (line: string) => setLogLines((l) => [...l, { id: logIdRef.current++, text: line }]);
         try {
             await apiService.importOrgStream(ndjson, (evt: any) => {
                 if (evt.type === 'start') pushLog(`Importing ${evt.totalRows.toLocaleString()} rows across ${evt.totalTables} tables…`);
@@ -240,7 +252,7 @@ const OrgImportTab: React.FC = () => {
                                         <div className={`h-full ${result ? 'bg-emerald-500' : 'bg-sky-500'} transition-all duration-300`} style={{ width: `${pct}%` }} />
                                     </div>
                                     <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-700/40 bg-slate-950 p-2 font-mono text-[10px] text-slate-400 space-y-0.5">
-                                        {logLines.map((l, i) => <div key={i} className={l.startsWith('⚠') ? 'text-amber-400' : l.startsWith('✗') ? 'text-rose-400' : ''}>{l}</div>)}
+                                        {logLines.map((l) => <div key={l.id} className={l.text.startsWith('⚠') ? 'text-amber-400' : l.text.startsWith('✗') ? 'text-rose-400' : ''}>{l.text}</div>)}
                                     </div>
                                 </div>
                             )}
@@ -255,7 +267,7 @@ const OrgImportTab: React.FC = () => {
                                 <details className="mt-1">
                                     <summary className="cursor-pointer text-amber-300">{result.warnings.length} warning(s)</summary>
                                     <ul className="mt-1 list-disc list-inside text-amber-200/80 space-y-0.5">
-                                        {result.warnings.slice(0, 50).map((w, i) => <li key={i}>{w}</li>)}
+                                        {warningRows.map((w) => <li key={w.id}>{w.text}</li>)}
                                     </ul>
                                 </details>
                             )}

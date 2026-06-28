@@ -64,10 +64,11 @@ const WikiToolbar: React.FC<WikiToolbarProps> = ({ editor }) => {
     // useEditor only re-renders on content changes, so editor.isActive('table')
     // (and the bold/italic active states) stay stale until the user types.
     // That made the contextual table toolbar appear seconds late.
-    const [, forceRender] = useState(0);
+    // renderTick value is intentionally unused; this state exists only to force a re-render via its setter.
+    const [renderTick, setRenderTick] = useState(0);
     useEffect(() => {
         if (!editor) return;
-        const handler = () => forceRender((n) => n + 1);
+        const handler = () => setRenderTick((n) => n + 1);
         editor.on('selectionUpdate', handler);
         editor.on('transaction', handler);
         return () => {

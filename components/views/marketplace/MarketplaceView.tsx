@@ -60,7 +60,11 @@ const MarketplaceView: React.FC = () => {
         }
     }, []);
 
-    useEffect(() => { load(); }, [load]);
+    // Mount fetch. load setStates only after its awaited subset fetch (or in
+    // finally), so awaiting it from an async IIFE keeps every update on the
+    // post-await path (no synchronous set-in-effect). `loading` initialises to
+    // true, so the spinner shows on mount with no extra render pass.
+    useEffect(() => { void (async () => { await load(); })(); }, [load]);
 
     // Realtime nudge → coalesced refetch.
     useEffect(() => {

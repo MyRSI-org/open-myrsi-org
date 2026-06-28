@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
@@ -10,6 +10,9 @@ import { TabPageHeader } from '../../shared/ui';
 import { useNotification } from '../../../contexts/NotificationContext';
 
 interface ProgressLine {
+    // Stable client-only id minted when the line is appended. Used solely as the
+    // React list key for this append-only log; it is never sent to the server.
+    id: string;
     message: string;
     type: 'info' | 'success' | 'error' | 'warning';
 }
@@ -37,7 +40,10 @@ const IntelligenceManagementTab: React.FC = () => {
 
     // API & Feed States
     const [keys, setKeys] = useState<ApiKey[]>([]);
-    const [isLoadingKeys, setIsLoadingKeys] = useState(false);
+    // Initialised true: the mount-time fetch below is always in flight on first
+    // render, so the loading flag starts raised rather than being set synchronously
+    // inside the effect. The async fetch lowers it in its finally.
+    const [isLoadingKeys, setIsLoadingKeys] = useState(true);
 
     const [newKeyLabel, setNewKeyLabel] = useState('');
     const [justCreatedKey, setJustCreatedKey] = useState<{ label: string, key: string } | null>(null);
@@ -46,8 +52,13 @@ const IntelligenceManagementTab: React.FC = () => {
     const [maxShareableClearance, setMaxShareableClearance] = useState(0);
     const [isSavingShareConfig, setIsSavingShareConfig] = useState(false);
 
-    const fetchData = async () => {
-        setIsLoadingKeys(true);
+    // Loads the API keys list + intel-sharing config. Does NOT raise the loading
+    // flag itself: on mount the flag is already initialised true, and the
+    // event-handler callers below raise it explicitly before invoking a refresh.
+    // Keeping the synchronous set out of here means the mount effect performs no
+    // synchronous setState. Memoised on rpcAction (a stable useCallback from
+    // context) so its identity is stable and the mount effect runs exactly once.
+    const fetchData = useCallback(async () => {
         try {
             const [keysData, sharingConfig] = await Promise.all([
                 rpcAction('api:list_keys', {}),
@@ -62,19 +73,26 @@ const IntelligenceManagementTab: React.FC = () => {
         } finally {
             setIsLoadingKeys(false);
         }
-    };
+    }, [rpcAction]);
 
     useEffect(() => {
-        fetchData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional mount-once fetch; fetchData is an inline helper that closes over current state at call time.
-    }, []);
+        // Mount external-data fetch. isLoadingKeys is initialised true, so this
+        // path performs no synchronous setState — the fetch and all of its result
+        // sets run after the first await inside fetchData. fetchData's identity is
+        // stable (memoised on the stable rpcAction), so this runs once on mount.
+        void (async () => { await fetchData(); })();
+    }, [fetchData]);
 
     useEffect(() => {
         progressEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [progressLines]);
 
     const addProgress = (message: string, type: ProgressLine['type'] = 'info') => {
-        setProgressLines(prev => [...prev, { message, type }]);
+        // Mint a stable client-only id for the React list key. Generated here (in
+        // a handler/async context, never during render) so each appended log line
+        // carries a unique, non-reordering key. The id never leaves the client.
+        const id = crypto.randomUUID();
+        setProgressLines(prev => [...prev, { id, message, type }]);
     };
 
     const openModal = (title: string, icon: string) => {
@@ -144,6 +162,7 @@ const IntelligenceManagementTab: React.FC = () => {
                 if (newWarrants > 0) parts.push(`${newWarrants} caution note(s)`);
                 if (newBulletins > 0) parts.push(`${newBulletins} bulletin(s)`);
                 addProgress(`Total ingested: ${parts.join(', ')}`, 'success');
+                setIsLoadingKeys(true);
                 fetchData();
             } else {
                 addProgress('No new records were ingested across all feeds.', 'warning');
@@ -461,8 +480,8 @@ const IntelligenceManagementTab: React.FC = () => {
                             )}
                         </div>
                         <div className="p-5 max-h-96 overflow-y-auto custom-scrollbar font-mono text-xs space-y-1.5">
-                            {progressLines.map((line, i) => (
-                                <div key={i} className={`flex items-start gap-2 ${
+                            {progressLines.map((line) => (
+                                <div key={line.id} className={`flex items-start gap-2 ${
                                     line.type === 'error' ? 'text-red-400' :
                                     line.type === 'success' ? 'text-green-400' :
                                     line.type === 'warning' ? 'text-amber-400' :

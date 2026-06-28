@@ -104,7 +104,7 @@ import servicesFn, { validatePermissionMap } from './api/services.js';
 import queryFn from './api/query.js';
 import swFn from './api/sw.js';
 import publicFn from './api/public.js';
-import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allianceGetSelfProfile, verifyApiKey as allianceVerifyApiKey, getAlliancePeerByInboundKey as allianceGetPeerByInboundKey, getAllianceShareableData as allianceGetShareableData,
+import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allianceGetSelfProfile, getAlliancePeerByInboundKey as allianceGetPeerByInboundKey, getAllianceShareableData as allianceGetShareableData,
     getOperationSnapshotForPeer, getOperationManifestForPeer, acceptInviteForPeer, declineInviteForPeer, upsertAlliedParticipant, removeAlliedParticipant,
     receiveMirrorInvite, receiveMirrorPush, receiveMirrorRevoke,
     getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, getPlatformSettings } from './lib/db.js';
@@ -499,9 +499,17 @@ app.get('/api/alliance/profile', allianceLimiter, async (req, res) => {
     noStore(res);
     try {
         const key = req.headers['x-api-key'];
-        const verified = typeof key === 'string' ? await allianceVerifyApiKey(key) : null;
-        if (!verified) return res.status(403).json({ error: 'forbidden' });
-        res.json(await allianceGetSelfProfile());
+        // Gate identically to every other inbound federation route: the caller
+        // must resolve to an Active alliance_peers row. A raw api_keys hash match
+        // (verifyApiKey) would also admit manual / legacy intel-feed keys that
+        // were never an alliance peer, leaking the self-profile to non-allies.
+        const peer = typeof key === 'string' ? await allianceGetPeerByInboundKey(key) : null;
+        if (!peer) return res.status(403).json({ error: 'forbidden' });
+        const profile = await allianceGetSelfProfile();
+        // Honor the operator's directory-visibility choice: if the org opted out
+        // of exposing its contact card, return a minimal card even to allies.
+        if (!profile.directoryVisible) return res.json({ orgName: '', directoryVisible: false });
+        res.json(profile);
     } catch (e) {
         log.error('alliance profile error', { err: e });
         if (!res.headersSent) res.status(500).json({ error: 'profile_failed' });

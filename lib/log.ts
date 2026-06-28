@@ -48,10 +48,23 @@ export interface Logger {
 
 // Any field whose name looks like a secret (top-level or nested) is replaced with
 // '[REDACTED]' before it's written. Callers should still avoid logging secrets;
-// this is a backstop, depth-capped, so one stray log.error('x', { botToken }) can't
-// dump a credential into the logs.
+// this is a backstop so one stray log.error('x', { botToken }) can't dump a
+// credential into the logs. The walk is depth-bounded, but the bound fails closed
+// (a subtree past the cap is redacted wholesale rather than emitted raw) and
+// free-form strings (Error message/stack, stringified instances) are value-scanned.
 const SECRET_KEY_RE = /(authorization|secret|password|cookie|token|api[_-]?key|client[_-]?secret|bot[_-]?token|private[_-]?key|credential)/i;
-const REDACT_MAX_DEPTH = 4;
+const REDACT_MAX_DEPTH = 8;
+
+// Matches a secret-looking value embedded in a free-form string — e.g. a token
+// pasted into an Error message/stack, or a credential carried on a stringified
+// instance. Catches `Bearer <tok>` and `<keyword><sep><value>` (optionally a
+// bearer token), so the value (not just the label) is removed. Global so every
+// occurrence in the string is scrubbed.
+const SECRET_VALUE_RE = /\b(?:bearer\s+[^\s]+|(?:authorization|api[_-]?key|client[_-]?secret|bot[_-]?token|private[_-]?key|secret|password|token|credential)[\s:="']+(?:bearer\s+)?[^\s,;]+)/gi;
+
+function scrubSecretValues(s: string): string {
+    return s.replace(SECRET_VALUE_RE, '[REDACTED]');
+}
 
 function isPlainObject(v: object): boolean {
     const proto = Object.getPrototypeOf(v);
@@ -60,11 +73,18 @@ function isPlainObject(v: object): boolean {
 
 function serializeField(v: unknown, depth = 0): unknown {
     if (v instanceof Error) {
-        return { name: v.name, message: v.message, stack: v.stack };
+        // Error strings can carry a credential (e.g. an upstream "401: Bearer …"
+        // body); scrub the value-patterns out of both message and stack.
+        return {
+            name: v.name,
+            message: scrubSecretValues(v.message),
+            stack: typeof v.stack === 'string' ? scrubSecretValues(v.stack) : v.stack,
+        };
     }
-    // Only walk arrays and plain objects (let Date/Buffer/class instances serialize
-    // as before), redacting any secret-named keys along the way.
-    if (v && typeof v === 'object' && depth < REDACT_MAX_DEPTH) {
+    if (v && typeof v === 'object') {
+        // Past the cap, never emit a raw subtree (it could still hold secret-named
+        // keys) — collapse it to a sentinel. This also bounds cyclic structures.
+        if (depth >= REDACT_MAX_DEPTH) return '[REDACTED:depth]';
         if (Array.isArray(v)) return v.map((item) => serializeField(item, depth + 1));
         if (isPlainObject(v as object)) {
             const out: Record<string, unknown> = {};
@@ -73,6 +93,12 @@ function serializeField(v: unknown, depth = 0): unknown {
             }
             return out;
         }
+        // Date/Buffer keep their native JSON form. Any other non-plain object
+        // (Map/Set/class instance) is coerced to a scrubbed string so an own-property
+        // secret can't ride along untouched via JSON.stringify.
+        if (v instanceof Date) return v;
+        if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v)) return v;
+        return scrubSecretValues(String(v));
     }
     return v;
 }

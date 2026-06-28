@@ -21,6 +21,43 @@ const getTypeColor = (type: OperationType) => {
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+interface OpBlockProps {
+    op: HydratedOperation;
+    compact?: boolean;
+    viewOperationDetails: (op: HydratedOperation) => void;
+    formatTime: (dateStr: string) => string;
+}
+
+const OpBlock: React.FC<OpBlockProps> = ({ op, compact, viewOperationDetails, formatTime }) => {
+    const colors = getTypeColor(op.type);
+    const activeParticipants = op.participants.filter(p => p.timeLeft === null).length;
+    const accepted = op.participants.filter(p => p.rsvpStatus === 'Accepted').length;
+    const isConcluded = op.status === OperationStatus.Concluded;
+    const displayTime = op.scheduledStart || op.activeStartTime;
+
+    return (
+        <div
+            onClick={(e) => { e.stopPropagation(); viewOperationDetails(op); }}
+            className={`${colors.bg} ${colors.border} border rounded-md cursor-pointer hover:brightness-125 transition-all ${compact ? 'px-1.5 py-0.5' : 'px-2 py-1.5'} ${isConcluded ? 'opacity-40' : ''}`}
+        >
+            <div className="flex items-center gap-1.5 min-w-0">
+                <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${colors.dot} ${op.status === OperationStatus.Active ? 'animate-pulse' : ''}`}></div>
+                <span className={`${colors.text} font-bold truncate ${compact ? 'text-[9px]' : 'text-[10px]'}`}>
+                    {compact ? op.name : `${displayTime ? formatTime(displayTime) : ''} ${op.name}`}
+                </span>
+            </div>
+            {!compact && (
+                <div className="flex items-center gap-2 mt-0.5 ml-3">
+                    <span className="text-[9px] text-slate-500">
+                        <i className="fa-solid fa-users mr-0.5"></i>{accepted > 0 ? `${accepted} RSVP` : `${activeParticipants} PAX`}
+                    </span>
+                    {isConcluded && <span className="text-[9px] text-slate-600 italic">Concluded</span>}
+                </div>
+            )}
+        </div>
+    );
+};
+
 interface OperationsCalendarViewProps {
     operations: HydratedOperation[];
 }
@@ -31,7 +68,7 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
     const { updateOperationStatus } = useOperations();
     const fmt = useFormatDate();
     const [viewMode, setViewMode] = useState<'month' | 'week' | 'day'>('month');
-    const [currentDate, setCurrentDate] = useState(new Date());
+    const [currentDate, setCurrentDate] = useState(() => new Date());
 
     // Include both scheduled ops and active ops (on their active start date)
     const calendarOps = useMemo(() => {
@@ -101,35 +138,11 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
 
     const formatTime = (dateStr: string) => fmt.time(dateStr);
 
-    const OpBlock: React.FC<{ op: HydratedOperation; compact?: boolean }> = ({ op, compact }) => {
-        const colors = getTypeColor(op.type);
-        const activeParticipants = op.participants.filter(p => p.timeLeft === null).length;
-        const accepted = op.participants.filter(p => p.rsvpStatus === 'Accepted').length;
-        const isConcluded = op.status === OperationStatus.Concluded;
-        const displayTime = op.scheduledStart || op.activeStartTime;
-
-        return (
-            <div
-                onClick={(e) => { e.stopPropagation(); viewOperationDetails(op); }}
-                className={`${colors.bg} ${colors.border} border rounded-md cursor-pointer hover:brightness-125 transition-all ${compact ? 'px-1.5 py-0.5' : 'px-2 py-1.5'} ${isConcluded ? 'opacity-40' : ''}`}
-            >
-                <div className="flex items-center gap-1.5 min-w-0">
-                    <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${colors.dot} ${op.status === OperationStatus.Active ? 'animate-pulse' : ''}`}></div>
-                    <span className={`${colors.text} font-bold truncate ${compact ? 'text-[9px]' : 'text-[10px]'}`}>
-                        {compact ? op.name : `${displayTime ? formatTime(displayTime) : ''} ${op.name}`}
-                    </span>
-                </div>
-                {!compact && (
-                    <div className="flex items-center gap-2 mt-0.5 ml-3">
-                        <span className="text-[9px] text-slate-500">
-                            <i className="fa-solid fa-users mr-0.5"></i>{accepted > 0 ? `${accepted} RSVP` : `${activeParticipants} PAX`}
-                        </span>
-                        {isConcluded && <span className="text-[9px] text-slate-600 italic">Concluded</span>}
-                    </div>
-                )}
-            </div>
-        );
-    };
+    const dayOps = getOpsForDate(currentDate).slice().sort((a, b) => {
+        const aTime = a.scheduledStart || a.activeStartTime || '';
+        const bTime = b.scheduledStart || b.activeStartTime || '';
+        return new Date(aTime).getTime() - new Date(bTime).getTime();
+    });
 
     return (
         <div className="flex flex-col h-full bg-slate-900/60 backdrop-blur-md border border-slate-700/50 rounded-xl overflow-hidden">
@@ -186,11 +199,11 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                         ))}
                     </div>
                     <div className="grid grid-cols-7 flex-1 auto-rows-fr gap-px bg-slate-800/30 rounded-lg overflow-hidden">
-                        {monthDays.map(({ date, isCurrentMonth }, i) => {
+                        {monthDays.map(({ date, isCurrentMonth }) => {
                             const dayOps = getOpsForDate(date);
                             return (
                                 <div
-                                    key={i}
+                                    key={date.toISOString()}
                                     onClick={() => { setCurrentDate(date); setViewMode('day'); }}
                                     className={`p-1.5 border border-slate-800/50 min-h-[80px] cursor-pointer transition-colors ${
                                         isCurrentMonth ? 'bg-slate-900/40 hover:bg-slate-800/60' : 'bg-slate-950/40 opacity-40'
@@ -201,7 +214,7 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                                     </span>
                                     <div className="mt-1 space-y-0.5 overflow-hidden">
                                         {dayOps.slice(0, 3).map(op => (
-                                            <OpBlock key={op.id} op={op} compact />
+                                            <OpBlock key={op.id} op={op} compact viewOperationDetails={viewOperationDetails} formatTime={formatTime} />
                                         ))}
                                         {dayOps.length > 3 && (
                                             <span className="text-[9px] text-slate-500 font-bold">+{dayOps.length - 3} more</span>
@@ -220,14 +233,14 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                         {weekDays.map((date, i) => {
                             const dayOps = getOpsForDate(date);
                             return (
-                                <div key={i} className={`flex flex-col rounded-xl border ${isToday(date) ? 'border-purple-500/50 bg-purple-500/5 shadow-lg shadow-purple-900/20' : 'border-slate-700/50 bg-slate-900/60'}`}>
+                                <div key={date.toISOString()} className={`flex flex-col rounded-xl border ${isToday(date) ? 'border-purple-500/50 bg-purple-500/5 shadow-lg shadow-purple-900/20' : 'border-slate-700/50 bg-slate-900/60'}`}>
                                     <div className={`text-center py-2 border-b ${isToday(date) ? 'border-purple-500/30' : 'border-slate-700/50'}`}>
                                         <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{DAYS[i]}</p>
                                         <p className={`text-lg font-black ${isToday(date) ? 'text-purple-300' : 'text-white'}`}>{date.getDate()}</p>
                                     </div>
                                     <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1.5">
                                         {dayOps.map(op => (
-                                            <OpBlock key={op.id} op={op} />
+                                            <OpBlock key={op.id} op={op} viewOperationDetails={viewOperationDetails} formatTime={formatTime} />
                                         ))}
                                         {dayOps.length === 0 && (
                                             <p className="text-[9px] text-slate-600 text-center italic mt-4">No ops</p>
@@ -242,22 +255,13 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
 
             {viewMode === 'day' && (
                 <div className="flex-1 overflow-y-auto custom-scrollbar">
-                    {(() => {
-                        const dayOps = getOpsForDate(currentDate).sort((a, b) => {
-                            const aTime = a.scheduledStart || a.activeStartTime || '';
-                            const bTime = b.scheduledStart || b.activeStartTime || '';
-                            return new Date(aTime).getTime() - new Date(bTime).getTime();
-                        });
-                        if (dayOps.length === 0) {
-                            return (
-                                <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 p-10 text-center">
-                                    <i className="fa-solid fa-calendar-xmark text-4xl text-purple-400 opacity-40 mb-3"></i>
-                                    <h3 className="text-lg font-bold text-white mb-1">No operations scheduled</h3>
-                                    <p className="text-sm text-slate-500">Try a different day or create a new operation.</p>
-                                </div>
-                            );
-                        }
-                        return (
+                    {dayOps.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 p-10 text-center">
+                            <i className="fa-solid fa-calendar-xmark text-4xl text-purple-400 opacity-40 mb-3"></i>
+                            <h3 className="text-lg font-bold text-white mb-1">No operations scheduled</h3>
+                            <p className="text-sm text-slate-500">Try a different day or create a new operation.</p>
+                        </div>
+                    ) : (
                             <div className="space-y-3 max-w-3xl">
                                 {dayOps.map(op => {
                                     const colors = getTypeColor(op.type);
@@ -267,7 +271,7 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                                     const declined = op.participants.filter(p => p.rsvpStatus === 'Declined').length;
                                     const isConcluded = op.status === OperationStatus.Concluded;
                                     const displayTime = op.scheduledStart || op.activeStartTime;
-                                    const isOverdue = op.status === OperationStatus.Scheduled && op.scheduledStart && new Date(op.scheduledStart).getTime() < Date.now();
+                                    const isOverdue = op.status === OperationStatus.Scheduled && op.scheduledStart && new Date(op.scheduledStart).getTime() < today.getTime();
 
                                     return (
                                         <div
@@ -330,8 +334,7 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                                     );
                                 })}
                             </div>
-                        );
-                    })()}
+                    )}
                 </div>
             )}
             </div>

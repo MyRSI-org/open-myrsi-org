@@ -1,6 +1,7 @@
 
 import React, { useMemo } from 'react';
 import DOMPurify from 'dompurify';
+import parse from 'html-react-parser';
 import { useConfig } from '../../../contexts/ConfigContext';
 import CallsignChip from '../../shared/ui/CallsignChip';
 
@@ -79,8 +80,11 @@ const TermsOfServiceView: React.FC<TermsOfServiceViewProps> = ({ onBack }) => {
                         prose-p:text-slate-300 prose-p:leading-relaxed
                         prose-li:text-slate-300
                         prose-strong:text-white prose-strong:font-bold"
-                        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(tosContent) }}
-                    />
+                    >
+                        {/* DOMPurify-sanitized, then rendered to React elements via
+                            html-react-parser — no raw HTML injection. */}
+                        {parse(DOMPurify.sanitize(tosContent))}
+                    </div>
 
                     <div className="text-center text-slate-600 text-[10px] pt-8 mt-10 border-t border-white/5 font-mono uppercase tracking-widest">
                         <p>End of File</p>

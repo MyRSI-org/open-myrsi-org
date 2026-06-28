@@ -34,7 +34,7 @@ const AllianceManagementTab: React.FC = () => {
 
     const [peers, setPeers] = useState<AlliancePeer[]>([]);
     const [profile, setProfile] = useState<AllianceSelfProfile>({ orgName: '', directoryVisible: false });
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState(false);
     const [status, setStatus] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
@@ -55,10 +55,10 @@ const AllianceManagementTab: React.FC = () => {
     const [newFeedUrl, setNewFeedUrl] = useState('');
     const [newFeedKey, setNewFeedKey] = useState('');
 
-    const flash = (kind: 'ok' | 'err', text: string) => {
+    const flash = useCallback((kind: 'ok' | 'err', text: string) => {
         setStatus({ kind, text });
         setTimeout(() => setStatus(null), 6000);
-    };
+    }, []);
 
     const load = useCallback(async () => {
         setLoading(true);
@@ -76,9 +76,36 @@ const AllianceManagementTab: React.FC = () => {
         } finally {
             setLoading(false);
         }
-    }, [rpcAction]);
+    }, [rpcAction, flash]);
 
-    useEffect(() => { load(); }, [load]);
+    // Mount data fetch. `loading` initializes to true (below), so the mount path needs no
+    // synchronous setLoading(true): we inline the same fetch the shared `load` callback
+    // performs, so the only setState calls are provably post-await and the
+    // set-state-in-effect rule is satisfied without behavior change. `load` itself is left
+    // intact (it keeps its leading setLoading(true)) for every other call site — the
+    // realtime-refresh effect and the mutation handlers all rely on that loading flash.
+    // A cancelled flag drops a late resolution after unmount / rpcAction change.
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const [peerData, profileData, feedData] = await Promise.all([
+                    rpcAction('alliance:list_peers', {}),
+                    rpcAction('alliance:get_self_profile', {}),
+                    rpcAction('admin:get_trusted_feeds', {}),
+                ]);
+                if (cancelled) return;
+                setPeers(peerData || []);
+                setFeeds(feedData || []);
+                if (profileData) setProfile(profileData);
+            } catch (e: any) {
+                if (!cancelled) flash('err', e?.message || 'Failed to load alliances.');
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [rpcAction, flash]);
 
     // Live refresh: the engine broadcasts alliance_update (ids only) on health
     // / alert transitions; DataCoreContext relays it as a window event. Coalesce

@@ -41,8 +41,8 @@ const GazetteTab: React.FC = () => {
                             </div>
                             <p className="text-sm text-slate-300 leading-relaxed mb-4 bg-slate-950/40 p-4 rounded-lg border border-slate-700/50">{job.description}</p>
                             <div className="flex flex-wrap gap-2">
-                                {job.requirements.map((req, i) => (
-                                    <span key={i} className="inline-flex items-center gap-1.5 text-[10px] bg-slate-900/60 px-3 py-1.5 rounded-full border border-slate-700 text-slate-400 font-mono">
+                                {job.requirements.map((req) => (
+                                    <span key={req} className="inline-flex items-center gap-1.5 text-[10px] bg-slate-900/60 px-3 py-1.5 rounded-full border border-slate-700 text-slate-400 font-mono">
                                         <i className="fa-solid fa-check text-green-400"></i>{req}
                                     </span>
                                 ))}

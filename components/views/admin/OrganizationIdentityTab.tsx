@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
 import { BrandingConfig } from '../../../types';
 import { TabPageHeader, SectionPanel } from '../../shared/ui';
@@ -18,9 +18,13 @@ const OrganizationIdentityTab: React.FC = () => {
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
 
-    useEffect(() => {
+    // Re-sync local editable config when the upstream branding config changes,
+    // using the "adjust state during render" pattern instead of an effect.
+    const [prevBrandingConfig, setPrevBrandingConfig] = useState<BrandingConfig>(brandingConfig);
+    if (prevBrandingConfig !== brandingConfig) {
+        setPrevBrandingConfig(brandingConfig);
         setConfig(brandingConfig);
-    }, [brandingConfig]);
+    }
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const { name, value, type } = e.target;

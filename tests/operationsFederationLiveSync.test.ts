@@ -185,7 +185,7 @@ describe('getOperationSnapshotForPeer posture (invite row, not acceptance)', () 
     });
 });
 
-describe('getOperationManifestForPeer (SECURITY: per-peer scoping, L6)', () => {
+describe('getOperationManifestForPeer (SECURITY: per-peer scoping)', () => {
     it('contains ONLY the calling peer\'s ops — accepted with versions, invited as ids', async () => {
         h.tables.operation_allied_orgs = [
             { operation_id: 'op1', peer_id: 'peerA', accepted: true },
@@ -214,7 +214,7 @@ describe('getOperationManifestForPeer (SECURITY: per-peer scoping, L6)', () => {
         expect(m.invited).toEqual([]);
     });
 
-    it('withholds an op whose clearance now exceeds the peer ceiling (F17)', async () => {
+    it('withholds an op whose clearance now exceeds the peer ceiling', async () => {
         h.globalMax = 5;
         h.tables.operation_allied_orgs = [
             { operation_id: 'opHigh', peer_id: 'peerA', accepted: true },
@@ -269,7 +269,7 @@ describe('removeAlliedParticipant (SECURITY: delete scoped to the caller)', () =
 
 // --- Inbound pushes stay version-gated (the regression override is NOT here) ---
 
-describe('receiveMirrorInvite cross-peer clobber guard (VULN-1 regression)', () => {
+describe('receiveMirrorInvite cross-peer clobber guard', () => {
     it('a DIFFERENT peer cannot clobber a victim-hosted mirror (host_peer_id / snapshot / accepted unchanged)', async () => {
         h.tables.mirrored_operations = [{
             id: 'op1', host_peer_id: 'victimHost', version: 5, accepted: true, revoked_at: null,
@@ -295,7 +295,7 @@ describe('receiveMirrorInvite cross-peer clobber guard (VULN-1 regression)', () 
         await receiveMirrorInvite({ id: 'hostA' }, { v: 1, op_id: 'newop', version: 1, snapshot: { name: 'x' } as never });
         expect(h.tables.mirrored_operations.find(m => m.id === 'newop')).toMatchObject({ host_peer_id: 'hostA', accepted: false });
     });
-    it('rejects an oversized inbound snapshot (storage-amplification guard, VULN-2)', async () => {
+    it('rejects an oversized inbound snapshot (storage-amplification guard)', async () => {
         h.tables.mirrored_operations = [];
         const huge = { blob: 'x'.repeat(1_000_001) } as never;
         await expect(receiveMirrorInvite({ id: 'hostA' }, { v: 1, op_id: 'op1', version: 1, snapshot: huge })).rejects.toThrow('malformed_request');
@@ -350,8 +350,8 @@ describe('pushOperationToAllies live-sync gating', () => {
         ];
         h.tables.operations = [{ id: 'op1', joint_version: 3 }];
         h.tables.alliance_peers = [
-            { id: 'peerA', sync_health: 'healthy' },
-            { id: 'peerB', sync_health: 'down' },
+            { id: 'peerA', sync_health: 'healthy', channels: { operations: true } },
+            { id: 'peerB', sync_health: 'down', channels: { operations: true } },
         ];
     };
     it('drops pushes to down peers (reconcile converges on recovery) but pushes to healthy ones', async () => {
@@ -365,7 +365,7 @@ describe('pushOperationToAllies live-sync gating', () => {
     it('budget-starved FULL pushes defer (re-coalesce) instead of dropping silently', async () => {
         vi.useFakeTimers();
         seedJointOp();
-        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy' }];
+        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy', channels: { operations: true } }];
         h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
         drainBucket('peerA');
         h.respond = () => ({ status: 200, json: { ok: true } });
@@ -377,7 +377,7 @@ describe('pushOperationToAllies live-sync gating', () => {
     });
     it('immediate events are never blocked by an empty bucket', async () => {
         seedJointOp();
-        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy' }];
+        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy', channels: { operations: true } }];
         h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
         drainBucket('peerA');
         h.respond = () => ({ status: 200, json: { ok: true } });
@@ -389,13 +389,34 @@ describe('pushOperationToAllies live-sync gating', () => {
         await pushOperationToAllies('op1', 'full');
         expect(h.peerCalls).toHaveLength(0);
     });
+    it('SECURITY: does NOT push to an accepted peer whose operations channel is disabled/absent (fail-closed egress gate)', async () => {
+        // Three accepted, healthy allies. Only the one with channels.operations===true
+        // receives the live-sync push; a peer with operations:false and one whose
+        // channels object omits the flag are both dropped at the per-peer egress gate
+        // — proving the gate stops crossing the org boundary even for already-accepted
+        // ops once "Joint Ops" is toggled off.
+        h.tables.operation_allied_orgs = [
+            { operation_id: 'op1', peer_id: 'peerA', accepted: true },
+            { operation_id: 'op1', peer_id: 'peerOff', accepted: true },
+            { operation_id: 'op1', peer_id: 'peerNoChan', accepted: true },
+        ];
+        h.tables.operations = [{ id: 'op1', joint_version: 3 }];
+        h.tables.alliance_peers = [
+            { id: 'peerA', sync_health: 'healthy', channels: { operations: true } },
+            { id: 'peerOff', sync_health: 'healthy', channels: { operations: false } },
+            { id: 'peerNoChan', sync_health: 'healthy', channels: {} },
+        ];
+        h.respond = () => ({ status: 200, json: { ok: true } });
+        await pushOperationToAllies('op1', 'full');
+        expect(h.peerCalls.map(c => c.peerId)).toEqual(['peerA']);
+    });
 });
 
 describe('pushOperationToAllies clearance ceiling', () => {
     const seedPeers = (peers: Array<{ id: string; outbound_max_clearance: number }>) => {
         h.tables.operation_allied_orgs = peers.map((p) => ({ operation_id: 'op1', peer_id: p.id, accepted: true }));
         h.tables.operations = [{ id: 'op1', joint_version: 3 }];
-        h.tables.alliance_peers = peers.map((p) => ({ id: p.id, sync_health: 'healthy', outbound_max_clearance: p.outbound_max_clearance }));
+        h.tables.alliance_peers = peers.map((p) => ({ id: p.id, sync_health: 'healthy', outbound_max_clearance: p.outbound_max_clearance, channels: { operations: true } }));
         h.tables.operation_limiting_markers = [];
         h.respond = () => ({ status: 200, json: { ok: true } });
     };
@@ -483,7 +504,7 @@ describe('scheduleAlliedPush coalescing', () => {
         vi.useFakeTimers();
         h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
         h.tables.operations = [{ id: 'op1', joint_version: 3 }];
-        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy' }];
+        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy', channels: { operations: true } }];
         h.respond = () => ({ status: 200, json: { ok: true } });
         scheduleAlliedPush('op1');
         scheduleAlliedPush('op1');
@@ -495,7 +516,7 @@ describe('scheduleAlliedPush coalescing', () => {
         vi.useFakeTimers();
         h.tables.operation_allied_orgs = [{ operation_id: 'op1', peer_id: 'peerA', accepted: true }];
         h.tables.operations = [{ id: 'op1', joint_version: 3 }];
-        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy' }];
+        h.tables.alliance_peers = [{ id: 'peerA', sync_health: 'healthy', channels: { operations: true } }];
         h.respond = () => ({ status: 200, json: { ok: true } });
         scheduleAlliedPush('op1');
         await pushOperationToAllies('op1', 'status_change');
@@ -535,11 +556,11 @@ describe('reconcileMirrorsWithPeer — healing', () => {
         await reconcileMirrorsWithPeer('peerA');
         expect(h.tables.mirrored_operations.find(m => m.id === 'op2')).toMatchObject({ accepted: false, revoked_at: null });
     });
-    it('fed-sync-1: missing-* heal does NOT clobber a mirror owned by a DIFFERENT host', async () => {
+    it('missing-* heal does NOT clobber a mirror owned by a DIFFERENT host', async () => {
         // A mirror legitimately held for otherHost. peerB serves a forged manifest
-        // listing the same opId; reconcile sees no peerB-owned row for it and would
-        // (pre-fix) upsert by the id-only PK, taking the row over. The ownership
-        // guard must skip it: content/owner/version stay intact.
+        // listing the same opId; reconcile sees no peerB-owned row for it. Without an
+        // ownership guard it would upsert by the id-only PK, taking the row over. The
+        // ownership guard must skip it: content/owner/version stay intact.
         h.tables.mirrored_operations = [{ id: 'op1', host_peer_id: 'otherHost', version: 7, accepted: true, revoked_at: null, snapshot: { name: 'legit' } }];
         h.respond = (_p, path) => {
             if (path === '/api/alliance/op-manifest') return manifest({ op1: 9 });
@@ -581,7 +602,7 @@ describe('reconcileMirrorsWithPeer — healing', () => {
         expect((h.tables.mirrored_operations[0].snapshot as { name: string }).name).toBe('rolled-back-truth');
         expect(r.alert).toMatch(/restored from a backup/i);
     });
-    it('heals a LOST ACCEPT-ACK: host accepted, local still pending → latches accepted (BUG-1 regression)', async () => {
+    it('heals a LOST ACCEPT-ACK: host accepted, local still pending → latches accepted', async () => {
         // Guest accepted; host committed accepted=true but the HTTP ack was lost,
         // so the local mirror is stuck pending at the same version.
         h.tables.mirrored_operations = [{ id: 'op1', host_peer_id: 'peerA', version: 4, accepted: false, revoked_at: null, snapshot: { name: 'pending' } }];
@@ -696,7 +717,7 @@ describe('directory cache never feeds an outbound projection (source pin)', () =
     });
 });
 
-describe('getMirroredOperation pending visibility (F16)', () => {
+describe('getMirroredOperation pending visibility', () => {
     beforeEach(() => {
         h.tables['mirrored_operations'] = [
             { id: 'm-pending', accepted: false, revoked_at: null, host_peer_id: 'p1', snapshot: { name: 'Secret Plan' }, version: 0, peer: { peer_org_name: 'Ally' } },

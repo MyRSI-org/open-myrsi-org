@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useAuth } from '../../../contexts/AuthContext';
@@ -24,7 +24,13 @@ const AddCaseFileModal: React.FC<AddCaseFileModalProps> = ({ isOpen, onClose }) 
     const [isLoading, setIsLoading] = useState(false);
     const [linkedUser, setLinkedUser] = useState<any>(null);
 
-    useEffect(() => {
+    // Reset the editable form when the modal opens. React-documented "adjust state
+    // during render" pattern (previous-value tracker): behaviour-equivalent to the
+    // prior effect (deps [isOpen]) which cleared the fields on the closed -> open
+    // transition.
+    const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+    if (isOpen !== prevIsOpen) {
+        setPrevIsOpen(isOpen);
         if (isOpen) {
             setRsiHandle('');
             setSubjectName('');
@@ -32,7 +38,7 @@ const AddCaseFileModal: React.FC<AddCaseFileModalProps> = ({ isOpen, onClose }) 
             setLinkedUser(null);
             setIsLoading(false);
         }
-    }, [isOpen]);
+    }
 
     const handleRsiChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setRsiHandle(e.target.value);

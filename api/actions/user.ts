@@ -3,6 +3,16 @@ import * as db from '../../lib/db.js';
 import { sendPushToUsers } from '../../lib/push.js';
 import { assertSubmissionRateLimit } from '../../lib/submissionRateLimit.js';
 
+// Genuine HR / roster-admin permission set allowed to read ANOTHER member's
+// position history. Mirrors HR_METADATA_PERMS in lib/db/userFilters.ts and is kept
+// in sync with that field-stripping policy — crucially it omits the rank-and-file
+// 'hr:view' perm (held by the seeded Member role), so ordinary members cannot read
+// other users' HR/government position history.
+const HR_ROSTER_VIEW_PERMS = [
+    'admin:view:roster', 'admin:user:update',
+    'hr:recruiter', 'hr:manager', 'hr:admin',
+];
+
 /** Actor-id fields the dispatcher injects on every payload. */
 interface ActorPayload {
     userId: number;
@@ -104,12 +114,17 @@ export const userActions = {
     'user:update_preferences': ({ userId, timezone, dateFormat }: UpdatePreferencesPayload) => db.updateUserPreferences(userId, { timezone, dateFormat }),
     'user:get_clearance_history': ({ userId }: GetClearanceHistoryPayload) => db.getClearanceHistory(userId),
     // Position history (HR + Government, unified). Self-fetch is always allowed;
-    // cross-user fetch requires hr:view or admin:user:update permission.
+    // cross-user fetch is restricted to genuine HR / roster-admin staff. NOTE the
+    // gate deliberately EXCLUDES the base 'hr:view' perm: the seeded Member role
+    // holds 'hr:view', so gating on it would let every ordinary member read any
+    // other user's full position history (position names, start/end dates, end
+    // reasons). This mirrors HR_METADATA_PERMS in lib/db/userFilters.ts, which omits
+    // 'hr:view' for exactly the same reason so HR metadata can't leak to the rank-and-file.
     'user:get_position_history': ({ targetUserId, userId, user }: GetPositionHistoryPayload) => {
         const target = targetUserId ?? userId;
         const isSelf = target === userId;
         const perms: string[] = user?.permissions || [];
-        const canViewOthers = perms.includes('hr:view') || perms.includes('admin:user:update');
+        const canViewOthers = HR_ROSTER_VIEW_PERMS.some((p) => perms.includes(p));
         if (!isSelf && !canViewOthers) throw new Error('Not authorized to view this user’s position history.');
         return db.getUserPositionHistory(target);
     },

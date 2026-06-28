@@ -42,8 +42,8 @@ const DutyRosterView: React.FC = () => {
     // Dual-mode rendering + cross-cutting filter chips. State persists across
     // mode switches so the user's filter selections aren't lost.
     const [rosterMode, setRosterMode] = useState<RosterMode>('hierarchy');
-    const [unitFilter, setUnitFilter] = useState<Set<number>>(new Set());
-    const [rankFilter, setRankFilter] = useState<Set<number>>(new Set());
+    const [unitFilter, setUnitFilter] = useState<Set<number>>(() => new Set());
+    const [rankFilter, setRankFilter] = useState<Set<number>>(() => new Set());
     const [flatSortKey, setFlatSortKey] = useState<FlatSortKey>('name');
     const [flatSortDir, setFlatSortDir] = useState<SortDir>('asc');
 
@@ -97,15 +97,22 @@ const DutyRosterView: React.FC = () => {
         return map;
     }, [members]);
 
-    // Ensure data hydration and smooth rendering
+    // One-way loading latch on data arrival. The moment members are available
+    // we release the loading state during render (React re-renders before paint,
+    // so this is equivalent to the old effect-set but without a post-paint flash).
+    // isLoading is never set back to true, so this is self-terminating and cannot
+    // loop. The empty-roster grace fallback below keeps its async timer.
+    if (isLoading && members.length > 0) {
+        setIsLoading(false);
+    }
+
+    // Fallback timeout for an empty roster or a fetch delay: if members never
+    // arrive, release the loading state after 500ms. (The async set inside the
+    // timer is not a synchronous effect set.)
     useEffect(() => {
-        if (members.length > 0) {
-            setIsLoading(false);
-        } else {
-            // Fallback timeout in case of empty roster or fetch delay
-            const timer = setTimeout(() => setIsLoading(false), 500);
-            return () => clearTimeout(timer);
-        }
+        if (members.length > 0) return; // arrival is handled during render above
+        const timer = setTimeout(() => setIsLoading(false), 500);
+        return () => clearTimeout(timer);
     }, [members]);
 
     // Centralised member predicate so hierarchy + flat use the same filter logic.

@@ -13,7 +13,7 @@ import {
     GovernmentType, GovernmentBranchType, PositionFillMethod,
     ElectionType, ElectionStatus, LegislationStatus, MotionStatus
 } from '../../../types.js';
-import { createHash } from 'crypto';
+import { createHmac } from 'crypto';
 import { log as baseLog } from '../../log.js';
 
 export const log = baseLog.child({ module: 'db.government' });
@@ -327,11 +327,39 @@ export const toGovernmentElectionCandidate = (row: NullToUndefined<Tables<'gover
 });
 
 // ---------------------------------------------------------------------------
-// Voter hash: one-way hash to prevent double-voting without revealing identity
+// Voter hash: keyed one-way hash to prevent double-voting without revealing
+// identity.
+//
+// HMAC-SHA256 with a server-held secret (a pepper) — NOT a bare SHA-256. The
+// inputs (electionId/motionId and userId) are small, enumerable integers and
+// userIds are widely visible across the app, so an unkeyed digest of
+// `${id}:${userId}` could be brute-forced from a DB-only leak of voter_hash to
+// re-identify every "secret" ballot. Keying with a secret that never reaches the
+// browser/DB makes that offline brute-force infeasible without also holding the
+// env secret, so the secret-ballot guarantee actually holds.
+//
+// The message stays `${electionId}:${userId}` so the hash is still deterministic
+// per deployment — this preserves the one-vote guards that key off voter_hash
+// (uq_gov_election_vote / uq_gov_motion_vote_hash and the castElectionVote /
+// castMotionVote pre-checks). Migration caveat: keying changes the output, so an
+// in-flight secret-ballot MOTION cast before this change has a legacy unkeyed
+// voter_hash and its caster could vote once more (voter_hash is the motion's
+// only secret-ballot guard); elections are unaffected because the per-user
+// voter_registry is their real one-vote guard.
+//
+// Fail closed: refuse to derive a hash when no server secret is configured
+// rather than silently falling back to an unkeyed (brute-forceable) digest.
+// SECRETS_ENCRYPTION_KEY is required + validated at server boot;
+// JWT_SECRET is an acceptable fallback (also required + validated at boot).
+// Read at call time so a key rotation/restart is picked up without re-import.
 // ---------------------------------------------------------------------------
 
 export function computeVoterHash(electionId: number, userId: number): string {
-    return createHash('sha256')
+    const secret = process.env.SECRETS_ENCRYPTION_KEY || process.env.JWT_SECRET;
+    if (!secret) {
+        throw new Error('Cannot compute voter hash: SECRETS_ENCRYPTION_KEY (or JWT_SECRET) is not configured — secret ballots require a server-held key to stay non-de-anonymizable.');
+    }
+    return createHmac('sha256', secret)
         .update(`${electionId}:${userId}`)
         .digest('hex');
 }

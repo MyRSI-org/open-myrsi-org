@@ -53,11 +53,11 @@ export default function WhStockCreateDialog({ isOpen, onClose, onSubmitted }: Pr
         : null;
     const qualityLocked = !!lockedCustom;
 
-    useEffect(() => {
-        if (!lockedCustom) return;
-        // Mirror the picked catalog row's quality so the displayed value matches.
-        setQualityLabel(lockedCustom.qualityLabel || '');
-    }, [lockedCustom]);
+    // When a custom commodity is picked the quality is owned by its catalog row,
+    // so show that value (read-only) instead of the user-typed state. Derived
+    // during render — the field is disabled while locked and `qualityLabel` is
+    // not sent for custom rows (see handleSubmit), so this preserves behavior.
+    const displayedQuality = lockedCustom ? (lockedCustom.qualityLabel || '') : qualityLabel;
 
     const qualitySuggestions = useMemo(() => {
         const name = selectedCommodity?.name?.split(' · ')[0]?.trim();
@@ -69,15 +69,32 @@ export default function WhStockCreateDialog({ isOpen, onClose, onSubmitted }: Pr
         ));
     }, [warehouseCatalog, selectedCommodity]);
 
+    // Reset all user-editable form fields on the dialog's closed→open transition.
+    // Done during render via a prevIsOpen tracker (React re-renders before paint,
+    // so it is behavior-equivalent to the old open-reset effect) instead of a
+    // synchronous setState inside the effect. The async locations fetch (which
+    // owns locationsLoading on its async path) stays in the effect below; the
+    // synchronous setLocationsLoading(true) moves here so the effect carries no
+    // synchronous set.
+    const [prevIsOpen, setPrevIsOpen] = useState(false);
+    if (isOpen && !prevIsOpen) {
+        setPrevIsOpen(true);
+        setSelectedCommodity(null);
+        setLocationId('');
+        setInitialQty('');
+        setNotes('');
+        setQualityLabel('');
+        setSubmitting(false);
+        setLocationsLoading(true);
+    } else if (!isOpen && prevIsOpen) {
+        setPrevIsOpen(false);
+    }
+
     useEffect(() => {
         if (isOpen) {
-            setSelectedCommodity(null);
-            setLocationId('');
-            setInitialQty('');
-            setNotes('');
-            setQualityLabel('');
-            setSubmitting(false);
-            setLocationsLoading(true);
+            // Kick off the locations fetch on open. The loading flag was already
+            // flipped true in the render-time open-reset above; only the async
+            // result handlers (not flagged) set state here.
             rpcAction('warehouse:list_locations', {})
                 .then((rows: any[]) => setLocations(Array.isArray(rows) ? rows : []))
                 .catch((err: any) => {
@@ -166,7 +183,7 @@ export default function WhStockCreateDialog({ isOpen, onClose, onSubmitted }: Pr
                         <input
                             type="text"
                             list="wh-stock-quality-suggestions"
-                            value={qualityLabel}
+                            value={displayedQuality}
                             onChange={(e) => setQualityLabel(e.target.value)}
                             disabled={qualityLocked || !selectedCommodity}
                             placeholder="500-600"

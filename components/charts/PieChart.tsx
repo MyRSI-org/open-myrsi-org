@@ -12,13 +12,13 @@ const PieChart: React.FC<PieChartProps> = ({ data, title, icon, unit = '' }) => 
     const total = data.reduce((acc, item) => acc + item.value, 0);
     const colors = ['#38bdf8', '#34d399', '#facc15', '#fb923c', '#f87171', '#c084fc', '#818cf8', '#a3e635', '#22d3ee', '#f472b6'];
     
-    let cumulativePercent = 0;
-    const segments = data.map((item, index) => {
+    const segments = data.reduce<{ name: string; value: number; percent: number; offset: number; color: string }[]>((acc, item, index) => {
         const percent = total > 0 ? (item.value / total) * 100 : 0;
+        const cumulativePercent = acc.reduce((sum, seg) => sum + seg.percent, 0);
         const offset = 25 - cumulativePercent;
-        cumulativePercent += percent;
-        return { ...item, percent, offset, color: colors[index % colors.length] };
-    });
+        acc.push({ ...item, percent, offset, color: colors[index % colors.length] });
+        return acc;
+    }, []);
 
     return (
         <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 h-full flex flex-col">
@@ -31,9 +31,9 @@ const PieChart: React.FC<PieChartProps> = ({ data, title, icon, unit = '' }) => 
                         <div className="relative w-full h-full max-h-32 min-h-[120px] flex items-center justify-center">
                             <svg viewBox="0 0 36 36" className="h-full w-auto max-w-full">
                                 <circle cx="18" cy="18" r="15.9155" className="stroke-slate-700" strokeWidth="3" fill="transparent" />
-                                {segments.map((segment, index) => (
+                                {segments.map((segment) => (
                                     <circle
-                                        key={index}
+                                        key={segment.name}
                                         cx="18" cy="18" r="15.9155"
                                         stroke={segment.color} strokeWidth="3" fill="transparent"
                                         strokeDasharray={`${segment.percent} ${100 - segment.percent}`}
@@ -49,8 +49,8 @@ const PieChart: React.FC<PieChartProps> = ({ data, title, icon, unit = '' }) => 
                             </div>
                         </div>
                         <div className="space-y-1.5 text-xs overflow-y-auto max-h-[140px] pr-2 custom-scrollbar">
-                            {segments.sort((a,b) => b.value - a.value).map((segment, index) => (
-                                <div key={index} className="flex items-center justify-between">
+                            {segments.sort((a,b) => b.value - a.value).map((segment) => (
+                                <div key={segment.name} className="flex items-center justify-between">
                                    <div className="flex items-center truncate mr-2">
                                         <span className="h-2 w-2 rounded-full mr-2 shrink-0" style={{ backgroundColor: segment.color }}></span>
                                         <span className="text-slate-300 truncate" title={segment.name}>{segment.name}</span>
