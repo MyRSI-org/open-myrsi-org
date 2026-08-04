@@ -54,13 +54,13 @@
     "react-konva": "^19.2.5",
     "recharts": "^3.9.0",
     "sharp": "^0.35.3",
-    "undici": "8.7.0",
+    "undici": "8.10.0",
     "web-push": "3.6.7"
   },
   "overrides": {
-    "undici": "8.7.0",
+    "undici": "8.10.0",
     "jsdom": {
-      "undici": "^7.25.0"
+      "undici": "^7.29.0"
     },
     "path-to-regexp": "8.4.2",
     "minimatch": "10.2.5",
