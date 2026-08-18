@@ -1,13 +1,81 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
+# Dependabot version updates for My RSI Org.
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Set on 17 Aug 26 - Jenko
 
 version: 2
 updates:
-  - package-ecosystem: "" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # ---------------------------------------------------------------------------
+  # npm — the whole app (client + server share one manifest at the repo root).
+  # Updates are grouped so a routine week lands a couple of reviewable PRs
+  # instead of ~40. Majors are deliberately left ungrouped: they arrive as
+  # individual PRs so a breaking upgrade is never buried in a batch.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Australia/Brisbane"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+      include: "scope"
+    groups:
+      # Families that must move in lockstep — a partial bump breaks the build.
+      tiptap:
+        patterns:
+          - "@tiptap/*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-konva"
+          - "@types/react"
+      livekit:
+        patterns:
+          - "livekit-client"
+          - "livekit-server-sdk"
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/*"
+          - "@eslint-react/*"
+          - "eslint-plugin-*"
+          - "typescript-eslint"
+          - "globals"
+      vite-vitest:
+        patterns:
+          - "vite"
+          - "vitest"
+          - "@vitejs/*"
+          - "@vitest/*"
+      # Everything else, split so a prod-dep bump is never reviewed with the
+      # same eyes as a test-harness bump.
+      production-minor-patch:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      development-minor-patch:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
 
-# Set on 17 Aug 26 - Jenko
+  # ---------------------------------------------------------------------------
+  # GitHub Actions — no workflows committed yet; this keeps them pinned-current
+  # from the day the first one lands.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Australia/Brisbane"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"

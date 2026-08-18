@@ -1,7 +1,7 @@
 
 import { Request, Response } from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { getAnnouncementsState } from '../lib/db.js';
+import { getLoginScreenAnnouncements } from '../lib/db.js';
 import { tryParseTiptapJson, tiptapJsonToSafeHtml, isEmptyTiptapDoc } from '../lib/tiptapValidate.js';
 import { sanitizePublicLinkUrl } from '../lib/linkUrl.js';
 import { sanitizeImageUrl } from '../lib/imageUrl.js';
@@ -201,7 +201,7 @@ export default async function handler(req: Request, res: Response) {
                     type: string; audience: string[]; publishDate: string; expiryDate?: string;
                 }> = [];
                 try {
-                    const { announcements: rawAnnouncements } = await getAnnouncementsState();
+                    const { announcements: rawAnnouncements } = await getLoginScreenAnnouncements();
                     const nowMs = Date.now();
                     announcementsForPublic = rawAnnouncements
                         .filter(a => Array.isArray(a.audience) && a.audience.includes('Login Screen'))

@@ -19,14 +19,40 @@ const DANGEROUS_SCHEME_ATTR = /(\s(?:href|src|xlink:href|formaction|action|data|
 
 const MAX_LEN = 100_000;
 
+// Every replacement splices the text on either side of the removed span back
+// together, which can REASSEMBLE the very construct that was removed:
+//   '<scr' + <link> + 'ipt>'          -> '<script>'
+//   ' on'  + ' ona="1"' + 'error="…"' -> ' onerror="…"'
+// So a SINGLE pass demonstrably returns dangerous output. Re-run the whole chain
+// until it reaches a fixpoint. The cap stops a pathological input from spinning;
+// each pass strictly shortens the string, so real inputs converge in one or two.
+const MAX_SANITIZE_PASSES = 10;
+
+// Belt and braces: after the loop, no event-handler attribute may survive under
+// any spelling. These are never legitimate in operator-entered rich text.
+const RESIDUAL_EVENT_HANDLER = /\son\w+\s*=/gi;
+
+function sanitizePass(input: string): string {
+    return input
+        .replace(DANGEROUS_BLOCK_TAGS, '')
+        .replace(DANGEROUS_VOID_TAGS, '')
+        .replace(EVENT_HANDLER_ATTR, '')
+        .replace(DANGEROUS_SCHEME_ATTR, '$1$2#');
+}
+
 /** Strip known-dangerous HTML constructs from operator-entered rich HTML.
  *  Defense-in-depth only (see file header). Non-string input → ''. */
 export function sanitizeRichHtml(html: unknown): string {
     if (typeof html !== 'string' || !html) return '';
-    return html
-        .replace(DANGEROUS_BLOCK_TAGS, '')
-        .replace(DANGEROUS_VOID_TAGS, '')
-        .replace(EVENT_HANDLER_ATTR, '')
-        .replace(DANGEROUS_SCHEME_ATTR, '$1$2#')
-        .slice(0, MAX_LEN);
+    let out = html;
+    for (let i = 0; i < MAX_SANITIZE_PASSES; i++) {
+        const prev = out;
+        out = sanitizePass(out);
+        if (out === prev) break;
+    }
+    // If anything still parses as an event handler after the fixpoint, neuter the
+    // attribute name so it cannot bind (rather than dropping to a partial match
+    // and re-splicing again).
+    out = out.replace(RESIDUAL_EVENT_HANDLER, ' data-blocked-handler=');
+    return out.slice(0, MAX_LEN);
 }

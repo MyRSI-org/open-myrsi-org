@@ -766,13 +766,19 @@ export const operationActions = {
         await db.broadcastToOrg('operation_templates_changed', { id: tpl.id });
         return tpl;
     },
-    'operation:template:update': async ({ id, name, description, payload }: TemplateUpdatePayload) => {
-        const tpl = await db.updateOperationTemplate(id, { name, description, payload });
+    'operation:template:update': async ({ id, name, description, payload, user }: TemplateUpdatePayload & { user?: Parameters<typeof db.updateOperationTemplate>[2] }) => {
+        // Clearance twin of template:get. 'operations:create' is not a clearance
+        // check, and this path re-selects the row — payload included — so without
+        // the viewer a member below the template's classification could both
+        // overwrite it and read back the source op's full plan.
+        const tpl = await db.updateOperationTemplate(id, { name, description, payload }, user);
         await db.broadcastToOrg('operation_templates_changed', { id: tpl.id });
         return tpl;
     },
-    'operation:template:delete': async ({ id }: TemplateDeletePayload) => {
-        await db.deleteOperationTemplate(id);
+    'operation:template:delete': async ({ id, user }: TemplateDeletePayload & { user?: Parameters<typeof db.deleteOperationTemplate>[1] }) => {
+        // Same clearance gate as update — destruction of a classified template
+        // must not be reachable from 'operations:create' alone.
+        await db.deleteOperationTemplate(id, user);
         await db.broadcastToOrg('operation_templates_changed', { id });
     },
     // Builds (but does not persist) a payload from an existing operation. The

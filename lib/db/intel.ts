@@ -14,6 +14,7 @@ import { decryptSecret } from '../crypto.js';
 import { filterByClearance, canViewAllClassifications, passesClearance, assertCanClassify, type ClearanceUser } from '../clearance.js';
 import { canUserSeeOpInList, type OpViewer } from './ops.js';
 import { ssrfSafeFetch } from '../ssrf.js';
+import { isSelfHostedUrl } from '../selfHost.js';
 import { getCachedAllianceSyncConfig, recordPeerFailure, recordPeerSuccess, setSyncAlert } from './allianceSyncState.js';
 import type { Tables } from './rows.js';
 export { toHydratedWarrant, toHydratedIntelReport, toIntelBulletin };
@@ -1321,15 +1322,23 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                 url += `${isQueryFeed ? '&' : '?'}since=${encodeURIComponent(deltaSince)}`;
             }
 
-            // 2. Determine if this is a local (same-platform) feed or external
-            //    Local feeds on *.myrsi.org can be resolved directly via DB query,
-            //    bypassing HTTP which can fail in containerized deployments (DNS/TLS loopback issues).
-            //    Alliance peers are ALWAYS independent instances (separate DBs), so
-            //    they must use the HTTP path — never the same-DB shortcut, which
-            //    would return our own data instead of the peer's.
+            // 2. Determine if this feed lives on THIS instance, or is external.
+            //    A feed served by this very deployment can be resolved with a direct
+            //    DB read, bypassing HTTP which can fail in containerized deployments
+            //    (DNS/TLS loopback issues). Alliance peers are ALWAYS independent
+            //    instances (separate DBs), so they must use the HTTP path — never
+            //    the same-DB shortcut, which would return our own data instead of
+            //    the peer's.
+            //
+            //    This compares the parsed HOSTNAME against our own host. It used to
+            //    substring-match '.myrsi.org' / 'localhost' anywhere in the whole
+            //    constructed URL, which (a) let a remote URL carrying the marker in
+            //    its path or query take the privileged local branch, and (b) wrongly
+            //    classified a SIBLING *.myrsi.org deployment — a different database —
+            //    as local. Set APP_URL for the shortcut to apply to your own host;
+            //    without it only loopback qualifies, which fails closed to HTTP.
             let data: FeedSyncData;
-            const feedUrlLower = url.toLowerCase();
-            const isLocalPlatformFeed = !feed.isAlliance && (feedUrlLower.includes('.myrsi.org') || feedUrlLower.includes('localhost'));
+            const isLocalPlatformFeed = !feed.isAlliance && isSelfHostedUrl(url, process.env.APP_URL);
 
             if (isLocalPlatformFeed) {
                 feedLog.push(`Local platform feed detected — resolving via direct DB query`);

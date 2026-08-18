@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
+import DOMPurify from 'dompurify';
 import { useConfig } from '../../../contexts/ConfigContext';
 import { TabPageHeader } from '../../shared/ui';
 import { useNotification } from '../../../contexts/NotificationContext';
@@ -121,8 +122,17 @@ const RichTextEditor: React.FC<{ value: string; onChange: (html: string) => void
     useEffect(() => {
         if (editorRef.current) {
             if (document.activeElement !== editorRef.current) {
-                if (editorRef.current.innerHTML !== value) {
-                    editorRef.current.innerHTML = value || '';
+                // This is the ONE termsOfService render sink that isn't already
+                // DOMPurify'd (TermsOfServiceView and DashboardView both do
+                // parse(DOMPurify.sanitize(...))). The server-side
+                // sanitizeRichHtml is explicitly defence-in-depth, not a complete
+                // allow-list parser, so it must not be the sole control here —
+                // event handlers on nodes inserted via innerHTML DO fire, and
+                // `admin:config:branding` is a delegatable role, which made this
+                // a stored-XSS path into a full Admin's session.
+                const safe = DOMPurify.sanitize(value || '');
+                if (editorRef.current.innerHTML !== safe) {
+                    editorRef.current.innerHTML = safe;
                 }
             }
         }

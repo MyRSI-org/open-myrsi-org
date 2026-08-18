@@ -34,6 +34,33 @@ function templateVisibleTo(viewer: ClearanceUser | null | undefined, row: Templa
     );
 }
 
+// Mutation twin of the read gate. The read paths (list/get) already hide a
+// template the viewer's clearance can't cover, but the mutation paths are gated
+// only by 'operations:create' — a LOWER bar than the 'operations:manage' bypass
+// inside templateVisibleTo. Without this, a clearance-0 holder of
+// operations:create who learns a template id (they are small serial ints, and
+// every template mutation broadcasts one) could overwrite or delete a classified
+// template — and, because update re-selects the row, read back the full payload
+// (every phase/task/milestone of the source op) that template:get denies them.
+// Same reasoning as updateWikiPage/deleteWikiPage in lib/db/wiki.ts.
+//
+// `viewer` undefined = server-internal caller (no gate), matching
+// getOperationTemplate. A missing row soft-passes so the caller surfaces its
+// normal not-found/no-op path rather than a misleading clearance error.
+async function assertTemplateVisible(id: number, viewer?: ClearanceUser | null): Promise<void> {
+    if (viewer === undefined) return;
+    const { data, error } = await supabase
+        .from('operation_templates')
+        .select('classification_level, limiting_marker_ids')
+        .eq('id', id)
+        .maybeSingle();
+    handleSupabaseError({ error, message: 'Failed to verify operation template clearance' });
+    if (!data) return;
+    if (!templateVisibleTo(viewer, data as TemplateRow)) {
+        throw new Error('You are not cleared to modify this operation template.');
+    }
+}
+
 // Re-export so existing call sites in lib/db.ts (`export * from './db/operation-templates.js'`)
 // continue to expose validateTemplatePayload to the rest of the server.
 export { validateTemplatePayload };
@@ -136,7 +163,9 @@ export async function createOperationTemplate(
 export async function updateOperationTemplate(
     id: number,
     updates: { name?: string; description?: string | null; payload?: OperationTemplatePayload },
+    viewer?: ClearanceUser | null,
 ): Promise<OperationTemplate> {
+    await assertTemplateVisible(id, viewer);
     const patch: { name?: string; description?: string | null; payload?: OperationTemplatePayload } = {};
     if (updates.name !== undefined) {
         const trimmed = stripHtmlSingleLine(updates.name, 200);
@@ -162,7 +191,8 @@ export async function updateOperationTemplate(
     return toTemplate(data) as OperationTemplate;
 }
 
-export async function deleteOperationTemplate(id: number): Promise<void> {
+export async function deleteOperationTemplate(id: number, viewer?: ClearanceUser | null): Promise<void> {
+    await assertTemplateVisible(id, viewer);
     const { error } = await supabase
         .from('operation_templates')
         .delete()

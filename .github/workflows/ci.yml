@@ -1,0 +1,73 @@
+# Quality gates for My RSI Org.
+# Runs the exact commands documented in CLAUDE.md so local and CI agree.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to a PR cancels the previous run for that PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: these jobs only read the repo.
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: lint · typecheck · test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      # `npm ci` fails if package.json and package-lock.json have drifted,
+      # which is itself a gate worth having.
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck (client)
+        run: npx tsc --noEmit
+
+      - name: Typecheck (server)
+        run: npx tsc -p tsconfig.server.json --noEmit
+
+      # Enforces the coverage regression floor in vite.config.ts.
+      - name: Test + coverage
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+  audit:
+    name: prod dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      # Same gate as `npm run audit` — prod deps only, high and above.
+      - name: Audit production dependencies
+        run: npm run audit

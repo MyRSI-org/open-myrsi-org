@@ -6,6 +6,7 @@ import compression from 'compression';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { randomBytes } from 'node:crypto';
 import { getClientIp } from './lib/clientIp.js';
+import { buildConnectSrc } from './lib/cspConnectSrc.js';
 import { pruneAuthRateLimitBuckets } from './lib/authRateLimit.js';
 import orgUploadHandler, { pruneOrgUploadBuckets } from './api/orgUpload.js';
 import { MAX_UPLOAD_BYTES } from './lib/storage.js';
@@ -199,20 +200,22 @@ app.use(compression());
 // Explicit connect-src list for the CSP, replacing a bare `https:` (which let the
 // page send fetch/WebSocket/beacon to any https site — so an XSS could ship the
 // stored token anywhere). Lists exactly what the browser talks to: same-origin
-// /api, Supabase REST + Realtime (wildcard, plus the env origin for a custom domain),
-// LiveKit, and the Cloudflare analytics beacon. img-src/media-src keep `https:` for
-// user-supplied images.
-const SUPABASE_ORIGIN = (() => {
-    try { return process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL).origin : ''; } catch { return ''; }
-})();
-const CSP_CONNECT_SRC = [
-    "'self'",
-    SUPABASE_ORIGIN,
-    SUPABASE_ORIGIN ? SUPABASE_ORIGIN.replace(/^https:/, 'wss:') : '',
-    'https://*.supabase.co', 'wss://*.supabase.co',
-    'https://*.livekit.cloud', 'wss://*.livekit.cloud',
-    'https://cloudflareinsights.com',
-].filter(Boolean).join(' ');
+// /api, the Supabase project's REST + Realtime origin, LiveKit, and the
+// Cloudflare analytics beacon. img-src/media-src keep `https:` for user-supplied
+// images.
+//
+// Built by the pure helper in lib/cspConnectSrc.ts so the allow-list can be tested
+// directly rather than by grepping this file. The exact configured origin is
+// pinned whenever it is known; a platform wildcard is the fallback ONLY when it
+// is not, because a wildcard matches every project on that platform — including
+// a free one an attacker can register — which would re-open the exfiltration
+// channel this list exists to close. Set LIVEKIT_URL in the environment to pin
+// the radio origin too (it otherwise lives in the admin-console settings row,
+// which this module-level header cannot read).
+const CSP_CONNECT_SRC = buildConnectSrc({
+    supabaseUrl: process.env.SUPABASE_URL,
+    livekitUrl: process.env.LIVEKIT_URL,
+});
 
 // Security Headers Middleware
 app.use((req, res, next) => {

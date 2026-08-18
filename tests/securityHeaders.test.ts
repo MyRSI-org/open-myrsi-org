@@ -40,11 +40,25 @@ describe('security headers (s5-2)', () => {
         expect(src).toMatch(/setHeader\('Strict-Transport-Security',\s*'max-age=\d+; includeSubDomains'\)/);
     });
     // connect-src must not use a bare `https:` (that would allow sending to any
-    // origin). It is built from an explicit allow-list constant.
+    // origin). It is built from an explicit allow-list constant, itself produced
+    // by the pure builder in lib/cspConnectSrc.ts. The builder's contract (exact
+    // origins pinned, platform wildcard only as a fallback) is covered in
+    // tests/cspConnectSrc.test.ts; this pins the wiring.
     it('CSP connect-src is an explicit allow-list, not bare https:', () => {
         expect(src).toMatch(/connect-src \$\{CSP_CONNECT_SRC\}/);
         expect(src).not.toMatch(/connect-src 'self' https:/);
-        expect(src).toMatch(/wss:\/\/\*\.supabase\.co/);
+    });
+
+    it('connect-src is built by the pure builder, from the environment', () => {
+        expect(src).toMatch(/import \{ buildConnectSrc \} from '\.\/lib\/cspConnectSrc\.js'/);
+        expect(src).toMatch(/const CSP_CONNECT_SRC = buildConnectSrc\(/);
+        expect(src).toMatch(/supabaseUrl: process\.env\.SUPABASE_URL/);
+        expect(src).toMatch(/livekitUrl: process\.env\.LIVEKIT_URL/);
+        // The platform wildcards must not be hardcoded into the header any more:
+        // they belong in the builder's fallback arm, reached only when the exact
+        // origin is unknown.
+        expect(src).not.toMatch(/'https:\/\/\*\.supabase\.co'/);
+        expect(src).not.toMatch(/'https:\/\/\*\.livekit\.cloud'/);
     });
 });
 

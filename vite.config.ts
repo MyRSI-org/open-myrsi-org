@@ -1,4 +1,3 @@
-import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 import { configDefaults } from 'vitest/config';
 import react from '@vitejs/plugin-react';
@@ -14,7 +13,7 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': import.meta.dirname,
       }
     },
     test: {
@@ -35,10 +34,14 @@ export default defineConfig(({ mode }) => {
         exclude: ['**/*.d.ts'],
         reporter: ['text-summary'],
         thresholds: {
-          lines: 5,
-          statements: 5,
-          functions: 3,
-          branches: 3,
+          // Ratcheted 18 Aug 26 to sit ~1pt under the measured baseline
+          // (lines 41.19 / statements 39.05 / functions 32.17 / branches 35.38).
+          // The previous 5/5/3/3 floor sat so far below actual coverage that a
+          // collapse to 6% would still have passed the gate.
+          lines: 40,
+          statements: 38,
+          functions: 31,
+          branches: 34,
         },
       },
     },

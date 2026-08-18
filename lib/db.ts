@@ -203,6 +203,23 @@ export async function getAnnouncementsState(currentUser?: { role?: string; permi
     return { announcements };
 }
 
+// Pre-auth twin of getAnnouncementsState. That helper scopes by the viewer's
+// ROLE and — correctly — drops every row when there is no viewer, so calling it
+// for the anonymous public page yielded a permanently empty Notices card.
+// 'Login Screen' is the one audience that is public by definition ("Shown on the
+// login screen for all visitors"), so this scopes to that audience IN THE QUERY
+// rather than bypassing the filter — an anonymous caller can never reach a
+// Client/Member/Admin-audience notice through this path.
+export async function getLoginScreenAnnouncements() {
+    const { data, error } = await supabase.from('announcements')
+        .select('id, title, body, author, type, audience, publish_date, expiry_date')
+        .contains('audience', ['Login Screen'])
+        .order('publish_date', { ascending: false })
+        .limit(50);
+    handleSupabaseError({ error, message: 'Failed to get login screen announcements' });
+    return { announcements: (data || []).map(toAnnouncement) };
+}
+
 export async function getDiscordState() {
     const settingsQuery = supabase.from('settings').select('value').eq('key', 'discordConfig');
     const rolesQuery = supabase.from('synced_discord_roles').select('id, name, color');

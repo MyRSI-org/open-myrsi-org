@@ -6,7 +6,7 @@ import { toUnitPost, toServiceTypeConfig } from './mappers.js';
 import type { Tables } from './rows.js';
 import type { AIConfig, Announcement, BrandingConfig, Certification, Commendation, DiscordConfig, ExternalTool, GovernmentsFeatureConfig, HeroCardConfig, HRConfig, IntelSharingConfig, Location, OpenGraphConfig, PublicPageConfig, RadioChannel, RadioConfig, Rank, Role, ServiceTypeConfig, SpecializationTag, SystemConfig, ThemeConfig, UnitPost, WikiHomeConfig } from '../../types.js';
 import { normalizeHexColor } from '../color.js';
-import { normalizeDocMediaForStorage } from '../orgMediaDocs.js';
+import { normalizeDocMediaForStorage, assertDocImageCap } from '../orgMediaDocs.js';
 import { randomBytes, createHash } from 'node:crypto';
 import { CLIENT_DEFAULT_PERMS } from '../clientRolePermissions.js';
 import { encryptConfigSecrets, decryptConfigSecrets, encryptSecret, decryptSecret } from '../crypto.js';
@@ -274,7 +274,42 @@ export const updateRadioConfig = async (config: Record<string, unknown>) => {
     handleSupabaseError({ error, message: 'Failed to update radio config' });
     broadcastSettingsUpdate();
 };
-export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>) => { const value = config.welcomeContent ? { ...config, welcomeContent: normalizeDocMediaForStorage(config.welcomeContent) } : config; const { error } = await supabase.from('settings').upsert({ key: 'wikiHomeConfig', value }, { onConflict: 'key' }); handleSupabaseError({ error, message: 'Failed to update wiki home config' }); broadcastSettingsUpdate(); };
+// This was the only Tiptap write path storing its doc unsanitised, so the
+// ALLOWED_EMBED_HOSTS check on iframe/youtube nodes, the forced
+// rel="noopener noreferrer" sanitizeMark stamps onto links, and MAX_DOC_IMAGES
+// were all bypassed here — while the stored blob ships to every authenticated
+// caller in the `main` subset and gets its media re-signed on each read. The
+// `{ ...config }` spread also allowed arbitrary keys into the settings row.
+// Now mirrors updateWikiPage (sanitize + image cap) and updatePublicPageConfig
+// (explicit key allowlist).
+export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>) => {
+    if (!config || typeof config !== 'object') throw new Error('Invalid wiki home config payload');
+
+    const allowedKeys = new Set(['welcomeContent', 'featuredPageIds', 'hideRecentlyUpdated']);
+    for (const k of Object.keys(config)) {
+        if (!allowedKeys.has(k)) throw new Error(`Unknown wiki home config field: ${k}`);
+    }
+
+    const value: Partial<WikiHomeConfig> = {};
+    if (config.welcomeContent) {
+        const safeContent = normalizeDocMediaForStorage(sanitizeTiptapJson(config.welcomeContent, 'wiki'));
+        assertDocImageCap(safeContent);
+        value.welcomeContent = safeContent;
+    } else if (config.welcomeContent !== undefined) {
+        // Explicitly cleared — store the empty value rather than the raw falsy input.
+        value.welcomeContent = null;
+    }
+    if (config.featuredPageIds !== undefined) {
+        value.featuredPageIds = (Array.isArray(config.featuredPageIds) ? config.featuredPageIds : [])
+            .filter((id): id is string => typeof id === 'string')
+            .slice(0, 50);
+    }
+    if (config.hideRecentlyUpdated !== undefined) value.hideRecentlyUpdated = !!config.hideRecentlyUpdated;
+
+    const { error } = await supabase.from('settings').upsert({ key: 'wikiHomeConfig', value }, { onConflict: 'key' });
+    handleSupabaseError({ error, message: 'Failed to update wiki home config' });
+    broadcastSettingsUpdate();
+};
 
 const PUBLIC_LINK_URL_RE = /^(https:\/\/|discord:\/\/)/i;
 const HTML_TAG_RE = /<[^>]*>/g;
