@@ -38,8 +38,12 @@ const INSERT_BATCH = 200;
 // ---------------------------------------------------------------------------
 // Structural view of the untyped query builder (no `any` escapes the module).
 // ---------------------------------------------------------------------------
-interface WriteResult { data: Record<string, unknown>[] | null; error: { message: string; code?: string } | null; }
-interface SelectResult { data: Record<string, unknown>[] | null; error: { message: string; code?: string } | null; count?: number | null; }
+// PostgREST hands back the parsed error body as a PLAIN object (not a
+// PostgrestError instance) on the `{ data, error }` path this module uses, so
+// `details`/`hint` are present and must be typed to be logged — see insertRows.
+interface PostgrestErrorShape { message: string; code?: string; details?: string | null; hint?: string | null }
+interface WriteResult { data: Record<string, unknown>[] | null; error: PostgrestErrorShape | null; }
+interface SelectResult { data: Record<string, unknown>[] | null; error: PostgrestErrorShape | null; count?: number | null; }
 interface Insertable extends PromiseLike<WriteResult> {
     insert: (rows: Record<string, unknown>[] | Record<string, unknown>) => Insertable;
     update: (patch: Record<string, unknown>) => Insertable & { eq: (c: string, v: unknown) => PromiseLike<WriteResult> };
@@ -64,7 +68,12 @@ export interface ImportHeader {
     version: number;
     exportedAt?: string;
     sourceApp?: string;
-    sourceOrg?: { name?: string; slug?: string };
+    /** `features` is the source org's optional-module on/off state. It rides the
+     *  HEADER rather than a settings row because `organizations` (where the hosted
+     *  app keeps it) is never exported — see applyImportedFeatureToggles. Typed as
+     *  `unknown` values, not booleans: this is attacker-controlled input and is
+     *  allowlisted + coerced, never trusted by shape. */
+    sourceOrg?: { name?: string; slug?: string; features?: Record<string, unknown> };
     tableOrder: string[];
     manifest: Record<string, number>;
 }
@@ -76,12 +85,35 @@ export interface ParsedExport {
     totalRows: number;
 }
 
+/** Why a row did not make it in. `rowsSkipped` is the SUM of these — it was
+ *  previously reported to the operator as "rows from unrecognized tables", which
+ *  is only ONE of the five causes and hid the one that actually cost data
+ *  (`catalogMiss`: a ship whose model this instance's catalog lacks). Every
+ *  `rowsSkipped` increment must land in exactly one bucket. */
+export interface ImportSkipBreakdown {
+    /** Table present in the export but not in IMPORTABLE_TABLES (older fork). */
+    unknownTable: number;
+    /** Table deliberately never imported (deployment-local federation state). */
+    excludedTable: number;
+    /** A required catalog FK (ship / permission / QM item) did not resolve here. */
+    catalogMiss: number;
+    /** The row itself was rejected by the database (FK orphan, CHECK, enum, unique). */
+    constraintViolation: number;
+    /** A `settings` key on SETTINGS_IMPORT_DENYLIST — deployment config stays local. */
+    deploymentSettings: number;
+}
+
 export interface ImportResult {
     tablesProcessed: number;
     rowsInserted: number;
     rowsSkipped: number;
+    /** Per-cause split of `rowsSkipped` (they sum to it). */
+    skipBreakdown: ImportSkipBreakdown;
     sequencesReset: string[];
     warnings: string[];
+    /** Optional modules switched ON from the export header's `sourceOrg.features`,
+     *  by display label, so the operator can see what the import enabled. */
+    modulesEnabled: string[];
     /** When a first-run/admin MERGE re-anchored the acting admin onto an imported
      *  identity, the admin's resulting users.id + role_id — the caller re-issues a
      *  session token for it. Absent when no merge occurred. */
@@ -143,6 +175,29 @@ const NULL_FKS: Record<string, string[]> = {
     warrants: ['source_feed_id'],
 };
 
+// FK columns pointing at a row that THIS import may have dropped on a required
+// catalog remap (see prepareRow step 1a). The droppable parents are the tables with a
+// `required: true` CATALOG_REMAPS entry — user_ships (an unsynced ship model) and
+// quartermaster_inventory (an unsynced platform item). Without an entry here their
+// dependants FK-fail one at a time in the row-by-row fallback and are reported as a
+// generic "rejected by the database", which hides the fact that ONE unsynced catalog
+// caused all of it. `nullable` mirrors the local schema exactly.
+// (role_permissions is the third required remap but nothing references a grant.)
+// Every parent listed here MUST be inserted earlier in the export's tableOrder, which
+// the exporter guarantees. Completeness is pinned by
+// tests/importTableSetInvariants.test.ts against schema.sql, not by this comment.
+export const DROPPED_PARENT_FKS: Record<string, { col: string; parent: string; nullable: boolean }[]> = {
+    // user_ships.ship_id is NOT NULL → an unsynced ship model drops the hangar row.
+    fleet_group_ships: [{ col: 'user_ship_id', parent: 'user_ships', nullable: false }],
+    operation_participants: [{ col: 'user_ship_id', parent: 'user_ships', nullable: true }],
+    // quartermaster_inventory rows for PLATFORM catalog items drop when the item
+    // catalog is unsynced. Both dependants' inventory_id is NOT NULL (ON DELETE
+    // RESTRICT), so they cannot survive their parent — but they can at least be
+    // counted and explained instead of failing opaquely.
+    quartermaster_issuances: [{ col: 'inventory_id', parent: 'quartermaster_inventory', nullable: false }],
+    quartermaster_inventory_movements: [{ col: 'inventory_id', parent: 'quartermaster_inventory', nullable: false }],
+};
+
 // Secret / transient per-install columns that must NEVER carry over from a source
 // export, on ANY table (table-agnostic + future-proof). A hand-crafted or
 // pre-hardening NDJSON could otherwise import a verification token, pending
@@ -162,8 +217,19 @@ interface CatalogRemap {
     fkColumn: string;
     /** Alias under which the exporter embedded the external key object (== catalog table name). */
     embedAlias: string;
-    /** Build a lookup key from an embed object (or row), for both export embed and fork catalog. */
-    keyOf: (obj: Record<string, unknown>) => string | null;
+    /**
+     * EVERY lookup key form this object supports, most precise FIRST. Used for both
+     * sides of the match: `buildCatalogIndex` indexes a fork catalog row under ALL of
+     * them, and `prepareRow` probes an export embed's forms in this order and takes
+     * the first hit.
+     *
+     * It is deliberately a LIST, not a single key. The old single-key form chose one
+     * form per row by preference, which meant the two sides could pick DIFFERENT
+     * branches for the same ship and miss — see PLATFORM_SHIP_REMAP for the concrete
+     * failure. Prefixing each form (`a:` / `u:` / `n:`) keeps the forms in one map
+     * without collision.
+     */
+    keysOf: (obj: Record<string, unknown>) => string[];
     /** Fork catalog table to index. */
     catalogTable: string;
     /** Columns to select from the fork catalog for keying. */
@@ -174,16 +240,71 @@ interface CatalogRemap {
      *  NOT NULL / CHECK-constrained — a grant/ship for a catalog this fork lacks is
      *  meaningless and can't be nulled); if false the FK is set NULL. */
     required?: boolean;
+    /** Where the operator syncs THIS catalog, for the "row skipped" warning. Omitted
+     *  when there is nothing to sync (permissions are code-owned and seeded on boot). */
+    syncHint?: string;
 }
 
-const CATALOG_REMAPS: Record<string, CatalogRemap> = {
+/**
+ * Ship catalog key forms, most precise first: api id → uuid → name+manufacturer.
+ *
+ * WHY THE ORDER, AND WHY ALL THREE. `platform_ships` rows can carry either external
+ * id, both, or neither, and the two installs populate them differently:
+ *   - a self-hosted catalog is api-id-ONLY (syncShipCatalog upserts on
+ *     external_api_id and never writes external_uuid — lib/db/fleet.ts),
+ *   - a hosted row created before its shipmatrix pivot carries BOTH (that migration
+ *     stamped the api id onto legacy rows rather than replacing the uuid),
+ *   - a hosted legacy paint variant shipmatrix does not enumerate carries NEITHER.
+ * The old code stored exactly one key per catalog row and computed exactly one key
+ * per embed, both uuid-first — so a both-keys embed produced `u:` while an api-id-only
+ * catalog produced `a:`, a guaranteed miss on EVERY ship. (`fleet_groups` has no
+ * catalog FK, which is why the symptom was an intact group tree containing nothing.)
+ * Indexing every form makes the match succeed whichever columns each side happens to
+ * hold, and probing in precision order means a name collision can never outrank a
+ * real external id.
+ *
+ * The name+manufacturer form is the LAST resort and exists only for the rows with no
+ * external id at all. It is sound because both catalogs derive their names from the
+ * same upstream feed and the fork's own sync already claims legacy rows by exactly
+ * this pair (lib/db/fleet.ts). Lower-cased + trimmed, exact otherwise — no fuzzy
+ * matching, ever.
+ */
+function shipCatalogKeys(o: Record<string, unknown>): string[] {
+    const keys: string[] = [];
+    if (o.external_api_id != null) keys.push(`a:${String(o.external_api_id)}`);
+    if (o.external_uuid != null) keys.push(`u:${String(o.external_uuid)}`);
+    const name = typeof o.name === 'string' ? o.name.trim().toLowerCase() : '';
+    const manufacturer = typeof o.manufacturer === 'string' ? o.manufacturer.trim().toLowerCase() : '';
+    if (name && manufacturer) keys.push(`n:${name}|${manufacturer}`);
+    return keys;
+}
+
+// Shared by every FK that points at platform_ships. One definition so the two
+// consumers can never key the same catalog differently (buildCatalogIndex caches
+// one index per catalogTable — see importOrgData).
+const PLATFORM_SHIP_REMAP = {
+    embedAlias: 'platform_ships',
+    catalogTable: 'platform_ships',
+    // name/manufacturer are part of the key set (see shipCatalogKeys), so they must
+    // be selected. Explicit column list — never a wildcard (security rule 1).
+    catalogSelect: 'id, external_uuid, external_api_id, name, manufacturer',
+    keysOf: shipCatalogKeys,
+    syncHint: 'Admin → Catalogs → Ship Catalog (Sync from Wiki)',
+} as const;
+
+export const CATALOG_REMAPS: Record<string, CatalogRemap> = {
     user_ships: {
+        ...PLATFORM_SHIP_REMAP,
         fkColumn: 'ship_id',
-        embedAlias: 'platform_ships',
-        catalogTable: 'platform_ships',
-        catalogSelect: 'id, external_uuid, external_api_id',
         required: true, // user_ships.ship_id is NOT NULL — drop ships whose platform model isn't synced
-        keyOf: (o) => (o.external_uuid != null ? `u:${String(o.external_uuid)}` : (o.external_api_id != null ? `a:${String(o.external_api_id)}` : null)),
+    },
+    // operation_participants.ship_id is nullable (ON DELETE SET NULL) and the exporter
+    // nullifies it + embeds the same key object, so an unresolvable model costs the
+    // ship attribution on that participant, never the participation record itself.
+    operation_participants: {
+        ...PLATFORM_SHIP_REMAP,
+        fkColumn: 'ship_id',
+        required: false,
     },
     role_permissions: {
         fkColumn: 'permission_id',
@@ -191,7 +312,10 @@ const CATALOG_REMAPS: Record<string, CatalogRemap> = {
         catalogTable: 'permissions',
         catalogSelect: 'id, name',
         required: true, // permission_id is NOT NULL — drop grants for perms this fork doesn't have
-        keyOf: (o) => (o.name != null ? `n:${String(o.name)}` : null),
+        // No syncHint: `permissions` is a CODE-OWNED catalog seeded on first boot, not
+        // something the operator can sync. A miss means the source org held a permission
+        // this fork does not define; ensureAdminRoleHasAllPermissions covers the reverse.
+        keysOf: (o) => (o.name != null ? [`n:${String(o.name)}`] : []),
     },
     quartermaster_inventory: {
         fkColumn: 'catalog_id',
@@ -199,22 +323,38 @@ const CATALOG_REMAPS: Record<string, CatalogRemap> = {
         catalogTable: 'quartermaster_catalog',
         catalogSelect: 'id, external_uuid, external_id, source',
         required: true, // catalog_id has a NOT-NULL-or-custom_name CHECK; platform rows have no custom_name
+        syncHint: 'Admin → Catalogs → Item Catalog',
         // Only platform catalog rows need remap; custom rows were imported with
         // their original ids preserved, so their catalog_id already resolves.
         shouldRemap: (e) => e.source === 'platform',
-        keyOf: (o) => {
-            if (o.source !== 'platform') return null;
-            if (o.external_uuid != null) return `u:${String(o.external_uuid)}`;
-            if (o.external_id != null) return `e:${String(o.external_id)}`;
-            return null;
+        keysOf: (o) => {
+            if (o.source !== 'platform') return [];
+            const keys: string[] = [];
+            if (o.external_uuid != null) keys.push(`u:${String(o.external_uuid)}`);
+            if (o.external_id != null) keys.push(`e:${String(o.external_id)}`);
+            return keys;
         },
+    },
+    // Category taxonomies are seeded per install, so the raw integer category_id is
+    // meaningless here — the exporter NULLs it and embeds the stable slug instead.
+    // required:false is load-bearing: an unmatched slug must leave the listing
+    // UNCATEGORISED, never drop it (category_id is nullable on both sides).
+    marketplace_listings: {
+        fkColumn: 'category_id',
+        embedAlias: 'marketplace_categories',
+        catalogTable: 'marketplace_categories',
+        catalogSelect: 'id, slug',
+        required: false,
+        keysOf: (o) => (o.slug != null ? [`s:${String(o.slug)}`] : []),
     },
 };
 
-// All embed-alias keys that must be stripped from any row before insert
-// (they are joined objects, never real columns).
-const STRIP_ALWAYS = new Set<string>([
-    'platform_ships', 'permissions', 'quartermaster_catalog',
+// All embed-alias keys that must be stripped from any row before insert (they are
+// joined objects, never real columns — an un-stripped embed fails the whole row).
+// Pinned as a superset of every CATALOG_REMAPS embedAlias by
+// tests/importTableSetInvariants.test.ts, so a new remap cannot forget its entry.
+export const STRIP_ALWAYS = new Set<string>([
+    'platform_ships', 'permissions', 'quartermaster_catalog', 'marketplace_categories',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -228,6 +368,23 @@ const EMPTINESS_GUARD_TABLES = [
     'intel_reports', 'warrants', 'announcements', 'treasury_ledger_entries',
 ];
 
+/**
+ * A REFUSAL, as distinct from a failure: the import was declined before a single
+ * row was written, so the instance is exactly as it was.
+ *
+ * The distinction is load-bearing in the UI, not cosmetic. The first-run wizard's
+ * import-failed panel tells the operator that the instance "may now hold partial
+ * data", that it is not safe to continue or skip, and to reset the database and
+ * start over — correct for a failure halfway through 40k rows, and actively harmful
+ * for a refusal, where the honest advice is "fix the one named thing and try again".
+ * Since the empty-ship-catalog refusal fires on the ORDINARY fresh-install path,
+ * routing it through the destructive panel would have been the common case.
+ */
+export class ImportRefusedError extends Error {
+    readonly refused = true;
+    constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = 'ImportRefusedError'; }
+}
+
 export async function assertDatabaseEmpty(): Promise<void> {
     for (const table of EMPTINESS_GUARD_TABLES) {
         const { count, error } = await sb.from(table).select('id', { count: 'exact', head: true }) as unknown as SelectResult;
@@ -237,7 +394,7 @@ export async function assertDatabaseEmpty(): Promise<void> {
             throw new Error(`Pre-import emptiness check failed on ${table}: ${error.message}`);
         }
         if ((count || 0) > 0) {
-            throw new Error(
+            throw new ImportRefusedError(
                 `Import refused: this instance already contains data (${table} has ${count} rows). ` +
                 `Org import is a one-time bootstrap into an empty instance.`,
             );
@@ -308,13 +465,31 @@ async function buildCatalogIndex(remap: CatalogRemap): Promise<Map<string, numbe
         }
         const rows = data || [];
         for (const row of rows) {
-            const key = remap.keyOf(row);
-            if (key != null && row.id != null) index.set(key, row.id as number);
+            if (row.id == null) continue;
+            // EVERY key form this catalog row supports, so a lookup succeeds whichever
+            // form the export embed happens to carry. FIRST-WRITE-WINS: catalog rows
+            // arrive in id order, and the imprecise `n:` (name+manufacturer) form can
+            // legitimately repeat across rows — letting a later duplicate overwrite
+            // would make the winner depend on page boundaries. The external-id forms
+            // are backed by UNIQUE columns and cannot collide at all.
+            for (const key of remap.keysOf(row)) {
+                if (!index.has(key)) index.set(key, row.id as number);
+            }
         }
         if (rows.length < PAGE) break;
         from += PAGE;
     }
     return index;
+}
+
+/** Why a prepared row lost (or could not resolve) its catalog FK. Returned rather
+ *  than pushed as a warning so the per-table caller can COLLAPSE hundreds of these
+ *  into one line — see the note on `summariseRemapMisses`. */
+interface RemapMiss {
+    /** true → the whole row was dropped (required FK); false → the FK was set NULL. */
+    dropped: boolean;
+    /** The un-prefixed external key that failed to resolve, for the operator. */
+    ref: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,33 +501,83 @@ function prepareRow(
     table: string,
     raw: Record<string, unknown>,
     catalogIndex: Map<string, Map<string, number>>,
-    warnings: string[],
-): { row: Record<string, unknown>; selfRef: Record<string, unknown> | null; drop: boolean } {
+    droppedIds: Map<string, Set<string>>,
+): { row: Record<string, unknown>; selfRef: Record<string, unknown> | null; drop: boolean; remapMiss: RemapMiss | null; orphanedBy: string | null } {
     const row: Record<string, unknown> = { ...raw };
     let drop = false;
+    let remapMiss: RemapMiss | null = null;
 
-    // 1. Catalog remap (read embed BEFORE stripping).
+    // 1. Catalog remap (read embed BEFORE stripping). Probe the embed's key forms in
+    // PRECISION order (api id → uuid → name+manufacturer) and take the first hit, so
+    // an imprecise form can never outrank an exact external-id match.
     const remap = CATALOG_REMAPS[table];
     if (remap) {
         const embed = row[remap.embedAlias] as Record<string, unknown> | null | undefined;
+        if (!embed && !remap.required && row[remap.fkColumn] != null) {
+            // A NULLABLE catalog FK arrived with a raw value and NO key to resolve it
+            // by. That id belongs to the SOURCE deployment's independently-numbered
+            // catalog, so inserting it verbatim does not fail — it silently points at
+            // whatever unrelated row happens to hold that integer here. (Reachable
+            // because the format version is deliberately not bumped, so an export
+            // predating the exporter's nullify+embed still imports.) Null is a visible
+            // gap; a wrong ship or category is silent corruption.
+            //
+            // Only for `required: false`. A required remap's absent embed is
+            // meaningful: quartermaster_inventory's CUSTOM rows carry no embed and
+            // their catalog_id was imported with its id preserved, so it resolves.
+            row[remap.fkColumn] = null;
+            // Reported, not silent — it is still a link the org had and no longer has.
+            remapMiss = { dropped: false, ref: '(no catalog key in export)' };
+        }
         if (embed && (!remap.shouldRemap || remap.shouldRemap(embed))) {
-            const key = remap.keyOf(embed);
-            const forkId = key != null ? catalogIndex.get(remap.catalogTable)?.get(key) : undefined;
+            const keys = remap.keysOf(embed);
+            const index = catalogIndex.get(remap.catalogTable);
+            let forkId: number | undefined;
+            for (const key of keys) {
+                forkId = index?.get(key);
+                if (forkId != null) break;
+            }
             if (forkId != null) {
                 row[remap.fkColumn] = forkId;
-            } else if (remap.required) {
-                // FK is NOT NULL / CHECK-constrained and the catalog row isn't in this
-                // instance (a permission/ship this fork lacks, or an unsynced platform
-                // catalog) → DROP the row rather than insert NULL and fail the import.
-                drop = true;
-                const ref = key ? key.replace(/^[a-z]:/, '') : '(unknown)';
-                warnings.push(`${table}: "${ref}" is not in this instance's ${remap.catalogTable} catalog — row skipped. (Sync catalogs in Admin → Database Tools before importing to keep these.)`);
             } else {
-                // Nullable FK → null it rather than fail the import. Surface a warning.
-                row[remap.fkColumn] = null;
-                warnings.push(`${table}#${String(row.id)}: ${remap.catalogTable} external key not found in synced catalog; FK ${remap.fkColumn} set NULL.`);
+                // `ref` is the MOST PRECISE form the export carried, un-prefixed — the
+                // string an operator can actually search their catalog for.
+                const ref = keys.length > 0 ? keys[0].replace(/^[a-z]:/, '') : '(unknown)';
+                if (remap.required) {
+                    // FK is NOT NULL / CHECK-constrained and the catalog row isn't in this
+                    // instance (a permission/ship this fork lacks, or an unsynced platform
+                    // catalog) → DROP the row rather than insert NULL and fail the import.
+                    drop = true;
+                    if (row.id != null) {
+                        let set = droppedIds.get(table);
+                        if (!set) { set = new Set<string>(); droppedIds.set(table, set); }
+                        set.add(String(row.id));
+                    }
+                } else {
+                    // Nullable FK → null it rather than fail the import.
+                    row[remap.fkColumn] = null;
+                }
+                remapMiss = { dropped: drop, ref };
             }
         }
+    }
+
+    // 1a. Cascade from a parent this import already DROPPED. Without this a dropped
+    // user_ships row silently takes its dependants with it: the exporter nullifies
+    // operation_participants.ship_id but NOT user_ship_id, so the participant row
+    // FK-fails and the whole record — attendance, RSVP, payout share — is discarded
+    // by the row-by-row fallback with no operator-visible warning. Nullable columns
+    // are nulled (keep the row, lose the ship link); NOT NULL ones drop the row, but
+    // now as an accounted, reported `catalogMiss` rather than an opaque constraint
+    // violation. Safe by construction: every parent here is inserted earlier in the
+    // manifest, so `droppedIds` is complete before its dependants are prepared.
+    let orphanedBy: string | null = null;
+    for (const fk of DROPPED_PARENT_FKS[table] || []) {
+        const val = row[fk.col];
+        if (val == null) continue;
+        if (!droppedIds.get(fk.parent)?.has(String(val))) continue;
+        orphanedBy = fk.parent;
+        if (fk.nullable) row[fk.col] = null; else drop = true;
     }
 
     // 1b. Null FKs that reference a table whose ids don't carry over from the SaaS
@@ -381,7 +606,38 @@ function prepareRow(
             }
         }
     }
-    return { row, selfRef, drop };
+    return { row, selfRef, drop, remapMiss, orphanedBy };
+}
+
+// Cap on how many distinct external keys a collapsed catalog-miss warning names.
+// Enough to identify the pattern ("it's all Drake hulls"), short enough that the
+// line stays readable and the `warnings` array stays a small payload.
+const WARNING_EXAMPLE_LIMIT = 5;
+
+/**
+ * Collapse one table's per-row catalog misses into at most two lines.
+ *
+ * WHY: `user_ships` emits one miss per ship and sits early in the manifest, so on a
+ * fleet-loss import it used to produce thousands of near-identical warnings — which
+ * (a) crowded every later table's warning out of the client's summary list, and
+ * (b) shipped the whole array to the browser inside the `done` event. One counted
+ * line with a handful of examples says strictly more, in one line.
+ */
+function summariseRemapMisses(table: string, misses: RemapMiss[], remap: CatalogRemap | undefined): string[] {
+    if (misses.length === 0 || !remap) return [];
+    const out: string[] = [];
+    const sync = remap.syncHint ? ` Sync it in ${remap.syncHint} and re-run the import to keep these.` : '';
+    for (const dropped of [true, false]) {
+        const group = misses.filter((m) => m.dropped === dropped);
+        if (group.length === 0) continue;
+        const refs = [...new Set(group.map((m) => m.ref))];
+        const shown = refs.slice(0, WARNING_EXAMPLE_LIMIT).map((r) => `"${r}"`).join(', ');
+        const more = refs.length > WARNING_EXAMPLE_LIMIT ? `, +${refs.length - WARNING_EXAMPLE_LIMIT} more` : '';
+        out.push(dropped
+            ? `${table}: ${group.length} row(s) SKIPPED — not in this instance's ${remap.catalogTable} catalog (${shown}${more}).${sync}`
+            : `${table}: ${group.length} row(s) imported with ${remap.fkColumn} left empty — no match in this instance's ${remap.catalogTable} (${shown}${more}).${sync}`);
+    }
+    return out;
 }
 
 // Parse a PostgREST "unknown column" error → the offending column name, or null.
@@ -430,7 +686,23 @@ async function insertRows(table: string, rows: Record<string, unknown>[]): Promi
                 if (!error) { rowOk = true; break; }
                 const col = unknownColumnFromError(error);
                 if (col) { stripped.add(col); single = drop(single, col); continue; }
-                log.warn('import: row skipped (constraint violation)', { table, error: error.message });
+                // Log the FULL PostgREST error, not just `message`. The SQLSTATE in
+                // `code` is the entire difference between an FK orphan (23503), an
+                // enum/CHECK mismatch (23514/22P02) and a unique violation (23505),
+                // and `details`/`hint` name the offending column and value — without
+                // them a skipped row is undiagnosable after the fact. `details` can
+                // quote the failing row, so it is length-capped; it never leaves the
+                // server (this is the only record of the row, by design) and the
+                // secret columns are already dropped in prepareRow. The row's own id
+                // is logged so the operator can find it in the export.
+                log.warn('import: row skipped (constraint violation)', {
+                    table,
+                    rowId: single.id ?? null,
+                    code: error.code || '',
+                    errMessage: error.message,
+                    details: String(error.details ?? '').slice(0, 500),
+                    hint: error.hint || '',
+                });
                 break;
             }
             if (rowOk) inserted++; else skipped++;
@@ -442,16 +714,25 @@ async function insertRows(table: string, rows: Record<string, unknown>[]): Promi
 // ---------------------------------------------------------------------------
 // Second pass: restore self-ref FKs by id.
 // ---------------------------------------------------------------------------
-async function restoreSelfRefs(table: string, deferred: Record<string, unknown>[]): Promise<void> {
+// TOLERANT, like the deferred cross-table FK restore below it. This used to THROW,
+// which aborted an otherwise-complete import at whatever table it happened to reach:
+// nothing is transactional, so the seeded defaults were already gone, every earlier
+// table was already committed, and the run skipped resetSequences (leaving every
+// identity table on a stale sequence), the merge re-anchor and the permission
+// reconcile. The self-ref columns are all nullable — they were just nulled on insert
+// — so a failed restore costs one parent link, not the migration.
+async function restoreSelfRefs(table: string, deferred: Record<string, unknown>[]): Promise<string[]> {
     const cols = SELF_REF_FKS[table];
-    if (!cols) return;
+    if (!cols) return [];
+    const warnings: string[] = [];
     for (const d of deferred) {
         const patch: Record<string, unknown> = {};
         for (const c of cols) if (c in d) patch[c] = d[c];
         if (Object.keys(patch).length === 0) continue;
         const { error } = await sb.from(table).update(patch).eq('id', d.__id);
-        if (error) throw new Error(`Restoring self-ref on ${table}#${String(d.__id)} failed: ${error.message}`);
+        if (error) warnings.push(`Could not restore ${table}#${String(d.__id)}'s parent link (${cols.join(', ')}): ${error.message}; left empty.`);
     }
+    return warnings;
 }
 
 // Integer-id (sequence-backed) tables — generated from the database id-type
@@ -474,6 +755,14 @@ export const SEQUENCE_BACKED = new Set<string>([
     'quartermaster_issuances', 'treasury_accounts', 'warehouse_catalog',
     'warehouse_stock', 'external_tools', 'conduct_records', 'clearance_history',
     'reputation_history',
+    // Academy: the SEVEN bigint-identity tables only. academy_courses,
+    // academy_sessions and academy_enrollments are uuid PKs and own no sequence.
+    // Omitting these would not fail the import — it would leave every sequence at 0,
+    // so the FIRST module/lesson/outcome/progress row created AFTER the import
+    // collides on the primary key, days later and far from the cause.
+    // tests/importTableSetInvariants.test.ts makes this mechanical, not a memo.
+    'academy_course_instructors', 'academy_modules', 'academy_lessons', 'academy_outcomes',
+    'academy_session_instructors', 'academy_lesson_progress', 'academy_outcome_results',
 ]);
 
 // Tables we recognise and will import. Anything in the export's tableOrder that
@@ -509,6 +798,20 @@ export const IMPORTABLE_TABLES = new Set<string>([
     'announcements', 'external_tools', 'radio_channels', 'synced_discord_roles',
     'rank_mappings', 'dossier_summaries', 'conduct_records', 'clearance_history',
     'reputation_history', 'settings',
+    // Marketplace: LISTINGS ONLY. Contracts / milestones / ratings / considerations
+    // are bilateral (seller_org_id + buyer_org_id, both NOT NULL) so a row names a
+    // second tenant, and reports are platform moderation — the exporter sends none of
+    // them, and this fork must not invent them. marketplace_categories is seeded
+    // locally (lib/db/seeder.ts) and is the re-map TARGET, never imported.
+    'marketplace_listings',
+    // Academy (training / LMS). Column parity with the hosted schema is exact once
+    // organization_id is stripped — no drop, null, re-map or self-ref needed; the
+    // only outward FKs are users and certifications.id, both imported earlier with
+    // their ids preserved. Order below mirrors the exporter's manifest order, which
+    // IS the insert order (courses → children → sessions → enrolments → per-enrolment).
+    'academy_courses', 'academy_course_instructors', 'academy_modules', 'academy_lessons',
+    'academy_outcomes', 'academy_sessions', 'academy_session_instructors',
+    'academy_enrollments', 'academy_lesson_progress', 'academy_outcome_results',
 ]);
 
 // First-boot SEEDER defaults (lib/db/seeder.ts) cleared before import so the org's
@@ -661,6 +964,21 @@ function sanitizePublicPageConfigValue(cfg: Record<string, unknown>): Record<str
     return safe;
 }
 
+// systemConfig.appUrl is THIS deployment's own public origin, not portable org data.
+// The rest of the row (welcomeMessage, …) is ordinary org config and is kept, so the
+// key is stripped surgically here rather than denylisting the whole row. Importing it
+// would overwrite the destination's origin with the SOURCE's — and that origin is what
+// alliance pairing advertises and verifies (lib/db/alliances.ts getOurOrigin,
+// lib/db.ts getOrgTenantUrl), so a stale value silently breaks federation. OMITTING
+// the key (rather than writing '') is deliberate: both readers guard on truthiness and
+// fall back to process.env.APP_URL, i.e. "unset — the operator configures it here".
+function sanitizeSystemConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    if (!('appUrl' in cfg)) return cfg;
+    const safe = { ...cfg };
+    delete safe.appUrl;
+    return safe;
+}
+
 /** Re-apply the admin-console write-boundary sanitizers to ONE imported settings
  *  row's `value`, keyed by the settings key. Keys with no sanitizing write path
  *  (and non-object values) pass through unchanged. */
@@ -673,8 +991,86 @@ function sanitizeImportedSettingRow(row: Record<string, unknown>): Record<string
         case 'publicPageConfig': return { ...row, value: sanitizePublicPageConfigValue(cfg) };
         case 'openGraphConfig': return { ...row, value: sanitizeOpenGraphConfigValue(cfg) };
         case 'heroCardConfig': return { ...row, value: sanitizeHeroCardConfigValue(cfg) };
+        case 'systemConfig': return { ...row, value: sanitizeSystemConfigValue(cfg) };
         default: return row;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Optional-module toggles from the export HEADER (`sourceOrg.features`).
+//
+// The hosted app keeps module on/off state on its `organizations.features` column,
+// and `organizations` is the one table its exporter never sends — so before this,
+// every import came up with Marketplace, Academy, Warehouse, Quartermaster and
+// Finances switched OFF and nothing said about it, which reads to an owner exactly
+// like the data having failed to import. (Government is unaffected: its flag rides
+// inside settings.governmentsConfig, which IS exported.)
+//
+// WHY THIS IS NOT A HOLE IN SETTINGS_IMPORT_DENYLIST. That denylist blocks an
+// imported `orgFeatures` settings ROW, and it still does — a doctored export cannot
+// write an arbitrary blob into this key. THIS channel is deliberately narrower in
+// every dimension: a fixed allowlist of the five keys this fork actually gates on,
+// each value coerced through `=== true` (so no object, string or truthy value can
+// smuggle anything through), rebuilt into the fork's own `{ enabled }` shape rather
+// than passed through. Unknown hosted keys (starcomms, blueprints) are ignored, and
+// the two DEFAULT-ON keys (leaderboard, externalTools) are never named here — the
+// header does not carry them, and writing `false` for an absent key would switch OFF
+// modules the source org never disabled.
+//
+// Blast radius of a wrongly-enabled module: a nav entry plus RPCs that still have to
+// pass the permission gate (the feature gate is additive to RBAC, never a substitute
+// — api/services.ts). Academy's member self-service surface is permission-LESS by
+// design, so enabling it exposes the published course catalogue to every member;
+// that is the honest worst case, and it is exactly what the source org had.
+const IMPORTABLE_FEATURE_MODULES: Readonly<Record<string, string>> = {
+    marketplace: 'Marketplace',
+    warehouse: 'Warehouse',
+    academy: 'Academy',
+    finances: 'Finances',
+    quartermaster: 'Quartermaster',
+};
+
+/**
+ * Write the allowlisted module toggles into the `orgFeatures` settings row.
+ * Returns the display labels of the modules switched ON, for the import summary.
+ *
+ * Read-merge-write rather than a blind overwrite, mirroring db.updateOrgFeatures'
+ * one-level deep merge, so sibling keys and any nested per-module settings survive.
+ * Implemented inline (not by importing lib/db/system) to keep this module's write
+ * surface self-contained and to avoid a mid-import settings broadcast — the import
+ * is a bootstrap and the UI does a full reload afterwards.
+ */
+async function applyImportedFeatureToggles(features: Record<string, unknown> | undefined): Promise<{ enabled: string[]; warnings: string[] }> {
+    if (!features || typeof features !== 'object' || Array.isArray(features)) return { enabled: [], warnings: [] };
+    const patch: Record<string, { enabled: boolean }> = {};
+    const enabled: string[] = [];
+    for (const [key, label] of Object.entries(IMPORTABLE_FEATURE_MODULES)) {
+        if (!(key in features)) continue;              // absent → leave this fork's default
+        const on = features[key] === true;             // strict: only a real `true` enables
+        patch[key] = { enabled: on };
+        if (on) enabled.push(label);
+    }
+    if (Object.keys(patch).length === 0) return { enabled: [], warnings: [] };
+
+    const { data, error: readErr } = await sb.from('settings').select('value').eq('key', 'orgFeatures') as unknown as SelectResult;
+    if (readErr && readErr.code !== '42P01' && readErr.code !== 'PGRST205') {
+        return { enabled: [], warnings: [`Could not read this instance's module toggles (${readErr.message}); modules left at their defaults — set them in Admin → Optional Features.`] };
+    }
+    const existingRow = (data || [])[0];
+    const current = (existingRow?.value && typeof existingRow.value === 'object' && !Array.isArray(existingRow.value))
+        ? existingRow.value as Record<string, unknown>
+        : null;
+    const next: Record<string, unknown> = { ...(current || {}), ...patch };
+
+    // No `upsert` here on purpose: the module's structural query-builder view models
+    // only what it uses, and an update-or-insert keeps that surface unchanged.
+    const { error: writeErr } = current
+        ? await sb.from('settings').update({ value: next }).eq('key', 'orgFeatures')
+        : await sb.from('settings').insert([{ key: 'orgFeatures', value: next }]);
+    if (writeErr) {
+        return { enabled: [], warnings: [`Could not apply the source org's module toggles (${writeErr.message}); switch them on in Admin → Optional Features.`] };
+    }
+    return { enabled, warnings: [] };
 }
 
 // Tables NEVER imported even though the export carries them: deployment-LOCAL
@@ -809,11 +1205,85 @@ export type ImportProgressEvent =
 
 export type ImportProgressFn = (evt: ImportProgressEvent) => void | Promise<void>;
 
+/**
+ * Pre-flight: refuse an import that would drop the org's whole fleet.
+ *
+ * `platform_ships` is a synced catalog, not org data — this fork never imports it and
+ * nothing seeds it (the only writer is the admin-triggered `catalog:sync_ships`). An
+ * import run before that sync resolves no ship at all, and because user_ships.ship_id
+ * is NOT NULL every one of those rows is dropped.
+ *
+ * Read-only, and called BEFORE the merge pre-flight — which captures and DELETES the
+ * acting admin's row outside the try. On a fresh install the catalog is always empty
+ * and the wizard always takes the merge path, so this refusal is the ordinary
+ * first-run outcome; routing it through the delete would make the best-effort
+ * restoreAdminRow the routine path for something we can decline without touching a
+ * single row.
+ */
+async function assertShipCatalogReadyFor(parsed: ParsedExport): Promise<void> {
+    // Count the actual parsed rows, not header.manifest — the manifest is a claim the
+    // export makes about itself and this decides whether to refuse.
+    const shipRows = parsed.rowsByTable.get('user_ships')?.length || 0;
+    if (shipRows === 0) return;
+    const { count, error } = await sb.from('platform_ships').select('id', { count: 'exact', head: true }) as unknown as SelectResult;
+    // A missing table means the schema predates the catalog; there is nothing to sync
+    // and nothing to protect, so don't block on it.
+    if (error) {
+        if (error.code === '42P01' || error.code === 'PGRST205') return;
+        throw new Error(`Pre-import ship-catalog check failed: ${error.message}`);
+    }
+    if ((count || 0) > 0) return;
+    throw new ImportRefusedError(
+        `Import refused: this instance's ship catalog is empty, and the export contains ${shipRows} member ship(s). ` +
+        `Every one of them would be discarded, leaving your fleet groups intact but empty. ` +
+        `Sync the catalog first (Admin → Catalogs → Ship Catalog → "Sync from Wiki"), then run this import again — ` +
+        `if you are still in first-run setup, skip this step and import afterwards from Admin → Import Organization.`,
+    );
+}
+
+/** Flips at the FIRST mutating call of an import run. See importOrgData. */
+interface WriteState { wrote: boolean }
+
+/**
+ * Import an organization export.
+ *
+ * The wrapper exists to make "was anything written?" STRUCTURAL. Whether a failure is
+ * a refusal (instance untouched — retry after fixing the named thing) or a genuine
+ * failure (possibly-partial data — reset and start over) drives destructive advice in
+ * the first-run wizard, so deriving it from "did we reach a write?" is the only
+ * version that cannot drift: a new pre-flight, a new validation error, or a transient
+ * read failure is classified correctly without anyone remembering to pick the right
+ * Error subclass. `ImportRefusedError` is still thrown directly at the deliberate
+ * decline points, for the message; this backstops everything else — including
+ * parseExport, which is a pure function over the input and therefore always a refusal.
+ */
 export async function importOrgData(ndjson: string, onProgress?: ImportProgressFn, merge?: ImportMergeOptions): Promise<ImportResult> {
+    const writeState: WriteState = { wrote: false };
+    try {
+        return await runImport(ndjson, writeState, onProgress, merge);
+    } catch (err) {
+        if (!writeState.wrote && err instanceof Error && !(err instanceof ImportRefusedError)) {
+            throw new ImportRefusedError(err.message, { cause: err });
+        }
+        throw err;
+    }
+}
+
+async function runImport(ndjson: string, writeState: WriteState, onProgress?: ImportProgressFn, merge?: ImportMergeOptions): Promise<ImportResult> {
     const emit = async (evt: ImportProgressEvent) => { if (onProgress) await onProgress(evt); };
 
     const parsed = parseExport(ndjson);
     await emit({ type: 'phase', phase: 'validate' });
+
+    // REFUSE before the first destructive write — and, critically, before the merge
+    // pre-flight below FREES the acting admin's row — if the ship catalog is empty and
+    // the export carries ships. Nothing seeds platform_ships (its only writer is the
+    // admin-triggered sync) and user_ships.ship_id is NOT NULL, so importing against
+    // an empty catalog silently discards EVERY member ship while the fleet-group tree
+    // imports intact and empty. That was the reported bug, and the only recovery is a
+    // full DB wipe and re-import, so declining here — at the cost of one catalog sync
+    // and nothing else — is strictly better than succeeding-but-empty.
+    await assertShipCatalogReadyFor(parsed);
 
     // MERGE pre-flight (id-reanchor): the acting admin already exists (created at
     // first-run setup), so the DB is NOT empty. After non-destructive validation,
@@ -825,7 +1295,7 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
     if (merge) {
         const usersRows = parsed.rowsByTable.get('users') || [];
         if (!usersRows.some((r) => Number(r.id) === merge.importedUserId)) {
-            throw new Error(`Merge target user #${merge.importedUserId} is not present in this export.`);
+            throw new ImportRefusedError(`Merge target user #${merge.importedUserId} is not present in this export.`);
         }
         // Refuse BEFORE freeing the admin if the instance already holds org content,
         // so we never CASCADE-delete the admin's child rows and then abort. Mirrors
@@ -838,7 +1308,7 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
                 throw new Error(`Merge pre-check failed on ${guardTable}: ${gErr.message}`);
             }
             if ((count || 0) > allowed) {
-                throw new Error(
+                throw new ImportRefusedError(
                     `Import refused: this instance already contains data (${guardTable} has ${count} rows). ` +
                     `A merge import is a one-time bootstrap into a fresh admin instance.`,
                 );
@@ -848,6 +1318,10 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
         if (capErr) throw new Error(`Merge pre-flight failed reading admin #${merge.adminUserId}: ${capErr.message}`);
         captured = (adminRows || [])[0] || null;
         if (!captured) throw new Error(`Merge pre-flight: admin user #${merge.adminUserId} not found.`);
+        // FIRST WRITE of the merge path. Everything above is a pure read, so a failure
+        // up to this point leaves the instance untouched; from here it does not, even
+        // though restoreAdminRow tries (best-effort, and it cannot undo the CASCADE).
+        writeState.wrote = true;
         const { error: delErr } = await sb.from('users').delete().eq('id', merge.adminUserId);
         if (delErr) throw new Error(`Merge pre-flight failed freeing admin #${merge.adminUserId}: ${delErr.message}`);
     }
@@ -857,12 +1331,24 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
 
         const warnings: string[] = [];
 
-        // Build catalog indexes once (only for tables present in the export).
+        // Build catalog indexes once PER CATALOG TABLE (only for tables present in the
+        // export). Two remaps can share a catalog — user_ships and
+        // operation_participants both key platform_ships — and they are guaranteed to
+        // key it identically because they share PLATFORM_SHIP_REMAP.
         const catalogIndex = new Map<string, Map<string, number>>();
         for (const [table, remap] of Object.entries(CATALOG_REMAPS)) {
-            if (parsed.rowsByTable.has(table)) {
+            if (parsed.rowsByTable.has(table) && !catalogIndex.has(remap.catalogTable)) {
                 catalogIndex.set(remap.catalogTable, await buildCatalogIndex(remap));
             }
+        }
+        // The category taxonomy is seeded on first boot, never imported. An instance
+        // whose Admin predates the marketplace seeder has none at all, in which case
+        // every listing lands uncategorised — say so up front rather than letting it
+        // read as an import failure. (Recoverable afterwards: Marketplace admin →
+        // seed categories.)
+        if ((parsed.rowsByTable.get('marketplace_listings')?.length || 0) > 0
+            && (catalogIndex.get('marketplace_categories')?.size || 0) === 0) {
+            warnings.push('marketplace_listings: this instance has no marketplace categories seeded, so every listing will import uncategorised. Seed the categories from the Marketplace admin tools, then re-file the listings.');
         }
 
         // Plan totals for the progress bar: importable, non-empty tables in order.
@@ -873,6 +1359,10 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
         const totalTables = plannedTables.length;
         const totalRows = plannedTables.reduce((n, t) => n + (parsed.rowsByTable.get(t)?.length || 0), 0);
         await emit({ type: 'start', totalTables, totalRows });
+
+        // FIRST WRITE of the non-merge path: the pre-clear below deletes the seeded
+        // defaults, after which the instance is no longer in its original state.
+        writeState.wrote = true;
 
         // Clear first-boot seeded defaults that would collide with imported ids/keys.
         await emit({ type: 'phase', phase: 'preclear' });
@@ -899,9 +1389,18 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
         }
 
         let rowsInserted = 0;
-        let rowsSkipped = 0;
         let tablesDone = 0;
+        // Every skipped row lands in exactly one bucket; rowsSkipped is their sum.
+        // Kept as a breakdown because the single number used to be reported to the
+        // operator as "rows from unrecognized tables", which described one bucket and
+        // hid the one that cost data.
+        const skipBreakdown: ImportSkipBreakdown = {
+            unknownTable: 0, excludedTable: 0, catalogMiss: 0, constraintViolation: 0, deploymentSettings: 0,
+        };
         const importedTables: string[] = [];
+        // ids dropped by a required catalog remap, so a later table's FK to one of them
+        // can be nulled (or the row dropped and REPORTED) instead of failing opaquely.
+        const droppedIds = new Map<string, Set<string>>();
         // Captured deferred cross-table FKs (e.g. units.leader_id) to restore after
         // every table — including the referenced one — has been inserted.
         const deferredFkRestores: { table: string; id: unknown; col: string; value: unknown }[] = [];
@@ -914,7 +1413,7 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
             // Deployment-local federation tables are never imported (peer crypto +
             // dangling api_keys FKs would break federation auth). Re-pair on this install.
             if (IMPORT_EXCLUDED_TABLES.has(table)) {
-                rowsSkipped += rawRows.length;
+                skipBreakdown.excludedTable += rawRows.length;
                 const msg = `${table}: deployment-local federation data (${rawRows.length} rows) — never imported; re-establish alliances via the handshake flow on this install.`;
                 warnings.push(msg);
                 await emit({ type: 'warning', message: msg });
@@ -922,7 +1421,7 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
             }
 
             if (!IMPORTABLE_TABLES.has(table)) {
-                rowsSkipped += rawRows.length;
+                skipBreakdown.unknownTable += rawRows.length;
                 const msg = `Unknown table "${table}" in export (${rawRows.length} rows) — skipped.`;
                 warnings.push(msg);
                 await emit({ type: 'warning', message: msg });
@@ -938,7 +1437,7 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
                 rawRows = rawRows.filter((r) => !SETTINGS_IMPORT_DENYLIST.has(String(r.key)));
                 const dropped = before - rawRows.length;
                 if (dropped > 0) {
-                    rowsSkipped += dropped;
+                    skipBreakdown.deploymentSettings += dropped;
                     const msg = `settings: skipped ${dropped} deployment-config key(s) (${[...SETTINGS_IMPORT_DENYLIST].join(', ')}) — these stay local to this install; configure them via .env / the admin console.`;
                     warnings.push(msg);
                     await emit({ type: 'warning', message: msg });
@@ -952,13 +1451,17 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
                 rawRows = rawRows.map(sanitizeImportedSettingRow);
             }
 
-            const warnStart = warnings.length;
             const prepared: Record<string, unknown>[] = [];
             const deferred: Record<string, unknown>[] = [];
+            const misses: RemapMiss[] = [];
+            let orphanDropped = 0;
+            let orphanNulled = 0;
             const deferredCols = DEFERRED_FKS[table];
             for (const raw of rawRows) {
-                const { row, selfRef, drop } = prepareRow(table, raw, catalogIndex, warnings);
-                if (drop) { rowsSkipped++; continue; } // unresolved required catalog FK → skip the row
+                const { row, selfRef, drop, remapMiss, orphanedBy } = prepareRow(table, raw, catalogIndex, droppedIds);
+                if (remapMiss) misses.push(remapMiss);
+                if (orphanedBy) { if (drop) orphanDropped++; else orphanNulled++; }
+                if (drop) { skipBreakdown.catalogMiss++; continue; } // unresolved required catalog FK → skip the row
                 if (table === 'users') {
                     row.auth_user_id = null;            // re-link on first login
                     row.rsi_verification_code = null;   // transient per-install RSI token — never carry over
@@ -976,23 +1479,38 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
                 prepared.push(row);
                 if (selfRef) deferred.push(selfRef);
             }
-            // Surface any per-row prepare warnings (catalog-remap nulls) live.
-            for (let i = warnStart; i < warnings.length; i++) await emit({ type: 'warning', message: warnings[i] });
+            // COLLAPSED per-table catalog-miss report — one counted line per outcome
+            // instead of one line per row, so a fleet-loss import can no longer crowd
+            // every later table's warning out of the summary (or bloat the `done`
+            // payload with thousands of near-identical strings).
+            const tableWarnings = summariseRemapMisses(table, misses, CATALOG_REMAPS[table]);
+            // Name the PARENT, never a hard-coded noun: this same path serves both
+            // user_ships and quartermaster_inventory, and "member ship" on a dropped
+            // issuance would send the operator to sync the wrong catalog.
+            const orphanParent = DROPPED_PARENT_FKS[table]?.[0]?.parent ?? 'parent';
+            if (orphanDropped > 0) tableWarnings.push(`${table}: ${orphanDropped} row(s) skipped because the ${orphanParent} row they reference was itself skipped (see the ${orphanParent} warning above).`);
+            if (orphanNulled > 0) tableWarnings.push(`${table}: ${orphanNulled} row(s) imported without their ${orphanParent} link, because that row was skipped. Any name recorded on the row itself is kept.`);
+            for (const msg of tableWarnings) { warnings.push(msg); await emit({ type: 'warning', message: msg }); }
 
             const { inserted, strippedColumns, skipped } = await insertRows(table, prepared);
             rowsInserted += inserted;
-            rowsSkipped += skipped;
+            skipBreakdown.constraintViolation += skipped;
             for (const col of strippedColumns) {
                 const msg = `${table}: column "${col}" is in the export but not in this instance's schema — dropped from import.`;
                 warnings.push(msg);
                 await emit({ type: 'warning', message: msg });
             }
             if (skipped > 0) {
-                const msg = `${table}: ${skipped} row(s) skipped — they reference data not present in this instance (e.g. an unsynced catalog). See server logs.`;
+                const msg = `${table}: ${skipped} row(s) were rejected by this instance's database (a missing reference, or a value this version doesn't allow) — the reason for each is in the server log.`;
                 warnings.push(msg);
                 await emit({ type: 'warning', message: msg });
             }
-            if (deferred.length > 0) await restoreSelfRefs(table, deferred);
+            if (deferred.length > 0) {
+                for (const msg of await restoreSelfRefs(table, deferred)) {
+                    warnings.push(msg);
+                    await emit({ type: 'warning', message: msg });
+                }
+            }
             importedTables.push(table);
             tablesDone++;
             log.info('imported table', { table, inserted, skipped });
@@ -1040,12 +1558,28 @@ export async function importOrgData(ndjson: string, onProgress?: ImportProgressF
             await emit({ type: 'warning', message: msg });
         }
 
+        // Turn on the optional modules the source org was running, from the export
+        // header. Without this the org's Marketplace/Academy/Warehouse/Quartermaster/
+        // Finances data all imports correctly and then sits behind a switched-off
+        // module, which reads as the import having failed. Reported, never silent.
+        const { enabled: modulesEnabled, warnings: featureWarnings } = await applyImportedFeatureToggles(parsed.header.sourceOrg?.features);
+        for (const msg of featureWarnings) { warnings.push(msg); await emit({ type: 'warning', message: msg }); }
+        if (modulesEnabled.length > 0) {
+            const msg = `Enabled ${modulesEnabled.length} module(s) the source org had switched on: ${modulesEnabled.join(', ')}. Change these any time in Admin → Optional Features.`;
+            warnings.push(msg);
+            await emit({ type: 'warning', message: msg });
+        }
+
         const result: ImportResult = {
             tablesProcessed: importedTables.length,
             rowsInserted,
-            rowsSkipped,
+            rowsSkipped: skipBreakdown.unknownTable + skipBreakdown.excludedTable
+                + skipBreakdown.catalogMiss + skipBreakdown.constraintViolation
+                + skipBreakdown.deploymentSettings,
+            skipBreakdown,
             sequencesReset: reset,
             warnings,
+            modulesEnabled,
             reanchoredAdminUserId,
             reanchoredAdminRoleId,
         };

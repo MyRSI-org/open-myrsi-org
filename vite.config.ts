@@ -34,14 +34,14 @@ export default defineConfig(({ mode }) => {
         exclude: ['**/*.d.ts'],
         reporter: ['text-summary'],
         thresholds: {
-          // Ratcheted 18 Aug 26 to sit ~1pt under the measured baseline
-          // (lines 41.19 / statements 39.05 / functions 32.17 / branches 35.38).
-          // The previous 5/5/3/3 floor sat so far below actual coverage that a
-          // collapse to 6% would still have passed the gate.
-          lines: 40,
-          statements: 38,
-          functions: 31,
-          branches: 34,
+          // Ratcheted 23 Aug 26 (importer contract suites) to sit ~1pt under the
+          // measured baseline (lines 42.12 / statements 40.05 / functions 32.80 /
+          // branches 36.21). Previously 40/38/31/34 against a 41.19/39.05/32.17/35.38
+          // baseline. This is a regression FLOOR — ratchet it up, never down.
+          lines: 41,
+          statements: 39,
+          functions: 32,
+          branches: 35,
         },
       },
     },

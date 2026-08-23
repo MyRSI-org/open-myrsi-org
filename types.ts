@@ -1492,7 +1492,12 @@ export interface OrgExportHeader {
     version: number;
     exportedAt: string;
     sourceApp: string;
-    sourceOrg: { name: string; slug: string };
+    /** `features` is the source org's optional-module on/off state, carried on the
+     *  header because the hosted `organizations` table (where it lives) is never
+     *  exported. Plain booleans on the wire; the importer allowlists the keys this
+     *  fork gates on and rebuilds them into the local `{ enabled }` shape. Optional —
+     *  an export produced before this field existed still imports. */
+    sourceOrg: { name: string; slug: string; features?: Record<string, boolean> };
     /** FK-dependency order the importer must follow (parents before children). */
     tableOrder: string[];
     /** Per-table row counts — completeness check + progress denominator. */

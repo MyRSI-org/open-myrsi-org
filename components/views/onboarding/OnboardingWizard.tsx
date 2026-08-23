@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useSession } from '../../../contexts/SessionContext';
 import apiService from '../../../services/apiService';
 
@@ -335,6 +335,40 @@ function RsiStep({ finalize }: { finalize: (rsiHandle: string, verificationCode?
 
 // Import step (optional, streamed)
 interface ImportUserOption { id: number; label: string; sub?: string; discordId?: string }
+
+// Mirrors the server's ImportResult (lib/db/importer.ts) — structurally duplicated
+// because the ESLint client boundary forbids a component importing a server module.
+// Most people run the import HERE, inside first-boot, so this step must report what
+// it skipped just as fully as the admin tab does; it used to drop the result entirely
+// and log two numbers, which is how a fleet-loss import could look like a clean one.
+interface ImportRunResult {
+    tablesProcessed: number;
+    rowsInserted: number;
+    rowsSkipped: number;
+    skipBreakdown?: {
+        unknownTable: number; excludedTable: number; catalogMiss: number;
+        constraintViolation: number; deploymentSettings: number;
+    };
+    sequencesReset: string[];
+    warnings: string[];
+    modulesEnabled?: string[];
+}
+
+type ImportSkipBreakdown = NonNullable<ImportRunResult['skipBreakdown']>;
+
+const IMPORT_SKIP_LABELS: { key: keyof ImportSkipBreakdown; text: (n: number) => string; severe: boolean }[] = [
+    { key: 'catalogMiss', severe: true, text: (n) => `${n} row(s) referenced a ship, item or permission this instance's catalogs don't have.` },
+    { key: 'constraintViolation', severe: true, text: (n) => `${n} row(s) were rejected by the database — the reason for each is in the server log.` },
+    { key: 'unknownTable', severe: false, text: (n) => `${n} row(s) came from tables this version doesn't have.` },
+    { key: 'excludedTable', severe: false, text: (n) => `${n} row(s) were deployment-local federation data, never imported by design.` },
+    { key: 'deploymentSettings', severe: false, text: (n) => `${n} deployment-config setting(s) stayed local to this install, by design.` },
+];
+
+/** Render-ready skip lines for the causes that actually occurred. */
+function importSkipLines(bd: ImportSkipBreakdown | undefined): { key: string; text: string; severe: boolean }[] {
+    if (!bd) return [];
+    return IMPORT_SKIP_LABELS.filter((s) => (bd[s.key] || 0) > 0).map((s) => ({ key: s.key, text: s.text(bd[s.key]), severe: s.severe }));
+}
 // Parse the export's `users` rows client-side for the "which of these is you?"
 // merge picker. The file is already in the browser, so no extra round-trip.
 function parseImportUsers(ndjson: string): ImportUserOption[] {
@@ -365,7 +399,11 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
     const [pct, setPct] = useState(0);
     const [logLines, setLogLines] = useState<{ id: number; text: string }[]>([]);
     const [done, setDone] = useState(false);
+    const [result, setResult] = useState<ImportRunResult | null>(null);
     const [error, setError] = useState('');
+    // A REFUSED import wrote nothing (the server's `refused` flag); a FAILED one may
+    // have left partial data. The two need opposite advice and opposite buttons.
+    const [refused, setRefused] = useState(false);
     const [users, setUsers] = useState<ImportUserOption[]>([]);
     const [mergeUserId, setMergeUserId] = useState<number | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
@@ -376,8 +414,15 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
     const pushLog = (line: string) => setLogLines((l) => [...l, { id: logIdRef.current++, text: line }]);
     useEffect(() => { logRef.current?.scrollTo({ top: logRef.current.scrollHeight }); }, [logLines]);
 
+    // Warnings are set once per import and never reordered; mint a stable client-only
+    // id per row so the list isn't keyed by array index (warning text can repeat).
+    const warningRows = useMemo(
+        () => (result ? result.warnings.map((text) => ({ id: crypto.randomUUID(), text })) : []),
+        [result],
+    );
+
     const onFile = (file: File) => {
-        setParseError(''); setManifest(null); setDone(false); setError(''); setLogLines([]); setPct(0);
+        setParseError(''); setManifest(null); setDone(false); setResult(null); setError(''); setRefused(false); setLogLines([]); setPct(0);
         setFilename(file.name);
         const reader = new FileReader();
         reader.onload = () => {
@@ -400,9 +445,15 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
     };
 
     const runImport = async () => {
-        setRunning(true); setError(''); setDone(false); setPct(0); setLogLines([]);
+        setRunning(true); setError(''); setRefused(false); setDone(false); setResult(null); setPct(0); setLogLines([]);
+        // Did the server get far enough to start streaming progress? A rejection BEFORE
+        // that (file too large, empty body, the request never landing) cannot have
+        // written anything, so it is a refusal even though there is no `refused` flag
+        // to read — the stream that would have carried one never opened.
+        let streamStarted = false;
         try {
             await apiService.importOrgStream(ndjson, (evt: any) => {
+                streamStarted = true;
                 if (evt.type === 'start') pushLog(`Importing ${evt.totalRows.toLocaleString()} rows across ${evt.totalTables} tables…`);
                 else if (evt.type === 'phase') pushLog(`• ${evt.phase}…`);
                 else if (evt.type === 'table') {
@@ -411,13 +462,14 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
                 }
                 else if (evt.type === 'warning') pushLog(`⚠ ${evt.message}`);
                 else if (evt.type === 'done') {
-                    setPct(100); setDone(true);
+                    setPct(100); setDone(true); setResult(evt.result as ImportRunResult);
                     pushLog(`Done — ${evt.result.rowsInserted.toLocaleString()} rows, ${evt.result.tablesProcessed} tables.`);
                 }
-                else if (evt.type === 'error') { setError(evt.message); pushLog(`✗ ${evt.message}`); }
+                else if (evt.type === 'error') { setError(evt.message); setRefused(!!evt.refused); pushLog(`✗ ${evt.message}`); }
             }, mergeUserId ?? undefined);
         } catch (e) {
             setError(e instanceof Error ? e.message : 'Import failed');
+            setRefused(!streamStarted);
         } finally {
             setRunning(false);
         }
@@ -472,7 +524,67 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
                     </div>
                 </div>
             )}
-            {error && (
+            {done && result && (
+                <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 mb-4 text-xs text-slate-300 space-y-2">
+                    <p className="text-emerald-300 font-semibold text-sm">
+                        <i className="fa-solid fa-circle-check mr-2" />
+                        Imported {result.rowsInserted.toLocaleString()} rows across {result.tablesProcessed} tables.
+                    </p>
+                    {result.modulesEnabled && result.modulesEnabled.length > 0 && (
+                        <p className="text-sky-300">
+                            Switched on the modules your org was running: {result.modulesEnabled.join(', ')}.
+                            <span className="text-slate-400"> Change these later in Admin &rarr; Optional Features.</span>
+                        </p>
+                    )}
+                    {result.rowsSkipped > 0 && (
+                        <div className="text-amber-300">
+                            <p>{result.rowsSkipped.toLocaleString()} row(s) were not imported:</p>
+                            {result.skipBreakdown ? (
+                                <ul className="mt-0.5 list-disc list-inside space-y-0.5">
+                                    {importSkipLines(result.skipBreakdown).map((l) => (
+                                        <li key={l.key} className={l.severe ? 'text-rose-300' : 'text-amber-200/80'}>{l.text}</li>
+                                    ))}
+                                </ul>
+                            ) : (
+                                <p className="text-amber-200/80">See the log above for the reason.</p>
+                            )}
+                            {/* A partial import is only fixable by a wipe + re-import, and the
+                                hosted export is rate-limited to one per 24h — so say it here,
+                                while the file they used is still on disk, not after they leave. */}
+                            <p className="text-slate-400 mt-1">
+                                If that is more than you expected, the fix is to reset the database and import again with
+                                the catalogs synced first — a second import into this instance is refused once it holds data.
+                            </p>
+                        </div>
+                    )}
+                    {result.warnings.length > 0 && (
+                        <details>
+                            <summary className="cursor-pointer text-amber-300">{result.warnings.length} warning(s)</summary>
+                            <ul className="mt-1 list-disc list-inside text-amber-200/80 space-y-0.5 max-h-40 overflow-y-auto">
+                                {warningRows.map((w) => <li key={w.id}>{w.text}</li>)}
+                            </ul>
+                        </details>
+                    )}
+                </div>
+            )}
+            {/* A REFUSAL is not a failure. The server declines these before writing a
+                single row — an empty ship catalog, an instance that already holds data,
+                a merge target missing from the file — so the instance is untouched and
+                the honest advice is "fix the one named thing and try again", not "wipe
+                the database". The empty-ship-catalog refusal fires on the ordinary
+                fresh-install path, so getting this branch wrong would send most
+                migrating owners to reset_db.sql for no reason. */}
+            {error && refused && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 mb-4">
+                    <p className="text-amber-300 font-semibold text-sm mb-1"><i className="fa-solid fa-circle-exclamation mr-2" />Import declined — nothing was changed</p>
+                    <p className="text-amber-100/90 text-xs break-words">{error}</p>
+                    <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                        Your instance is exactly as it was, so you can fix the above and import again,
+                        or skip this step and import later from <span className="text-slate-300">Admin &rarr; Import Organization</span>.
+                    </p>
+                </div>
+            )}
+            {error && !refused && (
                 <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 mb-4">
                     <p className="text-rose-300 font-semibold text-sm mb-1"><i className="fa-solid fa-circle-exclamation mr-2" />Import failed</p>
                     <p className="text-rose-200/90 text-xs break-words">{error}</p>
@@ -487,11 +599,12 @@ function ImportStep({ onContinue, selfDiscordId }: { onContinue: () => void; sel
             <div className="flex flex-wrap items-center gap-3">
                 {/* A failed import leaves the instance in an incomplete state (seeded defaults
                     were cleared before the failed insert), so we must NOT let the user continue
-                    or skip past it — only reset + restart is safe. */}
-                {!done && !error && <PrimaryBtn onClick={runImport} disabled={running || !ndjson || !!parseError || (users.length > 0 && mergeUserId == null)}>{running ? 'Importing…' : 'Import data'}</PrimaryBtn>}
+                    or skip past it — only reset + restart is safe. A REFUSED one wrote nothing,
+                    so retry and skip both stay available. */}
+                {!done && (!error || refused) && <PrimaryBtn onClick={runImport} disabled={running || !ndjson || !!parseError || (users.length > 0 && mergeUserId == null)}>{running ? 'Importing…' : refused ? 'Try import again' : 'Import data'}</PrimaryBtn>}
                 {done && <PrimaryBtn onClick={onContinue}>Continue <i className="fa-solid fa-arrow-right ml-1" /></PrimaryBtn>}
-                {!running && !done && !error && <button onClick={onContinue} className="px-4 py-3 text-slate-400 hover:text-white text-sm font-medium">Skip — I'll do this later</button>}
-                {error && <button onClick={() => window.location.assign('/')} className="px-4 py-3 text-slate-400 hover:text-white text-sm font-medium"><i className="fa-solid fa-rotate-left mr-2" />Reload</button>}
+                {!running && !done && (!error || refused) && <button onClick={onContinue} className="px-4 py-3 text-slate-400 hover:text-white text-sm font-medium">Skip — I'll do this later</button>}
+                {error && !refused && <button onClick={() => window.location.assign('/')} className="px-4 py-3 text-slate-400 hover:text-white text-sm font-medium"><i className="fa-solid fa-rotate-left mr-2" />Reload</button>}
             </div>
         </Shell>
     );

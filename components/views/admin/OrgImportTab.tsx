@@ -9,17 +9,54 @@ interface ImportHeaderPreview {
     version: number;
     exportedAt?: string;
     sourceApp?: string;
-    sourceOrg?: { name?: string; slug?: string };
+    // `features` is the source org's optional-module on/off state. Server-authored,
+    // display-only here — the server applies it through its own allowlist.
+    sourceOrg?: { name?: string; slug?: string; features?: Record<string, boolean> };
     tableOrder: string[];
     manifest: Record<string, number>;
+}
+
+// Mirrors ImportResult / ImportSkipBreakdown in lib/db/importer.ts. Structurally
+// duplicated rather than imported: the ESLint client boundary forbids a component
+// importing a server-only module.
+interface ImportSkipBreakdown {
+    unknownTable: number;
+    excludedTable: number;
+    catalogMiss: number;
+    constraintViolation: number;
+    deploymentSettings: number;
 }
 
 interface ImportResult {
     tablesProcessed: number;
     rowsInserted: number;
     rowsSkipped: number;
+    skipBreakdown?: ImportSkipBreakdown;
     sequencesReset: string[];
     warnings: string[];
+    modulesEnabled?: string[];
+}
+
+// The optional modules the export header can report, in the order shown.
+const FEATURE_LABELS: Record<string, string> = {
+    marketplace: 'Marketplace', warehouse: 'Warehouse', academy: 'Academy',
+    finances: 'Finances', quartermaster: 'Quartermaster',
+};
+
+// One line per skip CAUSE, so the summary can no longer describe a dropped ship as
+// "a row from an unrecognized table". Only non-zero causes are rendered.
+const SKIP_LABELS: { key: keyof ImportSkipBreakdown; text: (n: number) => string; severe: boolean }[] = [
+    { key: 'catalogMiss', severe: true, text: (n) => `${n} row(s) referenced a ship, item or permission this instance's catalogs don't have — sync your catalogs and re-import to keep them.` },
+    { key: 'constraintViolation', severe: true, text: (n) => `${n} row(s) were rejected by this instance's database (a missing reference, or a value this version doesn't allow). The reason for each is in the server log.` },
+    { key: 'unknownTable', severe: false, text: (n) => `${n} row(s) came from tables this version doesn't have.` },
+    { key: 'excludedTable', severe: false, text: (n) => `${n} row(s) were deployment-local federation data, never imported by design.` },
+    { key: 'deploymentSettings', severe: false, text: (n) => `${n} deployment-config setting(s) stayed local to this install, by design.` },
+];
+
+/** Render-ready skip lines for the causes that actually occurred. */
+function skipLines(bd: ImportSkipBreakdown | undefined): { key: string; text: string; severe: boolean }[] {
+    if (!bd) return [];
+    return SKIP_LABELS.filter((s) => (bd[s.key] || 0) > 0).map((s) => ({ key: s.key, text: s.text(bd[s.key]), severe: s.severe }));
 }
 
 interface ImportUserOption { id: number; label: string; sub?: string; discordId?: string }
@@ -108,10 +145,24 @@ const OrgImportTab: React.FC = () => {
     // Server-provided warnings are display-only and set once per import; mint a stable
     // client-only id per row (recomputed only when `result` changes) so the list isn't keyed
     // by array index. These ids never touch the wire shape — `result.warnings` is untouched.
+    //
+    // The cap is high (the server now collapses per-row catalog misses into one counted
+    // line per table, so a normal import is well under it) and, unlike the old silent
+    // slice(0, 50), whatever it hides is stated — a truncated list that claims to be
+    // complete is how the fleet-loss warnings went unread in the first place.
+    const WARNING_DISPLAY_CAP = 200;
     const warningRows = useMemo(
-        () => (result ? result.warnings.slice(0, 50).map((text) => ({ id: crypto.randomUUID(), text })) : []),
+        () => (result ? result.warnings.slice(0, WARNING_DISPLAY_CAP).map((text) => ({ id: crypto.randomUUID(), text })) : []),
         [result],
     );
+    const warningsHidden = result ? Math.max(0, result.warnings.length - WARNING_DISPLAY_CAP) : 0;
+
+    // Modules the source org had switched on, from the export header.
+    const sourceModules = useMemo(() => {
+        const f = header?.sourceOrg?.features;
+        if (!f) return null;
+        return Object.keys(FEATURE_LABELS).filter((k) => f[k] === true).map((k) => FEATURE_LABELS[k]);
+    }, [header]);
 
     const handleImport = async () => {
         if (!ndjson || !header) return;
@@ -214,9 +265,19 @@ const OrgImportTab: React.FC = () => {
                             <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
                                 <i className="fa-solid fa-circle-info mr-2"></i>
                                 Import is refused if this instance already contains users/requests/operations/etc.
-                                Catalog references (ships, items) are re-linked against this instance's synced
-                                catalogs — run the Database Tools catalog syncs first for best coverage.
+                                Ship and item references are re-linked against this instance's own catalogs, so
+                                run <span className="font-semibold">Admin &rarr; Catalogs &rarr; Ship Catalog &rarr; Sync from Wiki</span> first
+                                (and the Item Catalog sync if you use the Quartermaster). An empty ship catalog
+                                will refuse the import rather than discard every member's ships.
                             </div>
+
+                            {sourceModules && (
+                                <div className="rounded-lg border border-slate-700/60 bg-slate-900/60 px-3 py-2 text-[11px] text-slate-300">
+                                    <span className="text-slate-500 uppercase tracking-wider mr-2">Modules on in the source org:</span>
+                                    {sourceModules.length > 0 ? sourceModules.join(', ') : 'none'}
+                                    <span className="text-slate-500"> &mdash; these are switched on for you as part of the import.</span>
+                                </div>
+                            )}
 
                             {users.length > 0 && (
                                 <div className="rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-2">
@@ -262,12 +323,33 @@ const OrgImportTab: React.FC = () => {
                     {result && (
                         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200 space-y-1">
                             <div><i className="fa-solid fa-check mr-2"></i>Imported {result.rowsInserted.toLocaleString()} rows across {result.tablesProcessed} tables. Sequences reset: {result.sequencesReset.length}.</div>
-                            {result.rowsSkipped > 0 && <div className="text-amber-300">Skipped {result.rowsSkipped} rows from unrecognized tables.</div>}
+                            {result.modulesEnabled && result.modulesEnabled.length > 0 && (
+                                <div className="text-sky-300">
+                                    <i className="fa-solid fa-toggle-on mr-2"></i>
+                                    Switched on {result.modulesEnabled.length} module(s) the source org was running: {result.modulesEnabled.join(', ')}.
+                                    <span className="text-slate-400"> Change these in Admin &rarr; Optional Features.</span>
+                                </div>
+                            )}
+                            {result.rowsSkipped > 0 && (
+                                <div className="text-amber-300">
+                                    <div>Skipped {result.rowsSkipped.toLocaleString()} row(s):</div>
+                                    {result.skipBreakdown ? (
+                                        <ul className="mt-0.5 list-disc list-inside space-y-0.5">
+                                            {skipLines(result.skipBreakdown).map((l) => (
+                                                <li key={l.key} className={l.severe ? 'text-rose-300' : 'text-amber-200/80'}>{l.text}</li>
+                                            ))}
+                                        </ul>
+                                    ) : (
+                                        <div className="text-amber-200/80">See the warnings below for the reason.</div>
+                                    )}
+                                </div>
+                            )}
                             {result.warnings.length > 0 && (
                                 <details className="mt-1">
                                     <summary className="cursor-pointer text-amber-300">{result.warnings.length} warning(s)</summary>
                                     <ul className="mt-1 list-disc list-inside text-amber-200/80 space-y-0.5">
                                         {warningRows.map((w) => <li key={w.id}>{w.text}</li>)}
+                                        {warningsHidden > 0 && <li className="text-slate-400">…and {warningsHidden.toLocaleString()} more (full list in the server log).</li>}
                                     </ul>
                                 </details>
                             )}

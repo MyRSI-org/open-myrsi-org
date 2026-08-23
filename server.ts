@@ -112,7 +112,7 @@ import publicFn from './api/public.js';
 import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allianceGetSelfProfile, getAlliancePeerByInboundKey as allianceGetPeerByInboundKey, getAllianceShareableData as allianceGetShareableData,
     getOperationSnapshotForPeer, getOperationManifestForPeer, acceptInviteForPeer, declineInviteForPeer, upsertAlliedParticipant, removeAlliedParticipant,
     receiveMirrorInvite, receiveMirrorPush, receiveMirrorRevoke,
-    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, getPlatformSettings } from './lib/db.js';
+    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, ImportRefusedError, getPlatformSettings } from './lib/db.js';
 import { runFirstBootCheck } from './lib/firstBoot.js';
 import { verifyToken, signToken, isSessionForceLoggedOut, isSessionRevokedByWatermark } from './lib/auth.js';
 import { counts404TowardAbuse, isLoopbackIp } from './lib/abuseFilter.js';
@@ -457,7 +457,16 @@ app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64
                 write({ type: 'reauth', token, userId: result.reanchoredAdminUserId });
             }
         } catch (err) {
-            write({ type: 'error', message: err instanceof Error ? err.message : 'Import failed.' });
+            // `refused: true` means the import was DECLINED before any write, so the
+            // instance is untouched. The client uses it to offer "fix this and retry"
+            // instead of the mid-import "you may hold partial data, reset the database"
+            // guidance, which would be actively wrong (and, for the empty-ship-catalog
+            // refusal, would be the ordinary first-run outcome).
+            write({
+                type: 'error',
+                message: err instanceof Error ? err.message : 'Import failed.',
+                refused: err instanceof ImportRefusedError,
+            });
         }
         res.end();
     } catch (e) {
