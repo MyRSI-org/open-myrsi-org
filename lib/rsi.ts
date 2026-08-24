@@ -18,7 +18,13 @@ export async function verifyRsiHandle(rsiHandle: string, verificationCode: strin
     // that ever passes a trivial value.
     if (typeof verificationCode !== 'string' || verificationCode.length < 10) return false;
     try {
-        const url = `https://robertsspaceindustries.com/citizens/${encodeURIComponent(rsiHandle)}`;
+        // The `/en/` locale prefix is REQUIRED. The bare `/citizens/<handle>` path
+        // answers 301 -> `/en/citizens/<handle>`, and ssrfSafeFetch refuses redirects
+        // by design (see lib/ssrf.ts), so the un-prefixed URL made EVERY verification
+        // fail with the generic "could not connect" error below. The localized path
+        // answers 200 directly (handle casing is ignored) and 404 for an unknown
+        // handle -- no redirect hop, so the SSRF guard can stay strict.
+        const url = `https://robertsspaceindustries.com/en/citizens/${encodeURIComponent(rsiHandle)}`;
         // The handle is user-supplied (reachable PRE-AUTH via auth:finalize_setup),
         // so route this outbound request through the mandated SSRF guard: it pins
         // the vetted DNS answer (defeats rebind/poisoning of the fixed public host),
