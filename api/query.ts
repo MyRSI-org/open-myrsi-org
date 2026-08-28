@@ -260,11 +260,11 @@ export function stripSecrets(state: any): any {
     // RPC (triggered by the id-only eam_broadcast realtime ping).
     delete cleaned.active_eam;
 
-    // systemConfig (appUrl / welcomeMessage) rides the settings blob but no client
-    // slice setter or component consumes it — the only appUrl reader derives it from
-    // window.location.origin and writes via admin:update_system_config. Server-internal
-    // callers (getOrgTenantUrl, public page data) read it via their own paths, so drop
-    // it from every browser-bound payload here rather than at the source.
+    // systemConfig (appUrl / welcomeMessage) rides the settings blob but no client slice
+    // setter or component consumes it, and the browser has no business knowing this
+    // deployment's configured origin. Server-internal callers (getOrgTenantUrl,
+    // getOurOrigin, public page data) read it via their own paths, so drop it from every
+    // browser-bound payload here rather than at the source.
     delete cleaned.systemConfig;
 
     // Public page config: public-intent by design, but explicitly allowlist here so that

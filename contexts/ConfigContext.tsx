@@ -96,7 +96,6 @@ export interface ConfigContextValue {
     updateRadioConfig: (config: any) => Promise<void>;
     updateAIConfig: (config: any) => Promise<void>;
     updateWikiHomeConfig: (config: WikiHomeConfig) => Promise<void>;
-    updateSystemConfig: (appUrl: string) => Promise<void>;
     updatePublicPageConfig: (config: PublicPageConfig) => Promise<void>;
     updateOrgFeatures: (patch: Record<string, any>) => Promise<void>;
 
@@ -289,10 +288,6 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         rpcAction('admin:update_wiki_home_config', config).then(() => refreshMain()),
     [rpcAction, refreshMain]);
 
-    const updateSystemConfig = useCallback((appUrl: string) =>
-        rpcAction('admin:update_system_config', { appUrl }).then(() => refreshMain()),
-    [rpcAction, refreshMain]);
-
     const updatePublicPageConfig = useCallback((config: PublicPageConfig) =>
         rpcAction('admin:update_public_page_config', config).then(() => refreshMain()),
     [rpcAction, refreshMain]);
@@ -326,7 +321,7 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         addExternalTool, updateExternalTool, deleteExternalTool, reorderExternalTool,
         deleteRadioChannel,
         updateDiscordConfig, updateHeroCardConfig, updateBrandingConfig, updateThemeConfig, updateOpenGraphConfig,
-        updateRadioConfig, updateAIConfig, updateWikiHomeConfig, updateSystemConfig,
+        updateRadioConfig, updateAIConfig, updateWikiHomeConfig,
         updatePublicPageConfig, updateOrgFeatures,
         listTestimonialCandidates,
         registerRefreshMainState, registerRefreshDiscord, registerRefreshExternalTools,
@@ -339,7 +334,7 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         addExternalTool, updateExternalTool, deleteExternalTool, reorderExternalTool,
         deleteRadioChannel,
         updateDiscordConfig, updateHeroCardConfig, updateBrandingConfig, updateThemeConfig, updateOpenGraphConfig,
-        updateRadioConfig, updateAIConfig, updateWikiHomeConfig, updateSystemConfig,
+        updateRadioConfig, updateAIConfig, updateWikiHomeConfig,
         updatePublicPageConfig, updateOrgFeatures,
         listTestimonialCandidates,
         registerRefreshMainState, registerRefreshDiscord, registerRefreshExternalTools,

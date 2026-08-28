@@ -10,6 +10,7 @@ import * as intel from './db/intel.js';
 import * as hr from './db/hr.js';
 import * as system from './db/system.js';
 import { log as baseLog } from './log.js';
+import { resolveAppUrl, type ResolvedAppUrl } from './appUrl.js';
 
 const log = baseLog.child({ module: 'db.barrel' });
 
@@ -244,12 +245,23 @@ export async function getDiscordState() {
     };
 }
 
-export async function getOrgTenantUrl(): Promise<string> {
-    // Single-org: prefer the configured app URL, else the deployment origin.
+/**
+ * Resolve this deployment's public base URL, with the diagnostic detail (which
+ * source won, which candidates were skipped) the boot check in server.ts reports.
+ *
+ * ENV WINS over the stored `settings.systemConfig.appUrl` — see lib/appUrl.ts for
+ * why. Most callers want getOrgTenantUrl() below; this variant exists so the boot
+ * log can name the source without re-deriving it.
+ */
+export async function resolveOrgAppUrl(): Promise<ResolvedAppUrl> {
     const { data: setting } = await supabase.from('settings').select('value').eq('key', 'systemConfig').maybeSingle();
-    const appUrl = (setting?.value as { appUrl?: string } | null)?.appUrl;
-    if (appUrl) return appUrl;
-    return process.env.APP_URL || 'http://localhost:3000';
+    const stored = (setting?.value as { appUrl?: string } | null)?.appUrl;
+    return resolveAppUrl(process.env.APP_URL, stored);
+}
+
+/** This deployment's public base URL — Discord deep links, scheduled-event location. */
+export async function getOrgTenantUrl(): Promise<string> {
+    return (await resolveOrgAppUrl()).url;
 }
 
 export async function getOperationsState(user?: any) {

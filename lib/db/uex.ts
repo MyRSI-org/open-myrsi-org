@@ -26,7 +26,57 @@ const cat = (v: unknown, n = 200): string | null => stripHtmlSingleLine(v, n) ||
 
 const log = baseLog.child({ module: 'db.uex' });
 
-const UEX_BASE = 'https://api.uexcorp.space/2.0';
+// The API base. Overridable because a self-hosted deployment can be blocked from the
+// default host by Cloudflare — the operator report that prompted this got a 403 with a
+// "Just a moment…" interstitial on api.uexcorp.space while the SAME bearer token from
+// the SAME host succeeded against api.uexcorp.uk. Both hosts are Cloudflare-fronted and
+// serve identical payloads, so this is a per-zone WAF/reputation decision about the
+// caller's egress IP, not something a header or a hostname can be relied on to dodge.
+// The fix that works regardless of cause is letting the operator repoint the base —
+// at the alternate host, or at their own outbound proxy — WITHOUT editing source and
+// rebuilding, which is what they had to do.
+//
+// Default stays api.uexcorp.space: it is the documented host, every working install is
+// already on it, and .uk is a different zone whose settings merely happen to be laxer
+// today. Flipping the default would migrate every deployment onto an undocumented host
+// to fix a minority of them.
+//
+// ON RULE 6 (lib/ssrf.ts): this stays a bare fetch, and that is deliberate — do not
+// "harden" it to ssrfSafeFetch. Rule 6 governs REMOTELY-WRITABLE URLs (alliance_peers
+// rows, intel_feeds rows, a pre-auth RSI handle); this one comes from the process
+// environment, and whoever sets it already holds SUPABASE_SERVICE_ROLE_KEY and
+// SECRETS_ENCRYPTION_KEY, so there is no privilege boundary to cross. lib/secrets.ts
+// makes the same call for credentials (env beats the encrypted DB value). Routing
+// through ssrfSafeFetch would also break the legitimate reason to set this — an
+// operator's own proxy on a private address — for no boundary gained. The validation
+// below is typo hygiene, not a security control.
+const DEFAULT_UEX_BASE = 'https://api.uexcorp.space/2.0';
+
+/** Resolved per call (not a module const) so tests and a restart-free env change
+ *  both take effect, mirroring getDelayMs() below. */
+function getUexBase(): string {
+    const raw = process.env.UEX_API_BASE;
+    if (!raw || !raw.trim()) return DEFAULT_UEX_BASE;
+    const trimmed = raw.trim();
+    try {
+        const u = new URL(trimmed);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('bad protocol');
+        // Trailing slash would double up against the leading slash on every path.
+        return trimmed.replace(/\/+$/, '');
+    } catch {
+        log.warn('UEX_API_BASE is not a valid http(s) URL — falling back to the default host', { fallback: DEFAULT_UEX_BASE });
+        return DEFAULT_UEX_BASE;
+    }
+}
+
+// Identify ourselves rather than shipping undici's default. Hygiene, NOT the fix for
+// the 403 above — a UA is one term in a bot score, and the operator's A/B held it
+// constant while changing only the hostname.
+const UEX_USER_AGENT = 'myRSI/1.0 (+https://github.com/MyRSI-org/open-myrsi-org)';
+
+// No timeout at all previously, against undici's 300s default: fetchAllUexItems makes
+// ~67 sequential calls, so a stalled upstream could hang an admin's sync for hours.
+export const UEX_TIMEOUT_MS = 30_000;
 
 const DEFAULT_DELAY_MS = 600;
 function getDelayMs(): number {
@@ -50,6 +100,62 @@ async function throttle(): Promise<void> {
 }
 
 /**
+ * Strip anything credential-shaped out of an upstream response snippet before it is
+ * logged. NOT redundant with lib/log.ts: that redacts by FIELD KEY (`bodyPreview` isn't
+ * one) and value-scans only Error message/stack and stringified objects — a plain
+ * string field is emitted verbatim. Per CLAUDE.md rule 5 the logger is a backstop, not
+ * the defence. Worth doing because the whole point of UEX_API_BASE is letting an
+ * operator repoint at their own proxy, and a proxy's debug/error page echoing the
+ * request headers back is exactly how our own Bearer would land in the snippet.
+ */
+function redactUpstreamPreview(text: string): string {
+    return text
+        .replace(/bearer\s+\S+/gi, 'Bearer [REDACTED]')
+        .replace(/(authorization|x-api-key|api[-_]?key)(\s*[:=]\s*)\S+/gi, '$1$2[REDACTED]');
+}
+
+/** Why a UEX request failed, in the terms an operator can act on. */
+export type UexFailureKind = 'challenge' | 'credential' | 'rate-limit' | 'upstream';
+
+/**
+ * Classify a failed (or non-JSON) UEX response WITHOUT retaining any of its bytes.
+ * Exported for the pinning test — the three shapes are genuinely different actions:
+ * a CDN challenge is fixed with UEX_API_BASE, a credential rejection with
+ * UEX_API_KEY, and a 429 with UEX_REQUEST_DELAY_MS.
+ */
+export function classifyUexFailure(status: number, contentType: string, body: string): UexFailureKind {
+    if (status === 429) return 'rate-limit';
+    const ct = contentType.toLowerCase();
+    const head = body.slice(0, 200).toLowerCase().trimStart();
+    // An interstitial arrives as HTML where the API contract promises JSON. Checked
+    // before the status codes because a challenge is normally served as 403.
+    if (ct.includes('html') || head.startsWith('<!doctype') || head.startsWith('<html') || head.includes('just a moment')) {
+        return 'challenge';
+    }
+    if (status === 401 || status === 403) return 'credential';
+    return 'upstream';
+}
+
+/**
+ * Build the operator-facing failure message from classified fields ONLY. Nothing here
+ * derives from the response body — see the call sites for why that matters.
+ */
+export function uexFailureMessage(path: string, status: number, kind: UexFailureKind): string {
+    switch (kind) {
+        case 'challenge':
+            return `UEX API ${path} was blocked by an anti-bot challenge (HTTP ${status}, HTML instead of JSON). `
+                + `That is the upstream CDN refusing this server's IP, not a bad API key — curl from this same host can succeed while the app does not. `
+                + `Point UEX_API_BASE at an alternate host (https://api.uexcorp.uk/2.0) or at your own outbound proxy and retry. Server log has the cf-ray.`;
+        case 'credential':
+            return `UEX API ${path} rejected the credentials (HTTP ${status}). Check that UEX_API_KEY is a current Bearer token from https://uexcorp.space/api.`;
+        case 'rate-limit':
+            return `UEX API ${path} rate-limited this server (HTTP ${status}). Raise UEX_REQUEST_DELAY_MS and retry.`;
+        default:
+            return `UEX API ${path} returned HTTP ${status}. See the server log for the response details.`;
+    }
+}
+
+/**
  * Authenticated GET against the UEX API. Returns the parsed `data` field of
  * the response. Throws on missing API key, network error, non-2xx status, or
  * `status !== 'ok'` in the body.
@@ -60,18 +166,53 @@ async function uexFetch<T = unknown>(path: string): Promise<T> {
         throw new Error('UEX_API_KEY environment variable is not set. Register an app at https://uexcorp.space/api and set the Bearer token.');
     }
     await throttle();
-    const url = `${UEX_BASE}${path}`;
+    const base = getUexBase();
+    const url = `${base}${path}`;
     const res = await fetch(url, {
         method: 'GET',
         headers: {
             'Authorization': `Bearer ${key}`,
             'Accept': 'application/json',
+            'User-Agent': UEX_USER_AGENT,
         },
+        signal: AbortSignal.timeout(UEX_TIMEOUT_MS),
     });
+    const contentType = res.headers.get('content-type') || '';
+
     if (!res.ok) {
         const body = await res.text().catch(() => '');
-        throw new Error(`UEX API ${path} returned ${res.status}: ${body.slice(0, 300)}`);
+        const kind = classifyUexFailure(res.status, contentType, body);
+        // Full detail goes to the SERVER log only, with the snippet scrubbed at the
+        // source (see redactUpstreamPreview — lib/log.ts does not value-scan plain
+        // string fields, so it cannot be relied on here).
+        log.warn('uex request failed', {
+            path, status: res.status, kind, contentType,
+            cfRay: res.headers.get('cf-ray'), bytes: body.length,
+            bodyPreview: redactUpstreamPreview(body.slice(0, 200)),
+        });
+        // The thrown message is CONSTRUCTED from classified fields and never derived
+        // from the response body. It reaches the browser twice — the dispatcher
+        // returns error.message on the throw path, and fetchAllUexItems below pushes
+        // it into `errors[]`, which rides a 200 OK all the way to the admin catalog
+        // tab — so third-party bytes must not get into it. A Cloudflare interstitial
+        // used to arrive as 300 characters of raw HTML in an admin toast.
+        throw new Error(uexFailureMessage(path, res.status, kind));
     }
+
+    // A challenge/error page can also arrive with a 200. Guard before res.json(),
+    // whose SyntaxError has no code/errno and so is not opaque to lib/errors.ts —
+    // the raw parser message would cross the wire to the admin.
+    if (!contentType.includes('json')) {
+        const body = await res.text().catch(() => '');
+        const kind = classifyUexFailure(res.status, contentType, body);
+        log.warn('uex returned a non-JSON 2xx', {
+            path, status: res.status, kind, contentType,
+            cfRay: res.headers.get('cf-ray'), bytes: body.length,
+            bodyPreview: redactUpstreamPreview(body.slice(0, 200)),
+        });
+        throw new Error(uexFailureMessage(path, res.status, kind));
+    }
+
     const json = await res.json() as { status?: string; data?: T; message?: string };
     if (json.status && json.status !== 'ok') {
         throw new Error(`UEX API ${path} status=${json.status}: ${json.message || ''}`);
@@ -161,14 +302,18 @@ export interface UexCommodity {
 // ---------------------------------------------------------------------------
 
 const CATEGORY_CACHE_TTL_MS = 60 * 60 * 1000;
-let categoryCache: { fetchedAt: number; data: UexCategory[] } | null = null;
+// Keyed on the resolved base as well as time: an operator who repoints UEX_API_BASE
+// mid-hour (the whole point of the knob) would otherwise keep being served categories
+// fetched from the host they just moved off.
+let categoryCache: { fetchedAt: number; base: string; data: UexCategory[] } | null = null;
 
 export async function fetchUexCategories(force = false): Promise<UexCategory[]> {
-    if (!force && categoryCache && Date.now() - categoryCache.fetchedAt < CATEGORY_CACHE_TTL_MS) {
+    const base = getUexBase();
+    if (!force && categoryCache && categoryCache.base === base && Date.now() - categoryCache.fetchedAt < CATEGORY_CACHE_TTL_MS) {
         return categoryCache.data;
     }
     const data = await uexFetch<UexCategory[]>('/categories');
-    categoryCache = { fetchedAt: Date.now(), data };
+    categoryCache = { fetchedAt: Date.now(), base, data };
     return data;
 }
 

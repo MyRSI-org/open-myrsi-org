@@ -183,7 +183,6 @@ export const fullPermissionMap: Record<string, string> = {
     'admin:update_theme_config': 'admin:config:theme',
     'admin:update_public_page_config': 'admin:config:branding',
     'admin:list_testimonial_candidates': 'admin:config:branding',
-    'admin:update_system_config': 'admin:config:branding',
     'admin:update_intel_sharing_config': 'admin:config:api',
     'admin:update_hr_config': 'hr:admin',
     'admin:get_intel_sharing_config': 'admin:config:api',

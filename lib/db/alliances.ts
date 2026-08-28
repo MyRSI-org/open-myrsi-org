@@ -28,6 +28,7 @@ import { collectShareableIntel, getMaxShareableClearance, verifyApiKey } from '.
 import { getCachedAllianceSyncConfig, noteInboundContact, tryConsumeToken } from './allianceSyncState.js';
 import { encryptSecret, decryptSecret } from '../crypto.js';
 import { sanitizePublicLinkUrl } from '../linkUrl.js';
+import { resolveAppUrl } from '../appUrl.js';
 import { sanitizeImageUrl } from '../imageUrl.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import { ssrfSafeFetch } from '../ssrf.js';
@@ -149,11 +150,27 @@ async function deleteSetting(key: string): Promise<void> {
     await supabase.from('settings').delete().eq('key', key);
 }
 
-/** Our own public origin, from systemConfig.appUrl. Required for pairing. */
+/**
+ * Our own public origin — the value we ADVERTISE to a peer as `fromBaseUrl`, which
+ * the peer looks up with an exact `.eq('base_url', origin)` match (see respondToPair).
+ * A wrong value therefore fails pairing outright rather than degrading.
+ *
+ * Resolution is env-first (process.env.APP_URL over settings.systemConfig.appUrl) —
+ * see lib/appUrl.ts. It previously read the stored row ONLY, so an install that set
+ * APP_URL correctly in .env but never triggered the admin console's write could not
+ * federate at all, and a database restored onto a new host advertised the old origin.
+ *
+ * The resolved value then goes through validatePeerBaseUrl — the SAME public-https +
+ * SSRF check we apply to a peer's origin, including its NODE_ENV!=='production' +
+ * ALLIANCE_DEV_ALLOW_LOOPBACK=1 hatch for two-instance local E2E. Reusing it (rather
+ * than hand-rolling a second check) keeps both sides of the handshake on one rule, and
+ * means the localhost fallback from resolveAppUrl is rejected in production instead of
+ * being advertised.
+ */
 async function getOurOrigin(): Promise<string | undefined> {
     const sys = await readSetting<{ appUrl?: string }>('systemConfig');
-    if (sys?.appUrl) { try { return new URL(sys.appUrl).origin; } catch { /* ignore */ } }
-    return undefined;
+    const resolved = resolveAppUrl(process.env.APP_URL, sys?.appUrl);
+    return validatePeerBaseUrl(resolved.url) ?? undefined;
 }
 
 // Our singleton one-time pairing code (the code WE generated and shared OOB).
@@ -404,7 +421,9 @@ async function postPair(origin: string, body: Record<string, unknown>): Promise<
 /** Run the outbound handshake for an existing Pending peer (initiator side). */
 export async function connectPeer(peerId: string): Promise<{ peerId: string; status: string }> {
     const ourOrigin = await getOurOrigin();
-    if (!ourOrigin) throw new Error('Set your public App URL in System settings before pairing.');
+    // Names the env var rather than a settings screen: APP_URL is the source of truth
+    // and there is no App URL field in the admin console to point an operator at.
+    if (!ourOrigin) throw new Error('Set APP_URL to this deployment’s public https origin (in .env) before pairing.');
     const localCode = await getLocalCode();
     if (!localCode) throw new Error('Generate a pairing code first (it may have expired).');
 

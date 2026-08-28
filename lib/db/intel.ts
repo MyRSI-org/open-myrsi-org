@@ -1337,6 +1337,14 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
             //    classified a SIBLING *.myrsi.org deployment — a different database —
             //    as local. Set APP_URL for the shortcut to apply to your own host;
             //    without it only loopback qualifies, which fails closed to HTTP.
+            //
+            //    DELIBERATELY process.env.APP_URL AND NOT resolveAppUrl()/getOrgTenantUrl().
+            //    Everywhere else the stored settings.systemConfig.appUrl is an acceptable
+            //    fallback, but this anchor decides whether to SKIP ssrfSafeFetch and run a
+            //    privileged local DB read whose result is ingested as if a peer had served
+            //    it. Widening the anchor to a DB-sourced value would let anything that can
+            //    write that row widen the set of URLs that take the privileged branch. Env
+            //    only — no fallback — so the check fails closed to the guarded HTTP path.
             let data: FeedSyncData;
             const isLocalPlatformFeed = !feed.isAlliance && isSelfHostedUrl(url, process.env.APP_URL);
 

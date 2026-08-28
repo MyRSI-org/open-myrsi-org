@@ -526,12 +526,13 @@ export const getIntelSharingConfig = async () => {
     return data?.value || { maxShareableClearance: 0 };
 };
 
-export const updateSystemConfig = async (config: Record<string, unknown>) => {
-    const sanitizedUrl = config.appUrl ? (config.appUrl as string).replace(/\/+$/, '') : '';
-    const { error } = await supabase.from('settings').upsert({ key: 'systemConfig', value: { ...config, appUrl: sanitizedUrl } }, { onConflict: 'key' });
-    handleSupabaseError({ error, message: 'Failed to update system config' });
-    broadcastSettingsUpdate();
-};
+// NOTE: there is deliberately no updateSystemConfig writer. systemConfig.appUrl is this
+// deployment's own public origin and is now operator config (process.env.APP_URL — see
+// lib/appUrl.ts); the stored row survives only as a legacy fallback for installs that
+// predate that. The removed writer had exactly one caller, the Organization Identity
+// tab's save handler, which posted window.location.origin — an invisible side effect on
+// a branding screen that let whatever host an admin happened to browse from silently
+// become the origin advertised to alliance peers and embedded in Discord announcements.
 
 export async function getRoleDetails(roleId: number) {
     const id = parseInt(roleId.toString());

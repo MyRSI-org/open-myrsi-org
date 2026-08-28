@@ -112,7 +112,7 @@ import publicFn from './api/public.js';
 import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allianceGetSelfProfile, getAlliancePeerByInboundKey as allianceGetPeerByInboundKey, getAllianceShareableData as allianceGetShareableData,
     getOperationSnapshotForPeer, getOperationManifestForPeer, acceptInviteForPeer, declineInviteForPeer, upsertAlliedParticipant, removeAlliedParticipant,
     receiveMirrorInvite, receiveMirrorPush, receiveMirrorRevoke,
-    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, ImportRefusedError, getPlatformSettings } from './lib/db.js';
+    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, ImportRefusedError, getPlatformSettings, resolveOrgAppUrl } from './lib/db.js';
 import { runFirstBootCheck } from './lib/firstBoot.js';
 import { verifyToken, signToken, isSessionForceLoggedOut, isSessionRevokedByWatermark } from './lib/auth.js';
 import { counts404TowardAbuse, isLoopbackIp } from './lib/abuseFilter.js';
@@ -902,6 +902,31 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
     if (permCheck.missing.length === 0 && permCheck.stale.length === 0) {
         log.info('permission map ok');
     }
+
+    // Report the public origin this deployment will actually put in Discord deep links
+    // and advertise to alliance peers, plus which source it came from. Deliberately
+    // READ-ONLY — converging the stored row to APP_URL at boot would let a staging
+    // container pointed at a clone of the production database silently rewrite the live
+    // org's origin, with no audit row and no undo. Non-blocking and non-fatal: a DB
+    // hiccup here must never stop the server coming up.
+    resolveOrgAppUrl().then((appUrl) => {
+        log.info('app origin resolved', { effective: appUrl.url, source: appUrl.source });
+        for (const r of appUrl.rejected) {
+            log.warn('app origin candidate ignored', { source: r.source, value: r.value, reason: r.reason });
+        }
+        if (appUrl.drift) {
+            // The migration case: a restored database carries the OLD deployment's
+            // origin. APP_URL wins, so this is informational — but naming the stale
+            // stored value is what turns "links point at the wrong host" into a
+            // one-line diagnosis.
+            log.warn('APP_URL and the stored systemConfig.appUrl disagree — APP_URL wins', appUrl.drift);
+        }
+        if (appUrl.source === 'fallback' && process.env.NODE_ENV === 'production') {
+            log.error('no usable APP_URL — Discord deep links and alliance pairing will use the localhost fallback', { effective: appUrl.url });
+        }
+    }).catch((err) => {
+        log.warn('app origin resolution failed at boot (non-fatal)', { err });
+    });
 
     cron.schedule('* * * * *', async () => {
       await withCronLease('duty_cleanup', 50, async () => {

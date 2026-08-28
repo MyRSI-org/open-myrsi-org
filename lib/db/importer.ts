@@ -970,8 +970,16 @@ function sanitizePublicPageConfigValue(cfg: Record<string, unknown>): Record<str
 // would overwrite the destination's origin with the SOURCE's — and that origin is what
 // alliance pairing advertises and verifies (lib/db/alliances.ts getOurOrigin,
 // lib/db.ts getOrgTenantUrl), so a stale value silently breaks federation. OMITTING
-// the key (rather than writing '') is deliberate: both readers guard on truthiness and
-// fall back to process.env.APP_URL, i.e. "unset — the operator configures it here".
+// the key (rather than writing '') is deliberate: it leaves the origin resolving from
+// process.env.APP_URL alone, i.e. "unset — the operator configures it here".
+//
+// This strip still matters now that APP_URL WINS over the stored row (lib/appUrl.ts).
+// Env-first only helps an operator who actually sets APP_URL; importing the source
+// org's origin would poison the fallback for everyone who doesn't, reproducing the
+// exact migration failure — old-domain links from a correctly-restored database —
+// that the precedence flip was written to end. Note a raw pg_dump/psql restore
+// bypasses this sanitiser entirely, which is why env-first is the real fix and this
+// is defence in depth.
 function sanitizeSystemConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
     if (!('appUrl' in cfg)) return cfg;
     const safe = { ...cfg };

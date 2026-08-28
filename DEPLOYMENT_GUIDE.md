@@ -39,7 +39,7 @@ Copy `.env.example` to `.env` and fill it in (or set them in your host's environ
 | :--- | :--- |
 | `NODE_ENV` | `production` |
 | `PORT` | `3000` |
-| `APP_URL` | `https://yourdomain.com` (no trailing slash) |
+| `APP_URL` | `https://yourdomain.com` (no trailing slash). **Set this.** It overrides the `appUrl` stored in the database and is what Discord deep links and alliance pairing use — see [Moving to a new domain](#moving-to-a-new-domain) |
 | `SUPABASE_URL` | Project URL |
 | `SUPABASE_ANON_KEY` | Public anon key |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Required.** Server-only; bypasses RLS |
@@ -103,6 +103,38 @@ Notes:
 
 If you seed/import a `users` row by `discord_id` (e.g. migrating from another deployment), that user's `auth_user_id` is bound automatically on their first successful Discord login, keeping their original `user.id` and all historical records (requests, intel, ops) intact. You can import a full org export during first-run setup, or any time from **Admin → Import**.
 
+### Moving to a new domain
+
+Set `APP_URL` on the new host and restart. That is the whole procedure — `APP_URL` **wins** over the `appUrl` value stored in the database's `settings.systemConfig` row, so a migrated database carrying the old origin no longer overrides it.
+
+This matters because that stored row is org data: it comes across in a `pg_dump`/restore or a Supabase project move, and it is what Discord announcement deep links, Discord scheduled-event locations, and the origin advertised to alliance federation peers are built from. Before `APP_URL` took precedence, a correct `.env` on the new host was silently ignored and announcements kept linking to the old deployment.
+
+On every boot the server logs which source it used, so you can confirm it from the deploy log:
+
+```text
+app origin resolved   {"effective":"https://newdomain.com","source":"env"}
+```
+
+If the old value is still in the database you'll also get, harmlessly:
+
+```text
+APP_URL and the stored systemConfig.appUrl disagree — APP_URL wins  {"env":"https://newdomain.com","stored":"https://olddomain.com"}
+```
+
+`APP_URL` wins, so this needs no action. To silence it, clear the stale key in the **Supabase SQL Editor**:
+
+```sql
+UPDATE settings
+SET value = value - 'appUrl'
+WHERE key = 'systemConfig';
+```
+
+A `source` of `stored` means `APP_URL` was blank or rejected (unparseable, not `http(s)`, or left as the `yourdomain.com` placeholder — placeholders are ignored on purpose so a half-edited `.env` can't publish links to a domain you don't own). A `source` of `fallback` in production means neither was usable and links will point at `localhost`; that one is logged as an error.
+
+The importer already strips `systemConfig.appUrl` from an **Admin → Import** org export, so a normal import never carries another deployment's origin in. A raw database restore bypasses that, which is why `APP_URL` is the reliable control.
+
+Two related things do **not** need changing when you move: Discord OAuth uses the browser's own origin (register the new redirect URL in the Discord Developer Portal), and web-push deep links are origin-relative.
+
 ---
 
 ## 7. Updating an Existing Deployment
@@ -127,4 +159,8 @@ The applied schema version is recorded in `settings.schema_version`. A release t
 - **Live updates not working:** set `SUPABASE_JWT_SECRET` (Dashboard → Settings → API → JWT Secret); without it realtime is disabled (the app still works, refreshing manually).
 - **DB/RLS errors:** confirm `schema.sql` ran and the service-role key is set.
 - **Setup code not appearing:** it only prints when **no Admin exists**. If you already have an Admin, that's expected. Check logs for `admin setup code generated (first boot)`.
+- **Discord announcements link to your old domain:** set `APP_URL` on the new host and restart — see [Moving to a new domain](#moving-to-a-new-domain). The boot log line `app origin resolved` tells you which value is actually in use.
+- **Alliance pairing fails with `no_pending_pairing`:** the origin you advertise must byte-match what the peer's admin typed into **Add Peer** (exact match — scheme, `www.`, and port all count). Check `app origin resolved` in your boot log against their peer entry. Pairing needs a public **https** origin, so it will refuse to run on the `localhost` fallback.
+- **UEX catalog sync returns 403 / a Cloudflare "Just a moment..." page:** the UEX CDN is challenging your server's IP — a `curl` with the same token from the same box can still succeed. Set `UEX_API_BASE=https://api.uexcorp.uk/2.0` (the same API on a different zone) or point it at your own outbound proxy, then restart and retry **Sync from UEX**. No source edit or rebuild needed.
+- **UEX sync returns 429:** raise `UEX_REQUEST_DELAY_MS` (default `600`).
 - **Uploaded images fail or don't appear:** make sure `schema.sql` has been run — it creates the image storage buckets. If an upload says you don't have permission, run **Admin → Database Tools → Repair Database** so your Admin role picks up the newer permissions.

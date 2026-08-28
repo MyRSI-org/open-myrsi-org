@@ -2476,7 +2476,6 @@ export interface DataContextType {
     updateAIConfig: (config: any) => Promise<void>;
     updateWikiHomeConfig: (config: WikiHomeConfig) => Promise<void>;
     reorderWikiPages: (pages: { id: string; sortOrder: number }[]) => Promise<void>;
-    updateSystemConfig: (url: string) => Promise<void>;
     updatePublicPageConfig: (config: PublicPageConfig) => Promise<void>;
     listTestimonialCandidates: (params: { search?: string; limit?: number; offset?: number }) => Promise<{ items: TestimonialCandidate[]; total: number }>;
     updateOrgFeatures: (patch: Record<string, any>) => Promise<void>;

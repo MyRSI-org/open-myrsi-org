@@ -92,10 +92,6 @@ interface ListTestimonialCandidatesPayload extends OrgScopedPayload {
     offset?: number;
 }
 
-interface UpdateSystemConfigPayload extends OrgScopedPayload {
-    appUrl?: string;
-}
-
 interface IntelSharingConfigPayload extends OrgScopedPayload {
     config: Record<string, unknown>;
 }
@@ -451,7 +447,6 @@ export const adminActions = {
     'admin:update_theme_config': async (payload: { enabled?: boolean; accent?: string }) => { await db.updateThemeConfig(stripActorFields(payload)); },
     'admin:update_public_page_config': async (payload: PublicPageConfigPayload) => { await db.updatePublicPageConfig(stripActorFields(payload)); invalidatePublicCache(); },
     'admin:list_testimonial_candidates': async ({ search, limit, offset }: ListTestimonialCandidatesPayload) => db.getTestimonialCandidates({ search, limit, offset }),
-    'admin:update_system_config': async ({ appUrl }: UpdateSystemConfigPayload) => { await db.updateSystemConfig({ appUrl }); },
     'admin:update_intel_sharing_config': async ({ config }: IntelSharingConfigPayload) => { await db.updateIntelSharingConfig(config); },
     'admin:update_hr_config': async ({ config }: HRConfigPayload) => { await db.updateHRConfig(config); },
     'admin:get_intel_sharing_config': async () => { return db.getIntelSharingConfig(); },

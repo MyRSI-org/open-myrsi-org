@@ -12,10 +12,9 @@ const inputCls = "w-full bg-slate-900/60 border border-slate-700 rounded-lg p-2.
 const inputMonoCls = inputCls + " font-mono";
 
 const OrganizationIdentityTab: React.FC = () => {
-    const { brandingConfig, updateBrandingConfig, updateSystemConfig } = useConfig();
+    const { brandingConfig, updateBrandingConfig } = useConfig();
     const { addToast } = useNotification();
     const [config, setConfig] = useState<BrandingConfig>(brandingConfig);
-    const [systemAppUrl] = useState(typeof window !== 'undefined' ? window.location.origin : '');
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
 
@@ -57,9 +56,6 @@ const OrganizationIdentityTab: React.FC = () => {
         }
         try {
             await updateBrandingConfig(config);
-            if (systemAppUrl) {
-                await updateSystemConfig(systemAppUrl);
-            }
             setIsSaved(true);
             setTimeout(() => setIsSaved(false), 2000);
         } catch (err) {
