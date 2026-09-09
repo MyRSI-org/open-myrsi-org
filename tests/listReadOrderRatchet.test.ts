@@ -38,7 +38,7 @@ function scan(): Site[] {
     const files = [...walk(join(ROOT, 'lib')), ...walk(join(ROOT, 'api'))];
     const rows: Site[] = [];
     for (const f of files) {
-        const raw = readFileSync(f, 'utf8');
+        const raw = readFileSync(f, 'utf8').replace(/\r\n/g, '\n');
         const src = stripComments(raw);
         let idx = 0;
         while ((idx = src.indexOf('.select(', idx)) !== -1) {
@@ -51,7 +51,8 @@ function scan(): Site[] {
             }
             let chain = src.slice(idx, end);
             const before = src.slice(Math.max(0, idx - 400), idx);
-            const isWrite = /\.(insert|update|upsert|delete)\s*\(/.test(before.slice(-200));
+            const stmtStart = before.lastIndexOf(';');
+            const isWrite = /\.(insert|update|upsert|delete)\s*\(/.test(stmtStart === -1 ? before : before.slice(stmtStart + 1));
             const isSingle = /\.(single|maybeSingle)\s*\(/.test(chain);
             const isHead = /head:\s*true/.test(chain);
 
@@ -171,7 +172,7 @@ const UNCAPPED_BASELINE: Record<string, number> = {
     'lib/db.ts': 12,
     'lib/db/academy.ts': 11,
     'lib/db/allianceSync.ts': 2,
-    'lib/db/alliances.ts': 5,
+    'lib/db/alliances.ts': 4,
     'lib/db/clientRoleLock.ts': 1,
     'lib/db/common.ts': 2,
     'lib/db/finances.ts': 1,
