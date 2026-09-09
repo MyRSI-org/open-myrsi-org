@@ -58,8 +58,14 @@ vi.mock('../lib/db/operations-federation', () => ({
     scheduleAlliedPush: vi.fn(() => undefined),
 }));
 vi.mock('../lib/push', () => ({ sendPushToUsers: vi.fn(async () => undefined) }));
-// getUserById is invoked for log attribution after a successful write.
-vi.mock('../lib/db/users', () => ({ getUserById: vi.fn(async () => ({ id: 1, name: 'Actor' })) }));
+// getActorLabel is invoked for log attribution after a successful write; it
+// wraps the (fail-closed, throwing) getUserById so a read fault can't report a
+// committed mutation as an error.
+vi.mock('../lib/db/users', () => ({
+    getUserById: vi.fn(async () => ({ id: 1, name: 'Actor' })),
+    // ops.ts reads the LABEL, not the user, for post-commit log attribution.
+    getActorLabel: vi.fn(async () => 'Actor'),
+}));
 
 // Handler-wiring stubs.
 // operations.ts imports the db barrel (../../lib/db.js → '../lib/db' here) and
@@ -163,6 +169,33 @@ describe('HIGH-1 — op sub-resource UPDATE/fulfill are scoped by operation_id',
         for (const q of [...loads, ...updates]) {
             expect(q.calls).toContainEqual({ method: 'eq', args: ['operation_id', OP] });
         }
+    });
+});
+
+// fulfilled_by_user_id is an attribution FK. `data` is a free-form client bag and
+// the dispatcher's actor-field overwrite is top-level only (it does not recurse
+// into payload.data), so a writable fulfilled_by_user_id let an operations:manage
+// holder — or the op's own owner, via the api/services.ts owner bypass — forge a
+// fulfilment onto any real user. fulfillLogisticsItem is the only writer.
+describe('updateLogisticsItem — fulfilment attribution is not client-writable', () => {
+    it('ignores a client-supplied fulfilledByUserId while still applying the real fields', async () => {
+        await updateLogisticsItem(7, { itemName: 'Medpen', quantityNeeded: 5, fulfilledByUserId: 4211 }, 'op-A');
+        const q = h.queries.find(q => q.table === 'operation_logistics' && q.calls.some(c => c.method === 'update'));
+        const payload = q?.calls.find(c => c.method === 'update')?.args[0] as Record<string, unknown> | undefined;
+        expect(payload).toBeDefined();
+        expect(payload).not.toHaveProperty('fulfilled_by_user_id');
+        // ...and the allowlisted fields still land, so a lazy "stop updating at all"
+        // regression can't pass this.
+        expect(payload?.item_name).toBe('Medpen');
+        expect(payload?.quantity_needed).toBe(5);
+    });
+
+    it('fulfillLogisticsItem still writes the ACTOR as the fulfiller', async () => {
+        h.resolveQuery = () => ({ data: { quantity_fulfilled: 0, quantity_needed: 10 }, error: null });
+        await fulfillLogisticsItem(7, 3, 42, 'op-A');
+        const q = h.queries.find(q => q.table === 'operation_logistics' && q.calls.some(c => c.method === 'update'));
+        const payload = q?.calls.find(c => c.method === 'update')?.args[0] as { fulfilled_by_user_id?: number } | undefined;
+        expect(payload?.fulfilled_by_user_id).toBe(42);
     });
 });
 

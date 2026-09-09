@@ -13,6 +13,10 @@ const h = vi.hoisted(() => ({
     holderPosition: null as null | { can_veto_legislation?: boolean; can_call_elections?: boolean },
     rpcResult: { data: null as unknown, error: null as unknown },
     rpcCalls: [] as Array<{ fn: string; args: unknown }>,
+    // Inject a read fault on one table, to prove the apex gate fails CLOSED.
+    errorFor: null as null | string,
+    // When true the holder row itself is missing.
+    holderMissing: false,
 }));
 
 vi.mock('../lib/db/common', () => {
@@ -26,11 +30,13 @@ vi.mock('../lib/db/common', () => {
             if (table === 'government_positions') return h.position;
             // Superset row: flat holder fields for the appointment fetch + a `position`
             // embed for the removePositionHolder apex check.
+            if (table === 'government_position_holders' && h.holderMissing) return null;
             if (table === 'government_position_holders') return { id: 50, position_id: 3, user_id: 1, appointed_by_id: 2, election_id: null, started_at: 't', ended_at: null, position: h.holderPosition };
             return null;
         };
-        b.single = () => Promise.resolve({ data: data(), error: null });
-        b.maybeSingle = () => Promise.resolve({ data: data(), error: null });
+        const fault = () => (h.errorFor === table ? { message: 'boom' } : null);
+        b.single = () => { const e = fault(); return Promise.resolve(e ? { data: null, error: e } : { data: data(), error: null }); };
+        b.maybeSingle = () => { const e = fault(); return Promise.resolve(e ? { data: null, error: e } : { data: data(), error: null }); };
         b.then = (r: any) => Promise.resolve({ data: data(), error: null, count: 0 }).then(r);
         return b;
     }
@@ -46,7 +52,7 @@ import { appointPositionHolder, removePositionHolder } from '../lib/db/governmen
 beforeEach(() => {
     h.appointeeExists = true;
     h.position = { max_holders: 5, fill_method: 'Appointed', can_veto_legislation: false, can_call_elections: false };
-    h.holderPosition = null;
+    h.holderPosition = null; h.errorFor = null; h.holderMissing = false;
     h.rpcResult = { data: 50, error: null };
     h.rpcCalls = [];
 });
@@ -84,28 +90,38 @@ describe('appointPositionHolder atomic appointment (race-2)', () => {
 describe('appointPositionHolder authority ceiling (G2)', () => {
     it('refuses to hand-appoint an elected seat (must come through an election)', async () => {
         h.position = { max_holders: 1, fill_method: 'Elected', can_veto_legislation: true, can_call_elections: true };
-        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { role: 'Member', permissions: ['gov:manage'] }))
+        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { permissions: ['gov:manage'] }))
             .rejects.toThrow(/filled by elected, not by direct appointment/i);
         expect(h.rpcCalls.length).toBe(0);
     });
 
     it('refuses a non-admin appointing into an apex (veto/call-elections) appointed seat', async () => {
         h.position = { max_holders: 1, fill_method: 'Appointed', can_veto_legislation: false, can_call_elections: true };
-        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { role: 'Member', permissions: ['gov:manage'] }))
+        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { permissions: ['gov:manage'] }))
             .rejects.toThrow(/requires an administrator/i);
         expect(h.rpcCalls.length).toBe(0);
     });
 
-    it('refuses the seeded Dispatcher (gov:manage + admin:access, role Dispatcher) — the apex carve-out is the Admin ROLE, not admin:access', async () => {
+    it('refuses the seeded Dispatcher (gov:manage + admin:access) — the apex carve-out is the Admin ROLE IDENTITY, not admin:access', async () => {
         h.position = { max_holders: 1, fill_method: 'Appointed', can_veto_legislation: true, can_call_elections: true };
-        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { role: 'Dispatcher', permissions: ['gov:manage', 'admin:access'] }))
+        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { permissions: ['gov:manage', 'admin:access'] }))
             .rejects.toThrow(/requires an administrator/i);
         expect(h.rpcCalls.length).toBe(0);
     });
 
-    it('allows an org admin to appoint into an apex appointed seat', async () => {
+    // ROLE NAME IS NOT AUTHORITY. `role` is inferred from the role row's free-text
+    // name (lib/db/mappers.ts), so a permissionless custom role called 'Commander'
+    // arrived here as the Admin tier and could seat itself in a veto office.
+    it('refuses an actor whose Admin tier comes from the role NAME (forged), with no stamped identity', async () => {
         h.position = { max_holders: 1, fill_method: 'Appointed', can_veto_legislation: true, can_call_elections: true };
-        const res = await appointPositionHolder({ userId: 1, positionId: 3 }, { role: 'Admin', permissions: [] });
+        await expect(appointPositionHolder({ userId: 1, positionId: 3 }, { role: 'Admin', permissions: [] } as unknown as Parameters<typeof appointPositionHolder>[1]))
+            .rejects.toThrow(/requires an administrator/i);
+        expect(h.rpcCalls.length).toBe(0);
+    });
+
+    it('allows the stamped system Admin (role identity) to appoint into an apex appointed seat', async () => {
+        h.position = { max_holders: 1, fill_method: 'Appointed', can_veto_legislation: true, can_call_elections: true };
+        const res = await appointPositionHolder({ userId: 1, positionId: 3 }, { isSystemAdmin: true, permissions: [] });
         expect(h.rpcCalls.some((c) => c.fn === 'gov_appoint_holder')).toBe(true);
         expect(res).toBeTruthy();
     });
@@ -123,25 +139,62 @@ describe('appointPositionHolder authority ceiling (G2)', () => {
 describe('removePositionHolder apex gate (G2)', () => {
     it('refuses a non-admin removing the holder of an apex office', async () => {
         h.holderPosition = { can_veto_legislation: true, can_call_elections: false };
-        await expect(removePositionHolder(50, 'removed', { role: 'Member', permissions: ['gov:manage'] }))
+        await expect(removePositionHolder(50, 'removed', { permissions: ['gov:manage'] }))
             .rejects.toThrow(/requires an administrator/i);
     });
 
-    it('refuses the seeded Dispatcher (admin:access but role Dispatcher) from removing an apex holder', async () => {
+    it('refuses the seeded Dispatcher (gov:manage + admin:access) from removing an apex holder', async () => {
         h.holderPosition = { can_veto_legislation: false, can_call_elections: true };
-        await expect(removePositionHolder(50, 'removed', { role: 'Dispatcher', permissions: ['gov:manage', 'admin:access'] }))
+        await expect(removePositionHolder(50, 'removed', { permissions: ['gov:manage', 'admin:access'] }))
+            .rejects.toThrow(/requires an administrator/i);
+    });
+
+    it('refuses a forged Admin role NAME from removing an apex holder', async () => {
+        h.holderPosition = { can_veto_legislation: true, can_call_elections: false };
+        await expect(removePositionHolder(50, 'removed', { role: 'Admin', permissions: [] } as unknown as Parameters<typeof removePositionHolder>[2]))
             .rejects.toThrow(/requires an administrator/i);
     });
 
     it('allows removing the holder of an ordinary office', async () => {
         h.holderPosition = { can_veto_legislation: false, can_call_elections: false };
-        await expect(removePositionHolder(50, 'removed', { role: 'Member', permissions: ['gov:manage'] }))
+        await expect(removePositionHolder(50, 'removed', { permissions: ['gov:manage'] }))
             .resolves.toBeUndefined();
     });
 
-    it('allows an org admin to remove an apex holder', async () => {
+    it('allows the stamped system Admin to remove an apex holder', async () => {
         h.holderPosition = { can_veto_legislation: true, can_call_elections: true };
-        await expect(removePositionHolder(50, 'removed', { role: 'Admin', permissions: [] }))
+        await expect(removePositionHolder(50, 'removed', { isSystemAdmin: true, permissions: [] }))
             .resolves.toBeUndefined();
+    });
+});
+
+describe('the apex-office eviction guard FAILS CLOSED', () => {
+    // The guard exists so a gov:manage holder cannot clear opposition out of the seats
+    // that can veto legislation or call elections. It discarded its lookup error, so
+    // any read fault produced holder = null -> pos = undefined -> the guard was skipped
+    // entirely, and the eviction went through as an ordinary one. A check that switches
+    // itself off on the blip that made it unverifiable is not a check.
+    const NON_ADMIN = { id: 2, permissions: ['gov:manage'] } as never;
+
+    it('refuses when the holder lookup errors, instead of skipping the check', async () => {
+        h.errorFor = 'government_position_holders';
+        await expect(removePositionHolder(50, 'reason', NON_ADMIN)).rejects.toThrow(/Failed to load position holder/i);
+    });
+
+    it('refuses when the holder row is missing', async () => {
+        h.holderMissing = true;
+        await expect(removePositionHolder(50, 'reason', NON_ADMIN)).rejects.toThrow(/not found/i);
+    });
+
+    it('refuses when the office behind the holder cannot be resolved', async () => {
+        // A null position embed means "I could not tell whether this is an apex office",
+        // which must never read as "it is not".
+        h.holderPosition = null;
+        await expect(removePositionHolder(50, 'reason', NON_ADMIN)).rejects.toThrow(/cannot verify which office/i);
+    });
+
+    it('still allows the ordinary case, so the guard is not just a wall', async () => {
+        h.holderPosition = { can_veto_legislation: false, can_call_elections: false };
+        await expect(removePositionHolder(50, 'reason', NON_ADMIN)).resolves.not.toThrow();
     });
 });

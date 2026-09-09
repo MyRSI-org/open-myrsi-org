@@ -7,8 +7,9 @@ import HeroStat from '../../shared/ui/HeroStat';
 import { CatalogTab, MyLearningTab } from './AcademyStudentTabs';
 import { CourseBuilderTab, SessionsTab } from './AcademyInstructorTabs';
 import { ApprovalsTab, CertifyTab } from './AcademyManagerTabs';
+import { ReportsTab } from './AcademyReportsTab';
 
-type AcademyTab = 'catalog' | 'my-learning' | 'courses' | 'sessions' | 'approvals' | 'certify';
+type AcademyTab = 'catalog' | 'my-learning' | 'courses' | 'sessions' | 'approvals' | 'certify' | 'reports';
 
 const NavigationItem: React.FC<{ label: string; icon: string; isActive: boolean; onClick: () => void; badge?: number }> = ({ label, icon, isActive, onClick, badge }) => (
     <button
@@ -78,6 +79,7 @@ const AcademyHubView: React.FC = () => {
                 items: [
                     { id: 'approvals', label: 'Approvals', icon: 'fa-solid fa-clipboard-check', badge: stats.pendingApprovals },
                     { id: 'certify', label: 'Certify', icon: 'fa-solid fa-user-graduate' },
+                    { id: 'reports', label: 'Reports', icon: 'fa-solid fa-chart-line' },
                 ],
             });
         }
@@ -141,6 +143,7 @@ const AcademyHubView: React.FC = () => {
                     {effectiveTab === 'sessions' && (canInstruct || canManage) && <SessionsTab canManage={canManage} />}
                     {effectiveTab === 'approvals' && canManage && <ApprovalsTab />}
                     {effectiveTab === 'certify' && canManage && <CertifyTab />}
+                    {effectiveTab === 'reports' && canManage && <ReportsTab />}
                 </div>
             </div>
         </div>

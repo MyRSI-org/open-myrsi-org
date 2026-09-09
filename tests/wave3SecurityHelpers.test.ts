@@ -5,14 +5,20 @@ import { isPrivateIpv6Address, isPrivateIpv4 } from '../lib/linkUrl';
 // fed-peer-1 / injection-1: LIKE metacharacters in an externally-supplied value
 // must be escaped so '%' can't become a match-everything wildcard.
 describe('escapeLikePattern', () => {
-    it('escapes %, _, and backslash', () => {
+    it("escapes %, _, backslash and PostgREST's * alias", () => {
         expect(escapeLikePattern('%')).toBe('\\%');
         expect(escapeLikePattern('a_b')).toBe('a\\_b');
         expect(escapeLikePattern('x\\y')).toBe('x\\\\y');
         expect(escapeLikePattern('100%_off\\')).toBe('100\\%\\_off\\\\');
+        // PostgREST rewrites `*` to `%` in a like/ilike operand before Postgres
+        // sees it, so escaping %/_/\ alone still shipped a live wildcard.
+        expect(escapeLikePattern('*')).toBe('\\*');
+        // Combined: fails if ANY one of the four is dropped from the class.
+        expect(escapeLikePattern('a%b_c\\d*e')).toBe('a\\%b\\_c\\\\d\\*e');
     });
     it('leaves a clean value unchanged and handles non-strings', () => {
         expect(escapeLikePattern('Org-Name 1')).toBe('Org-Name 1');
+        expect(escapeLikePattern('')).toBe('');
         expect(escapeLikePattern(null)).toBe('');
         expect(escapeLikePattern(123)).toBe('');
     });

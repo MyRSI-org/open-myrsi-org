@@ -39,27 +39,54 @@ import { assertRequestResponderOrDuty, completeRequest, acceptRequest } from '..
 beforeEach(() => { h.adjustRepCalls = []; h.resolveQuery = () => ({ data: null, error: null }); });
 
 describe('assertRequestResponderOrDuty (disp-gate-1)', () => {
-    it('allows a duty holder (request:dispatch) without touching the request', async () => {
-        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:dispatch'] })).resolves.toBeUndefined();
+    // The row is now read BEFORE the duty bypass so the terminal-status guard can apply to
+    // duty holders too — they are the only callers whose completion report reaches the
+    // reputation RPC, so they are exactly who could replay it against a finished request.
+    const liveRequest = (over: Record<string, unknown> = {}) => (q: { table: string }) =>
+        q.table === 'service_requests'
+            ? { data: { lead_responder_id: 99, status: 'Accepted', ...over }, error: null }
+            : { data: null, error: null };
+
+    it('allows a duty holder (request:dispatch)', async () => {
+        h.resolveQuery = liveRequest();
+        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:dispatch'] }, 'complete')).resolves.toBeUndefined();
     });
-    it('allows Admin', async () => {
-        await expect(assertRequestResponderOrDuty('r1', { id: 5, role: 'Admin' })).resolves.toBeUndefined();
+    it('a role NAME alone is not duty — the bypass is permission-only', async () => {
+        h.resolveQuery = liveRequest();
+        await expect(assertRequestResponderOrDuty(
+            'r1',
+            { id: 5, role: 'Admin' } as unknown as Parameters<typeof assertRequestResponderOrDuty>[1],
+            'complete',
+        )).rejects.toThrow(/not assigned/i);
+    });
+    it('refuses to start or complete a request that is already finished — anyone, duty included', async () => {
+        // updateRequestStatus writes { status } unconditionally and never reads the current
+        // value, so without this an assigned responder could drive a Cancelled or Success row
+        // back to In-Progress, and re-complete it repeatedly — each re-completion re-applying
+        // report.clientReputationChange, which is idempotency-free.
+        for (const status of ['Success', 'Cancelled', 'Failed', 'Refused', 'Aborted', 'GameError']) {
+            h.resolveQuery = liveRequest({ status });
+            await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:dispatch'] }, 'complete'))
+                .rejects.toThrow(/already .* can no longer be completed/i);
+            await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:dispatch'] }, 'start'))
+                .rejects.toThrow(/already .* can no longer be started/i);
+        }
     });
     it('allows the lead responder', async () => {
-        h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { lead_responder_id: 5 }, error: null } : { data: null, error: null };
-        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: [] })).resolves.toBeUndefined();
+        h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { lead_responder_id: 5, status: 'Accepted' }, error: null } : { data: null, error: null };
+        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: [] }, 'complete')).resolves.toBeUndefined();
     });
     it('allows an assigned responder', async () => {
         h.resolveQuery = (q) => {
-            if (q.table === 'service_requests') return { data: { lead_responder_id: 99 }, error: null };
+            if (q.table === 'service_requests') return { data: { lead_responder_id: 99, status: 'Accepted' }, error: null };
             if (q.table === 'request_responders') return { data: { user_id: 5 }, error: null };
             return { data: null, error: null };
         };
-        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: [] })).resolves.toBeUndefined();
+        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: [] }, 'complete')).resolves.toBeUndefined();
     });
     it('rejects a plain member who is neither responder nor duty', async () => {
-        h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { lead_responder_id: 99 }, error: null } : { data: null, error: null };
-        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:complete'] })).rejects.toThrow(/not assigned/i);
+        h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { lead_responder_id: 99, status: 'Accepted' }, error: null } : { data: null, error: null };
+        await expect(assertRequestResponderOrDuty('r1', { id: 5, permissions: ['request:complete'] }, 'complete')).rejects.toThrow(/not assigned/i);
     });
 });
 
@@ -110,7 +137,7 @@ describe('completeRequest reputation write is duty-gated', () => {
     it('a duty actor can move client reputation', async () => {
         h.resolveQuery = (q) => q.table === 'service_requests' ? { data: { client_id: 7, service_type: 'x', reputation: 50 }, error: null }
             : q.table === 'users' ? { data: { reputation: 50 }, error: null } : { data: null, error: null };
-        await completeRequest('r1', { outcome: 'Success', clientReputationChange: -50 } as any, 5, { id: 5, role: 'Admin' });
+        await completeRequest('r1', { outcome: 'Success', clientReputationChange: -50 } as any, 5, { id: 5, permissions: ['request:dispatch'] });
         expect(h.adjustRepCalls.length).toBe(1);
     });
 });

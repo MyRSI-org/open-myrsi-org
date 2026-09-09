@@ -45,16 +45,18 @@ interface DiscordEmbed {
 
 // The dispatcher injects the authenticated user onto every payload. Intel reads
 // use it for server-side clearance/limiting-marker filtering.
-type ActorUser = { user?: { id?: number; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[]; role?: string; permissions?: string[] } };
+// `role` is deliberately absent: it is the NAME-derived display tier and must not
+// be passable into a clearance or duty decision. `isSystemAdmin` is the stamped
+// role IDENTITY the clearance module reads (lib/db/adminIdentity.ts).
+type ActorUser = { user?: { id?: number; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[]; isSystemAdmin?: boolean; permissions?: string[] } };
 
 // The request-BOLA predicate, replicated from lib/db.ts canSeeAllRequests
 // (private there, not cleanly importable). Holders of a request-duty permission
-// (the dispatch-board audience) — and Admins — may see service-request bodies;
-// everyone else may not. Keep in lock-step with the lib/db.ts original; if it
-// gains/loses a duty permission, mirror it.
+// (the dispatch-board audience) may see service-request bodies; everyone else may
+// not. NO ROLE-NAME BYPASS — see the lib/db.ts original. Keep in lock-step with it;
+// if it gains/loses a duty permission, mirror it.
 function canSeeAllRequests(user?: ActorUser['user'] | null): boolean {
     if (!user) return false;
-    if (user.role === 'Admin') return true;
     const perms = Array.isArray(user.permissions) ? user.permissions : [];
     return perms.includes('request:dispatch') || perms.includes('request:triage') || perms.includes('request:accept');
 }
@@ -267,7 +269,8 @@ export const intelActions = {
         const dossier = await db.getDossier(targetId, user);
         // Warrant/KOS records require warrant:view — they must NOT ride the
         // dossier under intel:view alone. Reports are filtered by clearance.
-        const canViewWarrants = user?.role === 'Admin' || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
+        // Permission only — no role-name bypass (see lib/db/intel.ts getIntelStats).
+        const canViewWarrants = Array.isArray(user?.permissions) && user.permissions.includes('warrant:view');
         // dossier.requests are service_requests bodies (description/location/
         // threat/PII) matched by the subject's RSI handle. They MUST honour the
         // same request-BOLA gate the requests read-path enforces (lib/db.ts
@@ -284,13 +287,24 @@ export const intelActions = {
     'intel:get_recent': (payload: IntelRecentPayload & ActorUser) =>
         db.getRecentIntelReports(payload?.subjectType).then((r) => db.filterIntelByClearance(r, payload?.user)),
     'intel:list': async (payload: IntelListPayload & ActorUser) => {
+        // warrantsOnly IS A WARRANT READ, filtered or not. The flag narrows the list to
+        // subjects carrying an ACTIVE WARRANT, so the result set itself discloses which
+        // targets are under warrant — the exact fact intel:get_dossier withholds two
+        // handlers above unless the caller holds warrant:view. Reached through a filter
+        // rather than a field, it bypassed that gate entirely: any intel:view holder
+        // could set the flag and read the warrant list off the response.
+        //
+        // Dropped rather than refused, so the action keeps working for a caller who
+        // simply is not entitled to that filter — they get the ordinary intel list.
+        const canViewWarrants = Array.isArray(payload?.user?.permissions)
+            && payload.user.permissions.includes('warrant:view');
         const result = await db.listIntelReports({
             limit: payload.limit,
             cursor: payload.cursor,
             threatLevel: payload.threatLevel,
             subjectType: payload.subjectType,
             tag: payload.tag,
-            warrantsOnly: payload.warrantsOnly,
+            warrantsOnly: canViewWarrants ? payload.warrantsOnly : undefined,
             q: payload.q,
             viewer: payload?.user, // SQL clearance-level ceiling (markers still filtered below)
         });

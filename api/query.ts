@@ -4,10 +4,19 @@ import * as db from '../lib/db.js';
 import { verifyToken, isSessionForceLoggedOut, isSessionRevokedByWatermark, signRealtimeToken } from '../lib/auth.js';
 import { stripSensitiveUserFields, stripSensitiveUserFieldsBulk, RequesterContext } from '../lib/db/userFilters.js';
 import { filterByClearance } from '../lib/clearance.js';
-import type { DiscordConfig } from '../types.js';
+import type { DiscordConfig, BanNotice } from '../types.js';
 import { normalizeHexColor } from '../lib/color.js';
+import { CLIENT_SAFE_DISCORD_KEYS } from '../lib/discordConfigKeys.js';
+import { permissionSatisfied } from '../lib/permissionImplications.js';
+import { mayReceiveRoster } from '../lib/rosterGate.js';
+import { projectSettingsForViewer } from '../lib/settingsProjection.js';
+import { parseFeedCursor } from '../lib/feedCursor.js';
+import { keyHasScope } from '../lib/apiKeyScopes.js';
+import { isApiKeySchemaOutdated } from '../lib/db/system.js';
+import { CLIENT_DENIED_SUBSETS, CLIENT_DENIED_MESSAGE } from '../lib/clientNamespaces.js';
 import { signDocMediaForClient } from '../lib/orgMediaDocs.js';
 import { log as baseLog } from '../lib/log.js';
+import { credentialFromRequest, SESSION_COOKIE_IS_SECURE, clearSessionCookie , appendSetCookie } from '../lib/sessionCookie.js';
 
 const log = baseLog.child({ module: 'api.query' });
 
@@ -18,6 +27,10 @@ function requesterFromUser(currentUser: any): RequesterContext | null {
     return {
         id: currentUser.id,
         role: currentUser.role,
+        // Role IDENTITY, stamped server-side by getUserById. currentUser is the
+        // UNSTRIPPED session actor here (requesterFromUser runs before
+        // stripSensitiveUserFields on every path), so the flag is still present.
+        isSystemAdmin: currentUser.isSystemAdmin === true,
         permissions: currentUser.permissions || [],
     };
 }
@@ -69,7 +82,26 @@ export function pickPublicThemeConfig(t: unknown): { enabled: boolean; accent?: 
 // api/services.ts dispatcher and the UI nav gates, so a low-privilege member
 // can't read them. Subsets not listed here are readable by any authenticated
 // org member.
-const SUBSET_REQUIRED_PERMISSION: Record<string, string> = {
+//
+// 'main' is intentionally NOT listed, and must stay unlisted: it is auth-only by
+// design because a Client legitimately reads serviceTypes, orgMeta.features and a
+// PROJECTION of the settings blob (brandingConfig incl. ToS, heroCardConfig,
+// radioConfig, platformSettings) out of it, and 403-ing it would silently kill their
+// request form. Both of its SENSITIVE halves are withheld inside the payload rather
+// than by a 403: the roster, the rank/unit/role tables and the classification taxonomy
+// INSIDE getMainState by lib/rosterGate.ts mayReceiveRoster (the one predicate every
+// roster surface shares), and the wiki/HR config keys by projectSettingsForViewer
+// (lib/settingsProjection.ts), which gates each on the same bare permission as the
+// subset it configures. So the gate here is a PROJECTION, not a 403. Ratcheted by
+// tests/rosterGate.test.ts, tests/mainBundleProjection.test.ts,
+// tests/rosterEgressGates.test.ts and tests/settingsProjection.test.ts.
+// EXPORTED for tests/readPathPermissionCoverage.test.ts — the read-path twin of
+// tests/permissionMapCoverage.test.ts, which has guarded the WRITE path for several releases
+// while this map had no CI guard at all because it was module-private. The test is
+// bidirectional: no servable subset may be ungated, and no map entry may name a subset that no
+// longer exists. This is a gate registry, not client data, and eslint.config.js already forbids
+// client code from importing `**/api/query`.
+export const SUBSET_REQUIRED_PERMISSION: Record<string, string> = {
     warrants: 'warrant:view',
     // Realtime slice subset — same gate as the 'warrants' list it patches.
     warrant_slice: 'warrant:view',
@@ -79,8 +111,9 @@ const SUBSET_REQUIRED_PERMISSION: Record<string, string> = {
     discord: 'admin:config:discord',
     intel: 'intel:view',
     // Realtime slice subsets — same gate as the 'intel' bundle they patch
-    // (the intel:view ⇄ intel:view:clearance synonym below applies because
-    // callerHasSubsetPermission keys on the required-permission STRING).
+    // (the intel:view ⇄ intel:view:clearance implication applies because
+    // callerHasSubsetPermission keys on the required-permission STRING —
+    // lib/permissionImplications.ts).
     intel_summary: 'intel:view',
     bulletin_slice: 'intel:view',
     hr: 'hr:view',
@@ -114,10 +147,15 @@ const SUBSET_REQUIRED_PERMISSION: Record<string, string> = {
     government_legislation: 'gov:view',
     government_motions: 'gov:view',
     operations: 'operations:view',
-    // Realtime slice subsets — same gate as the 'operations' bundle they
-    // patch. (users_slice is deliberately ungated, matching 'main': any
-    // authenticated member already receives the whole lite roster there, and
-    // the per-field strip below applies identically.)
+    // Realtime slice subsets — same gate as the 'operations' bundle they patch.
+    // (users_slice is NOT ungated any more. getMainState withholds the roster from a
+    // non-staff caller, so the old "they already receive the whole lite roster in main"
+    // justification is gone. It is gated INLINE in its case below — a 403, matching
+    // every other capability denial in this file and matching the user_detail gate,
+    // because 200-with-empty would introduce a THIRD meaning into a wire shape that two
+    // in-tree docstrings assert is unambiguous: lib/db/users.ts getUsersByIdsLite and
+    // lib/sliceMerge.ts both say `{users: []}` can only mean "deleted", which is why the
+    // endpoint throws on error rather than returning it.)
     operation_slice: 'operations:view',
     operation_templates: 'operations:view',
     warehouse: 'warehouse:view',
@@ -127,9 +165,11 @@ const SUBSET_REQUIRED_PERMISSION: Record<string, string> = {
     marketplace: 'marketplace:view',
     marketplace_listings: 'marketplace:view',
     marketplace_contracts: 'marketplace:view',
-    // Academy staff bundle. (The self-service 'academy_my' subset is intentionally
-    // NOT listed — it's scoped to currentUser.id in the db layer, like
-    // 'notifications', so every member has a My Academy without a role perm.)
+    // Academy staff bundle. academy:instruct / academy:manage satisfy this through
+    // the ladder in lib/permissionImplications.ts — an Instructor who can CREATE a
+    // course must be able to load the bundle that contains it. (The self-service
+    // 'academy_my' subset is intentionally NOT listed — self-scoped enrolments plus
+    // the published catalogue, deliberately auth-only, like 'notifications'.)
     academy: 'academy:view',
 };
 
@@ -182,15 +222,15 @@ export function emptyFeatureState(subset: string): Record<string, unknown> {
     }
 }
 
-// Mirror the BOLA permission check in api/services.ts: org-owner bypass, then a
-// direct permission grant, plus the intel:view ⇄ intel:view:clearance synonym.
+// Mirror the BOLA permission check in api/services.ts: org-owner bypass, then the
+// shared implication table (lib/permissionImplications.ts) — intel:view:clearance
+// satisfies intel:view, and manage ⊇ instruct ⊇ view on the Academy ladder. Keyed on
+// the required-permission STRING, so every *_slice subset that reuses its bundle's
+// string inherits the same implication and list/slice gates cannot drift.
 function callerHasSubsetPermission(currentUser: any, ctx: any, requiredPerm: string): boolean {
     if (!requiredPerm) return true;
     if (ctx?.ownerId && currentUser?.auth_user_id && ctx.ownerId === currentUser.auth_user_id) return true;
-    const perms: string[] = currentUser?.permissions || [];
-    if (perms.includes(requiredPerm)) return true;
-    if (requiredPerm === 'intel:view' && perms.includes('intel:view:clearance')) return true;
-    return false;
+    return permissionSatisfied(currentUser?.permissions, requiredPerm);
 }
 
 // --- SECURITY: Strip secrets before sending state to the browser ---
@@ -200,14 +240,16 @@ export function stripSecrets(state: any): any {
     if (!state) return state;
     const cleaned = { ...state };
 
-    // Discord: only clientId and channel IDs are needed by the frontend
+    // Discord: only clientId and channel/role ids are needed by the frontend.
+    // ALLOWLIST REBUILD from lib/discordConfigKeys.ts, which is also the write
+    // allowlist in updateDiscordSettings. A new key added to that one list reaches
+    // the client automatically — the hard-coded literal that used to live here is
+    // what stranded defaultOperationAnnounceChannelId (saved, never read back).
     if (cleaned.discordConfig) {
-        cleaned.discordConfig = {
-            clientId: cleaned.discordConfig.clientId,
-            newRequestChannelId: cleaned.discordConfig.newRequestChannelId,
-            intelChannelId: cleaned.discordConfig.intelChannelId,
-            eamChannelId: cleaned.discordConfig.eamChannelId,
-        };
+        const src = cleaned.discordConfig as Record<string, unknown>;
+        const rebuilt: Record<string, unknown> = {};
+        for (const key of CLIENT_SAFE_DISCORD_KEYS) rebuilt[key] = src[key];
+        cleaned.discordConfig = rebuilt;
     }
 
     // AI config: rebuild from an allowlist (NOT a denylist) so a future
@@ -235,7 +277,13 @@ export function stripSecrets(state: any): any {
 
     // Alliances: the singleton local pairing code is half of a handshake secret —
     // it rides the settings blob (getAllSettings reduces every settings row), so it
-    // must NEVER reach the browser. The self-profile is public-intent and stays.
+    // must NEVER reach the browser. The SELF-PROFILE is no longer deleted here: the
+    // three settings-carrying payloads are rebuilt one layer earlier by
+    // projectSettingsForViewer (lib/settingsProjection.ts), whose allow-list does not
+    // name it, and the two pre-auth boot branches below hand-build their bodies and
+    // never carried it. Its authorized reader is the alliance:view-gated
+    // alliance:get_self_profile RPC (api/services.ts), which AllianceManagementTab
+    // already uses — the same pattern as the intelSharingConfig delete below.
     delete cleaned.allianceLocalPairingCode;
     // Belt-and-suspenders: should a raw alliance_peers row ever ride the state,
     // scrub all key material, code, and handshake fields before it leaves.
@@ -260,12 +308,67 @@ export function stripSecrets(state: any): any {
     // RPC (triggered by the id-only eam_broadcast realtime ping).
     delete cleaned.active_eam;
 
+    // The org's OUTBOUND intel-federation clearance ceiling. Same overlay story as
+    // active_eam: getAllSettings reduces EVERY settings row into this blob, so
+    // maxShareableClearance rode `main` / `initial-state` to every authenticated
+    // member — and updateIntelSharingConfig broadcasts a settings_update, so changing
+    // the ceiling actively pushed the new value out. Data minimisation, not a secret:
+    // it is one integer, already disclosed to a paired peer as _meta.maxShareableLevel,
+    // and nothing in the bundle renders it. The scrubSecretKeys backstop below cannot
+    // catch it — that predicate matches KEY NAMES (_api_key|_secret|…) and neither
+    // `intelSharingConfig` nor `maxShareableClearance` matches. Unconditional delete
+    // rather than a permission-gated slice: no client tier reads it from here — the
+    // Admin console fetches it via admin:get_intel_sharing_config, gated by
+    // admin:config:api.
+    delete cleaned.intelSharingConfig;
+
+    // Which one-shot role-grant backfills this install has passed
+    // (lib/db/roleDefaults.ts ROLE_DEFAULT_BACKFILL_MARKER_KEY). Same overlay story as
+    // intelSharingConfig: getAllSettings reduces EVERY settings row into this blob, so
+    // the marker rode `main` / `initial-state` to every authenticated member. Repair
+    // BOOKKEEPING, not org data — no client slice setter or component reads it, and
+    // publishing which repair passes an install has run only tells a reader which
+    // grants Repair would decline to re-apply. Unconditional delete: the marker is
+    // written and read server-side by the backfill itself.
+    delete cleaned.role_permission_backfills;
+
     // systemConfig (appUrl / welcomeMessage) rides the settings blob but no client slice
     // setter or component consumes it, and the browser has no business knowing this
     // deployment's configured origin. Server-internal callers (getOrgTenantUrl,
     // getOurOrigin, public page data) read it via their own paths, so drop it from every
     // browser-bound payload here rather than at the source.
     delete cleaned.systemConfig;
+
+    // The org's last org-wide operational tasking, persisted forever by
+    // broadcastSystemAlert (lib/db/system.ts upserts settings.system_broadcast).
+    // Same overlay story as active_eam above: getAllSettings reduces EVERY settings row
+    // into this blob, so a permanently-stale copy of the message body rode `main` /
+    // `initial-state` to every authenticated member — a Client included. The
+    // scrubSecretKeys backstop below cannot catch it: that predicate matches KEY NAMES
+    // (_api_key|_secret|…) and neither `system_broadcast` nor `message` matches.
+    // Unconditional rather than permission-gated because NOTHING reads this key — the
+    // live delivery path is the auth-alerts broadcast, which contexts/SessionContext.tsx
+    // consumes, and the settings postgres_changes backup was narrowed to active_eam
+    // only. Unlike the EAM there is no gated re-fetch RPC to point authorized readers
+    // at, because none is needed.
+    delete cleaned.system_broadcast;
+
+    // A DUPLICATE, not a secret. The module-enablement blob is the authoritative
+    // `orgMeta.features` (built in lib/db.ts getMainState, read by Sidebar / HelpView /
+    // FeaturesSettingsTab and deliberately kept for EVERY caller); this is the raw
+    // settings row it is built from, riding the blob a second time under its storage
+    // key. No client slice setter or component reads `orgFeatures` — a grep over
+    // components/ contexts/ hooks/ services/ returns nothing. Deleting the duplicate
+    // does NOT close module-state disclosure; orgMeta.features still carries it by
+    // design (HelpView is Client-reachable and reads it).
+    delete cleaned.orgFeatures;
+
+    // BOTH deletes above are redundant on the three merged paths now that
+    // projectSettingsForViewer allow-lists the settings blob one layer earlier — they
+    // are the belt to the projection's braces, so a future FOURTH merge site that
+    // forgets the projection still cannot ship these two. tests/stripSecrets.test.ts
+    // ratchets the delete list so removing one is a decision, not an accident. Same
+    // posture as the regex backstop's own comment below.
 
     // Public page config: public-intent by design, but explicitly allowlist here so that
     // adding future fields to PublicPageConfig (e.g. internal moderation flags) will
@@ -341,7 +444,25 @@ async function handleConfig(req: Request, res: Response) {
     return res.status(200).json({ supabaseUrl, supabaseAnonKey });
 }
 
-async function handleManifest(req: Request, res: Response) {
+/**
+ * PWA manifest — public branding only, deliberately edge-cacheable.
+ *
+ * EXPORTED and called DIRECTLY by the GET /api/manifest route. That route used to
+ * pin its target by rewriting the URL (`req.url += '&target=manifest'`) and then
+ * calling the generic query handler, which is forgeable: a trailing `#` makes
+ * Express/parseurl treat the appended text as a fragment and DISCARD it, so
+ * `/api/manifest?target=state&subset=hr#` reached handleState — and config /
+ * initial-state / feed the same way. Each of those still fully authenticates, so no
+ * new data was readable, but the response then rode a route that sets
+ * `Access-Control-Allow-Origin: *`, skips noStore(), and is the one route marked
+ * edge-cacheable. Calling the sub-handler directly makes the target STRUCTURALLY
+ * unforgeable rather than dependent on two URL parsers agreeing — do not
+ * reintroduce the rewrite.
+ *
+ * `req` is unused here but stays in the signature: the `target=manifest` switch arm
+ * still calls it as (req, res).
+ */
+export async function handleManifest(req: Request, res: Response) {
     // Helper to guess mime type
     const getMimeType = (url: string) => {
         if (!url) return 'image/png';
@@ -407,8 +528,9 @@ async function handleManifest(req: Request, res: Response) {
     // Always set headers first — even if we fail, the response type is correct
     res.setHeader('Content-Type', 'application/manifest+json');
     res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-    // Allow cross-origin manifest fetch (tenant subdomains fetch from TLD)
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // No Access-Control-Allow-Origin: single-org has exactly one origin. The manifest
+    // is linked same-origin (index.html / api/index.ts) and CSP manifest-src 'self'
+    // already forbids a cross-origin one, so the grant had no consumer.
 
     try {
         let branding = {};
@@ -444,9 +566,10 @@ async function handleManifest(req: Request, res: Response) {
 async function handleInitialState(req: Request, res: Response) {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-    // Admin-ness is resolved server-side from the session JWT (users.role ===
-    // 'Admin') and enforced by the per-action permission gate in services.ts —
-    // never derived from anything sent to the client.
+    // Admin-ness is resolved server-side from the session JWT — by role IDENTITY
+    // (users.role_id vs the system Admin role, lib/db/adminIdentity.ts), never by
+    // the role's NAME — and enforced by the per-action permission gate in
+    // services.ts. Never derived from anything sent to the client.
     const clientConfig = { supabaseUrl, supabaseAnonKey };
 
     // First-run gating flag for the onboarding wizard (cheap settings read; false on db error).
@@ -497,9 +620,10 @@ async function handleInitialState(req: Request, res: Response) {
     }
 
     // Try to restore session from token
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+    const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
     let currentUser = null;
+    let bootBanNotice: BanNotice | null = null;
 
     if (token) {
         const decoded = verifyToken(token);
@@ -514,7 +638,7 @@ async function handleInitialState(req: Request, res: Response) {
                 const platformSettings = await db.getPlatformSettings();
                 if (platformSettings?.force_logout_timestamp &&
                     isSessionForceLoggedOut(decoded, platformSettings.force_logout_timestamp)) {
-                    return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+                    appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE)); return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
                 }
             } catch (e) {
                 // Fail closed: if we cannot confirm the session is still valid, do
@@ -539,6 +663,37 @@ async function handleInitialState(req: Request, res: Response) {
         }
     }
 
+    // ───────────────────────── ORG BAN GATE (boot) ─────────────────────────
+    // Deliberately BELOW the watermark drop above, which is the opposite order to
+    // the dispatcher's. There, the watermark has to run first or the appeal flow
+    // dies; here a pre-watermark token is genuinely stale and the correct answer is
+    // the login screen — which is also how a banned member GETS their appeal
+    // session (api/actions/auth.ts mints one on the banned login path).
+    //
+    // Nulling currentUser is what actually withholds the payload: it drops this
+    // request into the logged-out branch below, so db.getState() never runs and
+    // signRealtimeToken is never reached. The notice then rides that same branch.
+    // It is the anonymous-SHAPED body, but this line is only reachable with a
+    // VERIFIED token whose user we just loaded, so the field is self-scoped by
+    // construction — an actually-anonymous visitor never gets here.
+    //
+    // Fails closed, and closed here means "no org data", NOT "banned": a read fault
+    // drops the user WITHOUT a notice, so the login screen shows rather than an
+    // accusation. Telling an innocent member they are banned because a query failed
+    // is its own kind of incident.
+    if (currentUser) {
+        // Held separately: the assignment inside the try narrows currentUser to null
+        // for the catch, and the log line still needs to say WHOSE check failed.
+        const banSubjectId = currentUser.id;
+        try {
+            const notice = await db.getBanNotice(currentUser.id, currentUser.discordId);
+            if (notice) { bootBanNotice = notice; currentUser = null; }
+        } catch (e) {
+            log.warn('ban check failed on initial-state; booting logged-out', { userId: banSubjectId, err: e });
+            currentUser = null;
+        }
+    }
+
     // A logged-out visitor gets only the public boot data needed to render the
     // login screen (branding + Discord clientId), never full org state.
     if (!currentUser) {
@@ -557,6 +712,10 @@ async function handleInitialState(req: Request, res: Response) {
             discordConfig: bootDiscordConfig(bootSettings.discordConfig),
             themeConfig: pickPublicThemeConfig(bootSettings.themeConfig),
             platformSettings: bootPlatformSettings(platformSettings),
+            // Present ONLY for a verified session the gate above just banned.
+            // stripSecrets is a rebuild-specific-keys walk that leaves unknown keys
+            // alone, so this survives it unchanged.
+            ...(bootBanNotice ? { banNotice: bootBanNotice } : {}),
         }));
     }
 
@@ -574,9 +733,17 @@ async function handleInitialState(req: Request, res: Response) {
 
         // Wiki home content may reference private-bucket images by key. Sign them for a
         // wiki:view holder so they render on first load, matching the 'main' subset path.
+        // Redundant BY CONSTRUCTION for the same reason as its 'main' twin: getState()
+        // already ran the settings blob through projectSettingsForViewer, so
+        // state.wikiHomeConfig is absent for a caller without wiki:view by the time this
+        // reads it. Kept as defence in depth — and kept ANNOTATED so a later reader who
+        // deletes one copy does not leave the other looking unexplained.
         const wikiHome = (state as { wikiHomeConfig?: { welcomeContent?: unknown } }).wikiHomeConfig;
         if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, null, 'wiki:view')) {
-            wikiHome.welcomeContent = await signDocMediaForClient(wikiHome.welcomeContent);
+            // longLived: this rides the BOOT BUNDLE, which nothing on the client re-mints on a
+            // timer — a tab left visible here never triggers a `main` refetch, so the short
+            // read TTL would show broken images. The lifetime differs; the gate above does not.
+            wikiHome.welcomeContent = await signDocMediaForClient(wikiHome.welcomeContent, { longLived: true });
         }
 
         // The self record carried as `currentUser` keeps the viewer's own
@@ -615,11 +782,25 @@ async function handleInitialState(req: Request, res: Response) {
 }
 
 async function handleState(req: Request, res: Response) {
-    const { subset } = req.query;
+    // NORMALISE ONCE. `req.query.subset` is `string | string[] | ParsedQs | ParsedQs[]`.
+    // The two pre-existing gates below index a Record with a COERCING bracket lookup, so
+    // `?subset[]=academy_my` reaches them as 'academy_my' and still matches. An
+    // `Array.includes` membership test — which is what the new fail-closed client-denial
+    // gate is — does NOT coerce, so writing it against the raw value would put the one
+    // new fail-closed gate on this path in the only shape that fails OPEN, with its
+    // correctness resting on a `default:` branch four hundred lines away. Any non-string
+    // form collapses to a sentinel that matches no gate and no `case`, so it falls
+    // through to the switch's `default:` 400 exactly as today — the array form is
+    // REJECTED, not silently served.
+    const rawSubset = req.query.subset;
+    const subset: string | undefined =
+        rawSubset === undefined ? undefined
+            : typeof rawSubset === 'string' ? rawSubset
+                : '__non_string_subset__';
     try {
         // Resolve User for Authenticated Subsets (like operations)
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
+        // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+        const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
         let currentUser = null;
 
         if (token) {
@@ -634,7 +815,7 @@ async function handleState(req: Request, res: Response) {
                 // too — otherwise the revoke wouldn't take effect until the token
                 // expired on its own. Same check the write path runs.
                 if (currentUser && isSessionRevokedByWatermark(decoded, currentUser.tokensValidFrom)) {
-                    return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+                    appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE)); return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
                 }
             }
         }
@@ -643,6 +824,66 @@ async function handleState(req: Request, res: Response) {
         // authenticated user for ALL subsets (no cross-org check — one org only).
         if (!currentUser) {
             return res.status(403).json({ message: 'Forbidden: Authentication required.' });
+        }
+
+        // ───────────────────────── ORG BAN GATE ─────────────────────────
+        // FIRST gate on the read path, mirroring api/services.ts — see the long note
+        // there for why the write half sits where it does.
+        //
+        // Refuses EVERY subset, including the realtime slices: a banned member needs
+        // nothing from handleState, and refusing here is what stops an already-open
+        // tab from continuing to receive org content until its token expires. There
+        // is no exemption list on this surface, because the two actions a banned
+        // member is still entitled to are both MUTATIONS on the dispatcher; the ban
+        // notice itself reaches the client through target=initial-state, which is a
+        // different handler with its own gate.
+        //
+        // Fails closed, but never INTO a ban screen: a read fault is a retryable 503,
+        // not an accusation.
+        try {
+            const activeBan = await db.findActiveBan({ userId: currentUser.id, discordId: currentUser.discordId });
+            if (activeBan) {
+                log.warn('org ban denied a read', { userId: currentUser.id, subset, banId: activeBan.id });
+                return res.status(403).json({ code: 'ORG_BANNED', message: 'Your access to this organization has been suspended.' });
+            }
+        } catch (e) {
+            // Not a bare catch, for the same reason as the dispatcher's: an unexpected
+            // throw in the gate ITSELF would otherwise be a permanent, silent 503 for
+            // every user on every read. Checked by NAME, not instanceof — the class
+            // crosses a barrel re-export.
+            if ((e as Error)?.name !== 'BanCheckUnavailable') {
+                log.error('ban gate failed unexpectedly on the read path', { userId: currentUser.id, subset, err: e });
+            }
+            return res.status(503).json({ code: 'BAN_CHECK_UNAVAILABLE', message: 'Unable to verify account status. Please try again.' });
+        }
+
+        // CLIENT-TIER SUBSET DENIAL — the READ half of the dispatcher's
+        // CLIENT_DENIED_NAMESPACES gate, off the same registry (lib/clientNamespaces.ts)
+        // so the two cannot drift.
+        //
+        // SECOND, below the ORG BAN GATE above and ABOVE BOTH gates below — and
+        // api/services.ts puts its half in exactly the same position, so the two
+        // surfaces still carry ONE ordering invariant rather than two. (It was FIRST
+        // until org bans landed; a ban is a harder boundary than a tier, and unlike a
+        // tier it must also survive the member's row being deleted.)
+        //   · Above the PERMISSION gate because 'academy_my' has no entry there and must
+        //     never get one: academy:view is the STAFF read in this build and the member
+        //     surface is deliberately permission-less (lib/roleDefaultPermissions.ts;
+        //     tests/seederRoleDefaults.test.ts pins the absence).
+        //   · Above the FEATURE gate because that one answers 200-with-an-empty-body, and
+        //     a customer who is denied this data should be told so once, in one shape,
+        //     rather than handed a silent empty Academy whenever the module happens to be
+        //     off. NOT a module-state non-disclosure control: orgMeta.features and the raw
+        //     'orgFeatures' settings key already ship every module's enable state to every
+        //     caller on the `main` bundle. Phase 3 item 8 owns that; do not re-justify
+        //     this ordering as secrecy.
+        //
+        // includes() on the ARRAY, never a bracket lookup into
+        // CLIENT_DENIED_SUBSET_NAMESPACE, which is prototype-reachable. `subset` is the
+        // normalised string above, so the array form cannot slip past this by type.
+        if (subset !== undefined && CLIENT_DENIED_SUBSETS.includes(subset) && await db.isClientCaller(currentUser)) {
+            log.warn('client subset denied', { userId: currentUser.id, subset });
+            return res.status(403).json({ message: CLIENT_DENIED_MESSAGE });
         }
 
         // Per-subset permission gate for sensitive resources (warrants / intel / hr).
@@ -670,11 +911,13 @@ async function handleState(req: Request, res: Response) {
         switch (subset) {
             case 'main': {
                 // Fetch the settings blob alongside main so a 'main' refresh
-                // carries the config keys (radioConfig, discordConfig, etc.).
-                // The realtime layer re-pulls 'main' on reconnect and on
-                // settings_update; getMainState alone omits these.
+                // carries the config keys this viewer is entitled to (radioConfig,
+                // discordConfig, brandingConfig, platformSettings, …). The realtime
+                // layer re-pulls 'main' on reconnect and on settings_update;
+                // getMainState alone omits these. The blob is PROJECTED before it
+                // merges — see the projectSettingsForViewer call below.
                 const [mainState, settings] = await Promise.all([
-                    db.getMainState(),
+                    db.getMainState(currentUser),
                     db.getAllSettings({ decryptSecrets: false }),
                 ]);
                 // Bulk roster: every member fetches every other member's record,
@@ -683,14 +926,41 @@ async function handleState(req: Request, res: Response) {
                 if (mainState && Array.isArray(mainState.users)) {
                     mainState.users = stripSensitiveUserFieldsBulk(mainState.users as any, requesterFromUser(currentUser)) as any;
                 }
+                // The settings blob is EVERY settings row reduced by key (getAllSettings),
+                // so rebuild it as this viewer's projection BEFORE the signing block and
+                // the merge — an unlisted key (a future setting, an imported one this fork
+                // has never heard of) drops by default instead of riding `main` to an
+                // external customer. lib/db.ts's getState does the same for
+                // initial-state / the no-subset full state; the two must stay in step.
+                const viewerSettings = projectSettingsForViewer(settings, currentUser?.permissions);
                 // Wiki home content may reference private-bucket images by key. Sign them only
                 // for a caller who can view the wiki, so a member without wiki:view never gets
-                // readable URLs even though the config rides this shared subset.
-                const wikiHome = (settings as { wikiHomeConfig?: { welcomeContent?: unknown } }).wikiHomeConfig;
+                // readable URLs even though the config rides this shared subset. The projection
+                // above has already removed wikiHomeConfig outright for such a caller, so this
+                // check is redundant BY CONSTRUCTION — kept as defence in depth because if the
+                // projection were ever removed the signing would become ungated AND the key
+                // would return, and because drift between the two can only ever narrow the
+                // payload (fail-broken and immediately visible: images stop rendering), never
+                // widen it. Do not "fix" the redundancy by widening either side.
+                const wikiHome = (viewerSettings as { wikiHomeConfig?: { welcomeContent?: unknown } }).wikiHomeConfig;
                 if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, null, 'wiki:view')) {
-                    wikiHome.welcomeContent = await signDocMediaForClient(wikiHome.welcomeContent);
+                    // longLived — same reason as the initial-state twin above: `main` is not
+                    // re-minted on a timer, so this content outlives the short read TTL.
+                    wikiHome.welcomeContent = await signDocMediaForClient(wikiHome.welcomeContent, { longLived: true });
                 }
-                state = { ...mainState, ...settings };
+                state = { ...mainState, ...viewerSettings };
+                // OPERATOR ALARM, admin-only. When the running code needs api_keys columns the
+                // database does not have, API-key authentication is refused — which from the
+                // outside looks like "our ally is down", with nothing in the app to say
+                // otherwise. Surfacing it here means the operator sees it on their next page
+                // load instead of having to think to click Run Diagnostics.
+                //
+                // Gated on admin:db:destroy, the same high bar as Database Tools — this names
+                // internal schema detail and must never reach a member. It is a cached boolean
+                // set by verifyApiKey's own error path, so it costs no query.
+                if (isApiKeySchemaOutdated() && callerHasSubsetPermission(currentUser, null, 'admin:db:destroy')) {
+                    (state as Record<string, unknown>).schemaUpdateRequired = true;
+                }
                 break;
             }
             // Request visibility is scoped per-caller inside
@@ -699,8 +969,11 @@ async function handleState(req: Request, res: Response) {
             case 'requests': state = await db.getRequestsState(currentUser); break;
             // Realtime slice path: user_update broadcasts carry the affected
             // user id(s); the client refetches ONLY those roster rows instead of
-            // the whole 'main' bundle. Same exposure as 'main' — the shared
-            // stripSensitiveUserFieldsBulk below runs (this case isn't early-return).
+            // the whole 'main' bundle. The shared stripSensitiveUserFieldsBulk below
+            // still runs (this case isn't early-return), but "same exposure as 'main'"
+            // is no longer true: 'main' now withholds the roster from a non-staff
+            // caller, so this case carries the SAME entitlement gate, evaluated with the
+            // SAME predicate, so the bundle gate and the slice gate cannot drift.
             case 'users_slice': {
                 const rawIds = req.query.ids;
                 // Express yields string for ?ids=1,2 but string[] for
@@ -719,7 +992,43 @@ async function handleState(req: Request, res: Response) {
                 const ids = [...new Set(tokens.map((t) => parseInt(t, 10)))];
                 // Matches BULK_ACTION_MAX — bulk broadcasts never carry more.
                 if (ids.length > 100) return res.status(400).json({ message: 'Too many ids (max 100)' });
-                state = { users: await db.getUsersByIdsLite(ids) };
+                // CLIENT-TIER READ BOUNDARY. Same predicate as getMainState, so the
+                // bundle gate and the slice gate cannot drift. Placed AFTER the id
+                // validation above on purpose: a capability gate must never mask a
+                // client bug (pinned by the malformed-ids test).
+                //
+                // 403, not 200-with-empty. An empty/denied response evicts exactly the
+                // REQUESTED ids, not the whole array (lib/sliceMerge.ts preserves rows
+                // outside `requested`). A viewer demoted staff -> non-staff mid-session
+                // CAN reach this branch with a POPULATED prev, for the ids named in one
+                // broadcast, until the channel rebuilds — bounded and acceptable, but
+                // NOT impossible, and 200-with-empty would introduce a third meaning
+                // into a wire shape lib/db/users.ts and lib/sliceMerge.ts both document
+                // as unambiguous. The cost of the 403 is one caught error: the
+                // coalescer's fallback is a NON-force full 'main' refetch, which the 2 s
+                // dedupe collapses, and with the client-side attachment gating in
+                // contexts/DataCoreContext.tsx a non-staff caller never issues this
+                // request at all.
+                //
+                // No self carve-out. A non-staff viewer's own record reaches them
+                // through user_detail (the identity path), and adding a self branch here
+                // would couple this gate to the availability discriminator for no gain.
+                if (!mayReceiveRoster(currentUser)) {
+                    log.warn('users_slice denied', { userId: currentUser.id, requested: ids.length });
+                    return res.status(403).json({ message: 'Insufficient permissions' });
+                }
+                // The availability scalar rides EVERY response a user_update or a
+                // duty_update can trigger — main, initial-state, users_presence and
+                // here — because role changes and soft-deletes change the answer and
+                // emit `user_update`, which the client dispatches to users_slice (or,
+                // id-less, to main) and NEVER to users_presence
+                // (contexts/DataCoreContext.tsx user_update handler). Emitters:
+                // lib/db/users.ts bulkDemoteUsersToClient / bulkPromoteUsersToMember.
+                const [sliceUsers, anyStaffOnDuty] = await Promise.all([
+                    db.getUsersByIdsLite(ids),
+                    db.isAnyStaffOnDuty(),
+                ]);
+                state = { users: sliceUsers, anyStaffOnDuty };
                 break;
             }
             // Realtime slice path: operation_update broadcasts carry the
@@ -745,14 +1054,35 @@ async function handleState(req: Request, res: Response) {
                 if (!userId) return res.status(400).json({ message: "Missing id parameter" });
                 const parsedUserId = parseInt(userId as string, 10);
                 if (!Number.isFinite(parsedUserId)) return res.status(400).json({ message: "Invalid id parameter" });
+                // CLIENT-TIER READ BOUNDARY. SELF IS ALWAYS ALLOWED — SessionContext
+                // hydrates the caller's own record through exactly this route
+                // (fetchUserDetail / refreshSelfIdentity), and that is THE identity path
+                // once the roster leaves the bundle. Cross-user needs a staff
+                // capability: without this, a non-staff caller walks ?id=1..N and
+                // reassembles the roster one row at a time, defeating the bundle
+                // projection entirely.
+                //
+                // 403, not 404: the id space is dense and sequential so a 404 would leak
+                // existence anyway, the caller is authenticated, and the denial is about
+                // CAPABILITY — matching every other SUBSET_REQUIRED_PERMISSION denial in
+                // this file. Placed BEFORE the fetch: don't fetch what you will refuse.
+                //
+                // The gate belongs HERE, on the read route, and must NOT migrate into
+                // lib/db/users.ts getUserById — POST /api/admin/import-stream
+                // re-implements its session resolve around that function.
+                if (parsedUserId !== currentUser.id && !mayReceiveRoster(currentUser)) {
+                    log.warn('user_detail cross-user denied', { userId: currentUser.id, targetId: parsedUserId });
+                    return res.status(403).json({ message: 'Insufficient permissions' });
+                }
                 const userDetail = await db.getUserById(parsedUserId);
                 if (!userDetail) {
                     return res.status(404).json({ message: "User not found" });
                 }
-                // Auth-only by design: any member may open another member's profile,
-                // so this subset has no SUBSET_REQUIRED_PERMISSION entry. The payload
-                // is made safe per-viewer instead — stripSensitiveUserFields rebuilds
-                // an allow-list for a non-self / non-admin viewer, so HR/session
+                // Auth-only by design for SELF, staff-gated for anyone else — so this
+                // subset has no SUBSET_REQUIRED_PERMISSION entry (a flat entry would
+                // deny a Client their own record and break the identity path). The
+                // payload is ALSO made safe per-viewer — stripSensitiveUserFields
+                // rebuilds an allow-list for a non-self / non-admin viewer, so HR/session
                 // metadata (probation, tenure, jobTitle, rsiVerified, voiceChannelName,
                 // tokensValidFrom, auth_user_id) never leaves the server for them.
                 // Self always sees their own personnelNotes / conductRecord /
@@ -802,8 +1132,9 @@ async function handleState(req: Request, res: Response) {
                 break;
             }
             case 'hr_transfers': {
-                const recruiter = db.isHrRecruiter(currentUser);
-                state = { hr: { transfers: db.redactTransfersForViewer(await db.getTransferRequests(), recruiter) } };
+                // The WIDER staff predicate — an hr:manager or hr:admin runs HR too, and
+                // scoping transfers on hr:recruiter alone would hide every row from them.
+                state = { hr: { transfers: db.redactTransfersForViewer(await db.getTransferRequests(), db.isHrStaff(currentUser), currentUser?.id) } };
                 break;
             }
             case 'hr_jobs': state = { hr: { jobs: await db.getJobPostings() } }; break;
@@ -833,7 +1164,47 @@ async function handleState(req: Request, res: Response) {
                 state = { wikiPage: visible };
                 break;
             }
-            case 'users_presence': state = await db.getUsersPresenceState(); break;
+            // Realtime duty-flip hydration. contexts/DataContext re-pulls this on EVERY
+            // duty_update broadcast, and that handler is attached UNCONDITIONALLY for
+            // every member on the base channel (contexts/DataCoreContext.tsx duty_update),
+            // so this subset must answer 200 for every authenticated tier: a 403 here
+            // costs a caught console error, a wasted round-trip on every duty flip in
+            // the org for every rosterless caller, and — decisively — the loss of the
+            // one scalar those callers are entitled to. (It is NOT an unhandled
+            // rejection: contexts/DataContext.tsx wraps the whole subset switch in a
+            // try/catch and services/apiService.ts handleResponseError special-cases 401
+            // only. The conclusion stands; the mechanism is a caught error.)
+            //
+            // AUTH-ONLY BY DESIGN, and only for the `anyStaffOnDuty` scalar: one boolean
+            // answering "is anyone available to take my request?", which is the org's
+            // external customers' entire entitlement here and the gate on their only
+            // flow. It carries no identity and no staffing level. It rides this subset
+            // because duty_update dispatches SOLELY users_presence — a scalar that only
+            // rode `main` would freeze at its page-load reading for the whole session.
+            //
+            // The `usersPresence` LIST is a different thing: it enumerates every live
+            // user id in the org plus each one's lastActiveAt, i.e. it is a ROSTER
+            // surface and an org-wide user-id enumeration that would make a
+            // ?id=1..N user_detail walk trivial. It is therefore withheld from a
+            // non-staff caller by the SAME predicate as the `main` bundle projection and
+            // the users_slice / user_detail gates (lib/rosterGate.ts mayReceiveRoster,
+            // whose first disjunct is the isSystemAdmin identity flag), so the four
+            // roster surfaces cannot drift apart. 200 on BOTH branches — never a 403,
+            // see above. The GATE moved to the shared predicate; the SHAPE is unchanged
+            // and owner decision D1 still holds: the fetch is never gated on the client,
+            // only this payload is, and a non-staff caller still gets one boolean plus
+            // an empty array.
+            case 'users_presence': {
+                const isRosterViewer = mayReceiveRoster(currentUser);
+                const [presenceState, anyStaffOnDuty] = await Promise.all([
+                    isRosterViewer
+                        ? db.getUsersPresenceState()
+                        : Promise.resolve({ usersPresence: [] as Array<{ userId: number; isDuty: boolean; lastActiveAt: string | null }> }),
+                    db.isAnyStaffOnDuty(),
+                ]);
+                state = { ...presenceState, anyStaffOnDuty };
+                break;
+            }
             case 'warehouse': {
                 const [warehouseCatalog, warehouseStock, warehouseRequests] = await Promise.all([
                     db.listWarehouseCatalog(),
@@ -1003,14 +1374,34 @@ async function handleFeed(req: Request, res: Response) {
             return res.status(403).json({ message: 'Use the alliance data channel for this key' });
         }
 
-        const since = req.query.since as string;
-        const feedData = await db.getPublicFeedData(since);
+        // SCOPE ENFORCEMENT. The label check above is the historical, incidental gate — one
+        // direction only, and keyed on a naming convention. This is the declared capability: a
+        // key reaches this surface because it SAYS it may, not because its label happens not to
+        // start with a reserved prefix. A key with no scopes at all (issued before the column
+        // existed) is grandfathered; see lib/apiKeyScopes.ts for why that fail-open is bounded.
+        if (!keyHasScope((keyData as { scopes?: unknown }).scopes, 'feed')) {
+            return res.status(403).json({ message: 'This key is not scoped for the intel feed' });
+        }
+
+        // Validate the cursor rather than passing it through. An unhonourable
+        // cursor does not fail loudly: it returns an empty page, and the consumer
+        // stores our _meta.fetchedAt as its next cursor and moves PAST rows it never
+        // received. A 400 is the only outcome that does not lose the peer's data.
+        const cursor = parseFeedCursor(req.query.since);
+        if (!cursor.ok) {
+            log.warn('feed cursor rejected', { reason: cursor.reason });
+            return res.status(400).json({ message: cursor.message });
+        }
+        const feedData = await db.getPublicFeedData(cursor.since);
 
         return res.status(200).json({
             countReports: feedData.reports.length,
             countWarrants: feedData.warrants.length,
             countBulletins: feedData.bulletins.length,
-            fetchedAt: new Date().toISOString(),
+            // MIRROR _meta, never the wall clock — see the same field on
+            // /api/alliance/data: a consumer that falls back to this one would
+            // advance its cursor past the rows a saturated page withheld.
+            fetchedAt: feedData._meta.fetchedAt,
             reports: feedData.reports,
             warrants: feedData.warrants,
             bulletins: feedData.bulletins,
@@ -1044,15 +1435,15 @@ export default async function handler(req: Request, res: Response) {
             // logout screen). The platform admin needs to revoke compromised sessions
             // without taking the entire platform offline.
             if (platformSettings?.force_logout_timestamp && !skipMaintenanceBlock) {
-                const authHeader = req.headers['authorization'];
-                const token = authHeader && (authHeader as string).split(' ')[1];
+                // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+                const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
                 if (token) {
                     const decoded = verifyToken(token);
                     // Use the shared predicate (not a hand-rolled copy) so the
                     // read path can't drift from the dispatcher if the revocation
                     // rule changes.
                     if (decoded && isSessionForceLoggedOut(decoded, platformSettings.force_logout_timestamp)) {
-                        return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+                        appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE)); return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
                     }
                 }
             }
@@ -1062,13 +1453,28 @@ export default async function handler(req: Request, res: Response) {
                 // Single-org: maintenance blocks the dashboard whenever active.
                 {
                     let isAdmin = false;
-                    const authHeader = req.headers['authorization'];
-                    const token = authHeader && (authHeader as string).split(' ')[1];
+                    // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+                    const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
                     if (token) {
                         const decoded = verifyToken(token);
                         if (decoded) {
-                            const adminUser = await db.getUserById(decoded.userId);
-                            if (adminUser?.role === 'Admin') isAdmin = true;
+                            // Own try/catch: getUserById is fail-closed and THROWS on
+                            // a read fault. The outer catch below only warns, and the
+                            // 503 return lives inside it — so letting the throw escape
+                            // here would skip the maintenance gate entirely and serve
+                            // the dashboard to everyone on a DB blip. Unknown ⇒ not
+                            // Admin.
+                            let adminUser: Awaited<ReturnType<typeof db.getUserById>> = null;
+                            try { adminUser = await db.getUserById(decoded.userId); }
+                            catch (err) { log.warn('maintenance admin check failed; treating as non-admin', { err }); }
+                            // Role IDENTITY (stamped by getUserById), with a
+                            // cache-free re-resolve on the DENY path only. Must stay
+                            // byte-identical to the api/services.ts twin: if the two
+                            // surfaces disagree about who is an Admin during
+                            // maintenance, the dashboard loads and every mutation
+                            // 503s (or vice versa). Unknown ⇒ not Admin.
+                            if (adminUser?.isSystemAdmin === true) isAdmin = true;
+                            else if (adminUser) isAdmin = await db.resolveIsSystemAdminFresh(adminUser.roleId);
                         }
                     }
                     if (!isAdmin) {

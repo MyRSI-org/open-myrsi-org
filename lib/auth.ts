@@ -26,7 +26,7 @@ const SIGNING_KEY = SECRET || randomBytes(32).toString('hex');
 // because an attacker holding the token would simply keep refreshing it. Server-side
 // revocation (tokens_valid_from / force_logout) and one-click Discord re-login cover
 // the rest. Re-auth has no password — it's a single Discord click.
-const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;           // 24 hours
+export const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;           // 24 hours
 // Tokens minted before `iat` was added carried no issue time and a 7-day life;
 // derive their issue time from exp minus this so revocation comparisons stay correct.
 const LEGACY_TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;

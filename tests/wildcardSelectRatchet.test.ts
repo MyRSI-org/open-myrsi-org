@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
+import { stripComments } from './stripComments';
 
 // Wildcard-select ratchet (security / data-minimisation rule).
 //
@@ -45,11 +46,12 @@ function walk(dir: string, acc: string[] = []): string[] {
     return acc;
 }
 
-// Comments are stripped before scanning so prose that merely mentions a select
-// call does not register as a call site (or as an unresolvable one).
-function stripComments(src: string): string {
-    return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
-}
+// Comments are blanked before scanning so prose that merely mentions a select call
+// does not register as a call site (or as an unresolvable one). Shared with the other
+// three source-scanning ratchets: the local two-regex version this replaced treated a
+// block-comment opener inside a line comment as a real block opener and skipped to the
+// next closer anywhere in the file, blanking 820 lines of lib/db/system.ts from THIS
+// scan. Rule 1's only enforcement was reporting a pass over code it had not read.
 
 const STRING_LITERAL = /^(`[^`]*`|'[^']*'|"[^"]*")$/;
 const CONST_DECL = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(`[^`]*`|'[^']*'|"[^"]*")/g;

@@ -532,7 +532,7 @@ const manifest = (accepted: Record<string, number>, invited: string[] = []) =>
     ({ status: 200, json: { v: 1, fetchedAt: new Date().toISOString(), accepted, invited } });
 
 describe('reconcileMirrorsWithPeer — healing', () => {
-    it('heals a missed invite+accept: creates the accepted mirror from the manifest', async () => {
+    it('heals a missed invite+accept: creates the mirror, PENDING the local accept', async () => {
         h.tables.mirrored_operations = [];
         h.respond = (_p, path) => {
             if (path === '/api/alliance/op-manifest') return manifest({ op1: 5 });
@@ -543,7 +543,12 @@ describe('reconcileMirrorsWithPeer — healing', () => {
         expect(r.ok).toBe(true);
         expect(r.pulled).toBe(1);
         const mirror = h.tables.mirrored_operations.find(m => m.id === 'op1');
-        expect(mirror).toMatchObject({ host_peer_id: 'peerA', version: 5, accepted: true, revoked_at: null });
+        // The heal restores the ROW (it exists again, at the host's current version).
+        // It deliberately does NOT restore the DECISION: `accepted` is the local
+        // alliance:manage admin's answer, and the manifest asserting it is the
+        // counterparty answering a question only this org may answer. Lands as a
+        // pending invite for the admin to action.
+        expect(mirror).toMatchObject({ host_peer_id: 'peerA', version: 5, accepted: false, revoked_at: null });
         expect(h.orgEmits.some(e => e.event === 'operation_update' && (e.payload as { operationId: string }).operationId === 'op1')).toBe(true);
     });
     it('heals a missed invite: creates a PENDING mirror for admin review', async () => {
@@ -602,7 +607,7 @@ describe('reconcileMirrorsWithPeer — healing', () => {
         expect((h.tables.mirrored_operations[0].snapshot as { name: string }).name).toBe('rolled-back-truth');
         expect(r.alert).toMatch(/restored from a backup/i);
     });
-    it('heals a LOST ACCEPT-ACK: host accepted, local still pending → latches accepted', async () => {
+    it('a LOST ACCEPT-ACK refreshes the mirror but does NOT self-accept', async () => {
         // Guest accepted; host committed accepted=true but the HTTP ack was lost,
         // so the local mirror is stuck pending at the same version.
         h.tables.mirrored_operations = [{ id: 'op1', host_peer_id: 'peerA', version: 4, accepted: false, revoked_at: null, snapshot: { name: 'pending' } }];
@@ -613,7 +618,12 @@ describe('reconcileMirrorsWithPeer — healing', () => {
         };
         const r = await reconcileMirrorsWithPeer('peerA');
         expect(r.pulled).toBe(1);
-        expect(h.tables.mirrored_operations.find(m => m.id === 'op1')!.accepted).toBe(true);
+        const healed = h.tables.mirrored_operations.find(m => m.id === 'op1')!;
+        expect(healed.accepted, 'the peer decided our accept for us').toBe(false);
+        // The content heal itself must still happen — refusing the decision must not
+        // turn into refusing the repair.
+        expect(healed.version).toBe(4);
+        expect((healed.snapshot as { name: string }).name).toBe('confirmed');
     });
     it('resurrects a spuriously-revoked mirror the host still lists as accepted, at the SAME version', async () => {
         h.tables.mirrored_operations = [{ id: 'op1', host_peer_id: 'peerA', version: 7, accepted: true, revoked_at: new Date().toISOString(), snapshot: { name: 'stale' } }];

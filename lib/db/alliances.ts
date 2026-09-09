@@ -24,7 +24,10 @@ import {
 } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { supabase, handleSupabaseError, broadcastToOrg, safeFetch, getSystemRoles } from './common.js';
-import { collectShareableIntel, getMaxShareableClearance, verifyApiKey } from './system.js';
+import { collectShareableIntel, getMaxShareableClearance, verifyApiKey, FEED_PAIRING_STATES } from './system.js';
+import { SecurityDenial } from '../errors.js';
+import { keyHasScope } from '../apiKeyScopes.js';
+import { requireUuid } from '../pgrest.js';
 import { getCachedAllianceSyncConfig, noteInboundContact, tryConsumeToken } from './allianceSyncState.js';
 import { encryptSecret, decryptSecret } from '../crypto.js';
 import { sanitizePublicLinkUrl } from '../linkUrl.js';
@@ -235,7 +238,21 @@ function mapDirectoryRow(row: Partial<PeerRow>): AllianceDirectoryEntry {
 // Feed-style rows (legacy backfill + manual subscriptions) are managed in the
 // Alliances tab's "Receive-only Feeds" card; they are excluded from the alliance
 // directory + peer list, which show handshake-paired allies only.
-const FEED_STATES = '(legacy,manual)';
+//
+// Derived from the feed API's own constant rather than restated, so a future
+// third feed state can't land on one side of the table and not the other. This
+// is the PostgREST `in` literal for the .not() form; system.ts holds the array.
+//
+// Built on CALL, not at module scope: this module is pulled in transitively
+// through the lib/db barrel (secrets -> db -> alliances) by suites that
+// factory-mock lib/db/system, and an import-time read of one of its exports
+// would stop those files collecting at all.
+const feedStates = () => `(${FEED_PAIRING_STATES.join(',')})`;
+
+// Peer-half twin of system.ts's FEED_ONLY_MSG. Same reasoning: one message for
+// "no such peer" and "that id is a receive-only feed", so it is not an existence
+// oracle, and it names the API that actually owns the row.
+const PEER_ONLY_MSG = 'No handshake-paired ally with that id. Receive-only feeds are managed from the Alliances feed list.';
 
 // =============================================================================
 // Directory + peer CRUD
@@ -243,7 +260,7 @@ const FEED_STATES = '(legacy,manual)';
 
 export async function listAlliancePeers(): Promise<AlliancePeer[]> {
     const query = supabase.from('alliance_peers').select('id, label, base_url, peer_org_name, peer_org_tag, peer_icon_url, peer_blurb, status, type, inbound_max_clearance, outbound_max_clearance, channels, pairing_state, outbound_key_enc, inbound_key_id, entered_peer_code_enc, entered_peer_code_expires, last_contact_at, created_at, sync_health, sync_failures, sync_last_ok_at, sync_next_attempt_at, sync_alert, intel_synced_at, ops_synced_at')
-        .not('pairing_state', 'in', FEED_STATES)
+        .not('pairing_state', 'in', feedStates())
         .order('created_at', { ascending: false });
     const rows = await safeFetch<PeerRow[]>(query, [], 'Failed to list alliance peers');
     return rows.map(mapPeerRow);
@@ -252,7 +269,7 @@ export async function listAlliancePeers(): Promise<AlliancePeer[]> {
 export async function getAllianceDirectory(): Promise<AllianceDirectoryEntry[]> {
     const query = supabase.from('alliance_peers')
         .select('id, peer_org_name, peer_org_tag, peer_icon_url, peer_blurb, status, type, last_contact_at')
-        .not('pairing_state', 'in', FEED_STATES)
+        .not('pairing_state', 'in', feedStates())
         .neq('status', 'Dissolved')
         .order('peer_org_name', { ascending: true });
     const rows = await safeFetch<Partial<PeerRow>[]>(query, [], 'Failed to load alliance directory');
@@ -268,29 +285,64 @@ export interface AlliancePeerUpdates {
 }
 
 export async function updateAlliancePeer(id: string, updates: AlliancePeerUpdates): Promise<void> {
+    const peerId = requireUuid(id, 'peerId');
     const dbUpdates: Record<string, unknown> = { updated_at: nowIso() };
     if (updates.label !== undefined) dbUpdates.label = updates.label;
     if (updates.type !== undefined) dbUpdates.type = updates.type;
     if (updates.inboundMaxClearance !== undefined) dbUpdates.inbound_max_clearance = updates.inboundMaxClearance;
     if (updates.outboundMaxClearance !== undefined) dbUpdates.outbound_max_clearance = updates.outboundMaxClearance;
     if (updates.channels !== undefined) dbUpdates.channels = updates.channels;
-    const { error } = await supabase.from('alliance_peers').update(dbUpdates).eq('id', id);
+    // Scoped exactly like listAlliancePeers above: an id-addressed write must not
+    // reach a row the list half of this API never shows. Without it the peer API
+    // could retune a receive-only feed's clearance ceilings and channels.
+    const { data, error } = await supabase.from('alliance_peers').update(dbUpdates)
+        .eq('id', peerId)
+        .not('pairing_state', 'in', feedStates())
+        .select('id');
     handleSupabaseError({ error, message: 'Failed to update alliance peer' });
-    broadcastToOrg('alliance_update', { id });
+    if (!data || data.length === 0) {
+        throw new SecurityDenial(PEER_ONLY_MSG, { auditEvent: 'authz.peer_scope.denied', fields: { peerId } });
+    }
+    broadcastToOrg('alliance_update', { id: peerId });
 }
 
 /** Revoke an alliance: dissolve it and destroy both directions of key material. */
 export async function revokeAlliancePeer(id: string): Promise<void> {
-    const { data: row } = await supabase.from('alliance_peers').select('inbound_key_id').eq('id', id).maybeSingle();
-    if (row?.inbound_key_id) await supabase.from('api_keys').delete().eq('id', row.inbound_key_id);
-    const { error } = await supabase.from('alliance_peers').update({
+    const peerId = requireUuid(id, 'peerId');
+    // Scope the read BEFORE any key material is touched: run on a feed row this
+    // would delete its api_keys row and flip pairing_state to 'revoked', which
+    // strands the row — invisible to the feed API (not in FEED_PAIRING_STATES)
+    // and a phantom Dissolved ally in the peer list.
+    const { data: row, error: readError } = await supabase.from('alliance_peers').select('id, inbound_key_id')
+        .eq('id', peerId)
+        .not('pairing_state', 'in', feedStates())
+        .maybeSingle();
+    handleSupabaseError({ error: readError, message: 'Failed to load alliance peer' });
+    if (!row) throw new SecurityDenial(PEER_ONLY_MSG, { auditEvent: 'authz.peer_scope.denied', fields: { peerId } });
+    // Soft-revoke, not delete. The peer row is deliberately kept as the record of the
+    // relationship ("alliance teardown is soft — the row is the record"); the credential that
+    // authenticated it is part of that record. Destroying it left an operator unable to answer
+    // when the ally's key was issued or last used.
+    if (row.inbound_key_id) {
+        await supabase.from('api_keys')
+            .update({ revoked_at: nowIso(), revoked_reason: 'alliance_revoked' })
+            .eq('id', row.inbound_key_id)
+            .is('revoked_at', null);
+    }
+    const { data, error } = await supabase.from('alliance_peers').update({
         status: 'Dissolved', pairing_state: 'revoked',
         outbound_key_enc: null, inbound_key_id: null,
         entered_peer_code_enc: null, entered_peer_code_expires: null,
         revoked_at: nowIso(), updated_at: nowIso(),
-    }).eq('id', id);
+    })
+        .eq('id', peerId)
+        .not('pairing_state', 'in', feedStates())
+        .select('id');
     handleSupabaseError({ error, message: 'Failed to revoke alliance peer' });
-    broadcastToOrg('alliance_update', { id });
+    if (!data || data.length === 0) {
+        throw new SecurityDenial(PEER_ONLY_MSG, { auditEvent: 'authz.peer_scope.denied', fields: { peerId } });
+    }
+    broadcastToOrg('alliance_update', { id: peerId });
 }
 
 // =============================================================================
@@ -383,9 +435,21 @@ async function markFailed(peerId: string): Promise<void> {
 async function persistKeys(peerId: string, keys: { outboundKey: string; inboundKey: string }): Promise<void> {
     const hash = createHash('sha256').update(keys.inboundKey).digest('hex');
     const { data: prev } = await supabase.from('alliance_peers').select('inbound_key_id').eq('id', peerId).maybeSingle();
-    if (prev?.inbound_key_id) await supabase.from('api_keys').delete().eq('id', prev.inbound_key_id);
+    // Soft-revoke the superseded credential rather than deleting it: re-pairing is one of the
+    // things an operator most wants a record of, and the old key is dead either way because
+    // verifyApiKey refuses a revoked row.
+    if (prev?.inbound_key_id) {
+        await supabase.from('api_keys')
+            .update({ revoked_at: nowIso(), revoked_reason: 'rekeyed' })
+            .eq('id', prev.inbound_key_id)
+            .is('revoked_at', null);
+    }
+    // SCOPED at the mint. Alliance credentials are minted here, NOT through createApiKey — so
+    // scoping only createApiKey would leave every newly paired ally on a NULL (grandfathered)
+    // key forever, on the higher-privilege surface, and the scope column would be decorative
+    // exactly where it matters most.
     const { data: keyRow, error: keyErr } = await supabase.from('api_keys')
-        .insert({ label: `alliance:${peerId}`, key_hash: hash }).select('id').single();
+        .insert({ label: `alliance:${peerId}`, key_hash: hash, scopes: ['alliance'] }).select('id').single();
     handleSupabaseError({ error: keyErr, message: 'Failed to mint inbound alliance key' });
     const { error } = await supabase.from('alliance_peers').update({
         outbound_key_enc: encryptSecret(keys.outboundKey), inbound_key_id: keyRow!.id,
@@ -427,7 +491,12 @@ export async function connectPeer(peerId: string): Promise<{ peerId: string; sta
     const localCode = await getLocalCode();
     if (!localCode) throw new Error('Generate a pairing code first (it may have expired).');
 
-    const { data: row } = await supabase.from('alliance_peers').select('entered_peer_code_enc, entered_peer_code_expires, base_url').eq('id', peerId).maybeSingle();
+    // Same discriminator as the peer list — a receive-only feed row is not a
+    // pairing candidate, and reads by bare id are how the two halves drift.
+    const { data: row } = await supabase.from('alliance_peers').select('entered_peer_code_enc, entered_peer_code_expires, base_url')
+        .eq('id', peerId)
+        .not('pairing_state', 'in', feedStates())
+        .maybeSingle();
     if (!row) throw new Error('Alliance peer not found.');
     if (!row.entered_peer_code_enc) throw new Error('Missing the peer pairing code — re-add the partner.');
     if (row.entered_peer_code_expires && new Date(row.entered_peer_code_expires).getTime() < Date.now()) {
@@ -547,7 +616,15 @@ export async function refreshPeerProfile(id: string): Promise<void> {
     if (!row?.outbound_key_enc) return;
     const origin = validatePeerBaseUrl(row.base_url);
     if (!origin) return;
-    const key = decryptSecret(row.outbound_key_enc);
+    // Same reason as callAlliancePeer: an unreadable key must degrade to "skip this peer",
+    // not throw out of a best-effort profile refresh.
+    let key: string;
+    try {
+        key = decryptSecret(row.outbound_key_enc);
+    } catch (e) {
+        log.warn('peer key undecryptable — skipping profile refresh', { err: e, peerId: id });
+        return;
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -587,7 +664,16 @@ export async function callAlliancePeer(peerId: string, path: string, init?: { me
     if (!peer?.outbound_key_enc) return null;
     const origin = validatePeerBaseUrl(peer.base_url);
     if (!origin) return null;
-    const key = decryptSecret(peer.outbound_key_enc);
+    // Honour the documented "returns null if the peer is missing/inactive/unreachable"
+    // contract. decryptSecret THROWS, and this sits ABOVE the try below, so an unreadable key
+    // (the normal state mid-rotation) used to throw to every caller instead of returning null.
+    let key: string;
+    try {
+        key = decryptSecret(peer.outbound_key_enc);
+    } catch (e) {
+        log.warn('peer key undecryptable — treating peer as unreachable', { err: e, peerId });
+        return null;
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
@@ -613,6 +699,12 @@ export async function callAlliancePeer(peerId: string, path: string, init?: { me
 export async function getAlliancePeerByInboundKey(key: string): Promise<PeerRow | null> {
     const verified = await verifyApiKey(key);
     if (!verified) return null;
+    // SCOPE ENFORCEMENT for the higher-privilege surface. The inbound_key_id + status='Active'
+    // conjunction below is the historical gate and still stands; this makes the capability
+    // DECLARED rather than inferred from which table happens to reference the key. Without it
+    // the scopes column would be added and nothing would read it on the surface that matters
+    // most — which is precisely the gap the plan called out.
+    if (!keyHasScope((verified as { scopes?: unknown }).scopes, 'alliance')) return null;
     const { data } = await supabase.from('alliance_peers').select('id, label, base_url, peer_org_name, peer_org_tag, peer_icon_url, peer_blurb, status, type, inbound_max_clearance, outbound_max_clearance, channels, pairing_state, outbound_key_enc, inbound_key_id, entered_peer_code_enc, entered_peer_code_expires, last_contact_at, created_at, sync_health, sync_failures, sync_last_ok_at, sync_next_attempt_at, sync_alert, intel_synced_at, ops_synced_at')
         .eq('inbound_key_id', verified.id).eq('status', 'Active').maybeSingle();
     const peer = (data as PeerRow) || null;
@@ -707,7 +799,7 @@ export async function getAllyFleetProjection(peer: Pick<PeerRow, 'channels'>): P
 
     interface ShipRow { ship: { career: string | null; role: string | null } | { career: string | null; role: string | null }[] | null }
     const shipRows = await safeFetch<ShipRow[]>(
-        supabase.from('user_ships').select('ship:platform_ships(career, role)').limit(20_000),
+        supabase.from('user_ships').select('ship:platform_ships(career, role)').order('id', { ascending: true }).limit(20_000),
         [], 'Failed to project ally fleet ships');
     const byCategory = new Map<string, number>();
     let totalShips = 0;

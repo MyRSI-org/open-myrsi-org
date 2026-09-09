@@ -10,7 +10,7 @@ interface Props {
 }
 
 export default function DashboardHero({ variant }: Props) {
-    const { currentUser, toggleDutyStatus } = useAuth();
+    const { currentUser, toggleDutyStatus, hasPermission } = useAuth();
     const fmt = useFormatDate();
     const { isFetching } = useData();
     const [now, setNow] = useState(() => new Date());
@@ -100,7 +100,18 @@ export default function DashboardHero({ variant }: Props) {
                             </div>
                         </div>
 
-                        {variant === 'staff' && (
+                        {/* PERMISSION-gated, not tier-gated. `variant` is chosen from the
+                            name-derived display tier (DashboardView: variant={isClient ?
+                            'client' : 'staff'}), while the duty toggle's server gate is the
+                            'user:toggle_duty' PERMISSION (api/services.ts fullPermissionMap).
+                            Without this second condition a custom role holding request:accept
+                            but not user:toggle_duty — or any install whose Member/Dispatcher
+                            role had the grant revoked through the Roles UI — renders a button
+                            that 403s into a swallowed console.error. Cosmetic only: it hides a
+                            control the server ALSO denies, which is the safe direction for a
+                            menu gate. (The opposite direction — hiding something the server
+                            admits — is why the Academy nav gate was dropped from this item.) */}
+                        {variant === 'staff' && hasPermission('user:toggle_duty') && (
                             <button
                                 onClick={handleToggleDuty}
                                 disabled={toggling}

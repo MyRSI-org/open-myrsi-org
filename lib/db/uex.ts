@@ -321,6 +321,23 @@ export async function fetchUexItemsForCategory(categoryId: number): Promise<UexI
     return await uexFetch<UexItem[]>(`/items?id_category=${categoryId}`);
 }
 
+/**
+ * Per-item attributes (EAV), keyed by id_item — which is the external_id stored on
+ * quartermaster_catalog. Only the fields consumed here are typed.
+ */
+export interface UexItemAttribute {
+    id: number;
+    id_item: number;
+    id_category?: number | null;
+    attribute_name: string;
+    value?: string | null;
+    unit?: string | null;
+}
+
+export async function fetchUexItemAttributesForCategory(categoryId: number): Promise<UexItemAttribute[]> {
+    return await uexFetch<UexItemAttribute[]>(`/items_attributes?id_category=${categoryId}`);
+}
+
 export async function fetchUexCommodities(): Promise<UexCommodity[]> {
     return await uexFetch<UexCommodity[]>('/commodities');
 }
@@ -602,7 +619,13 @@ export function mapUexItemToQmRow(
         name: cat(item.name) || 'Unknown',
         category: uexSectionToQmLegacy(item.section, item.category),
         subcategory: cat(item.category || item.section),
-        attributes: {},
+        // The attributes column is DELIBERATELY NOT WRITTEN HERE. It is owned by the
+        // separate syncPlatformItemAttributes() pass, and an upsert only sets the
+        // columns it provides — so omitting the key PRESERVES attribute data across
+        // item re-syncs. Writing an empty object here (as this file used to) means every
+        // press of "Sync from UEX" silently blanks every attribute the sweep just
+        // collected, and the armoury facets quietly empty out with nothing to show
+        // for it. The facets work exactly once, then stop.
         source: 'platform',
         thumbnail_url: item.screenshot || null,
         wiki_url: null,

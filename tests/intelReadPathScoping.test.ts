@@ -127,7 +127,7 @@ import { getIntelStats, syncTrustedFeeds, bulkDeleteIntelReports, bulkUpdateInte
 import { intelActions } from '../api/actions/intel';
 import { __resetAllianceSyncStateForTests } from '../lib/db/allianceSyncState';
 
-type Viewer = { id?: number; role?: string; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] };
+type Viewer = { id?: number; role?: string; isSystemAdmin?: boolean; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] };
 const viewer = (over: Partial<Viewer> = {}): Viewer => ({ id: 6, role: 'Member', permissions: [], clearanceLevel: { level: 0 }, limitingMarkers: [], ...over });
 
 beforeEach(() => {
@@ -181,13 +181,21 @@ describe('getIntelStats clearance ceiling (clearance-markers#2)', () => {
         expect(stats.threatBreakdown.High).toBe(1);
     });
 
-    it('an Admin / intel:manage holder sees ALL reports (no ceiling)', async () => {
+    it('the stamped system Admin / an intel:manage holder sees ALL reports (no ceiling)', async () => {
         statsFixture();
-        const admin = await getIntelStats(viewer({ role: 'Admin' }));
+        const admin = await getIntelStats(viewer({ isSystemAdmin: true }));
         expect(admin.totalReports).toBe(3);
         expect(admin.threatBreakdown.Critical).toBe(1);
         const manager = await getIntelStats(viewer({ permissions: ['intel:manage'] }));
         expect(manager.totalReports).toBe(3);
+    });
+
+    // ROLE NAME IS NOT AUTHORITY: a permissionless custom role called 'Commander'
+    // arrived as the Admin tier and read the classified report volume.
+    it('a forged Admin role NAME with no permissions takes the clearance ceiling', async () => {
+        statsFixture();
+        const forged = await getIntelStats(viewer({ role: 'Admin' }));
+        expect(forged.totalReports).toBe(2);
     });
 
     it('an undefined viewer fails closed (treated as clearance 0)', async () => {
@@ -226,9 +234,11 @@ describe('intel:get_dossier withholds service-request bodies without request dut
         expect(res.requests).toEqual(REQUESTS);
     });
 
-    it('Admin receives the request bodies', async () => {
+    // The request-duty predicate is permission-only now: a role NAMED 'Admin' with no
+    // duty permission no longer receives service-request bodies through the dossier.
+    it('a forged Admin role NAME with no duty permission does NOT receive the request bodies', async () => {
         const res = await callDossier({ targetId: 'jdoe', user: viewer({ role: 'Admin' }) });
-        expect(res.requests).toEqual(REQUESTS);
+        expect(res.requests).toEqual([]);
     });
 
     it('request:triage and request:accept also unlock the requests', async () => {

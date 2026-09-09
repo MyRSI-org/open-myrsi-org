@@ -22,15 +22,31 @@ export function safeSearchTerm(raw: unknown, maxLen = 100): string {
 }
 
 /**
- * Escape PostgreSQL LIKE/ILIKE metacharacters (%, _, \) so a value matches
- * LITERALLY in a parameterized .ilike(). Use for dedup/lookup keyed on an
- * externally-supplied value (e.g. a federation peer's target_id) — without it a
- * value of '%' degenerates into a match-everything wildcard (full-table scan +
- * cross-record mis-linking). Returns '' for non-strings.
+ * Escape the LIKE metacharacters in a value passed as an `.ilike(col, value)` /
+ * `.like(col, value)` ARGUMENT so it matches LITERALLY instead of as a pattern.
+ * postgrest-js appends the operand verbatim into the `col=ilike.<operand>` query
+ * param, and that top-level filter has no comma/paren grammar (unlike an `.or()`
+ * string, which needs safeSearchTerm above), so the `\` escapes reach Postgres
+ * intact — but nothing escapes the metacharacters for you.
+ *
+ * Four characters matter, and missing any one of them re-opens the hole:
+ *   %   multi-character wildcard
+ *   _   single-character wildcard (legal inside an RSI handle, so escaping it
+ *       fixes correctness as well as safety)
+ *   \   Postgres' default LIKE escape character
+ *   *   PostgREST rewrites `*` to `%` in a like/ilike operand before Postgres
+ *       ever sees it, so an otherwise-perfect %/_/\ escape still leaks a wildcard
+ *
+ * USE THIS FOR IDENTITY LOOKUPS. `.ilike(col, handle)` on unescaped input is not
+ * "find the row with this handle" — a caller passing '%' or '*' matches EVERY
+ * row: a full-table scan and cross-record mis-linking on a read, a mass
+ * overwrite on updateIntelAffiliation's .update().ilike(). For a substring
+ * search, wrap the result: `` `%${escapeLikePattern(q)}%` ``. Returns '' for
+ * non-strings (fail closed — an empty pattern matches nothing).
  */
 export function escapeLikePattern(value: unknown): string {
     if (typeof value !== 'string') return '';
-    return value.replace(/[\\%_]/g, (m) => `\\${m}`);
+    return value.replace(/[\\%_*]/g, (m) => `\\${m}`);
 }
 
 /**

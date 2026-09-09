@@ -20,6 +20,11 @@ const IssueEamModal: React.FC<IssueEamModalProps> = ({ isOpen, onClose }) => {
     const [armCountdown, setArmCountdown] = useState(3);
     const [isArmed, setIsArmed] = useState(false);
     const [isTransmitting, setIsTransmitting] = useState(false);
+    // How loudly this ONE message pings Discord. Three fixed choices, not a role
+    // picker: which role may be @-mentioned is an admin:config:discord setting, while
+    // sending an EAM is admin:broadcast:eam — a role dropdown here would hand every
+    // Dispatcher an arbitrary mention primitive. '@everyone' is deliberately absent.
+    const [pingTarget, setPingTarget] = useState<'none' | 'here' | 'role'>('here');
 
     // Reset the arming state machine each time the modal transitions closed ->
     // open. Done during render via React's "adjust state during render" pattern
@@ -64,7 +69,7 @@ const IssueEamModal: React.FC<IssueEamModalProps> = ({ isOpen, onClose }) => {
         if (!isArmed || !message.trim()) return;
         setIsTransmitting(true);
         try {
-            await broadcastEAM(message.toUpperCase());
+            await broadcastEAM(message.toUpperCase(), pingTarget);
             setEamMessage(message.toUpperCase());
             setTimeout(() => {
                 onClose();
@@ -107,6 +112,21 @@ const IssueEamModal: React.FC<IssueEamModalProps> = ({ isOpen, onClose }) => {
                         placeholder="ENTER EAM CONTENT..."
                         disabled={isArming || isArmed || isTransmitting}
                     />
+
+                    <label className="block text-[10px] text-red-400 uppercase font-black mt-5 mb-2 tracking-wider relative z-10">Discord Ping</label>
+                    <select
+                        value={pingTarget}
+                        onChange={(e) => setPingTarget(e.target.value as 'none' | 'here' | 'role')}
+                        disabled={isArming || isArmed || isTransmitting}
+                        className="w-full bg-slate-900/90 border border-red-500/30 rounded-lg p-3 text-red-50 font-mono text-sm focus:border-red-500 focus:ring-1 focus:ring-red-500 outline-hidden relative z-10 disabled:opacity-50"
+                    >
+                        <option value="here">@here — everyone currently online</option>
+                        <option value="role">The configured EAM role</option>
+                        <option value="none">No ping — post quietly</option>
+                    </select>
+                    <p className="text-[10px] text-red-400/60 mt-1.5 relative z-10">
+                        Affects the Discord post only. The in-app override and push notification always fire.
+                    </p>
                 </div>
 
                 {/* Footer Controls */}

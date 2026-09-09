@@ -52,7 +52,7 @@ export async function getLegislationState(): Promise<GovernmentLegislation[]> {
                 )
             `)
             
-            .order('created_at', { ascending: false })
+            .order('created_at', { ascending: false }).order('id', { ascending: false })
             .limit(100),
         [], 'government_legislation'
     );
@@ -80,7 +80,7 @@ export async function getMotionsState(currentUserId?: number): Promise<Governmen
                 created_by:users!government_motions_created_by_id_fkey(${USER_HYDRATE})
             `)
             
-            .order('created_at', { ascending: false })
+            .order('created_at', { ascending: false }).order('id', { ascending: false })
             .limit(50),
         [], 'government_motions'
     );

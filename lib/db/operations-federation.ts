@@ -120,6 +120,9 @@ export function projectOperationSnapshot(op: HydratedOperation, hasRestrictedMar
         aarSubmittedAt: undefined,
         aarSubmittedBy: undefined,
         discordEventId: undefined,
+        // A peer's start-notice opt-in has no meaning here and must not arrive as one:
+        // consent to announce in THEIR guild is not consent to announce in ours.
+        discordStartNotice: undefined,
         discordAnnouncementChannelId: undefined,
         discordAnnouncementMessageId: undefined,
     } as HydratedOperation;
@@ -439,9 +442,27 @@ export async function upsertAlliedParticipant(opId: string, peerId: string, p: A
     // Bound how many participants a single peer can register for one op. A new
     // handle past the cap is refused; an existing handle still updates (it's an
     // upsert, not growth).
-    const { count } = await supabase.from('operation_allied_participants')
-        .select('id', { count: 'exact', head: true }).eq('operation_id', opId).eq('peer_id', peerId);
-    if ((count || 0) >= MAX_ALLIED_PARTICIPANTS_PER_PEER) {
+    // COUNTS A REAL COLUMN. This selected `id`, which operation_allied_participants
+    // does not have — its primary key is composite (operation_id, peer_id,
+    // remote_user_handle), and lib/database.types.ts, generated from the live project,
+    // confirms no such column exists. PostgREST answers an unknown column with a 42703
+    // (HTTP 400), supabase-js returns { count: null, error }, the error was discarded,
+    // and `(null || 0)` is 0 — so this cap has never fired on any deployment.
+    //
+    // That matters here because the write it guards is reached from the inbound
+    // /api/alliance RSVP route, authenticated by a PEER's api key: a paired-but-hostile
+    // ally, or a leaked ally key, could grow this table without bound, and every row is
+    // rendered in our operation detail and re-forwarded to other allies.
+    //
+    // Same shape and same contract as slotAssignedCount (lib/db/ops.ts) — whose comment
+    // documents this exact bug class in the hosted sibling. The error is bound so a read
+    // fault REFUSES the write rather than waving it through, which is the direction a
+    // volume cap has to fail.
+    const { count, error: countErr } = await supabase.from('operation_allied_participants')
+        .select('remote_user_handle', { count: 'exact', head: true })
+        .eq('operation_id', opId).eq('peer_id', peerId);
+    handleSupabaseError({ error: countErr, message: 'Failed to count allied participants' });
+    if ((count ?? 0) >= MAX_ALLIED_PARTICIPANTS_PER_PEER) {
         const { data: existingRow } = await supabase.from('operation_allied_participants')
             .select('remote_user_handle').eq('operation_id', opId).eq('peer_id', peerId).eq('remote_user_handle', handle).maybeSingle();
         if (!existingRow) throw new Error('participant_limit_reached');
@@ -498,6 +519,20 @@ const MAX_INBOUND_SNAPSHOT_BYTES = 1_000_000;
 function boundedInboundSnapshot(snapshot: HydratedOperation | null | undefined): HydratedOperation | null {
     if (snapshot == null) return null;
     if (JSON.stringify(snapshot).length > MAX_INBOUND_SNAPSHOT_BYTES) throw new Error('malformed_request');
+    // SHIP SEATS ARE NOT ACCEPTED FROM A PEER, and this is not tidiness.
+    //
+    // The outbound projection (projectOperationSnapshot) is a construct-fresh
+    // allowlist that never includes shipSlots, so a well-behaved peer never sends
+    // them — but the inbound side has only a SIZE bound, and every field on
+    // HydratedOperation is therefore peer-injectable. Seat assignments carry bare
+    // LOCAL user ids which the panel resolves against the LOCAL roster, so a hostile
+    // paired host could invent seats holding small integers and have our own UI
+    // render real local members' names in them. Peer-authored content displayed as
+    // locally authored. Dropped here, at the one place every mirror write passes
+    // through, rather than trusted to whichever view renders a mirror next.
+    if (snapshot && 'shipSlots' in snapshot) {
+        delete (snapshot as { shipSlots?: unknown }).shipSlots;
+    }
     return snapshot;
 }
 
@@ -896,11 +931,25 @@ async function pullMirrorFromHost(
             .select('host_peer_id').eq('id', opId).maybeSingle();
         if (existing && existing.host_peer_id !== peerId) return 'skipped';
 
-        const accepted = kind === 'missing-accepted';
+        // AN INBOUND MANIFEST MAY NOT RAISE `accepted`.
+        //
+        // The reconcile loop above reads the host's `manifest.accepted` map and its
+        // comment calls that flag authoritative "because only our own /accept sets
+        // it". That is true of the host's own bookkeeping and false as a trust
+        // statement: the MANIFEST IS SERVED BY THE HOST, so a hostile or compromised
+        // peer simply lists any op id under `accepted` and we latch it. `accepted` is
+        // the local alliance:manage admin's decision — it gates whether a mirror is
+        // visible to members rather than sitting in the admin-only pending queue — so
+        // letting the counterparty assert it is the guest's accept/decline gate being
+        // set by the party it exists to decide about.
+        //
+        // A healed mirror therefore always lands as a PENDING INVITE. The heal still
+        // does its job (the mirror exists again, with current content); the one thing
+        // it no longer does is answer a question only this org may answer.
         const { error } = await supabase.from('mirrored_operations').upsert({
             id: opId, host_peer_id: peerId,
             snapshot, version: payload.version, snapshot_updated_at: nowIso(),
-            accepted, invited_at: nowIso(), accepted_at: accepted ? nowIso() : null, revoked_at: null,
+            accepted: false, invited_at: nowIso(), accepted_at: null, revoked_at: null,
         }, { onConflict: 'id' });
         handleSupabaseError({ error, message: 'Failed to heal missing mirror' });
     } else if (kind === 'regression') {
@@ -913,13 +962,21 @@ async function pullMirrorFromHost(
         broadcastToOrg('operation_update', { operationId: opId });
         return 'regression-healed';
     } else if (kind === 'resurrect') {
-        // Revoked locally but the host lists it under accepted+alive (a spurious
-        // local revoke, or our cancel handling raced a missed re-share). The
-        // host's accepted flag is authoritative — only our own /accept sets it —
-        // so restore fully as accepted.
+        // Revoked locally but the host lists it under accepted+alive (a spurious local
+        // revoke, or our cancel handling raced a missed re-share).
+        //
+        // Restores the ROW but not the DECISION — same reasoning as the heal branch
+        // above. Un-revoking on the host's say-so is the sharper half of that bug: a
+        // revoke is frequently a deliberate decline, and the old code turned any
+        // declined mirror back into an accepted, member-visible one on the next
+        // reconcile tick, repeatedly, with the peer choosing when. It comes back as a
+        // pending invite for the local admin to action.
+        //
+        // `accepted` is left ALONE rather than forced false, so a mirror this org had
+        // genuinely accepted before a spurious revoke keeps its own prior answer.
         await supabase.from('mirrored_operations').update({
             snapshot, version: payload.version, snapshot_updated_at: nowIso(),
-            accepted: true, accepted_at: nowIso(), revoked_at: null,
+            invited_at: nowIso(), revoked_at: null,
         }).eq('id', opId).eq('host_peer_id', peerId);
     } else if (kind === 'reinvite') {
         // Missed re-invite after a revoke: back to a pending invite for admins.

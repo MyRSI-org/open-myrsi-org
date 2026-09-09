@@ -24,8 +24,18 @@ const TYPE_ICON: Record<string, string> = {
     qm_issuance: 'fa-box-open',
     hr_assignment: 'fa-user-check',
     academy_enrolled: 'fa-graduation-cap',
+    academy_enrollment_requested: 'fa-hand',
+    academy_enrollment_denied: 'fa-hand-back-fist',
     academy_completed: 'fa-award',
     academy_recommended: 'fa-user-graduate',
+    academy_course_approved: 'fa-circle-check',
+    academy_course_rejected: 'fa-rotate-left',
+    operation_assigned: 'fa-crosshairs',
+    operation_removed: 'fa-user-minus',
+    finance_confirmed: 'fa-circle-check',
+    finance_rejected: 'fa-circle-xmark',
+    ban_appeal: 'fa-gavel',
+    blueprint_request: 'fa-scroll',
 };
 
 function relativeTime(iso: string): string {

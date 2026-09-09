@@ -36,6 +36,16 @@ function globalPermissions(): Set<string> {
     return set;
 }
 
+// Inline server-side gate calls, by shape. `permissionSatisfied` is on this list
+// because gates are migrating off bare `.includes()` onto the shared implication
+// table (lib/permissionImplications.ts). A gate helper the alternation does not name
+// is INVISIBLE to this scanner: the gate keeps working and its permission silently
+// drops out of the deploy-seed contract below, with nothing going red. The loss is
+// structural and grows with every migration, so the alternation has to learn each new
+// helper as it appears — pinned by the gate-shape self-test at the bottom of the file,
+// which consumes this same factory.
+const gateCallRe = () => /\.includes\(\s*'([a-z][a-z0-9_]*:[a-z0-9_:]+)'\s*\)|(?:hasPerm|aggHasPerm|hasPermission|permissionSatisfied)\(\s*(?:[^,]+,\s*)?'([a-z][a-z0-9_]*:[a-z0-9_:]+)'/g;
+
 function gatedPermissions(): Set<string> {
     const set = new Set<string>();
     // fullPermissionMap values: 'action': 'permission'
@@ -54,7 +64,7 @@ function gatedPermissions(): Set<string> {
         }
     };
     walk('lib'); walk('api');
-    const re = /\.includes\(\s*'([a-z][a-z0-9_]*:[a-z0-9_:]+)'\s*\)|(?:hasPerm|aggHasPerm|hasPermission)\(\s*(?:[^,]+,\s*)?'([a-z][a-z0-9_]*:[a-z0-9_:]+)'/g;
+    const re = gateCallRe();
     for (const f of files) {
         for (const m of read(f).matchAll(re)) {
             const perm = m[1] || m[2];
@@ -85,5 +95,22 @@ describe('permission seed parity', () => {
         expect(seeded.size).toBeGreaterThan(80);
         expect(gated.size).toBeGreaterThan(80);
         expect(global.size).toBe(seeded.size);
+    });
+
+    // Self-test of the harness (see the gateCallRe note above): contract 1 is only as
+    // wide as the call shapes the scanner recognises, so pin one representative of
+    // every gate shape the tree uses today and make adding the next one deliberate.
+    it('recognises every gate-call shape in use, so no migrated gate leaves the contract', () => {
+        const shapes: Array<[string, string]> = [
+            ['bare includes', "if (perms.includes('intel:view')) return true;"],
+            ['hasPerm', "const ok = hasPerm(currentUser, 'warrant:view');"],
+            ['aggHasPerm', "const ok = aggHasPerm(currentUser, 'hr:view');"],
+            ['hasPermission', "if (hasPermission('operations:view')) return;"],
+            ['permissionSatisfied', "const ok = permissionSatisfied(u?.permissions, 'academy:view');"],
+        ];
+        for (const [name, snippet] of shapes) {
+            const found = [...snippet.matchAll(gateCallRe())].map(m => m[1] || m[2]);
+            expect(found, `${name} gate call is invisible to gatedPermissions()`).toHaveLength(1);
+        }
     });
 });

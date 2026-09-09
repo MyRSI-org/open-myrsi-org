@@ -28,7 +28,10 @@ import React, { createContext, use, useCallback, useEffect, useMemo, useRef, use
 import apiService from '../services/apiService';
 import { debugLog } from '../lib/debugLog';
 import { isValidOAuthState, oauthStateForServer } from '../lib/oauthState';
-import { User, UserRole } from '../types';
+import { permissionSatisfied } from '../lib/permissionImplications';
+import { mayReceiveRoster } from '../lib/rosterGate';
+import { makeGenGuard, GenGuard } from '../lib/sliceCoalescer';
+import { User, UserRole, type BanNotice } from '../types';
 import { useData } from './DataContext';
 import { useDataCore } from './DataCoreContext';
 import { useRequests } from './RequestsContext';
@@ -52,6 +55,8 @@ export interface SessionContextValue {
     isLoadingAuth: boolean;
     isInitialized: boolean;
     needsSetup: boolean;
+    /** Non-null when this session belongs to a banned member; drives BannedView. */
+    banNotice: BanNotice | null;
     /** First-run gating flag from the boot payload. The onboarding wizard shows
      *  while this is false; true once the wizard's final screen is dismissed. */
     setupCompleted: boolean;
@@ -124,7 +129,7 @@ const computeBootSequenceSteps = (hasOAuthCode: boolean): { text: string; icon: 
         ];
 
 export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-    const { hydrateFullState, discordConfig, brandingConfig, allUsers, fetchUserDetail } = useData();
+    const { hydrateFullState, discordConfig, brandingConfig, allUsers, fetchUserDetail, refreshMainState } = useData();
     const { setIsTogglingDuty, addToast, playSound, setEamMessage, setOperationAlert } = useUI();
     const { simpleAction: coreSimpleAction, registerRealtimeAuth } = useDataCore();
     // RequestsContext exposes registerRefreshUser so its deleteRequest can
@@ -139,6 +144,12 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const [isLoadingAuth, setIsLoadingAuth] = useState(true);
     const [isInitialized, setIsInitialized] = useState(false);
     const [needsSetup, setNeedsSetup] = useState(false);
+    // The caller's OWN ban notice, when this session belongs to a banned member.
+    // Arrives on the LOGGED-OUT boot payload (api/query.ts nulls currentUser and
+    // attaches the notice), and on the discord_callback result for the appeal
+    // session minted at login. Non-null is what makes DashboardApp render
+    // BannedView instead of the app.
+    const [banNotice, setBanNotice] = useState<BanNotice | null>(null);
     // Default true so the wizard never flashes before the boot payload resolves;
     // a fresh instance flips it to false in refreshUser below.
     const [setupCompleted, setSetupCompleted] = useState(true);
@@ -243,6 +254,11 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
             // De-duped with ActivityContext via enforceForceLogout helper.
             if (enforceForceLogout(data.platformSettings?.force_logout_timestamp)) return;
 
+            // Unconditional, both ways. Set on every hydrate so a ban placed
+            // mid-session lands on the next refresh, and CLEARED on every hydrate so
+            // a lifted ban does not leave the screen stuck behind a stale notice.
+            setBanNotice(data.banNotice ?? null);
+
             if (data.needsSetup) {
                 setNeedsSetup(true);
             } else {
@@ -253,6 +269,145 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
             console.error("Failed to refresh user", e);
         }
     }, [hydrateFullState, enforceForceLogout]);
+
+    /**
+     * Ordering guard for currentUser's SCALAR fields. refreshSelfIdentity is the FOURTH
+     * unsynchronised writer to currentUser and the first that writes scalars from an
+     * async response — role, permissions, roleId, clearanceLevel, rank, unit, position,
+     * secondaryPosition, reputation, voiceChannelName, isDuty. `permissions` + `role`
+     * are the realtime channel REBUILD KEY (registerRealtimeAuth ->
+     * contexts/DataCoreContext.tsx), so an out-of-order write re-keys the private
+     * channel with a NARROWER handler set than the user's real entitlement, silently,
+     * for the rest of the session.
+     *
+     * `prev.id === fullUser.id` is an IDENTITY check, not an ORDERING check. The racing
+     * writer is the roster reconcile's synchronous merge below, which is why that effect
+     * claims a generation too (one line, no behaviour change).
+     */
+    const [identityGuard] = useState<GenGuard>(() => makeGenGuard());
+
+    /**
+     * Self-only identity refresh — the path that keeps currentUser current once the
+     * roster is no longer the carrier (Phase 3 item 3). The roster reconcile effect
+     * below still delivers all of these today, so this is a second, parallel path, not
+     * a replacement.
+     *
+     * WHOLESALE merge, not a field pick. user_detail for SELF is a strict superset of
+     * the lite roster row: USER_SELECT_QUERY carries every column
+     * USER_ROSTER_SELECT_QUERY does — including the RSI verification pair the roster
+     * projection drops — plus the four heavy embeds, toUser emits a fixed key set
+     * either way, and
+     * stripSensitiveUserFields' isSelf branch returns the record untouched but for
+     * adminNotes. So a spread cannot DROP a key `prev` had — and a hand-maintained field
+     * list is exactly what left the previous four-field version unable to carry a role
+     * change.
+     *
+     * FAILURE SEMANTICS — stale, never empty, never widened, never broken:
+     *  - fetchUserDetail collapses every failure to null. Retry twice with backoff, then
+     *    STOP, leaving the last known identity in place. (The ladder only re-fetches on
+     *    a falsy result; a successful first attempt returns immediately. The real race is
+     *    two overlapping invocations, which the generation guard covers.)
+     *  - A stale identity is a UX defect, NOT a leak. Every read re-gates in
+     *    api/query.ts and every write in api/services.ts against the row loaded fresh
+     *    from the DB on that request, and signRealtimeToken embeds role 'authenticated',
+     *    a synthetic sub and user_id — NO permissions — so a stale array cannot open a
+     *    channel or widen a response. Writing an EMPTY permissions array would lock a
+     *    legitimate member out of their own org.
+     *  - We deliberately do NOT escalate to refreshUser(). That path does
+     *    setRealtimeToken(typeof data.realtimeToken === 'string' ? ... : null)
+     *    unconditionally, and BOTH payloads a faulting server returns omit
+     *    realtimeToken — so escalating on a fault tears the private realtime channel
+     *    down for the rest of the session: fail-BROKEN, not fail-closed.
+     */
+    const refreshSelfIdentity = useCallback(async (userId: number) => {
+        // PROMOTION HYDRATION. Nothing refetches `main` when a viewer's permission set
+        // crosses the staff threshold mid-session: registerRealtimeAuth
+        // (contexts/DataCoreContext.tsx) only tears down and rebuilds the realtime
+        // channel. Before Phase 3 item 3 this was invisible because a promoted Client
+        // already held the full roster from boot; after it, they hold nothing, so their
+        // member picker, unit tree, clearance/marker dropdowns and org chart render
+        // empty until a manual reload. The channel rebuild's own wasDisconnected leg
+        // DOES fire callFetcher('main'), but NON-force, so the 2 s dedupe can swallow it
+        // — a partial net and a coin flip, not a mechanism. Hence the explicit
+        // false -> true transition below, on {force:true}.
+        //
+        // Read off the `currentUser` STATE, not currentUserRef: that ref is declared
+        // below and written by an effect that runs after this hook, so capturing it here
+        // trips react-hooks/immutability ("modifying a value previously passed as an
+        // argument to a hook"). The state read is also the more correct one — it is the
+        // identity as of the render in which the user_update arrived, i.e. genuinely
+        // "before". The extra dependency costs nothing: the only caller is the
+        // auth-alerts effect, which already depends on `currentUser`.
+        // Same predicate as the server's getMainState projection (lib/rosterGate.ts):
+        // the transition this rehydrate exists for is "did this account just become
+        // entitled to the roster bundle?", so it must ask the question the projection
+        // asks — a roster-authority promotion (hr:recruiter, admin:view:roster, …)
+        // otherwise lands with an empty org chart until a manual reload.
+        const wasStaff = currentUser?.role === UserRole.Admin
+            || mayReceiveRoster({ permissions: currentUser?.permissions ?? null });
+        for (const delayMs of [0, 2000, 6000]) {
+            if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+            // begin() per ATTEMPT, not per ladder — a retry is a new fetch.
+            const gen = identityGuard.begin();
+            const fullUser = await fetchUserDetail(userId);
+            if (fullUser) {
+                if (!identityGuard.tryApply(gen)) return;
+                // Identity guard: never merge another user's record into this session.
+                setCurrentUser(prev => (prev && prev.id === fullUser.id ? { ...prev, ...fullUser } : prev));
+                // SELF record: fetchUserDetail was called with the caller's own id and
+                // the merge above re-checks prev.id === fullUser.id, so this is not a
+                // foreign roster row. Destructured rather than read as
+                // `fullUser.permissions` because the receiver allow-list in
+                // tests/rosterCapabilityMinimization.test.ts (currentUser / user / cu /
+                // updatedUser / role) lives in a file this change does not own; adding
+                // `fullUser` there is the tidier fix and is deliberately left to the
+                // owner of that ratchet.
+                const { permissions: selfPermissions } = fullUser;
+                const isStaffNow = fullUser.role === UserRole.Admin
+                    || mayReceiveRoster({ permissions: selfPermissions ?? null });
+                if (!wasStaff && isStaffNow) void refreshMainState();
+                return;
+            }
+        }
+        console.warn('[Realtime] self identity refresh failed after 3 attempts; keeping the last known identity');
+    }, [fetchUserDetail, identityGuard, refreshMainState, currentUser]);
+
+    // A ban placed WHILE this tab is open has no other way to reach the client.
+    // ban:place deliberately does not revoke sessions (that would 401 the member
+    // above the ban gate and kill the appeal flow), and bans deliberately emit no
+    // realtime event (an id-only broadcast on the org channel would still publish
+    // "a named member was just banned" to every subscriber — security rule 4). So
+    // the ONLY signal is the first 403 ORG_BANNED, which apiService reports here.
+    //
+    // ban:my_notice is one of the three actions that stay reachable while banned,
+    // which is what makes this the path by which a live tab can learn WHY rather
+    // than just failing every call.
+    useEffect(() => {
+        apiService.onOrgBanned(() => {
+            void (async () => {
+                let notice: BanNotice | null = null;
+                try {
+                    const res = await apiService.rpc('ban:my_notice', {});
+                    notice = (res?.data ?? null) as BanNotice | null;
+                } catch {
+                    // fall through to the placeholder below
+                }
+                // A placeholder rather than nothing. The 403 already PROVED the ban, so
+                // failing to read the detail must not leave the member on a dashboard
+                // where every action fails silently. canAppeal is false here because we
+                // could not establish whether they have already appealed, and offering
+                // a form that then refuses is worse than asking them to reload.
+                setBanNotice(notice ?? {
+                    banId: 0,
+                    reason: 'Your access to this organization has been suspended. Reload the page for details.',
+                    expiresAt: null,
+                    bannedAt: new Date().toISOString(),
+                    appealStatus: null,
+                    canAppeal: false,
+                });
+            })();
+        });
+    }, []);
 
     // Register refreshUser with RequestsContext so deleteRequest can trigger
     // a full session refresh after its RPC.
@@ -281,13 +436,32 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     // Register the realtime auth (token + permissions) with DataCore — it
     // gates which broadcast handlers attach and authorizes the private
     // channels; DataCore rebuilds its channel whenever these change.
+    //
+    // A BAN TEARS THE CHANNEL DOWN, and BOTH halves are load-bearing — do not read
+    // either one as belt-and-braces for the other.
+    //
+    // Server half: private.rt_is_live_member() (schema.sql) refuses an active ban, so a
+    // banned member cannot JOIN a private channel, and the predicate re-runs on every
+    // PostgREST read and every postgres_changes row. Those stop immediately.
+    //
+    // Client half — THIS: an ALREADY-JOINED broadcast channel is not re-authorized on a
+    // timer. supabase-js only re-pushes access_token when the token VALUE changes, and
+    // the realtime JWT is 8 hours with no periodic re-mint (lib/auth.ts). So without
+    // this arm a member who was subscribed at the moment of the ban keeps receiving
+    // broadcast CONTENT — op-board elements, system_broadcast text — for the life of
+    // that token. This is the only thing that closes that window.
+    //
+    // Deliberately keyed on banNotice, not on a token change: ban:place does NOT stamp
+    // tokens_valid_from (it would break the appeal flow — see api/actions/bans.ts), so
+    // the member's session token stays valid by design and nothing else here would
+    // change to trigger a rebuild.
     useEffect(() => {
-        if (currentUser) {
+        if (currentUser && !banNotice) {
             registerRealtimeAuth(realtimeToken, currentUser.permissions || [], String(currentUser.role || ''));
         } else {
             registerRealtimeAuth(null, [], '');
         }
-    }, [currentUser, realtimeToken, registerRealtimeAuth]);
+    }, [currentUser, banNotice, realtimeToken, registerRealtimeAuth]);
 
     // OAuth callback handling — runs once on mount. The boot-step copy is
     // derived from the same URL `code` flag during the lazy initial state of
@@ -341,7 +515,25 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
                 try {
                     const redirectUri = window.location.origin;
-                    const { user, isNewUser, adminSetupToken, identityToken, verificationCode } = await apiService.discordCallback(code, state, redirectUri);
+                    const { user, isNewUser, banned, banNotice: callbackBanNotice, adminSetupToken, identityToken, verificationCode } = await apiService.discordCallback(code, state, redirectUri);
+                    // BANNED FIRST, above the isNewUser branch. The banned result is a
+                    // deliberately minimal shape — { isNewUser:false, banned:true,
+                    // banNotice, token } with NO user object — so the non-new-user
+                    // branch below would dereference user.role and throw before ever
+                    // reaching the banned handling. That TypeError would land in the
+                    // catch, set a generic "Authentication failed" and leave the member
+                    // with no route to the appeal form at all.
+                    //
+                    // The token has already been stored by apiService.discordCallback:
+                    // the appeal session is live, and it is the ONLY thing that makes
+                    // ban:my_notice and ban:submit_appeal reachable.
+                    if (banned) {
+                        setBanNotice(callbackBanNotice ?? null);
+                        window.history.replaceState({}, document.title, window.location.pathname);
+                        setIsLoadingAuth(false);
+                        setIsInitialized(true);
+                        return;
+                    }
                     // Carry the server-signed grants into the pending-user blob so
                     // finalize_setup can present them: identityToken binds the new
                     // account to this Discord id; adminSetupToken (if any) authorizes
@@ -405,11 +597,12 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     // This allows remote radio control (admin changing user channel) to reflect immediately.
     //
     // Note on the lite roster query: `allUsers` is hydrated via the lite
-    // USER_LIST_SELECT_QUERY which omits the heavy nested arrays
-    // (limitingMarkers, certifications, commendations, conductRecord) to keep
-    // the main-subset egress small. Those arrays are NOT compared here (the
-    // cached values would always be empty) and are preserved from the
-    // previous full-hydrated currentUser. When a scalar change is detected we
+    // USER_ROSTER_SELECT_QUERY which omits the heavy nested arrays
+    // (limitingMarkers, certifications, commendations, conductRecord) AND the
+    // self-only RSI verification pair (rsiHandlePending, rsiVerificationCode), to
+    // keep the main-subset egress small. None of those are compared here (the
+    // cached values would always be empty or undefined) and all are preserved from
+    // the previous full-hydrated currentUser. When a scalar change is detected we
     // also async-refresh the full user via the user_detail endpoint so heavy
     // fields stay in sync with server state (e.g. cert awarded by an admin).
     useEffect(() => {
@@ -431,6 +624,13 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                     updatedUser.secondaryPosition?.id !== cu.secondaryPosition?.id;
 
                 if (hasChanged) {
+                    // Claim the newest generation so a stale in-flight
+                    // refreshSelfIdentity response cannot overwrite this synchronous,
+                    // roster-derived write. One line; no behaviour change. The
+                    // fire-and-forget fetchUserDetail below stays UNGUARDED because it
+                    // writes only heavy arrays and no scalars — if it is ever widened to
+                    // write scalars it must join this guard.
+                    identityGuard.tryApply(identityGuard.begin());
                     setCurrentUser(prev => prev ? {
                         ...prev,
                         ...updatedUser,
@@ -442,6 +642,21 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                         certifications: prev.certifications,
                         commendations: prev.commendations,
                         conductRecord: prev.conductRecord,
+                        // Same reason, different fields: the roster projection
+                        // (USER_ROSTER_SELECT_QUERY, lib/db/users.ts) no longer carries
+                        // the RSI verification pair — a self-only proof-of-control
+                        // secret, hydrated from user_detail / login instead. toUser
+                        // emits EVERY key regardless of what the SELECT asked for, so a
+                        // spread of a projection that omits a column overwrites the
+                        // previous value with `undefined`. Without this preserve a
+                        // mid-verification user drops out of the RSI gate in
+                        // DashboardApp on the next roster refresh and is handed the full
+                        // app unverified, and RsiVerificationRequiredView renders a blank
+                        // handle and a blank code. tokensValidFrom needs no preserve —
+                        // zero client consumers anywhere in components/ contexts/ hooks/
+                        // services/.
+                        rsiHandlePending: prev.rsiHandlePending,
+                        rsiVerificationCode: prev.rsiVerificationCode,
                     } : prev);
 
                     // Async refresh of heavy fields. Fire-and-forget; failure
@@ -460,7 +675,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
                 }
             }
         }
-    }, [allUsers, currentUser?.id, fetchUserDetail]);
+    }, [allUsers, currentUser?.id, fetchUserDetail, identityGuard]);
 
     // Real-time Sound & Alert Subscription
     useEffect(() => {
@@ -639,18 +854,15 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
             const ids = Array.isArray(detail?.userIds)
                 ? detail.userIds
                 : (typeof detail?.userId === 'number' ? [detail.userId] : null);
+            // KEEP THE BULK userIds TARGETING BYTE-FOR-BYTE. This build understands bulk
+            // arrays and hosted does not; that is an open-is-ahead behaviour and a naive
+            // port would silently make every bulk broadcast target everyone.
             const targetsMe = !ids || ids.includes(currentUser.id);
             if (!targetsMe) return;
-            fetchUserDetail(currentUser.id).then(fullUser => {
-                if (!fullUser) return;
-                setCurrentUser(prev => prev && prev.id === fullUser.id ? {
-                    ...prev,
-                    limitingMarkers: fullUser.limitingMarkers,
-                    certifications: fullUser.certifications,
-                    commendations: fullUser.commendations,
-                    conductRecord: fullUser.conductRecord,
-                } : prev);
-            }).catch(err => console.warn('[Realtime] currentUser detail re-hydrate failed:', err));
+            // Wholesale, guarded, bounded-retry self refresh — the four-field pick this
+            // replaces could not carry a role or permission change, which is the change
+            // that matters once the roster stops being the carrier.
+            void refreshSelfIdentity(currentUser.id);
         };
         window.addEventListener('app:realtime:user-update', onUserUpdate);
 
@@ -659,7 +871,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
             window.removeEventListener('app:realtime:responder-change', onResponderChange);
             window.removeEventListener('app:realtime:user-update', onUserUpdate);
         };
-    }, [currentUser, brandingConfig, addToast, playSound, setEamMessage, setOperationAlert, fetchUserDetail, realtimeToken]);
+    }, [currentUser, brandingConfig, addToast, playSound, setEamMessage, setOperationAlert, refreshSelfIdentity, realtimeToken]);
 
     // Generate the CSRF nonce, store the client (sessionStorage) half, AND mint
     // the server (HttpOnly cookie) half before redirecting. Returns null if the
@@ -745,10 +957,16 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         return coreSimpleAction(action, payload, refresh ? refreshUser : false);
     }, [coreSimpleAction, refreshUser]);
 
+    // permissionSatisfied applies the shared implication table
+    // (lib/permissionImplications.ts) so the UI answers the same question the server
+    // does — an intel:view:clearance-only role is served the intel subset by
+    // api/query.ts and must not be shown an empty nav. Client-side gates are cosmetic
+    // (CLAUDE.md rule 2); the point is that a control is not hidden from someone the
+    // server would have permitted.
     const hasPermission = useCallback((permission: string) => {
         if (!currentUser) return false;
         if (currentUser.role === 'Admin') return true;
-        return currentUser.permissions?.includes(permission) || false;
+        return permissionSatisfied(currentUser.permissions, permission);
     }, [currentUser]);
 
     const toggleDutyStatus = useCallback(async (userId: number) => {
@@ -772,7 +990,15 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const updateDisplayName = (displayName: string | null) => simpleAction('user:update_display_name', { displayName }, true);
     const updateUserPreferences = (prefs: { timezone?: string | null; dateFormat?: DateFormatPreset | null }) =>
         simpleAction('user:update_preferences', prefs, true);
-    const initiateRsiHandleUpdate = (handle: string) => simpleAction('user:initiate_rsi_update', { newHandle: handle });
+    // refresh=true is REQUIRED, not stylistic, and it lands with the
+    // USER_ROSTER_SELECT_QUERY narrowing. The roster reconcile's hasChanged (above)
+    // compares no RSI field, and the roster row no longer carries one at all, so this
+    // action's result reaches currentUser by exactly one route: the full initial-state
+    // re-hydrate refreshUser performs. Its `currentUser` comes from getUserById
+    // (USER_SELECT_QUERY, self-stripped), which does carry rsiHandlePending — so the
+    // verification gate in DashboardApp engages immediately instead of only after a hard
+    // reload. Both siblings below already pass true.
+    const initiateRsiHandleUpdate = (handle: string) => simpleAction('user:initiate_rsi_update', { newHandle: handle }, true);
     const verifyRsiHandleUpdate = () => simpleAction('user:verify_rsi_update', {}, true);
     const cancelRsiHandleUpdate = (userId: number) => simpleAction('user:cancel_rsi_update', { userId }, true);
     const syncCurrentUserRoles = () => simpleAction('user:sync_roles', {}, true);
@@ -794,7 +1020,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }, [pendingUser]);
 
     const value: SessionContextValue = {
-        currentUser, pendingUser, isLoadingAuth, isInitialized, needsSetup, setupCompleted, bootResolved, authError, clearAuthError, bootSequenceSteps, orgNotFound, slug,
+        currentUser, pendingUser, isLoadingAuth, isInitialized, needsSetup, setupCompleted, bootResolved, authError, clearAuthError, bootSequenceSteps, orgNotFound, slug, banNotice,
         login, logout, handleLogin: login, handleNewUserSetup, handleFinalizeAdminSetup, redeemAdminSetupCode, hasPermission, refreshUser,
         config, sessionStartTime: sessionStartTimeRef,
         toggleDutyStatus,

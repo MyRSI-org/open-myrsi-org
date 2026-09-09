@@ -64,6 +64,10 @@ interface SubmitApplicationPayload {
     referral?: string;
     notes?: string;
     assignedRecruiterId?: number | null;
+    // The db layer self-scopes this action against the actor's own handle (any
+    // session reaches it via the user:manage:self pseudo-perm), so the
+    // dispatcher-injected actor has to survive the payload type.
+    user?: { id?: number; role?: string; permissions?: string[]; rsiHandle?: string };
 }
 
 interface UnitFeedPayload extends ActorPayload {

@@ -3,6 +3,7 @@ import * as db from '../../lib/db.js';
 import * as discord from '../../lib/discord.js';
 import { assertIdArray } from '../../lib/pgrest.js';
 import { MAX_IMPORT_BATCH_SIZE } from '../../lib/db/system.js';
+import { SecurityDenial } from '../../lib/errors.js';
 import { stripActorFields } from '../services.js';
 import { invalidatePublicCache } from '../public.js';
 import type {
@@ -41,18 +42,30 @@ import type {
 // payloads below keep a stable shared marker without churning every signature.
 type OrgScopedPayload = Record<never, never>;
 
+// The actor the dispatcher injects, as far as the apex gates care about it.
+// `isSystemAdmin` is role IDENTITY (lib/db/adminIdentity.ts), stamped by
+// getUserById from users.role_id against the system Admin role — deliberately NOT
+// `role`, which toUser infers from the role row's free-text NAME, so a
+// permissionless custom role called "Commander" (or literally "admin") cleared
+// every gate below. Absent ⇒ not Admin, which is the deny direction here.
+type AdminActor = { id?: number; roleId?: number; isSystemAdmin?: boolean; permissions?: string[] | null } | undefined;
+
+const NOT_ADMIN = 'Only an Admin may perform this action.';
+
 // Danger-Zone (full reset / full wipe) destroys ALL data. Defense beyond the
 // dispatcher's admin:db:destroy perm gate: require the genuine Admin role AND a
 // confirmation phrase validated server-side — the typed phrase must never be a
 // browser-only gate. Fails closed on a missing/incorrect phrase or non-Admin.
+// Deliberately SYNCHRONOUS: it must throw before any DB await, so the destructive
+// RPC is unreachable even in principle (pinned by tests/dangerZoneAuthz.test.ts).
 interface DangerZonePayload extends OrgScopedPayload {
-    user?: { role?: string };
+    user?: AdminActor;
     confirmPhrase?: string;
 }
 
-function assertDangerZone(user: { role?: string } | undefined, confirmPhrase: string | undefined, expected: string): void {
-    if (user?.role !== 'Admin') {
-        throw new Error('Only an Admin may perform this action.');
+function assertDangerZone(user: AdminActor, confirmPhrase: string | undefined, expected: string): void {
+    if (user?.isSystemAdmin !== true) {
+        throw new Error(NOT_ADMIN);
     }
     if (typeof confirmPhrase !== 'string' || confirmPhrase.trim() !== expected) {
         throw new Error(`Confirmation phrase incorrect. Type "${expected}" exactly to proceed.`);
@@ -65,10 +78,61 @@ function assertDangerZone(user: { role?: string } | undefined, confirmPhrase: st
 // merely a delegated permission (admin:access was seeded to the non-Admin
 // Dispatcher). This is the load-bearing fail-closed gate even if the dispatcher's
 // permission mapping is ever loosened. The dispatcher injects `user`.
-function assertAdminRole(user: { role?: string } | undefined): void {
-    if (user?.role !== 'Admin') {
-        throw new Error('Only an Admin may perform this action.');
+function assertAdminRole(user: AdminActor): void {
+    if (user?.isSystemAdmin !== true) {
+        throw new Error(NOT_ADMIN);
     }
+}
+
+// RECOVERY family (db check/repair/prune, the maintenance toggle, force-logout-all).
+// Same bar, but re-resolved CACHE-FREE. The stamped flag comes from getSystemRoles,
+// a 5-minute memo; lib/db/importer.ts full-table-deletes and rebuilds `roles`, and
+// repairDatabase is the tool that re-stamps is_system. Gating repair on the memo
+// repair exists to fix is the circularity that manufactures a lockout — an org
+// steered at "reset the database" by a failed import would be told
+// "Only an Admin may perform this action.", which is false. Accepts the stamped
+// answer when it is already true (no query for the ordinary case) and only pays the
+// round-trip on the deny path.
+async function assertAdminRoleFresh(user: AdminActor): Promise<void> {
+    if (user?.isSystemAdmin === true) return;
+    if (await db.resolveIsSystemAdminFresh(user?.roleId)) return;
+    throw new Error(NOT_ADMIN);
+}
+
+// Domain-scoped destructive resets (treasury / quartermaster wipes) sit on TWO
+// independent bars, both load-bearing. (1) The genuine Admin role, exactly as for
+// the rest of the admin:db:* family. (2) The domain's own management perm — the
+// competence bar the dispatcher's permission map used to carry alone ("a
+// finance-blind dashboard user must not erase the treasury"). That map value is
+// now the family's high-bar admin:db:destroy, because 'admin:' is NOT one of
+// OPTIONAL_FEATURE_NAMESPACES' prefixes: a domain perm there was the ONLY gate,
+// and it let any holder of finance:manage / qm:manage — delegable to a custom
+// role — wipe a module that had never even been enabled. Re-asserting the domain
+// perm HERE narrows and retires nothing.
+function assertDomainResetPerm(user: AdminActor, perm: string): void {
+    assertAdminRole(user);
+    if (Array.isArray(user?.permissions) && user.permissions.includes(perm)) return;
+    throw new SecurityDenial('You do not have permission to reset this module.', {
+        auditEvent: 'authz.db_reset.denied',
+        fields: { userId: user?.id, perm },
+    });
+}
+
+// The testimonial candidate list is a searchable dump of the SAME free-text
+// service_requests.client_feedback column that every other read path redacts
+// per-viewer via redactRequestFeedbackForViewer (lib/db/requests.ts), gated on
+// request:view:feedback. Its mapped perm, admin:config:branding, is a delegatable
+// comms/PR bucket — so branding alone would be a second route around that boundary.
+// The dispatcher denies this before the DB round-trip; asserting it here too keeps
+// the handler safe for any future in-process caller. Predicate matches
+// redactRequestFeedbackForViewer's maySee exactly (the perm alone — no role-name
+// bypass) so the two cannot drift.
+function assertMayReadClientFeedback(user: { id?: number; permissions?: string[] | null } | undefined): void {
+    if (Array.isArray(user?.permissions) && user.permissions.includes('request:view:feedback')) return;
+    throw new SecurityDenial('You do not have permission to read client feedback.', {
+        auditEvent: 'authz.feedback.denied',
+        fields: { userId: user?.id },
+    });
 }
 
 // Config-update handlers: spread `...rest` into the matching db.update*Config
@@ -83,13 +147,15 @@ type AIConfigPayload = OrgScopedPayload & Partial<AIConfig>;
 // injects `user`; the handler asserts the genuine Admin role so this
 // credential-bearing write is not reachable via the operational radio:manage
 // perm (held by the non-Admin Dispatcher for channel CRUD / reboot).
-type RadioConfigPayload = OrgScopedPayload & Partial<RadioConfig> & { user?: { role?: string } };
+type RadioConfigPayload = OrgScopedPayload & Partial<RadioConfig> & { user?: AdminActor };
 type WikiHomeConfigPayload = OrgScopedPayload & Partial<WikiHomeConfig>;
 
 interface ListTestimonialCandidatesPayload extends OrgScopedPayload {
     search?: string;
     limit?: number;
     offset?: number;
+    // Dispatcher-injected actor — read by assertMayReadClientFeedback, never client-supplied.
+    user?: AdminActor;
 }
 
 interface IntelSharingConfigPayload extends OrgScopedPayload {
@@ -186,6 +252,14 @@ interface BulkGrantCommendationPayload extends OrgScopedPayload {
 
 interface TargetUserPayload extends OrgScopedPayload {
     targetUserId: number;
+}
+
+interface PromoteUserPayload extends OrgScopedPayload {
+    targetUserId: number;
+    // Authenticated actor injected by services.ts. promoteUserToMember is a bare
+    // role write with no guard of its own (it is also the HR hire primitive, called
+    // internally with no actor), so the target-side ceiling is asserted here.
+    user: User;
 }
 
 interface RepHistoryPayload {
@@ -405,7 +479,7 @@ interface DeleteLocationPayload extends OrgScopedPayload {
 // these handlers assert the genuine Admin role (fail-closed backstop beyond the
 // admin:db:destroy perm gate) before touching the DB.
 interface DbMaintenancePayload extends OrgScopedPayload {
-    user?: { role?: string };
+    user?: AdminActor;
 }
 interface DbPrunePayload extends DbMaintenancePayload {
     retentionDays: number;
@@ -440,13 +514,27 @@ function validateDiscordChannelIdField(data: { discordChannelId?: string | null 
 }
 
 export const adminActions = {
+    // --- SECURITY AUDIT TRAIL ---
+    // Read-only, and deliberately an RPC rather than an /api/query subset: the rows
+    // carry actor IPs and user ids, so keeping them off the state machinery entirely
+    // means they can never ride the boot bundle or a realtime slice by accident.
+    // Gated on admin:security:view_audit, NOT admin:access - admin:access is a
+    // DISPATCHER default (lib/roleDefaultPermissions.ts), and handing every dispatcher
+    // a queryable log of member IP addresses is not what the admin console implies.
+    'admin:security:list_events': async (payload: {
+        actorUserId?: number; event?: string; since?: string; until?: string;
+        limit?: number; beforeId?: number;
+    }) => db.listSecurityEvents(stripActorFields(payload)),
     // --- SETTINGS & CONFIG ---
     'admin:update_discord_config': async (payload: DiscordConfigPayload) => { await db.updateDiscordSettings(stripActorFields(payload)); },
     'admin:update_hero_config': async (payload: HeroConfigPayload) => { await db.updateHeroCardConfig(stripActorFields(payload)); },
     'admin:update_branding_config': async (payload: BrandingConfigPayload) => { await db.updateBrandingConfig(stripActorFields(payload)); },
     'admin:update_theme_config': async (payload: { enabled?: boolean; accent?: string }) => { await db.updateThemeConfig(stripActorFields(payload)); },
     'admin:update_public_page_config': async (payload: PublicPageConfigPayload) => { await db.updatePublicPageConfig(stripActorFields(payload)); invalidatePublicCache(); },
-    'admin:list_testimonial_candidates': async ({ search, limit, offset }: ListTestimonialCandidatesPayload) => db.getTestimonialCandidates({ search, limit, offset }),
+    'admin:list_testimonial_candidates': async ({ search, limit, offset, user }: ListTestimonialCandidatesPayload) => {
+        assertMayReadClientFeedback(user);
+        return db.getTestimonialCandidates({ search, limit, offset });
+    },
     'admin:update_intel_sharing_config': async ({ config }: IntelSharingConfigPayload) => { await db.updateIntelSharingConfig(config); },
     'admin:update_hr_config': async ({ config }: HRConfigPayload) => { await db.updateHRConfig(config); },
     'admin:get_intel_sharing_config': async () => { return db.getIntelSharingConfig(); },
@@ -483,10 +571,11 @@ export const adminActions = {
         assertIdArray(targetUserIds, MAX_IMPORT_BATCH_SIZE, 'targetUserIds');
         return db.bulkUpdateUserClearances(targetUserIds, userId, levelId, markerIds, markerMode, user);
     },
-    // Bulk demote N users to the org's Client system role. Wraps updateUser
-    // per-target so assertCanAssignRole's privilege guard applies; tier
-    // hierarchy permits demote-down. Used by the over-cap grace banner's
-    // bulk-demote tool to bring an org back under its tier's member cap.
+    // Bulk demote N users to the org's Client system role. The db layer hoists
+    // assertCanAssignRole (fixed target role) and runs assertCanChangeUsersRole per
+    // target with blockPeers, so an Admin-tier row or the actor's own row is counted
+    // as `skipped` rather than written — matching the roster UI, which hides their
+    // checkboxes. Partial success is the contract: one refusal never aborts the batch.
     'admin:bulk_demote_to_client': ({ targetUserIds, user }: BulkUsersWithActorPayload) => {
         assertIdArray(targetUserIds, MAX_IMPORT_BATCH_SIZE, 'targetUserIds');
         return db.bulkDemoteUsersToClient(targetUserIds, user);
@@ -532,7 +621,19 @@ export const adminActions = {
         assertIdArray(targetUserIds, MAX_IMPORT_BATCH_SIZE, 'targetUserIds');
         return db.bulkAwardCommendation(targetUserIds, commendationId, reason ?? null, userId);
     },
-    'admin:promote_user': ({ targetUserId }: TargetUserPayload) => db.promoteUserToMember(targetUserId),
+    // Target-side ceiling only. The action is already gated on
+    // admin:user:update_role and the role it grants is the fixed Member role, so
+    // the missing half was "who may be written OVER" — an unguarded promote is a
+    // demotion by another name against an Admin. assertCanAssignRole is
+    // deliberately NOT added: its tier ladder does not recognise admin:user:update_role
+    // or any hr:* permission, so a delegated Recruiter role scores tier 1 and the
+    // Clients-tab promote plus the HR case-file approval would both start failing.
+    'admin:promote_user': async ({ targetUserId, user }: PromoteUserPayload) => {
+        const sysRoles = await db.getSystemRoles();
+        if (!sysRoles.member) throw new Error('Cannot promote user: Member role not found');
+        await db.assertCanChangeUsersRole(user, targetUserId, sysRoles.member.id);
+        return db.promoteUserToMember(targetUserId);
+    },
     'admin:get_rep_history': ({ targetUserId }: RepHistoryPayload) => db.getReputationHistoryForUser(targetUserId),
     'admin:get_rating_history': ({ userId }: RatingHistoryPayload) => db.getRatingHistoryForUser(userId),
     'admin:toggle_duty': ({ targetUserId }: TargetUserPayload) => db.toggleUserDutyStatus(targetUserId),
@@ -587,7 +688,14 @@ export const adminActions = {
         // When a roleId is being written, gate by assertCanAssignRole — a
         // Discord-role → platform-role mapping is an indirect role-write path
         // (the next sync escalates anyone holding the Discord role).
+        // assertRoleIsMappable additionally refuses the two roles the mapping
+        // dropdown has never offered: Client (shadows every other mapping on the
+        // account and pins its holder off the ladder) and Admin (a standing
+        // escalation primitive administered outside this app — assertCanAssignRole
+        // only blocks that for NON-Admin actors). Clearing a mapping (no rankId and
+        // no roleId) is untouched.
         if (roleId) {
+            await db.assertRoleIsMappable(roleId);
             await db.assertCanAssignRole(user, parseInt(roleId.toString()));
         }
         return db.updateRankMapping(discordRoleId, rankId, roleId);
@@ -604,10 +712,12 @@ export const adminActions = {
     },
     'admin:get_role_details': ({ roleId }: GetRoleDetailsPayload) => db.getRoleDetails(roleId),
     'admin:update_role_permissions': async ({ roleId, permissionNames, user }: UpdateRolePermissionsPayload) => {
-        const sysRoles = await db.getSystemRoles();
-        if (sysRoles.client && sysRoles.client.id === roleId) {
-            throw new Error('The Client role is locked. Its permissions cannot be modified.');
-        }
+        // The Client role's permission set is code-owned. The predicate coerces the
+        // id and fails CLOSED on an unresolvable system role — the `if (sysRoles.client
+        // && …)` shape it replaces silently LIFTED the lock on a getSystemRoles read
+        // fault, which is the one state where it matters most. updateRolePermissions
+        // asserts the same predicate, so the two cannot drift.
+        await db.assertRoleIsNotClient(roleId);
         // Privilege-escalation guard: a non-Admin role manager must not grant
         // permissions they lack (e.g. admin:access) or edit a role at/above their tier.
         await db.assertCanManageRolePermissions(user, roleId, permissionNames);
@@ -648,13 +758,40 @@ export const adminActions = {
     // --- DB MAINTENANCE ---
     // Genuine-Admin gate on the whole family (load-bearing fail-closed backstop to
     // the admin:db:destroy perm enforced by the dispatcher): check is a count oracle
-    // over read-gated domains, repair re-seeds RBAC / promotes an Admin, and prune
-    // issues raw mass DELETEs. None may be triggered by a non-Admin (e.g. Dispatcher).
-    'admin:db:check': ({ user }: DbMaintenancePayload) => { assertAdminRole(user); return db.runDatabaseHealthCheck(); },
-    'admin:db:repair': ({ user }: DbMaintenancePayload) => { assertAdminRole(user); return db.repairDatabase(); },
-    'admin:db:prune': ({ user, retentionDays, targets }: DbPrunePayload) => { assertAdminRole(user); return db.pruneDatabaseData(retentionDays, targets); },
-    'admin:db:reset_finances': () => db.resetFinancesData(),
-    'admin:db:reset_quartermaster': () => db.resetQuartermasterData(),
+    // over read-gated domains, repair re-seeds RBAC / promotes an Admin, prune
+    // issues raw mass DELETEs, and the two module resets delete every treasury /
+    // quartermaster row outright. None may be triggered by a non-Admin (e.g.
+    // Dispatcher).
+    'admin:db:check': async ({ user }: DbMaintenancePayload) => { await assertAdminRoleFresh(user); return db.runDatabaseHealthCheck(); },
+    'admin:db:repair': async ({ user }: DbMaintenancePayload) => { await assertAdminRoleFresh(user); return db.repairDatabase(); },
+    'admin:db:prune': async ({ user, retentionDays, targets }: DbPrunePayload) => { await assertAdminRoleFresh(user); return db.pruneDatabaseData(retentionDays, targets); },
+    // Re-encrypt every at-rest secret under the CURRENT SECRETS_ENCRYPTION_KEY, so the
+    // previous key can be removed from the environment. Same genuine-Admin bar as the rest
+    // of this family. Values that decrypt under NEITHER key are counted and SKIPPED, never
+    // written back — a rotation tool must not be able to destroy the credentials it was
+    // pointed at.
+    'admin:db:rotate_secrets': async ({ user }: DbMaintenancePayload) => {
+        await assertAdminRoleFresh(user);
+        const result = await db.rotateSecretsEncryption();
+        // Structural guard, same shape as the dispatcher's auditDenial: `void` protects a
+        // caller from a REJECTED promise, not from an absent export in a partial test double.
+        // A failed audit write must never fail the rotation that already happened.
+        try {
+            void db.recordSecurityEvent({
+                event: result.failed > 0 ? 'secrets.rotation.incomplete' : 'secrets.rotation.completed',
+                action: 'admin:db:rotate_secrets',
+                actorUserId: user?.id ?? null,
+                outcome: 'allowed',
+                details: { ...result },
+            });
+        } catch { /* audit is best-effort; it must never fail the operation */ }
+        return result;
+    },
+    // These two carried NO guard at all — only the dispatcher's map entry, and that
+    // entry was the domain perm rather than the family's high bar, so the comment
+    // above was false for exactly the two rawest DELETEs in it. Both bars now apply.
+    'admin:db:reset_finances': ({ user }: DbMaintenancePayload) => { assertDomainResetPerm(user, 'finance:manage'); return db.resetFinancesData(); },
+    'admin:db:reset_quartermaster': ({ user }: DbMaintenancePayload) => { assertDomainResetPerm(user, 'qm:manage'); return db.resetQuartermasterData(); },
     // Danger Zone. userId is the dispatcher-injected acting admin (ACTOR_ID_FIELDS),
     // never client-supplied — full_reset restores exactly that account. The typed
     // confirmation phrase is validated HERE (server-side) — never trust the
@@ -671,11 +808,11 @@ export const adminActions = {
 
     // --- Maintenance mode + force-logout (org-wide operational settings) ---
     'admin:get_platform_settings': () => db.getPlatformSettings(),
-    'admin:update_platform_settings': ({ user, maintenanceMode, maintenanceMessage }: { user?: { role?: string }; maintenanceMode?: boolean; maintenanceMessage?: string }) => {
+    'admin:update_platform_settings': async ({ user, maintenanceMode, maintenanceMessage }: { user?: AdminActor; maintenanceMode?: boolean; maintenanceMessage?: string }) => {
         // Genuine-Admin gate: enabling maintenance mode locks out every non-Admin
         // (including the actor) until a true Admin lifts it — a non-Admin must never
         // be able to trigger that irreversible-to-them lockout.
-        assertAdminRole(user);
+        await assertAdminRoleFresh(user);
         const patch: Record<string, unknown> = {};
         if (maintenanceMode !== undefined) patch.maintenance_mode = !!maintenanceMode;
         if (maintenanceMessage !== undefined) patch.maintenance_message = String(maintenanceMessage);
@@ -684,8 +821,8 @@ export const adminActions = {
     // Timestamp is set server-side (now) so a client can't backdate it; tokens
     // issued before it are 401'd by the dispatcher/read-path enforcement. Advancing
     // it kills EVERY live session platform-wide — genuine Admin only.
-    'admin:force_logout_all': ({ user }: { user?: { role?: string } }) => {
-        assertAdminRole(user);
+    'admin:force_logout_all': async ({ user }: { user?: AdminActor }) => {
+        await assertAdminRoleFresh(user);
         return db.updatePlatformSettings({ force_logout_timestamp: new Date().toISOString() });
     },
     // Revoke ONE user's live sessions (compromised/leaked token) without removing

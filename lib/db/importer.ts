@@ -19,11 +19,16 @@
 
 import { randomBytes } from 'node:crypto';
 import { supabase } from './common.js';
+import { cache } from '../cache.js';
+import { IMPORTED_BALLOT_HASH_PREFIX } from './importedBallot.js';
+import { enforceClientRolePermissionLock } from './clientRoleLock.js';
 import { log as baseLog } from '../log.js';
-import { sanitizeImageUrl } from '../imageUrl.js';
+import { sanitizeImageUrl, sanitizeImageUrlOrLocalPath } from '../imageUrl.js';
 import { sanitizePublicLinkUrl } from '../linkUrl.js';
 import { stripHtml } from '../textSanitize.js';
 import { sanitizeTiptapJson, tryParseTiptapJson } from '../tiptapValidate.js';
+import { normalizeDocMediaForStorage, MAX_DOC_IMAGES } from '../orgMediaDocs.js';
+import { collectImageSrcs } from '../tiptapValidate.js';
 import { sanitizeRichHtml } from '../htmlSanitize.js';
 
 const log = baseLog.child({ module: 'db.importer' });
@@ -44,15 +49,20 @@ const INSERT_BATCH = 200;
 interface PostgrestErrorShape { message: string; code?: string; details?: string | null; hint?: string | null }
 interface WriteResult { data: Record<string, unknown>[] | null; error: PostgrestErrorShape | null; }
 interface SelectResult { data: Record<string, unknown>[] | null; error: PostgrestErrorShape | null; count?: number | null; }
+/** The read half of the shim. `order` is here because `.range()` paging without an ORDER BY is
+ *  undefined ACROSS PAGES — rows can repeat and rows can be skipped — so every paged read in
+ *  this module must be able to state one. */
+interface SelectChain {
+    eq: (c: string, v: unknown) => Insertable & SelectChain;
+    in: (c: string, v: unknown[]) => Insertable & SelectChain;
+    order: (c: string, opts?: { ascending?: boolean }) => Insertable & SelectChain;
+    range: (a: number, b: number) => PromiseLike<SelectResult>;
+}
 interface Insertable extends PromiseLike<WriteResult> {
     insert: (rows: Record<string, unknown>[] | Record<string, unknown>) => Insertable;
     update: (patch: Record<string, unknown>) => Insertable & { eq: (c: string, v: unknown) => PromiseLike<WriteResult> };
     delete: () => { neq: (c: string, v: unknown) => PromiseLike<WriteResult>; eq: (c: string, v: unknown) => PromiseLike<WriteResult>; in: (c: string, v: unknown[]) => PromiseLike<WriteResult> };
-    select: (sel: string, opts?: { count?: 'exact'; head?: boolean }) => Insertable & {
-        eq: (c: string, v: unknown) => Insertable;
-        in: (c: string, v: unknown[]) => Insertable;
-        range: (a: number, b: number) => PromiseLike<SelectResult>;
-    };
+    select: (sel: string, opts?: { count?: 'exact'; head?: boolean }) => Insertable & SelectChain;
     eq: (c: string, v: unknown) => Insertable;
 }
 const sb = supabase as unknown as {
@@ -143,12 +153,14 @@ const USERS_COLUMNS = 'id, auth_user_id, created_at, discord_id, name, avatar_ur
 // ---------------------------------------------------------------------------
 
 /** Self-referential FK columns to NULL on first pass and restore on second pass. */
-const SELF_REF_FKS: Record<string, string[]> = {
+export const SELF_REF_FKS: Record<string, string[]> = {
     units: ['parent_unit_id'],
     locations: ['parent_id'],
     quartermaster_locations: ['parent_id'],
     fleet_groups: ['parent_id'],
     operation_command_nodes: ['parent_id'],
+    // A seat's parent is the ship it belongs to, and both live in this table.
+    operation_ship_slots: ['parent_slot_id'],
     wiki_pages: ['parent_page_id'],
     government_elections: ['parent_election_id'],
     government_legislation: ['parent_legislation_id', 'repealed_by_legislation_id'],
@@ -160,7 +172,7 @@ const SELF_REF_FKS: Record<string, string[]> = {
 // import, once the referenced rows exist. The only one today: units.leader_id → users,
 // while users.unit_id → units (units is exported before users). Restore is tolerant —
 // a referenced row missing from the export leaves the (nullable) FK null.
-const DEFERRED_FKS: Record<string, string[]> = {
+export const DEFERRED_FKS: Record<string, string[]> = {
     units: ['leader_id'],
 };
 
@@ -170,9 +182,42 @@ const DEFERRED_FKS: Record<string, string[]> = {
 // alliance_peers, empty on a fresh self-hosted instance. The column is nullable, so the
 // report/warrant imports WITHOUT the (now-meaningless) federated source link rather than
 // orphaning on the FK.
-const NULL_FKS: Record<string, string[]> = {
+export const NULL_FKS: Record<string, string[]> = {
     intel_reports: ['source_feed_id'],
     warrants: ['source_feed_id'],
+};
+
+/**
+ * Columns naming ANOTHER deployment's Discord guild, or carrying its consent.
+ *
+ * IMPORT IS NOT CONSENT. `discord_start_notice` is the org's decision to publish an
+ * operation into ITS guild; carrying it across means importing someone else's
+ * operations schedules unattended posts in yours, from a decision nobody here made.
+ * The two channel/message ids are worse in a quieter way — they point at a channel in
+ * the SOURCE guild, so an edit to an imported operation would try to update a message
+ * this bot cannot see, and the start notice would aim at a channel id that means
+ * nothing here.
+ *
+ * Nulled rather than dropped, so an operator who wants notices on an imported
+ * operation re-opts-in deliberately through the UI. That is the whole point.
+ */
+export const FOREIGN_INTEGRATION_COLUMNS: Record<string, string[]> = {
+    operations: [
+        'discord_start_notice',
+        'discord_start_notice_sent_at',
+        'discord_announcement_channel_id',
+        'discord_announcement_message_id',
+        'discord_event_id',
+    ],
+    // Same rule, and the reason it belongs here is that this one is DURABLE where the
+    // operations columns are per-event. `service_types.discord_channel_id` routes the
+    // notification for EVERY new service request of that type, so an import carrying it
+    // verbatim points the receiving org's live request traffic at a channel in the
+    // SOURCE guild — indefinitely, and silently, because the bot simply fails to post
+    // and nothing surfaces it. If the source deployment is hostile (or is merely a
+    // shared template someone published), that is an ongoing egress of the importing
+    // org's request activity to a guild they do not control.
+    service_types: ['discord_channel_id'],
 };
 
 // FK columns pointing at a row that THIS import may have dropped on a required
@@ -190,6 +235,9 @@ export const DROPPED_PARENT_FKS: Record<string, { col: string; parent: string; n
     // user_ships.ship_id is NOT NULL → an unsynced ship model drops the hangar row.
     fleet_group_ships: [{ col: 'user_ship_id', parent: 'user_ships', nullable: false }],
     operation_participants: [{ col: 'user_ship_id', parent: 'user_ships', nullable: true }],
+    // Same shape and same reasoning: an unsynced hangar ship costs the "bringing
+    // this ship" attribution on a seat, never the seat itself.
+    operation_slot_assignments: [{ col: 'user_ship_id', parent: 'user_ships', nullable: true }],
     // quartermaster_inventory rows for PLATFORM catalog items drop when the item
     // catalog is unsynced. Both dependants' inventory_id is NOT NULL (ON DELETE
     // RESTRICT), so they cannot survive their parent — but they can at least be
@@ -203,9 +251,72 @@ export const DROPPED_PARENT_FKS: Record<string, { col: string; parent: string; n
 // pre-hardening NDJSON could otherwise import a verification token, pending
 // rename, or hashed credential verbatim. Dropped (not nulled) in prepareRow so a
 // column the fork schema lacks is simply absent rather than a stray null insert.
-const SECRET_DROP_COLUMNS = new Set<string>([
-    'rsi_verification_code', 'rsi_handle_pending', 'key_hash', 'password_hash', 'webhook_secret',
+//
+// This set is now EXACTLY the hosted exporter's GLOBAL_DROP. `voter_hash` was the
+// one member missing from the mirror, and that single omission cost every secret
+// election ballot on every import (see SYNTHESIZED_NOT_NULL). It belongs here in its
+// own right even though the ballot table gets a value written back below: a crafted
+// NDJSON carrying voter_hash === computeVoterHash(motionId, userId) would consume a
+// real member's one-vote slot on `government_motion_votes` via uq_gov_motion_vote_hash
+// and lock them out of an open motion, and on `government_election_votes` it would
+// forge the imported-ballot marker the ranked-choice tally refuses on.
+export const SECRET_DROP_COLUMNS = new Set<string>([
+    'rsi_verification_code', 'rsi_handle_pending', 'voter_hash', 'key_hash', 'password_hash', 'webhook_secret',
 ]);
+
+/** A unique, non-identifying stand-in for a dropped voter_hash. Random per ROW —
+ *  never constant (a constant collapses every voter's vote for one candidate onto a
+ *  single row under uq_gov_election_vote, so the table would report 1 vote per
+ *  candidate) and never derived from a user id (see SYNTHESIZED_NOT_NULL). */
+function syntheticVoterHash(): string {
+    return IMPORTED_BALLOT_HASH_PREFIX + randomBytes(16).toString('hex');
+}
+
+// Columns this schema requires NOT NULL that the export withholds BY DESIGN, with the
+// value to supply and the line that tells the operator what it cost them.
+//
+// WITHOUT AN ENTRY the whole table 23502s: the batch insert fails, every row is retried
+// alone, fails again, and is discarded into skipBreakdown.constraintViolation —
+// indistinguishable from an FK orphan. That is exactly what happened to every
+// government_election_votes row of every import.
+//
+// WHY NOT RECOMPUTE. This instance holds the pepper and imports
+// government_election_voter_registry intact (election_id + real user_id), so it COULD
+// derive a genuine computeVoterHash(electionId, userId) for every voter. That would
+// MANUFACTURE, locally, precisely the voter→ballot map the exporter drops the column to
+// prevent — the de-anonymisation attack, presented as an audit record. It is also
+// arithmetically impossible to do correctly: the exporter content-orders ballots by
+// (election_id, candidate_id, rank_order, id) and drops id + cast_at so that row order
+// carries no voter signal, leaving no true assignment to recover.
+//
+// WHY NOT MAKE THE COLUMN NULLABLE. (a) schema.sql is a re-runnable convergence script,
+// so dropping NOT NULL weakens the column permanently — for live votes too, not just
+// imported ones. (b) tallyPreferentialFull groups by voter_hash, so every imported row
+// would land under the single Map key `null`: one giant ballot ranking the whole field,
+// which is worse than refusing. What nullable does NOT cost is the anti-stuffing index:
+// uq_gov_election_vote is (election_id, candidate_id, voter_hash) and Postgres treats
+// NULLs as distinct, but a random-per-row hash is exactly as distinct — imported rows
+// sit outside that index's reach under EITHER design, and the registry UNIQUE is the
+// election's real one-person-one-vote guard.
+//
+// WHAT SURVIVES. Per-candidate totals are EXACT — the export keeps one row per
+// (voter, candidate) — so plurality / approval / simple-majority / proportional re-tally
+// correctly on imported ballots and must NOT be guarded. Only the per-voter GROUPING is
+// gone, and only ranked-choice needs it.
+//
+// Every column named here MUST also be in SECRET_DROP_COLUMNS: prepareRow writes the
+// synthesised value UNCONDITIONALLY (that is what makes the marker unforgeable), so an
+// entry for a column the export legitimately carries would destroy real data.
+// tests/importTableSetInvariants.test.ts pins both halves against schema.sql.
+export const SYNTHESIZED_NOT_NULL: Record<string, {
+    columns: Record<string, () => unknown>;
+    warning: (inserted: number) => string;
+}> = {
+    government_election_votes: {
+        columns: { voter_hash: syntheticVoterHash },
+        warning: (n) => `government_election_votes: ${n} ballot(s) imported without their voter linkage — an org export withholds it by design so the ballots stay secret. Per-candidate totals are exact and one-vote-per-member is still guarded by the imported voter registry. A RANKED-CHOICE election among them can never be re-tallied here (ballots cast here afterwards do not repair it) and closes as Cancelled if advanced — record its result from the source deployment.`,
+    },
+};
 
 /**
  * Catalog FK remap config. The exporter embedded the remote catalog row's stable
@@ -302,6 +413,14 @@ export const CATALOG_REMAPS: Record<string, CatalogRemap> = {
     // nullifies it + embeds the same key object, so an unresolvable model costs the
     // ship attribution on that participant, never the participation record itself.
     operation_participants: {
+        ...PLATFORM_SHIP_REMAP,
+        fkColumn: 'ship_id',
+        required: false,
+    },
+    // operation_ship_slots.ship_id is the same nullable platform-catalog reference.
+    // A slot whose designated ship model is unsynced keeps its LABEL — which is what
+    // the panel actually renders — and loses only the catalog link.
+    operation_ship_slots: {
         ...PLATFORM_SHIP_REMAP,
         fkColumn: 'ship_id',
         required: false,
@@ -457,7 +576,15 @@ async function buildCatalogIndex(remap: CatalogRemap): Promise<Map<string, numbe
     const PAGE = 1000;
     let from = 0;
     for (;;) {
-        const q = sb.from(remap.catalogTable).select(remap.catalogSelect);
+        // ORDERED BY id, and it is load-bearing rather than tidiness. The first-write-wins
+        // rule below states that "catalog rows arrive in id order" — but nothing established
+        // that order, so the claim was false. `.range()` paging without an ORDER BY is
+        // undefined ACROSS PAGES in Postgres: rows can repeat and rows can be skipped between
+        // one page and the next. That made the winner of a duplicate `n:` key depend on page
+        // boundaries, which is exactly the outcome the comment says must not happen, and it
+        // could also drop a catalog row from the index entirely — turning an import overwrite
+        // into a duplicate insert.
+        const q = sb.from(remap.catalogTable).select(remap.catalogSelect).order('id', { ascending: true });
         const { data, error } = await q.range(from, from + PAGE - 1);
         if (error) {
             if (error.code === '42P01' || error.code === 'PGRST205') break; // table missing → empty index
@@ -585,6 +712,11 @@ function prepareRow(
     const nullCols = NULL_FKS[table];
     if (nullCols) for (const c of nullCols) if (row[c] != null) row[c] = null;
 
+    // 1c. Neutralise references to the SOURCE deployment's Discord guild, and its
+    // consent to post there. See FOREIGN_INTEGRATION_COLUMNS — import is not consent.
+    const foreignCols = FOREIGN_INTEGRATION_COLUMNS[table];
+    if (foreignCols) for (const c of foreignCols) if (c in row) row[c] = null;
+
     // 2. Strip embed aliases (joined objects, never columns).
     for (const k of STRIP_ALWAYS) if (k in row) delete row[k];
 
@@ -593,6 +725,14 @@ function prepareRow(
 
     // 3. Defensive: drop organization_id if a stray slipped through.
     if ('organization_id' in row) delete row.organization_id;
+
+    // 3b. Supply columns this schema requires NOT NULL that the export withholds.
+    // Runs AFTER step 2b, which has already deleted any inbound value — so what is
+    // written here is always OURS and a crafted NDJSON cannot suppress the
+    // IMPORTED_BALLOT_HASH_PREFIX marker the ranked-choice tally keys off. That is
+    // why the assignment is unconditional rather than a `?? make()` fill-in.
+    const synth = SYNTHESIZED_NOT_NULL[table];
+    if (synth) for (const [col, make] of Object.entries(synth.columns)) row[col] = make();
 
     // 4. Self-ref FK two-pass: capture + null.
     let selfRef: Record<string, unknown> | null = null;
@@ -744,6 +884,7 @@ export const SEQUENCE_BACKED = new Set<string>([
     'user_hr_position_history', 'fleet_groups', 'user_ships', 'fleet_group_ships',
     'status_history', 'operation_templates', 'operation_phases', 'operation_tasks',
     'operation_schedule_entries', 'operation_board_elements', 'operation_command_nodes',
+    'operation_ship_slots', 'operation_slot_assignments',
     'operation_log_entries', 'operation_logistics', 'operation_aar_entries',
     'warrant_notes', 'hr_interview_templates', 'hr_interview_questions',
     'hr_interview_panel', 'hr_interview_responses', 'government_branches',
@@ -780,6 +921,7 @@ export const IMPORTABLE_TABLES = new Set<string>([
     'operation_board_elements', 'operation_command_nodes', 'operation_log_entries',
     'operation_logistics', 'operation_aar_entries', 'operation_reminders',
     'operation_limiting_markers', 'operation_locations',
+    'operation_ship_slots', 'operation_slot_assignments',
     'intel_reports', 'intel_report_limiting_markers', 'intel_bulletins',
     'intel_bulletin_limiting_markers', 'warrants', 'warrant_notes',
     'hr_interview_templates', 'hr_interview_questions', 'hr_applications',
@@ -855,8 +997,11 @@ const SETTINGS_IMPORT_DENYLIST = new Set<string>([
     // Deployment bootstrap / runtime state — never portable. Importing these would
     // shadow or falsely satisfy THIS install's first-boot + schema state (e.g. an
     // imported admin_setup_code lets an export holder claim Admin; an imported
-    // setup_completed skips first-boot; schema_version is owned by schema.sql).
-    'admin_setup_code', 'setup_completed', 'schema_version',
+    // setup_completed skips first-boot; schema_version is owned by schema.sql; an
+    // imported role_permission_backfills marker (lib/db/roleDefaults.ts) claims a
+    // one-shot role-defaults grant already ran HERE, so the next Repair declines it
+    // and the imported roles keep whatever the source install's grants were).
+    'admin_setup_code', 'setup_completed', 'schema_version', 'role_permission_backfills',
     // Operational / runtime state — importing a doctored export must not be able to
     // bootstrap a fresh instance into maintenance mode / a force-logout loop
     // (platformSettings), flip module toggles (orgFeatures), surface a stale
@@ -899,21 +1044,59 @@ function importImageUrl(val: unknown): string {
     return sanitizeImageUrl(val) || '';
 }
 
-const IMPORT_HTML_TAG_RE = /<[^>]*>/g;
-
-// Mirrors updateBrandingConfig: termsOfService is rich HTML rendered with
-// dangerouslySetInnerHTML → sanitizeRichHtml.
-function sanitizeBrandingConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
-    return typeof cfg.termsOfService === 'string'
-        ? { ...cfg, termsOfService: sanitizeRichHtml(cfg.termsOfService) }
-        : cfg;
+// brandingConfig.iconUrl additionally accepts the shipped same-origin asset paths
+// (the seeded default is '/media/cross-swords.png'), so it needs the OrLocalPath
+// variant — the https-only one would blank the default logo of every deployment on
+// import. Same resilient clear as importImageUrl.
+function importIconUrl(val: unknown): string {
+    if (val == null || val === '') return '';
+    return sanitizeImageUrlOrLocalPath(val) || '';
 }
 
-// Mirrors updateHeroCardConfig: backgroundImageUrl → sanitizeImageUrl || ''.
+// Public-link fields (hero card hrefs, the branding sound URLs) — resilient clear of
+// anything sanitizePublicLinkUrl refuses. updateBrandingConfig/updateHeroCardConfig
+// THROW on these instead; the import path keeps the never-throw contract stated above,
+// so the surviving VALUES match the admin write path even though the failure mode
+// differs (same divergence importImageUrl already documents).
+function importLinkUrl(val: unknown): string {
+    if (val == null || val === '') return '';
+    return sanitizePublicLinkUrl(val) || '';
+}
+
+// Mirrors updateBrandingConfig's BRANDING_SOUND_URL_FIELDS.
+const IMPORT_BRANDING_SOUND_URL_FIELDS = [
+    'bootSoundUrl', 'newRequestSoundUrl', 'assignmentSoundUrl',
+    'eamSoundUrl', 'radioMicCueUrl', 'radioSquelchUrl', 'notificationSoundUrl',
+] as const;
+
+const IMPORT_HTML_TAG_RE = /<[^>]*>/g;
+
+// Mirrors updateBrandingConfig: termsOfService → sanitizeRichHtml (keyed on presence,
+// so a non-string can't slip through); iconUrl → sanitizeImageUrlOrLocalPath; themeColor
+// → strict hex or dropped; every audio URL → sanitizePublicLinkUrl. Without the URL
+// fields a crafted export re-seeds exactly the values the admin write path now refuses.
+function sanitizeBrandingConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    const safe: Record<string, unknown> = { ...cfg };
+    if ('termsOfService' in safe) safe.termsOfService = sanitizeRichHtml(safe.termsOfService);
+    if ('iconUrl' in safe) safe.iconUrl = importIconUrl(safe.iconUrl);
+    if ('themeColor' in safe) {
+        const color = sanitizeThemeColorValue(safe.themeColor);
+        if (color) safe.themeColor = color; else delete safe.themeColor;
+    }
+    for (const f of IMPORT_BRANDING_SOUND_URL_FIELDS) {
+        if (f in safe) safe[f] = importLinkUrl(safe[f]);
+    }
+    return safe;
+}
+
+// Mirrors updateHeroCardConfig: backgroundImageUrl → sanitizeImageUrl || '';
+// discordUrl/organizationUrl are rendered as <a href> → sanitizePublicLinkUrl.
 function sanitizeHeroCardConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
-    return 'backgroundImageUrl' in cfg
-        ? { ...cfg, backgroundImageUrl: importImageUrl(cfg.backgroundImageUrl) }
-        : cfg;
+    const safe: Record<string, unknown> = { ...cfg };
+    if ('backgroundImageUrl' in safe) safe.backgroundImageUrl = importImageUrl(safe.backgroundImageUrl);
+    if ('discordUrl' in safe) safe.discordUrl = importLinkUrl(safe.discordUrl);
+    if ('organizationUrl' in safe) safe.organizationUrl = importLinkUrl(safe.organizationUrl);
+    return safe;
 }
 
 // Mirrors updateOpenGraphConfig: image fields → sanitizeImageUrl || ''; themeColor
@@ -987,6 +1170,47 @@ function sanitizeSystemConfigValue(cfg: Record<string, unknown>): Record<string,
     return safe;
 }
 
+/**
+ * Mirrors updateWikiHomeConfig's write-boundary sanitisers (resilient variant, per this
+ * file's convention — clears invalid input rather than throwing so the import never aborts).
+ *
+ * THIS WAS THE ONE TIPTAP-BEARING SETTINGS KEY WITH NO CASE IN THE SWITCH BELOW, which meant
+ * POST /api/admin/import-stream wrote an attacker-supplied wiki-home document verbatim — in
+ * direct contradiction of this function's own contract, which names sanitizeTiptapJson as one
+ * of the sanitisers it re-applies. There are exactly two writers of that settings row:
+ * updateWikiHomeConfig (sanitising) and this importer (which was not).
+ *
+ * It was masked, not harmless: the client posts {...config, <one field>} on every wiki-home
+ * save, so the next save accidentally laundered the imported row through the sanitiser. The
+ * untouched-round-trip passthrough added to updateWikiHomeConfig removes that laundering, so
+ * without this case an unsanitised imported document would become PERMANENT.
+ *
+ * Severity, stated honestly: server.ts ships script-src with no 'unsafe-inline' and an
+ * explicit frame-src allowlist, so this is defence-in-depth erosion rather than live XSS.
+ * What CSP does NOT cover is what an unsanitised doc keeps — a target="_blank" link without
+ * the rel="noopener noreferrer" that sanitizeMark forces (reverse tabnabbing), and data:
+ * image srcs that safeUrl would have rejected.
+ */
+function sanitizeWikiHomeConfigValue(cfg: Record<string, unknown>): Record<string, unknown> {
+    const safe: Record<string, unknown> = { ...cfg };
+    if (safe.welcomeContent) {
+        const doc = normalizeDocMediaForStorage(sanitizeTiptapJson(safe.welcomeContent, 'wiki'));
+        // The per-doc image cap is enforced on every interactive save, so a LEGITIMATE export
+        // cannot exceed it — the source org's own save path refused anything larger. A bundle
+        // that does is hand-crafted, and the doc it carries feeds the media GC's reference
+        // set, which is pinned permanently uncappable. Drop the document rather than abort
+        // the whole import; the welcome text is one settings blob and is easily re-authored.
+        safe.welcomeContent = collectImageSrcs(doc).size > MAX_DOC_IMAGES ? null : doc;
+    }
+    if (safe.featuredPageIds !== undefined) {
+        safe.featuredPageIds = (Array.isArray(safe.featuredPageIds) ? safe.featuredPageIds : [])
+            .filter((id): id is string => typeof id === 'string')
+            .slice(0, 50);
+    }
+    if (safe.hideRecentlyUpdated !== undefined) safe.hideRecentlyUpdated = !!safe.hideRecentlyUpdated;
+    return safe;
+}
+
 /** Re-apply the admin-console write-boundary sanitizers to ONE imported settings
  *  row's `value`, keyed by the settings key. Keys with no sanitizing write path
  *  (and non-object values) pass through unchanged. */
@@ -1000,9 +1224,14 @@ function sanitizeImportedSettingRow(row: Record<string, unknown>): Record<string
         case 'openGraphConfig': return { ...row, value: sanitizeOpenGraphConfigValue(cfg) };
         case 'heroCardConfig': return { ...row, value: sanitizeHeroCardConfigValue(cfg) };
         case 'systemConfig': return { ...row, value: sanitizeSystemConfigValue(cfg) };
+        case 'wikiHomeConfig': return { ...row, value: sanitizeWikiHomeConfigValue(cfg) };
         default: return row;
     }
 }
+
+/** Test seam. The switch above is module-private; tests drive it directly rather than
+ *  standing up a whole NDJSON import stream to exercise one settings row. */
+export const __sanitizeImportedSettingRowForTest = sanitizeImportedSettingRow;
 
 // ---------------------------------------------------------------------------
 // Optional-module toggles from the export HEADER (`sourceOrg.features`).
@@ -1020,7 +1249,7 @@ function sanitizeImportedSettingRow(row: Record<string, unknown>): Record<string
 // every dimension: a fixed allowlist of the five keys this fork actually gates on,
 // each value coerced through `=== true` (so no object, string or truthy value can
 // smuggle anything through), rebuilt into the fork's own `{ enabled }` shape rather
-// than passed through. Unknown hosted keys (starcomms, blueprints) are ignored, and
+// than passed through. Unknown hosted keys (starcomms) are ignored, and
 // the two DEFAULT-ON keys (leaderboard, externalTools) are never named here — the
 // header does not carry them, and writing `false` for an absent key would switch OFF
 // modules the source org never disabled.
@@ -1036,6 +1265,12 @@ const IMPORTABLE_FEATURE_MODULES: Readonly<Record<string, string>> = {
     academy: 'Academy',
     finances: 'Finances',
     quartermaster: 'Quartermaster',
+    // The TOGGLE only. blueprints / blueprint_requests are deliberately NOT in
+    // IMPORTABLE_TABLES: importing the rows would need sequence-repair entries and a
+    // move of tests/importTableSetInvariants.test.ts, and a registry is per-install
+    // state rather than org configuration. An import therefore lands the module in
+    // whichever position the source org had it, with an empty registry.
+    blueprints: 'Blueprint Manager',
 };
 
 /**
@@ -1145,6 +1380,13 @@ async function reanchorAdminOntoImportedUser(
     };
     const { error: upErr } = await sb.from('users').update(patch).eq('id', importedUserId);
     if (upErr) throw new Error(`Merge re-anchor failed binding admin onto user #${importedUserId}: ${upErr.message}`);
+    // The re-anchored admin now sits on the IMPORTED Admin role id. Drop the memo
+    // before server.ts mints their fresh session token, or resolveIsSystemAdmin
+    // compares that id against pre-import slots pointing at rows SEEDED_PRECLEAR
+    // deleted — denying the genuine admin every apex gate (maintenance escape, db
+    // repair) for the rest of the 5-minute TTL, or granting them to whoever holds
+    // the colliding imported id.
+    cache.invalidate('system_roles');
     return { userId: importedUserId, roleId: adminRoleId };
 }
 
@@ -1155,9 +1397,11 @@ async function reanchorAdminOntoImportedUser(
  * imported (see SEEDED_PRECLEAR note). So any permission this fork gates on that
  * the source org never had — e.g. `admin:config:catalog` (the Ship/Item/
  * Commodity/Location catalogs) — ends up granted to NO role, 403-ing the Admin.
- * The server's permission gate is a pure `permissions.includes(perm)` with no
- * super-admin bypass (api/services.ts) — the Admin "bypasses" only by holding
- * EVERY permission, exactly as the first-boot seeder grants it
+ * The server's permission gate is a `permissionSatisfied` lookup over the granted
+ * `permissions` (lib/permissionImplications.ts — a bare includes() plus three
+ * same-domain ladder rows) with no super-admin bypass (api/services.ts): nothing in
+ * that table reaches `admin:config:catalog`, so the reasoning below is unchanged —
+ * the Admin "bypasses" only by holding EVERY permission, exactly as the seeder grants it
  * (`adminPerms = permissions.map(p => p.name)`). Re-assert that invariant after
  * every import: grant the full local catalog to the Admin role. Idempotent —
  * only the missing grants are inserted, so no PK conflict on existing ones.
@@ -1178,6 +1422,65 @@ async function ensureAdminRoleHasAllPermissions(): Promise<number> {
     if (error) { log.error('post-import admin permission reconcile failed', { error: error.message }); return 0; }
     log.info('post-import admin permission reconcile', { added: missing.length });
     return missing.length;
+}
+
+/**
+ * Post-import role-permission reconciliation, BOTH directions:
+ *  - Admin must hold this FORK's full catalog (the export can only carry the source
+ *    org's permissions) — ensureAdminRoleHasAllPermissions, above; and
+ *  - Client must hold ONLY CLIENT_DEFAULT_PERMS. role_permissions is precleared and
+ *    replaced by the export's grants, so an export whose Client role carried
+ *    admin:access imported verbatim and escalated every Client in the org until
+ *    someone happened to click Database Repair. Same reconvergence repairDatabase
+ *    applies — an import must not be the one write path that skips it.
+ *
+ * The Client role is resolved by NAME with a direct query, exactly as the Admin
+ * reconcile above does and for the same reason: PRE_CLEAR deleted and re-inserted
+ * the whole roles table, so getSystemRoles' five-minute memo is stale by
+ * construction here and the strip is a DELETE — a mis-resolve would silently gut
+ * another imported role's grants.
+ *
+ * NEVER throws. Every neighbouring reconcile in this module returns a count and
+ * logs; a throw here would report failure for an import whose rows are all already
+ * written, and in merge mode it would fire the caller's restoreAdminRow over the
+ * admin the re-anchor has just bound. Faults come back as warnings — that is this
+ * module's refusal-vs-failure contract. Exported so the step can be pinned directly.
+ */
+export async function reconcileRolePermissionsAfterImport(): Promise<{ adminGrantsAdded: number; clientStripped: number; warnings: string[] }> {
+    const adminGrantsAdded = await ensureAdminRoleHasAllPermissions();
+    const warnings: string[] = [];
+    let clientStripped = 0;
+
+    // The roles table was replaced wholesale; drop the memo before anything else
+    // resolves a system role off it. The merge re-anchor does the same, but it only
+    // runs for merges.
+    cache.invalidate('system_roles');
+
+    const { data: roleRows, error: roleErr } = await sb.from('roles').select('id').eq('name', 'Client') as unknown as SelectResult;
+    if (roleErr) {
+        const msg = `Could not check the imported Client role's permissions: ${roleErr.message}. Run Admin → Database Tools → Repair Database.`;
+        log.error('post-import client role resolve failed', { error: roleErr.message });
+        warnings.push(msg);
+        return { adminGrantsAdded, clientStripped, warnings };
+    }
+    const clientRoleId = (roleRows || [])[0]?.id as number | undefined;
+    // No role named "Client" means the imported org has no Client tier at all —
+    // nothing to reconverge, and no ordinal fallback: a destructive strip must never
+    // run off "the lowest-id role".
+    if (clientRoleId == null) {
+        log.info('post-import client role reconcile skipped — no role named Client');
+        return { adminGrantsAdded, clientStripped, warnings };
+    }
+
+    try {
+        ({ stripped: clientStripped } = await enforceClientRolePermissionLock(clientRoleId));
+    } catch (e) {
+        const msg = 'Could not reconverge the imported Client role onto this build\'s Client defaults. '
+            + 'Run Admin → Database Tools → Repair Database.';
+        log.error('post-import client role lock failed', { err: e });
+        warnings.push(msg);
+    }
+    return { adminGrantsAdded, clientStripped, warnings };
 }
 
 /** Best-effort restore of the admin row freed for a merge, used when the import
@@ -1395,6 +1698,13 @@ async function runImport(ndjson: string, writeState: WriteState, onProgress?: Im
                 await emit({ type: 'warning', message: msg });
             }
         }
+        // The seeded roles (and the settings rows above) are GONE; the in-process
+        // memos still hold their ids/values. getSystemRoles backs the Admin-identity
+        // gates (lib/db/adminIdentity.ts), so a stale slot is not a cosmetic
+        // mis-label — it denies or grants apex authority. resetOrgToFreshInstall
+        // does the same thing for the same reason.
+        cache.invalidate('system_roles');
+        cache.invalidate('platform_settings');
 
         let rowsInserted = 0;
         let tablesDone = 0;
@@ -1503,6 +1813,14 @@ async function runImport(ndjson: string, writeState: WriteState, onProgress?: Im
             const { inserted, strippedColumns, skipped } = await insertRows(table, prepared);
             rowsInserted += inserted;
             skipBreakdown.constraintViolation += skipped;
+            // Say WHAT was lost and what still holds, instead of leaving the operator
+            // with the generic "rejected by the database" line these rows used to get.
+            const synthesized = SYNTHESIZED_NOT_NULL[table];
+            if (synthesized && inserted > 0) {
+                const msg = synthesized.warning(inserted);
+                warnings.push(msg);
+                await emit({ type: 'warning', message: msg });
+            }
             for (const col of strippedColumns) {
                 const msg = `${table}: column "${col}" is in the export but not in this instance's schema — dropped from import.`;
                 warnings.push(msg);
@@ -1554,17 +1872,25 @@ async function runImport(ndjson: string, writeState: WriteState, onProgress?: Im
             reanchoredAdminRoleId = anchor.roleId;
         }
 
-        // Re-assert "Admin holds every permission" — the import replaced the
+        // Re-assert "Admin holds every permission" (the import replaced the
         // role_permissions grants with the source org's, which can't reference
-        // fork-only permissions (e.g. admin:config:catalog). Runs for every
-        // import, merge or not, so whichever Admin role survives is complete.
+        // fork-only permissions like admin:config:catalog) AND "Client holds only
+        // the build's Client defaults". Runs for every import, merge or not.
         await emit({ type: 'phase', phase: 'permissions' });
-        const grantsAdded = await ensureAdminRoleHasAllPermissions();
+        const {
+            adminGrantsAdded: grantsAdded, clientStripped, warnings: permWarnings,
+        } = await reconcileRolePermissionsAfterImport();
         if (grantsAdded > 0) {
             const msg = `Granted ${grantsAdded} permission(s) to the Admin role that the imported org lacked (e.g. catalog management).`;
             warnings.push(msg);
             await emit({ type: 'warning', message: msg });
         }
+        if (clientStripped > 0) {
+            const msg = `Removed ${clientStripped} permission(s) the imported Client role held beyond this build's Client defaults.`;
+            warnings.push(msg);
+            await emit({ type: 'warning', message: msg });
+        }
+        for (const msg of permWarnings) { warnings.push(msg); await emit({ type: 'warning', message: msg }); }
 
         // Turn on the optional modules the source org was running, from the export
         // header. Without this the org's Marketplace/Academy/Warehouse/Quartermaster/

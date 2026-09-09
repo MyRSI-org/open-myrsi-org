@@ -76,7 +76,7 @@ export async function getPlatformLocations(opts: ListLocationsOptions = {}): Pro
         const safe = safeSearchTerm(opts.search);
         if (safe) qb = qb.or(`name.ilike.%${safe}%,path.ilike.%${safe}%,nickname.ilike.%${safe}%`);
     }
-    qb = qb.order('kind').order('name').range(offset, offset + limit - 1);
+    qb = qb.order('kind').order('name').order('id', { ascending: true }).range(offset, offset + limit - 1);
 
     const { data, error } = await qb;
     if (error && error.code === '42P01') return [];
@@ -130,7 +130,7 @@ export async function searchPlatformLocations(
         .or(`name.ilike.%${safe}%,path.ilike.%${safe}%,nickname.ilike.%${safe}%`);
     if (kind) qb = qb.eq('kind', kind);
     if (starSystemId) qb = qb.eq('star_system_id', starSystemId);
-    qb = qb.order('name').limit(cap);
+    qb = qb.order('name').order('id', { ascending: true }).limit(cap);
 
     const { data, error } = await qb;
     if (error && error.code === '42P01') return [];
@@ -249,7 +249,7 @@ async function refreshLookupForKind(kind: PlatformLocationKind, lookup: Lookup):
         const { data, error } = await supabase.from('platform_locations')
             .select('id, kind, external_id, nickname, is_hidden, is_internal, wiki_url')
             .eq('kind', kind)
-            .range(offset, offset + PAGE_SIZE - 1);
+            .order('id', { ascending: true }).range(offset, offset + PAGE_SIZE - 1);
         handleSupabaseError({ error, message: `Failed to reload ${kind} lookup` });
         const batch = data || [];
         for (const r of batch) {
@@ -357,7 +357,7 @@ async function recomputePaths(): Promise<{ updated: number }> {
     for (let offset = 0; ; offset += PAGE_SIZE) {
         const { data, error } = await supabase.from('platform_locations')
             .select('id, name, parent_id')
-            .range(offset, offset + PAGE_SIZE - 1);
+            .order('id', { ascending: true }).range(offset, offset + PAGE_SIZE - 1);
         handleSupabaseError({ error, message: 'Failed to load rows for path computation' });
         const batch = data || [];
         all.push(...batch);
@@ -411,7 +411,7 @@ export async function syncPlatformLocations(): Promise<SyncLocationsResult> {
     for (let offset = 0; ; offset += PAGE_SIZE) {
         const { data, error } = await supabase.from('platform_locations')
             .select('id, kind, external_id, nickname, is_hidden, is_internal, wiki_url')
-            .range(offset, offset + PAGE_SIZE - 1);
+            .order('id', { ascending: true }).range(offset, offset + PAGE_SIZE - 1);
         handleSupabaseError({ error, message: 'Failed to pre-load locations lookup' });
         const batch = data || [];
         for (const r of batch) {

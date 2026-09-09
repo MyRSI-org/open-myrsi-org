@@ -85,7 +85,7 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
         updateUserRecord, updateUserClearance, revokeCertification, revokeCommendation,
     } = useMembers();
     const { hrApplicants, hrPositions } = useHR();
-    const { hasPermission } = useAuth();
+    const { hasPermission, currentUser } = useAuth();
     const fmt = useFormatDate();
     const { addToast, confirm } = useNotification();
     const { openGenericCaseFileModal, openSecurityVettingModal } = useModalRegistry();
@@ -164,13 +164,7 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
             .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     }, [hrApplicants, userToDisplay.id]);
 
-    const clientRole = useMemo(() => {
-        const byName = roles.find(r => /^client$/i.test(r.name.trim()));
-        if (byName) return byName;
-        const systemRoles = roles.filter(r => r.is_system).sort((a, b) => a.id - b.id);
-        return systemRoles[0] || null;
-    }, [roles]);
-    const clientRoleId = clientRole?.id;
+    const isSelf = currentUser?.id === userToDisplay.id;
 
     const sortedRanks = useMemo(() => [...ranks].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0) || a.name.localeCompare(b.name)), [ranks]);
     const sortedUnits = useMemo(() => [...units].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0) || a.name.localeCompare(b.name)), [units]);
@@ -194,19 +188,16 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
             detailsToUpdate.tenureStartDate = tenureStartDate || null;
         }
 
-        const isSelectingClient = clientRoleId != null && roleId === clientRoleId.toString();
-        const wasClient = clientRoleId != null && userToDisplay.roleId === clientRoleId;
-        if (!isSelectingClient) {
-            detailsToUpdate.rankId = safeRankId;
-            detailsToUpdate.unitId = safeUnitId;
-            detailsToUpdate.positionId = safePositionId;
-            detailsToUpdate.secondaryPositionId = safeSecondaryPositionId;
-        } else if (!wasClient) {
-            detailsToUpdate.rankId = null;
-            detailsToUpdate.unitId = null;
-            detailsToUpdate.positionId = null;
-            detailsToUpdate.secondaryPositionId = null;
-        }
+        // A demotion to Client no longer wipes rank / unit / positions. Destroying
+        // them is unrecoverable and demotions are routinely reversed; the server has
+        // never cleared them either (bulkDemoteUsersToClient does not), so this
+        // browser-only rule was the reason the two paths disagreed. It also carried
+        // a fourth, independent guess at which role is "Client" — it resolved the id
+        // from the roles list by regex, then by lowest is_system id.
+        detailsToUpdate.rankId = safeRankId;
+        detailsToUpdate.unitId = safeUnitId;
+        detailsToUpdate.positionId = safePositionId;
+        detailsToUpdate.secondaryPositionId = safeSecondaryPositionId;
 
         try {
             await updateUserRecord(userToDisplay.id, detailsToUpdate);
@@ -340,9 +331,13 @@ const AdminUserDetailView: React.FC<AdminUserDetailViewProps> = ({
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                                         <div>
                                             <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">System Role</label>
-                                            <select value={roleId} onChange={e => setRoleId(e.target.value)} disabled={!hasPermission('admin:user:update_role') || isSaving} className="w-full bg-slate-950/60 border border-slate-700 rounded-lg p-2.5 text-white focus:border-sky-500/40 focus:ring-1 focus:ring-sky-500/30 outline-hidden text-sm">
+                                            {/* Cosmetic mirror of the server's self-demotion refusal
+                                                (assertCanChangeUsersRole) — the roster's bulk tools already
+                                                filter the actor out, this screen never did. */}
+                                            <select value={roleId} onChange={e => setRoleId(e.target.value)} disabled={!hasPermission('admin:user:update_role') || isSaving || isSelf} className="w-full bg-slate-950/60 border border-slate-700 rounded-lg p-2.5 text-white focus:border-sky-500/40 focus:ring-1 focus:ring-sky-500/30 outline-hidden text-sm disabled:opacity-60">
                                                 {sortedRoles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                                             </select>
+                                            {isSelf && <p className="mt-1.5 text-[10px] text-slate-500">You cannot change your own role. Have another Admin do it.</p>}
                                         </div>
                                         <div>
                                             <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Rank</label>

@@ -2,7 +2,7 @@ import React, { createContext, useState, useCallback, use, useEffect } from 'rea
 import { ToastVariant } from '../types';
 import { playCachedSound } from '../lib/audioCache';
 
-interface ToastOptions {
+export interface ToastOptions {
     description?: string;
     requestId?: string;
     variant?: ToastVariant;
@@ -10,6 +10,10 @@ interface ToastOptions {
     durationMs?: number;
     /** Suppress the variant chime — set when a paired branding sound is already played at the call site. */
     silent?: boolean;
+    /** An explicit affordance rendered as a button inside the toast, for a toast whose whole
+     *  purpose is to offer one (the "a new version is available — reload" prompt). Distinct
+     *  from requestId's whole-toast click target, which navigates rather than acts. */
+    action?: { label: string; onClick: () => void };
 }
 
 const VARIANT_CHIME_URL: Partial<Record<ToastVariant, string>> = {
@@ -31,6 +35,7 @@ export interface Toast {
     durationMs: number;
     persistent: boolean;
     createdAt: number;
+    action?: { label: string; onClick: () => void };
 }
 
 /**
@@ -151,6 +156,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
                 durationMs,
                 persistent,
                 createdAt: Date.now(),
+                action: options?.action,
             }];
         });
 

@@ -283,7 +283,12 @@ describe('fed#2: boundedInboundSnapshot caps the guest-INITIATED pull paths', ()
         };
         const r = await reconcileMirrorsWithPeer('peerA');
         expect(r.pulled).toBe(1);
-        expect(h.tables.mirrored_operations.find(m => m.id === 'op1')).toMatchObject({ host_peer_id: 'peerA', version: 5, accepted: true });
+        // This is the SIZE-cap control — what it needs to prove is that an in-cap
+        // snapshot is persisted. `accepted` is false because a manifest may not raise
+        // it (a heal restores the row, never the local admin's decision); that property
+        // has its own tests in operationsFederationLiveSync.
+        expect(h.tables.mirrored_operations.find(m => m.id === 'op1')).toMatchObject({ host_peer_id: 'peerA', version: 5, accepted: false });
+        expect((h.tables.mirrored_operations.find(m => m.id === 'op1')!.snapshot as { name: string }).name).toBe('healed');
     });
 });
 

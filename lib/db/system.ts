@@ -2,20 +2,30 @@
 import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, broadcastToChannel, getSystemRoles } from './common.js';
 import { cache } from '../cache.js';
 import { sendPushToAll, sendPushToStaff, sendPushToPermission } from '../push.js';
+import { drainStaleOperationReminders } from './opReminders.js';
+import { liftBansOnSystemAdmins } from './bans.js';
+import { backfillOptionalModuleRoleDefaults, type RoleDefaultsBackfillResult } from './roleDefaults.js';
 import { toUnitPost, toServiceTypeConfig } from './mappers.js';
 import type { Tables } from './rows.js';
 import type { AIConfig, Announcement, BrandingConfig, Certification, Commendation, DiscordConfig, ExternalTool, GovernmentsFeatureConfig, HeroCardConfig, HRConfig, IntelSharingConfig, Location, OpenGraphConfig, PublicPageConfig, RadioChannel, RadioConfig, Rank, Role, ServiceTypeConfig, SpecializationTag, SystemConfig, ThemeConfig, UnitPost, WikiHomeConfig } from '../../types.js';
 import { normalizeHexColor } from '../color.js';
 import { normalizeDocMediaForStorage, assertDocImageCap } from '../orgMediaDocs.js';
 import { randomBytes, createHash } from 'node:crypto';
-import { CLIENT_DEFAULT_PERMS } from '../clientRolePermissions.js';
-import { encryptConfigSecrets, decryptConfigSecrets, encryptSecret, decryptSecret } from '../crypto.js';
+import { assertRoleIsNotClient, enforceClientRolePermissionLock } from './clientRoleLock.js';
+import { encryptConfigSecrets, decryptConfigSecrets, encryptSecret, decryptSecret, hasPreviousKey } from '../crypto.js';
+import { inventorySecretCiphertexts } from './secretsRotation.js';
+import { recordSecurityEvent } from './securityEvents.js';
+import { isKeyExpired, normalizeScopes, type ApiKeyScope } from '../apiKeyScopes.js';
 import { sanitizeImageUrl, sanitizeImageUrlOrLocalPath } from '../imageUrl.js';
+import { ADMIN_WRITABLE_DISCORD_KEYS, normaliseDiscordSnowflake } from '../discordConfigKeys.js';
 import { stripHtml as sharedStripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import { sanitizeTiptapJson, tryParseTiptapJson } from '../tiptapValidate.js';
 import { sanitizePublicLinkUrl } from '../linkUrl.js';
 import { sanitizeRichHtml } from '../htmlSanitize.js';
+import { SecurityDenial } from '../errors.js';
+import { requireUuid } from '../pgrest.js';
 import { log as baseLog } from '../log.js';
+import { compareSchemaVersion } from '../schemaVersion.js';
 
 const log = baseLog.child({ module: 'db.system' });
 
@@ -194,7 +204,33 @@ export const updateDiscordSettings = async (config: Record<string, unknown>) => 
     const { data: existing } = await existingQuery.maybeSingle();
     // Decrypt existing before merging so we don't double-encrypt
     const decryptedExisting = decryptConfigSecrets('discordConfig', existing?.value || {});
-    const mergedConfig = { ...decryptedExisting, ...config };
+    // ALLOWLIST REBUILD, never a spread of the client blob (Rule 2). The payload
+    // reaches here as `stripActorFields(payload)` from admin:update_discord_config,
+    // which removes actor ids but NOT arbitrary keys — without this an
+    // admin:config:discord holder could POST botToken/clientSecret/guildId and
+    // repoint the deployment's whole Discord integration (lib/crypto.ts encrypts
+    // them, lib/secrets.ts then serves them as live credentials wherever the
+    // matching env var is unset). Derived from lib/discordConfigKeys.ts, the same
+    // source stripSecrets rebuilds the read-back from.
+    const safeConfig: Record<string, unknown> = {};
+    for (const key of ADMIN_WRITABLE_DISCORD_KEYS) {
+        if (!Object.hasOwn(config, key)) continue;
+        const incoming = config[key];
+        // Validate only what actually CHANGES. These ids are interpolated straight
+        // into Discord API paths, so a new junk value must be refused at the
+        // boundary. But the settings tab posts EVERY field on each save, so
+        // validating unconditionally would lock a deployment out of saving ANY
+        // Discord setting because one unrelated field holds legacy junk from before
+        // this validation existed. Pass an unchanged value through untouched;
+        // refuse a changed one.
+        const unchanged = String(incoming ?? '') === String((decryptedExisting as Record<string, unknown>)[key] ?? '');
+        safeConfig[key] = unchanged ? incoming : normaliseDiscordSnowflake(incoming, key);
+    }
+    // The spread of `decryptedExisting` is load-bearing: a self-host that
+    // configured botToken/clientSecret/guildId into settings.discordConfig would
+    // otherwise lose its live credentials on the admin's next channel save. The
+    // allowlist BOUNDS writes; it never deletes existing keys.
+    const mergedConfig = { ...decryptedExisting, ...safeConfig };
     // Encrypt sensitive fields before storing
     const encryptedConfig = encryptConfigSecrets('discordConfig', mergedConfig);
 
@@ -202,21 +238,90 @@ export const updateDiscordSettings = async (config: Record<string, unknown>) => 
     handleSupabaseError({ error, message: 'Failed to update Discord settings' });
     broadcastSettingsUpdate();
 };
+// Write-boundary check for an operator-supplied URL that is PUSHED to every browser.
+// Empty clears the field; anything the sanitizer refuses is REJECTED, not silently
+// blanked. Rejection (rather than the silent-clear contract the image fields use) is
+// deliberate for these: both branding editors re-send the WHOLE config object and the
+// upsert replaces the whole `value`, so a silent clear would destroy a stored icon or
+// chime as a side effect of saving an unrelated field — including a Terms-of-Service
+// save that never touched it. A throw refuses the write and leaves the stored value
+// intact, and the operator is told which field to fix instead of losing it silently.
+const requirePersistableUrl = (
+    raw: unknown,
+    sanitize: (v: unknown) => string | null,
+    field: string,
+    hint: string,
+): string => {
+    if (raw == null || raw === '') return '';
+    const safe = sanitize(raw);
+    if (!safe) throw new Error(`Invalid ${field}: ${hint}`);
+    return safe;
+};
+
+const LINK_URL_HINT = 'must be a public https:// URL.';
+const ICON_URL_HINT = 'must be an https image URL (.png/.jpg/.jpeg/.gif/.webp/.avif) or a shipped /media, /assets or /icons path.';
+
 export const updateHeroCardConfig = async (config: Record<string, unknown>) => {
-    const safeConfig = { ...(config || {}), backgroundImageUrl: sanitizeImageUrl(config?.backgroundImageUrl) || '' };
+    // discordUrl/organizationUrl are rendered straight into <a href> on the dashboard
+    // hero card (components/ui/HeroCard.tsx), settable by a holder of the delegable
+    // admin:config:branding perm — so a typosquat/phishing target or an internal host
+    // must not reach the column. Unconditional: both are non-optional on HeroCardConfig
+    // and the sole client caller always sends the whole object, with '' as "cleared".
+    // backgroundImageUrl keeps its established silent-clear contract (it is a CSS
+    // background, and HeroCard re-validates it at render).
+    const safeConfig = {
+        ...(config || {}),
+        backgroundImageUrl: sanitizeImageUrl(config?.backgroundImageUrl) || '',
+        discordUrl: requirePersistableUrl(config?.discordUrl, sanitizePublicLinkUrl, 'discordUrl', LINK_URL_HINT),
+        organizationUrl: requirePersistableUrl(config?.organizationUrl, sanitizePublicLinkUrl, 'organizationUrl', LINK_URL_HINT),
+    };
     const { error } = await supabase.from('settings').upsert({ key: 'heroCardConfig', value: safeConfig }, { onConflict: 'key' });
     handleSupabaseError({ error, message: 'Failed to update hero card config' });
     broadcastSettingsUpdate();
 };
+// Audio *Url fields on brandingConfig. Every one of these is pushed to every member
+// and fetched by lib/audioCache.ts prefetchSound(), which sets .src and calls .load()
+// at boot with NO user gesture — so an attacker-chosen host harvests the IP and
+// User-Agent of every member who opens the app (CSP media-src allows any https host).
+// notificationSoundUrl is declared-but-unplayed today; validated anyway so it can't
+// become a live forced-fetch vector the day something starts playing it.
+const BRANDING_SOUND_URL_FIELDS = [
+    'bootSoundUrl', 'newRequestSoundUrl', 'assignmentSoundUrl',
+    'eamSoundUrl', 'radioMicCueUrl', 'radioSquelchUrl', 'notificationSoundUrl',
+] as const;
+
 export const updateBrandingConfig = async (config: Record<string, unknown>) => {
+    const safeConfig: Record<string, unknown> = { ...(config || {}) };
+    // iconUrl feeds the SSR <link rel=icon>, the boot splash, the PWA manifest, the
+    // service worker, the UNAUTHENTICATED public page and the outbound Discord embed
+    // icon_url — an arbitrary-origin forced fetch from every browser AND from Discord's
+    // servers. OrLocalPath (not the strict https variant) because the shipped default is
+    // the same-origin '/media/cross-swords.png' (lib/db/seeder.ts).
+    if ('iconUrl' in safeConfig) {
+        safeConfig.iconUrl = requirePersistableUrl(safeConfig.iconUrl, sanitizeImageUrlOrLocalPath, 'iconUrl', ICON_URL_HINT);
+    }
     // termsOfService is rich HTML rendered with dangerouslySetInnerHTML on the
     // client. Sanitize on WRITE (mirrors the client's default DOMPurify) so raw
     // markup is never stored — defense in depth over the render-time DOMPurify.
-    // Other branding fields are plain strings / URLs validated at their own edit
-    // surfaces.
-    const safeConfig = config && typeof config.termsOfService === 'string'
-        ? { ...config, termsOfService: sanitizeRichHtml(config.termsOfService) }
-        : config;
+    // Keyed on presence, not on `typeof === 'string'`: a crafted non-string (an ARRAY
+    // of markup, say) used to skip the ternary entirely and survive the spread, and
+    // String(['<img onerror=…>']) is live markup. sanitizeRichHtml returns '' for
+    // non-strings, so coercing every present value is both simpler and closed.
+    if ('termsOfService' in safeConfig) safeConfig.termsOfService = sanitizeRichHtml(safeConfig.termsOfService);
+    // Emitted into the SSR <meta name="theme-color">. Escaped at the sink, so this is
+    // normalisation rather than a hole — drop-on-invalid keeps branding consistent with
+    // the sibling updateOpenGraphConfig writer below.
+    if ('themeColor' in safeConfig) {
+        const color = sanitizeThemeColor(safeConfig.themeColor);
+        if (color) safeConfig.themeColor = color; else delete safeConfig.themeColor;
+    }
+    // Without this the spread persisted the sound URLs verbatim. sanitizePublicLinkUrl
+    // (NOT an image sanitizer — these are .mp3 URLs, and the image extension allow-list
+    // would reject every shipped default) rejects anything that is not a public https://
+    // host, which is also what the client-side editor's own validator should require.
+    for (const f of BRANDING_SOUND_URL_FIELDS) {
+        if (f in safeConfig) safeConfig[f] = requirePersistableUrl(safeConfig[f], sanitizePublicLinkUrl, f, LINK_URL_HINT);
+    }
     const { error } = await supabase.from('settings').upsert({ key: 'brandingConfig', value: safeConfig }, { onConflict: 'key' });
     handleSupabaseError({ error, message: 'Failed to update branding config' });
     broadcastSettingsUpdate();
@@ -275,14 +380,14 @@ export const updateRadioConfig = async (config: Record<string, unknown>) => {
     broadcastSettingsUpdate();
 };
 // This was the only Tiptap write path storing its doc unsanitised, so the
-// ALLOWED_EMBED_HOSTS check on iframe/youtube nodes, the forced
+// ALLOWED_IFRAME_HOSTS check on iframe/youtube nodes, the forced
 // rel="noopener noreferrer" sanitizeMark stamps onto links, and MAX_DOC_IMAGES
 // were all bypassed here — while the stored blob ships to every authenticated
 // caller in the `main` subset and gets its media re-signed on each read. The
 // `{ ...config }` spread also allowed arbitrary keys into the settings row.
 // Now mirrors updateWikiPage (sanitize + image cap) and updatePublicPageConfig
 // (explicit key allowlist).
-export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>) => {
+export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>, opts?: { merge?: boolean }) => {
     if (!config || typeof config !== 'object') throw new Error('Invalid wiki home config payload');
 
     const allowedKeys = new Set(['welcomeContent', 'featuredPageIds', 'hideRecentlyUpdated']);
@@ -290,11 +395,83 @@ export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>) => {
         if (!allowedKeys.has(k)) throw new Error(`Unknown wiki home config field: ${k}`);
     }
 
+    // READ-MERGE, never a wholesale replace (Phase 3 owner decision OD-6). Every caller
+    // posts `{ ...config, <one field> }` from the wiki home editor, where `config` is
+    // whatever the browser hydrated. Building `value` from EMPTY meant that whenever that
+    // hydrated copy was absent, one click of any single editor control replaced the org's
+    // entire wiki home page with one field.
+    //
+    // Item 8 made that reachable rather than theoretical: projectSettingsForViewer
+    // (lib/settingsProjection.ts) withholds wikiHomeConfig from a caller without wiki:view,
+    // and the WRITE gate is wiki:edit_page (api/services.ts) — a pruned 'Admin'-named role
+    // is the most reachable holder of one without the other, because the CLIENT
+    // hasPermission short-circuits on role === 'Admin' and renders the editor regardless.
+    // The read gate is deliberately NOT widened to close this: that would make the config
+    // read wider than the `wiki` subset it configures. The write is made non-destructive
+    // instead — strictly narrower, and it also closes a PRE-EXISTING first-paint race where
+    // a toggle clicked before the first `main` payload landed had the same empty spread.
+    //
+    // Fails CLOSED on a read fault: without the explicit error check a transient DB blip
+    // would yield `existing = undefined`, collapse the base to {} and perform exactly the
+    // wipe this merge exists to prevent.
+    //
+    // `merge: false` is for the ORG IMPORTER only (lib/db/wiki.ts importWikiPages), which
+    // posts a COMPLETE config exported from the source org — there, "the target keeps a
+    // field the source did not have" is an import-fidelity break, not a rescue. Every
+    // interactive caller posts a PARTIAL config and must merge. Do not pass it to quieten
+    // an editor path: that re-creates the wipe this exists to close.
+    const merge = opts?.merge !== false;
     const value: Partial<WikiHomeConfig> = {};
+    let stored: Partial<WikiHomeConfig> | null = null;
+    if (merge) {
+        const { data: existing, error: readError } = await supabase.from('settings')
+            .select('value').eq('key', 'wikiHomeConfig').maybeSingle();
+        handleSupabaseError({ error: readError, message: 'Failed to read wiki home config' });
+
+        // Base rebuilt through the SAME allow-list the payload is checked against, so a
+        // stray key already sitting in the row is dropped rather than re-persisted forever.
+        stored = (existing?.value || {}) as Partial<WikiHomeConfig>;
+        for (const k of allowedKeys) {
+            if (Object.hasOwn(stored, k)) (value as Record<string, unknown>)[k] = (stored as Record<string, unknown>)[k];
+        }
+    }
+
+    // Posted fields overwrite the stored base — EXCEPT a welcome document that came back
+    // structurally identical to the one already stored.
+    //
+    // All three client save paths POST `{...config, <one field>}`, so ticking the
+    // "hide recently updated" checkbox hands the server back the entire welcome document.
+    // Re-running the sanitiser over it MUTATES content nobody touched: the sanitiser is a
+    // node/URL POLICY, and every policy decision it applies — a dropped node, a rewritten
+    // embed src, an image collapsed because the read signer fell back — is a change the
+    // user did not ask for, applied silently, 200 OK. assertDocImageCap is the same hazard
+    // in reverse: an org already over the cap could no longer save the OTHER two fields.
+    //
+    // THIS WEAKENS NOTHING **BECAUSE THE IMPORTER NOW SANITISES TOO**. The branch re-stores a
+    // value derived solely from what is persisted, so no client content can enter through it
+    // — but that is only safe if "persisted" implies "sanitised", and until the
+    // wikiHomeConfig case landed in sanitizeImportedSettingRow it did NOT: the org importer
+    // was a second writer that sanitised nothing, and this passthrough would have made an
+    // imported document permanently unsanitised instead of merely transiently so. Do not
+    // remove that case. A real edit takes the sanitise path below, unchanged.
+    //
+    // Compare NORMALISED docs, never raw bytes: the read path hands the client freshly SIGNED
+    // urls while the row holds durable KEYS, so a byte comparison would call every round-trip
+    // an edit and defeat this on the first save. The branch is therefore NOT a byte-for-byte
+    // no-op — normalizeDocMediaForStorage collapses signed urls to keys and drops an image
+    // node whose src is empty. It re-stores the NORMALISED stored value, not the stored bytes.
     if (config.welcomeContent) {
-        const safeContent = normalizeDocMediaForStorage(sanitizeTiptapJson(config.welcomeContent, 'wiki'));
-        assertDocImageCap(safeContent);
-        value.welcomeContent = safeContent;
+        const storedWelcome = merge && stored && stored.welcomeContent
+            ? normalizeDocMediaForStorage(stored.welcomeContent)
+            : undefined;
+        const postedNormalized = normalizeDocMediaForStorage(config.welcomeContent);
+        if (storedWelcome !== undefined && isSameJson(postedNormalized, storedWelcome)) {
+            value.welcomeContent = storedWelcome;
+        } else {
+            const safeContent = normalizeDocMediaForStorage(sanitizeTiptapJson(config.welcomeContent, 'wiki'));
+            assertDocImageCap(safeContent);
+            value.welcomeContent = safeContent;
+        }
     } else if (config.welcomeContent !== undefined) {
         // Explicitly cleared — store the empty value rather than the raw falsy input.
         value.welcomeContent = null;
@@ -309,6 +486,17 @@ export const updateWikiHomeConfig = async (config: Partial<WikiHomeConfig>) => {
     const { error } = await supabase.from('settings').upsert({ key: 'wikiHomeConfig', value }, { onConflict: 'key' });
     handleSupabaseError({ error, message: 'Failed to update wiki home config' });
     broadcastSettingsUpdate();
+};
+
+/**
+ * Structural equality by JSON serialisation — NOT canonicalised: key order counts.
+ * Used ONLY to recognise a value the client read from us and handed straight back untouched.
+ * `settings.value` is jsonb, so both the client's copy and the merge read come from the same
+ * Postgres-normalised ordering. A false negative merely routes the value through the normal
+ * sanitise path, so this fails in the safe direction and does not need to be exhaustive.
+ */
+const isSameJson = (a: unknown, b: unknown): boolean => {
+    try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
 };
 
 const PUBLIC_LINK_URL_RE = /^(https:\/\/|discord:\/\/)/i;
@@ -433,6 +621,18 @@ export const updateAIConfig = async (config: Record<string, unknown>) => {
     broadcastSettingsUpdate();
 };
 
+// Wholesale replace, and that is CURRENTLY safe only because HRConfig has exactly one
+// field (probationDays) and ProbationTab posts it whole rather than spreading a hydrated
+// copy — so there is nothing a merge could preserve. It is NOT the same shape as
+// updateWikiHomeConfig's read-merge above, and the difference is one field wide.
+//
+// KNOWN RESIDUAL (Phase 3 item 8, owner decision OD-6): projectSettingsForViewer withholds
+// hrConfig from a caller without hr:view, while this write is gated hr:admin — so an
+// hr:admin-without-hr:view holder sees a blank probation field and, if they save, sets
+// probation to 0. A one-field regression, not data loss, deliberately accepted rather than
+// widening the read gate past the `hr` subset it configures.
+// THE MOMENT HRConfig GAINS A SECOND FIELD, that residual becomes the wiki wipe: give this
+// the same read-merge as updateWikiHomeConfig before adding one.
 export const updateHRConfig = async (config: HRConfig) => {
     const { error } = await supabase.from('settings').upsert({ key: 'hrConfig', value: config }, { onConflict: 'key' });
     handleSupabaseError({ error, message: 'Failed to update HR config' });
@@ -453,12 +653,31 @@ export const updateGovernmentsConfig = async (config: GovernmentsFeatureConfig) 
 // getMainState so the Sidebar/views can gate on them. (Government keeps its own
 // 'governmentsConfig' key.)
 export const getOrgFeatures = async (): Promise<Record<string, unknown>> => {
-    const { data } = await supabase.from('settings').select('value').eq('key', 'orgFeatures').maybeSingle();
+    // THROWS on a read fault, deliberately. It used to discard the error and return {},
+    // which made isFeatureEnabled's `catch { return false }` — and the fail-closed
+    // guarantee documented below it — dead code that never ran. The gate still denied,
+    // but by accident (missing key -> undefined -> falsy), not by the stated mechanism.
+    //
+    // Both live consumers keep their behaviour: isFeatureEnabled catches this into
+    // `false` (fail closed), and getMainState catches it into {} (the nav hides optional
+    // modules, which that call site already documents as cosmetic). What changes is that
+    // the fault is now LOUD, and a future consumer that forgets to catch fails visibly
+    // instead of silently reading "no modules enabled" as fact.
+    const { data, error } = await supabase.from('settings').select('value').eq('key', 'orgFeatures').maybeSingle();
+    handleSupabaseError({ error, message: 'Failed to read optional features' });
     return (data?.value as Record<string, unknown>) || {};
 };
 
 export const updateOrgFeatures = async (patch: Record<string, unknown>) => {
-    const { data } = await supabase.from('settings').select('value').eq('key', 'orgFeatures').maybeSingle();
+    // BIND THE READ ERROR — identical defect to updatePlatformSettings (lib/db/platform.ts).
+    // The merge below is the only thing preserving the toggles the admin did not touch.
+    // Unbound, a failed read gave `current = {}` and wrote just the patch, so flipping ONE
+    // module during a DB hiccup silently dropped every other module's row. These are
+    // default-OFF (`!!enabled`), so "dropped" reads as "switched off": one admin toggle
+    // could take warehouse, quartermaster, finances and academy offline org-wide, behind a
+    // success toast. Fail CLOSED — refuse the write and leave the stored blob alone.
+    const { data, error: readError } = await supabase.from('settings').select('value').eq('key', 'orgFeatures').maybeSingle();
+    handleSupabaseError({ error: readError, message: 'Failed to read optional features — no change was made' });
     const current = (data?.value as Record<string, unknown>) || {};
     // One-level deep merge so toggling one module preserves the others (and any
     // extra per-module settings nested under the same feature key).
@@ -566,6 +785,12 @@ export async function updateRolePermissions(roleId: number, permissionNames: str
     const id = parseInt(roleId.toString());
     if (!Number.isInteger(id) || id <= 0) throw new Error('Invalid role id.');
 
+    // The Client role's permission set is code-owned (CLIENT_DEFAULT_PERMS) and
+    // reconverged by repairDatabase. The RPC handler asserts the same predicate so
+    // the caller is refused before the round-trip; asserting it HERE too means any
+    // future in-process caller is covered and the two cannot drift.
+    await assertRoleIsNotClient(id);
+
     // Validate the target role exists BEFORE rewriting its permissions — the
     // delete-leg would otherwise run unchecked against a phantom/forged id.
     const { data: role } = await supabase.from('roles').select('id').eq('id', id).maybeSingle();
@@ -577,34 +802,138 @@ export async function updateRolePermissions(roleId: number, permissionNames: str
     if (permIds.length > 0) await supabase.from('role_permissions').insert(permIds.map(pid => ({ role_id: id, permission_id: pid })));
 }
 
-export async function createApiKey(label: string) {
+export async function createApiKey(label: string, scopes?: unknown, expiresAt?: string | null) {
+    // Sanitise the label: it is operator input that lands in a durable row and is rendered in
+    // the admin list. stripHtml + a length cap, same as every other persisted plain string.
+    const cleanLabel = sharedStripHtml(label, 120).trim();
+    if (!cleanLabel) throw new Error('A label is required.');
+    // The `alliance:` prefix is a load-bearing grammar, not a naming convention: the feed
+    // refuses keys carrying it and deleteApiKey keys its orphan branch off it. Minting one by
+    // hand produces a key nothing will ever accept. Refused the same way addRadioChannel
+    // refuses its own reserved ids, and for the same reason.
+    if (cleanLabel.startsWith(ALLIANCE_KEY_LABEL_PREFIX)) {
+        throw new Error(`Labels starting with "${ALLIANCE_KEY_LABEL_PREFIX}" are reserved for alliance pairing credentials.`);
+    }
+
     const key = `sk_${randomBytes(12).toString('base64url')}`;
     const hash = createHash('sha256').update(key).digest('hex');
-    const { data } = await supabase.from('api_keys').insert({ label, key_hash: hash }).select('id, label, created_at, last_used_at').single();
-    // Return the raw key ONCE — it cannot be recovered after this response. Select
-    // explicit columns so the key_hash never rides the response back to the
-    // browser (defence-in-depth; it's a SHA-256 hash, not the key, but it has no
-    // business leaving the server).
-    return { ...data, rawKey: key, keyPrefix: `${key.substring(0, 7)}****` };
+    const keyPrefix = `${key.substring(0, 7)}****`;
+    // Default a manually-created key to the FEED surface only. Federation credentials are
+    // minted by the pairing handshake, never by hand, so a hand-made key has no business
+    // reaching /api/alliance/*. An explicit scopes argument still wins.
+    const wanted: ApiKeyScope[] = normalizeScopes(scopes);
+    const finalScopes: ApiKeyScope[] = wanted.length > 0 ? wanted : ['feed'];
+
+    const { data, error } = await supabase.from('api_keys')
+        .insert({ label: cleanLabel, key_hash: hash, key_prefix: keyPrefix, scopes: finalScopes, expires_at: expiresAt ?? null })
+        .select('id, label, created_at, last_used_at, scopes, expires_at, key_prefix')
+        .single();
+    // The error was previously not bound at all, so an insert failure returned
+    // `{ ...null, rawKey: 'sk_...' }` and the admin console DISPLAYED that raw key as a
+    // successfully-created credential. The operator wrote it down, handed it to an ally, and it
+    // never authenticated — with no error at any point. Same phantom-success shape the delete
+    // leg is already pinned against.
+    handleSupabaseError({ error, message: 'Failed to create API key' });
+    if (!data) throw new Error('Failed to create API key');
+
+    // Return the raw key ONCE — it cannot be recovered after this response. Explicit columns so
+    // key_hash never rides the response back to the browser.
+    return { ...data, rawKey: key, keyPrefix };
 }
+
+export type ApiKeyListRow = Pick<Tables<'api_keys'>, 'id' | 'label' | 'created_at' | 'last_used_at'>
+    & { scopes?: string[] | null; expires_at?: string | null; revoked_at?: string | null; revoked_reason?: string | null; key_prefix?: string | null };
 
 export async function listApiKeys() {
-    const query = supabase.from('api_keys').select('id, label, created_at, last_used_at').order('created_at', { ascending: false });
+    const query = supabase.from('api_keys')
+        .select('id, label, created_at, last_used_at, scopes, expires_at, revoked_at, revoked_reason, key_prefix')
+        .order('created_at', { ascending: false });
 
-    type ApiKeyListRow = Pick<Tables<'api_keys'>, 'id' | 'label' | 'created_at' | 'last_used_at'>;
     const data = await safeFetch<ApiKeyListRow[]>(query, [], 'Failed to list API keys');
-    return data.map((k) => ({ ...k, keyPrefix: 'sk_****' }));
+    // MAPPED, not spread. The rows are snake_case and the client renders camelCase, so
+    // `{ ...k }` meant Created showed a literal em-dash and Last Used showed "Never" on every
+    // row, forever — including for a key used a second ago. TypeScript never caught it because
+    // the spread widened the return type. An operator deciding WHICH key to revoke had three
+    // columns of no information; that is the practical reason this item exists.
+    return data.map((k) => ({
+        id: k.id,
+        label: k.label,
+        createdAt: k.created_at,
+        lastUsedAt: k.last_used_at ?? undefined,
+        scopes: Array.isArray(k.scopes) ? k.scopes : null,
+        expiresAt: k.expires_at ?? null,
+        revokedAt: k.revoked_at ?? null,
+        revokedReason: k.revoked_reason ?? null,
+        // Real prefix where we have one; the placeholder only for keys minted before the
+        // column existed. It used to be the placeholder on every row.
+        keyPrefix: k.key_prefix || 'sk_****',
+    }));
 }
 
-export async function deleteApiKey(id: string) {
-    await supabase.from('api_keys').delete().eq('id', id);
+// persistKeys (lib/db/alliances.ts) mints a paired ally's INBOUND credential into
+// this same table, labelled `alliance:<peerId>`, and listApiKeys surfaces it to
+// the admin UI beside ordinary keys. alliance_peers.inbound_key_id is ON DELETE
+// SET NULL, so deleting one from here severs the pairing's inbound authentication
+// with no signal at all: every /api/alliance/* call starts 403ing (getAlliancePeer-
+// ByInboundKey finds no row) while the peer still reads Active, and recovering
+// needs a fresh out-of-band code exchange. Teardown belongs to the alliance revoke
+// path, which destroys BOTH directions of key material and records revoked_at.
+const ALLIANCE_KEY_LABEL_PREFIX = 'alliance:';
+const ALLY_KEY_MSG = 'That key is an alliance pairing credential. Remove the ally from the Alliances peer list — revoking there destroys both directions of key material and keeps the record.';
+
+export async function deleteApiKey(id: string, revokedBy?: number | null, reason?: string | null) {
+    const keyId = requireUuid(id, 'keyId');
+    const { data: key, error: readError } = await supabase.from('api_keys').select('id, label')
+        .eq('id', keyId)
+        .maybeSingle();
+    handleSupabaseError({ error: readError, message: 'Failed to load API key' });
+    // Nothing to guard and nothing to delete — a delete stays idempotent.
+    if (!key) return;
+    // The FK is the authority, not the label: refuse while ANY peer row still
+    // points at this key, so a mislabelled credential can't slip past. No TOCTOU
+    // window either — persistKeys only ever INSERTS a fresh api_keys row, so an
+    // unreferenced key can never later become an ally's inbound credential. A read
+    // fault throws above rather than reading as "unreferenced".
+    const { data: peer, error: peerError } = await supabase.from('alliance_peers').select('id')
+        .eq('inbound_key_id', keyId)
+        .maybeSingle();
+    handleSupabaseError({ error: peerError, message: 'Failed to check alliance pairing' });
+    if (peer) throw new SecurityDenial(ALLY_KEY_MSG, { auditEvent: 'authz.alliance_key.delete_denied', fields: { keyId } });
+    // An unreferenced reserved-label key is an orphan left by a hard delete that
+    // predates the peer-scope guards. It stays deletable by hand — that is
+    // credential hygiene, not a live pairing — but never silently.
+    if (key.label.startsWith(ALLIANCE_KEY_LABEL_PREFIX)) log.warn('deleting an orphaned alliance inbound key', { keyId, label: key.label });
+    // SOFT revocation. Revoking used to DELETE the row, which destroyed the record an operator
+    // needs after a leak: when it was issued, when it was last used, who killed it and why. The
+    // credential is dead either way — verifyApiKey refuses a revoked row — but now there is
+    // something left to read. The row is small and it IS the audit trail, so nothing purges it.
+    const { error } = await supabase.from('api_keys')
+        .update({ revoked_at: new Date().toISOString(), revoked_by: revokedBy ?? null, revoked_reason: reason ?? 'operator' })
+        .eq('id', keyId)
+        .is('revoked_at', null);
+    handleSupabaseError({ error, message: 'Failed to revoke API key' });
 }
 
 // Intel feeds are now rows in the unified alliance_peers table, discriminated by
 // pairing_state ('legacy' = backfilled, 'manual' = added here). A feed is a
 // one-directional intel subscription (we hold a key to pull from the peer). The
 // admin UI still speaks the old snake_case feed shape, so these map to/from it.
-const FEED_PAIRING_STATES = ['legacy', 'manual'];
+//
+// SINGLE SOURCE OF TRUTH for "which alliance_peers rows the feed API may touch".
+// EVERY feed verb — read, add, update, delete — must be filtered by it, because
+// the other half of this table is handshake-paired allies whose teardown is the
+// SOFT revoke in lib/db/alliances.ts. A hard delete through here would cascade
+// mirrored ops (our own members' RSVPs), drop allied participants off live ops,
+// null intel provenance (disabling the partial dedup indexes) and discard the
+// revoked_at audit record. lib/db/alliances.ts imports this to derive its own
+// PostgREST exclusion literal, so the two halves cannot drift apart.
+export const FEED_PAIRING_STATES = ['legacy', 'manual'] as const;
+
+// One message for both "no such row" and "that row is a paired ally": the
+// SecurityDenial contract wants a message that can't be used as an existence
+// oracle, and this sentence is true of both cases without pointing an admin at
+// a remedy that doesn't apply to them.
+const FEED_ONLY_MSG = 'No receive-only feed with that id. Handshake-paired allies are managed from the Alliances peer list.';
 
 export async function getTrustedFeeds() {
     const query = supabase.from('alliance_peers').select('id, label, base_url, last_contact_at, created_at, inbound_max_clearance, outbound_key_enc, channels')
@@ -650,16 +979,41 @@ export async function addTrustedFeed(label: string, url: string, apiKey: string,
     broadcastSettingsUpdate();
 }
 export async function deleteTrustedFeed(id: string) {
-    await supabase.from('alliance_peers').delete().eq('id', id);
+    const feedId = requireUuid(id, 'feedId');
+    // The discriminator is filtered INSIDE the delete, not read first and deleted
+    // after: a select-then-delete leaves an unfiltered .delete() in the source for
+    // the next refactor to lift out of its guard, and opens a TOCTOU window.
+    const { data, error } = await supabase.from('alliance_peers').delete()
+        .eq('id', feedId)
+        .in('pairing_state', FEED_PAIRING_STATES)
+        .select('id');
+    // Error first: on a transport/RLS failure `data` is null too, and reporting
+    // that as a scope denial would mask a real outage behind a 403.
+    handleSupabaseError({ error, message: 'Failed to remove feed' });
+    if (!data || data.length === 0) {
+        throw new SecurityDenial(FEED_ONLY_MSG, { auditEvent: 'authz.feed_scope.denied', fields: { feedId } });
+    }
     broadcastSettingsUpdate();
 }
 export async function updateTrustedFeed(id: string, updates: { syncReports?: boolean; syncWarrants?: boolean; syncBulletins?: boolean; inboundMaxClearance?: number }) {
+    const feedId = requireUuid(id, 'feedId');
     const dbUpdates: Record<string, unknown> = {};
     // channels is a jsonb blob — merge against the existing value so a single
     // toggle doesn't wipe the others.
     if (updates.syncReports !== undefined || updates.syncWarrants !== undefined || updates.syncBulletins !== undefined) {
-        const { data: existing } = await supabase.from('alliance_peers').select('channels').eq('id', id).maybeSingle();
-        const channels = { ...(existing?.channels || {}) } as Record<string, boolean>;
+        const { data: existing, error: readError } = await supabase.from('alliance_peers').select('channels')
+            .eq('id', feedId)
+            .in('pairing_state', FEED_PAIRING_STATES)
+            .maybeSingle();
+        // Swallowing this read is destructive, not merely lossy: merging into {}
+        // REPLACES the jsonb, after which getTrustedFeeds (`!== false`) shows all
+        // three channels on while syncTrustedFeeds (`=== true`) treats the wiped
+        // ones as off — the UI and the ingest engine silently disagree.
+        handleSupabaseError({ error: readError, message: 'Failed to load feed' });
+        if (!existing) {
+            throw new SecurityDenial(FEED_ONLY_MSG, { auditEvent: 'authz.feed_scope.denied', fields: { feedId } });
+        }
+        const channels = { ...(existing.channels || {}) } as Record<string, boolean>;
         if (updates.syncReports !== undefined) channels.reports = updates.syncReports;
         if (updates.syncWarrants !== undefined) channels.warrants = updates.syncWarrants;
         if (updates.syncBulletins !== undefined) channels.bulletins = updates.syncBulletins;
@@ -668,7 +1022,17 @@ export async function updateTrustedFeed(id: string, updates: { syncReports?: boo
     if (updates.inboundMaxClearance !== undefined) dbUpdates.inbound_max_clearance = updates.inboundMaxClearance;
     if (Object.keys(dbUpdates).length > 0) {
         dbUpdates.updated_at = new Date().toISOString();
-        await supabase.from('alliance_peers').update(dbUpdates).eq('id', id);
+        // Same guard on the write half — inbound_max_clearance is the ceiling on
+        // how highly-classified inbound intel we accept, and the clearance-only
+        // path never touches the read above.
+        const { data, error } = await supabase.from('alliance_peers').update(dbUpdates)
+            .eq('id', feedId)
+            .in('pairing_state', FEED_PAIRING_STATES)
+            .select('id');
+        handleSupabaseError({ error, message: 'Failed to update feed' });
+        if (!data || data.length === 0) {
+            throw new SecurityDenial(FEED_ONLY_MSG, { auditEvent: 'authz.feed_scope.denied', fields: { feedId } });
+        }
         broadcastSettingsUpdate();
     }
 }
@@ -834,6 +1198,7 @@ const GLOBAL_PERMISSIONS = [
     { name: 'admin:user:manage_clearance', description: "Change User Clearance", category: 'User Management' },
     { name: 'admin:user:adjust_reputation', description: "Adjust User Reputation", category: 'User Management' },
     { name: 'admin:user:view_history', description: "View User History", category: 'User Management' },
+    { name: 'admin:user:ban', description: "Ban & Unban Members", category: 'User Management' },
     { name: 'user:manage:conduct_record', description: "Add/Remove Conduct Entries", category: 'User Management' },
     { name: 'user:manage:personnel_notes', description: "Add/View Personnel Notes", category: 'User Management' },
     { name: 'user:toggle_duty', description: "Toggle Duty Status", category: 'User Management' },
@@ -878,6 +1243,7 @@ const GLOBAL_PERMISSIONS = [
     { name: 'unit:manage:own', description: "Manage Own Unit", category: 'Organization' },
     { name: 'units:view_all', description: "View All Restricted Units", category: 'Organization' },
     { name: 'admin:config:settings', description: "Manage Client UI Settings", category: 'System' },
+    { name: 'admin:security:view_audit', description: "View Security Audit Trail", category: 'System' },
     { name: 'user:receive:eam', description: "Receive EAM Alerts", category: 'Communications' },
     { name: 'fleet:view', description: "View Fleet Manager", category: 'Fleet' },
     { name: 'fleet:manage_own', description: "Manage Own Ship Hangar", category: 'Fleet' },
@@ -917,6 +1283,11 @@ const GLOBAL_PERMISSIONS = [
     { name: 'academy:view', description: "View Academy (staff surfaces)", category: 'Academy' },
     { name: 'academy:instruct', description: "Instruct Courses & Run Sessions", category: 'Academy' },
     { name: 'academy:manage', description: "Manage Academy (approve, certify, award)", category: 'Academy' },
+    { name: 'blueprint:view', description: "Browse Blueprint Registry", category: 'Blueprints' },
+    { name: 'blueprint:register', description: "Register & Manage Own Blueprints", category: 'Blueprints' },
+    { name: 'blueprint:request', description: "Raise Crafting Requests", category: 'Blueprints' },
+    { name: 'blueprint:craft', description: "Claim & Fulfil Crafting Requests", category: 'Blueprints' },
+    { name: 'blueprint:manage', description: "Moderate Org Blueprints", category: 'Blueprints' },
 ];
 
 export async function repairDatabase() {
@@ -946,6 +1317,14 @@ export async function repairDatabase() {
                 .eq('name', perm.name);
         }
     }
+
+    // Declared out here because the backfill runs inside the block below (it needs the
+    // resolved system roles) but its outcome is reported in the return message.
+    let roleDefaults: RoleDefaultsBackfillResult;
+    // Same reason: the Client-role strip runs inside the block, its outcome (or its
+    // failure) is reported in the return message. Repair's only reporting channel is
+    // that string — DatabaseToolsTab toasts it verbatim.
+    let clientLockNote = '';
 
     // 1. Fix Users with missing roles & seeds
     {
@@ -1014,30 +1393,45 @@ export async function repairDatabase() {
         // Also mark any already-flagged roles (handles renamed roles that were previously flagged)
         const { data: byFlag } = await supabase.from('roles').select('id, name').eq('is_system', true).order('id', { ascending: true });
 
-        // Use getSystemRoles helper for all subsequent lookups (works with renamed roles)
+        // Use getSystemRoles helper for all subsequent lookups (works with renamed roles).
+        // Drop the 5-minute memo first: getSystemRoles was already called twice above,
+        // BEFORE the is_system stamp, so without this the lookups below — the Client
+        // strip and the module-defaults backfill included — act on the pre-stamp
+        // positional fallback the stamp just fixed.
+        cache.invalidate('system_roles');
         const repairedRoles = await getSystemRoles();
 
-        // Fix Client role: strip any permissions beyond the canonical defaults
-        const ALLOWED_CLIENT_PERMS = CLIENT_DEFAULT_PERMS;
+        // Fix Client role: strip any permissions beyond the canonical defaults.
+        // Shared with the post-import reconcile (lib/db/clientRoleLock.ts) so the
+        // Client role converges identically whichever path re-populated it — the
+        // import replaces role_permissions wholesale and used to skip this entirely.
+        //
+        // Contained on purpose. The helper throws so the RPC and the import can
+        // REFUSE on an unverifiable read, but everything below this line is the
+        // org's last-resort recovery — the null-role backfill, the module-defaults
+        // backfill, the "ensure at least one Admin exists" promotion and the
+        // reminder drain. A repair that cannot verify one invariant must still run
+        // the other four, and the error copy for that fault tells the operator to
+        // run Repair.
         const clientRole = repairedRoles.client;
         if (clientRole) {
-
-            const { data: clientRolePerms } = await supabase.from('role_permissions')
-                .select('permission_id, permissions!inner(name)')
-                .eq('role_id', clientRole.id);
-
-            const excessPermIds = (clientRolePerms as Array<{ permission_id: number; permissions: { name: string } }> | null || [])
-                .filter((rp) => !ALLOWED_CLIENT_PERMS.includes(rp.permissions.name))
-                .map((rp) => rp.permission_id);
-
-            if (excessPermIds.length > 0) {
-                log.info('repair stripping excess permissions from client role', { count: excessPermIds.length });
-                await supabase.from('role_permissions')
-                    .delete()
-                    .eq('role_id', clientRole.id)
-                    .in('permission_id', excessPermIds);
+            try {
+                const { stripped } = await enforceClientRolePermissionLock(clientRole.id);
+                if (stripped > 0) clientLockNote = ` Stripped ${stripped} excess permission(s) from the Client role.`;
+            } catch (e) {
+                log.error('repair client-role permission lock failed', { err: e });
+                clientLockNote = ' The Client role permission lock could not be verified — re-run Repair.';
             }
         }
+
+        // One-shot grant of the optional-module defaults (finances / quartermaster /
+        // warehouse) onto the Member and Dispatcher roles. Those strings were never in
+        // the seeder, so on an install created by the old code all three modules are
+        // Admin-only. One-time STATE, not convergence, and marker-gated so a second
+        // Repair can NEVER restore a permission the operator has since revoked — see
+        // lib/db/roleDefaults.ts for the three guards. Placed after the Client strip so
+        // the permission catalog is topped up and repairedRoles is live.
+        roleDefaults = await backfillOptionalModuleRoleDefaults(repairedRoles);
 
         // Fix Users with null roles in this org
         if (repairedRoles.member) {
@@ -1061,7 +1455,46 @@ export async function repairDatabase() {
         }
     }
 
-    return { success: true, message: "Database repair complete." };
+    // Retire the backlog of operation_reminders rows that accumulated while nothing
+    // consumed them (see lib/db/opReminders.ts). One-time STATE, which is why it
+    // lives here and not in schema.sql — that script is a re-runnable convergence
+    // script. Idempotent, and never fatal: the delivery job sweeps expired rows on
+    // every tick anyway, so this is only the fast way to clear a large backlog.
+    const drained = await drainStaleOperationReminders();
+
+    // Report the backfill's OUTCOME, never infer it from a count: four of the helper's
+    // five returns are zero-granted and only one of them means "nothing needed doing".
+    // Telling an admin their roles are already correct when the pass actually aborted
+    // on a read fault is the failure mode that makes this button untrustworthy.
+    const grantNote = {
+        'granted': ` Granted ${roleDefaults.granted} default module permission(s) to the Member/Dispatcher roles.`,
+        'skipped-configured': ' Module role defaults were left alone — those roles are already configured.',
+        'skipped-roles': ' Module role defaults were skipped — the Member/Dispatcher system roles could not be identified.',
+        'failed': ' Module role defaults could not be applied — see the server log; Repair can be run again.',
+        'already-applied': '',
+    }[roleDefaults.status];
+    const drainNote = drained > 0 ? ` Retired ${drained} stale operation reminder(s).` : '';
+
+    // BREAK-GLASS for the one state that makes a ban unliftable: a member banned
+    // first and promoted to Admin afterwards, with the org's other admin:user:ban
+    // holders since gone. See liftBansOnSystemAdmins — it only ever touches bans the
+    // peer rule in ban:place would have refused to place in the first place.
+    //
+    // Never fatal, and always REPORTED: repair's return string is its only channel
+    // to the operator (DatabaseToolsTab toasts it verbatim), so a silently lifted
+    // ban is not an acceptable outcome of a maintenance button.
+    let banNote = '';
+    try {
+        const liftedAdminBans = await liftBansOnSystemAdmins();
+        if (liftedAdminBans > 0) {
+            banNote = ` Lifted ${liftedAdminBans} ban(s) on Admin-role holders — an Admin cannot be banned.`;
+        }
+    } catch (e) {
+        log.error('repair could not check for bans on Admin-role holders', { err: e });
+        banNote = ' Bans on Admin-role holders could not be checked — re-run Repair.';
+    }
+
+    return { success: true, message: `Database repair complete.${clientLockNote}${grantNote}${drainNote}${banNote}` };
 }
 
 // Reuses the 'user_update' realtime event (mapped to main subset in DataContext)
@@ -1601,6 +2034,12 @@ export async function updateRankMapping(discordRoleId: string, rankId: number | 
             role_id: roleId ? parseInt(roleId.toString()) : null
         }, { onConflict: 'discord_role_id' });
     }
+    // This write had NO live carrier at all. The client used to bind postgres_changes on
+    // `rank_mappings` and `synced_discord_roles`, but neither table is in
+    // private.rt_client_tables(), which IS the realtime publication — so the bindings were
+    // inert and an admin saw stale mappings until they reloaded. Empty payload: receivers
+    // refetch the `discord` subset through the permission-gated read path.
+    await broadcastToOrg('discord_config_update', {});
 }
 
 // --- UNIT FEED ---
@@ -1663,7 +2102,7 @@ export async function getUnitFeed(unitId: number): Promise<UnitPost[]> {
     const { data } = await supabase.from('unit_posts')
         .select('id, unit_id, author_id, content, created_at, pinned, author:users(id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at)')
         .eq('unit_id', unitId)
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(50);
     return (data || []).map((row) => toUnitPost(row as unknown as Parameters<typeof toUnitPost>[0]));
 }
@@ -1767,14 +2206,70 @@ export async function deleteExternalTool(id: number) {
     await broadcastToOrg('external_tools_update', {});
 }
 
-export async function addRole(data: Partial<Role>) { await supabase.from('roles').insert({ name: data.name, description: data.description}); }
+// roles.name is operator-supplied free text under a CASE-SENSITIVE unique
+// constraint (roles_name_key), so 'admin' and ' Admin ' both slip past the
+// constraint while normalising onto a system name downstream. Reserve the four
+// seeded names case-insensitively (a SUPERSET of the byte-exact match toUser and
+// getSystemRoles accept) so a custom role can never impersonate one in the audience
+// vocabulary — announcements.audience / external_tools.audience store these literal
+// strings. Deliberately NOT applied to lib/db/importer.ts: an export must import
+// verbatim, and post-sweep an imported role named 'admin' is an audience label, not
+// privilege.
+const RESERVED_ROLE_NAMES = new Set(['client', 'member', 'dispatcher', 'admin']);
+
+function assertRoleNameAvailable(name: string | undefined | null): string {
+    const n = String(name ?? '').trim();
+    if (!n) throw new Error('Role name is required.');
+    if (n.length > 60) throw new Error('Role name is too long (max 60 characters).');
+    if (RESERVED_ROLE_NAMES.has(n.toLowerCase())) throw new Error('That role name is reserved for a system role.');
+    return n;
+}
+
+/**
+ * The description has no length guard of its own anywhere else, and it is rendered in
+ * the Roles tab for every admin. Capped at the same order as the name so an
+ * admin:config:roles delegate cannot park an unbounded blob in a table that the
+ * permission UI reads on every load.
+ */
+const MAX_ROLE_DESCRIPTION_LEN = 500;
+function normaliseRoleDescription(description: unknown): string | null {
+    if (description == null) return null;
+    const d = String(description).trim();
+    if (!d) return null;
+    if (d.length > MAX_ROLE_DESCRIPTION_LEN) throw new Error(`Role description is too long (max ${MAX_ROLE_DESCRIPTION_LEN} characters).`);
+    return d;
+}
+
+export async function addRole(data: Partial<Role>) {
+    const name = assertRoleNameAvailable(data.name);
+    // The insert error used to be discarded, so a UNIQUE violation returned success
+    // and the Roles tab toasted a role that was never created.
+    const { error } = await supabase.from('roles').insert({ name, description: normaliseRoleDescription(data.description) });
+    handleSupabaseError({ error, message: 'Failed to add role' });
+}
 export async function updateRole(data: Partial<Role>) {
     const id = data.id as number;
     const { data: existing } = await supabase.from('roles').select('name, is_system').eq('id', id).single();
-    if (existing?.is_system && data.name && data.name.trim() !== existing.name) {
+    if (!existing) throw new Error('Role not found');
+    if (existing.is_system && data.name && data.name.trim() !== existing.name) {
         throw new Error('System roles cannot be renamed.');
     }
-    await supabase.from('roles').update({ name: data.name, description: data.description }).eq('id', id);
+    // Renaming a CUSTOM role onto a reserved name was unguarded; only creation-time
+    // checks would have left the same channel open through the rename path.
+    //
+    // The is_system branch keeps the STORED name verbatim rather than echoing back
+    // whatever the caller sent. The rename guard above compares `data.name.trim()`,
+    // so '  Admin  ' passes it — and the old code then wrote that raw, untrimmed
+    // string. getSystemRoles resolves the Admin slot by a BYTE-EXACT name match
+    // (lib/db/common.ts, deliberately, so a decoy role called 'admin' cannot claim
+    // it), so a padded name silently unresolves the slot and every apex gate that
+    // depends on it — assertAdminRole, the danger zone, the ban identity arm —
+    // starts denying the real Admin. A rename that is refused must be a no-op, not a
+    // whitespace edit.
+    const name = existing.is_system ? existing.name : assertRoleNameAvailable(data.name);
+    const { error } = await supabase.from('roles')
+        .update({ name, description: normaliseRoleDescription(data.description) }).eq('id', id);
+    handleSupabaseError({ error, message: 'Failed to update role' });
 }
 export async function deleteRole(id: number) {
     const { data: role } = await supabase.from('roles').select('is_system').eq('id', id).single();
@@ -1790,7 +2285,46 @@ export async function deleteLocation(id: number) {
     handleSupabaseError({ error, message: 'Failed to delete location' });
 }
 
-export async function broadcastEAM(message: string) {
+/**
+ * How loudly an EAM pings Discord.
+ *
+ * A DELIBERATELY NARROW set. Hosted lets the sender pick any synced guild role;
+ * this build offers 'role' meaning THE ONE role an admin configured
+ * (discordConfig.eamPingRoleId) and nothing else, because configuring who may be
+ * @-mentioned is admin:config:discord while SENDING an EAM is admin:broadcast:eam,
+ * which the seeded Dispatcher role holds. A free-form role picker would hand every
+ * Dispatcher an arbitrary @-mention primitive aimed at any role in the guild, and
+ * would need its own read path into synced_discord_roles to populate.
+ *
+ * '@everyone' is NOT offered at all. buildMentionContent still supports it — it is
+ * tested and it is the right shape if it is ever wanted — but nothing in this build
+ * uses it, and adding it to a picker is a strict widening of the loudest thing the
+ * product can do for no request anyone has made.
+ */
+export type EamPingTarget = 'none' | 'here' | 'role';
+
+/**
+ * Resolve the ping BEFORE the fan-out, never inside notifyDiscordEam.
+ *
+ * That function swallows every error by contract (an EAM must reach in-app and push
+ * even when Discord is down), so a bad ping target resolved in there would vanish
+ * silently instead of telling the sender. Resolving here also means a fault costs
+ * the PING, never the EAM.
+ */
+function resolveEamPing(pingTarget: unknown, configuredRoleId?: string | null): { here?: boolean; roleId?: string | null } {
+    // No explicit choice ⇒ the historical behaviour: @here, plus the configured
+    // role if one is set. Existing callers keep working unchanged.
+    if (pingTarget == null || pingTarget === '') return { here: true, roleId: configuredRoleId ?? null };
+    if (pingTarget === 'none') return {};
+    if (pingTarget === 'here') return { here: true };
+    if (pingTarget === 'role') return { roleId: configuredRoleId ?? null };
+    // Anything else is a client sending something this build does not offer. Fail
+    // QUIET rather than loud: drop the ping, still send the EAM.
+    log.warn('unknown EAM ping target — sending without a ping', { pingTarget: String(pingTarget).slice(0, 32) });
+    return {};
+}
+
+export async function broadcastEAM(message: string, pingTarget?: EamPingTarget) {
     const eamData = { message, timestamp: new Date().toISOString() };
 
     // Update settings table (for persistence — the gated broadcast:get_active_eam
@@ -1824,7 +2358,7 @@ export async function broadcastEAM(message: string) {
         ),
         sendPushToStaff(eamPushPayload),
         sendPushToPermission('user:receive:eam', eamPushPayload),
-        notifyDiscordEam(message, eamData.timestamp),
+        notifyDiscordEam(message, eamData.timestamp, pingTarget),
     ]);
 }
 
@@ -1841,14 +2375,14 @@ export async function getActiveEam(): Promise<{ message: string; timestamp: stri
     return { message: v.message, timestamp: typeof v.timestamp === 'string' ? v.timestamp : '' };
 }
 
-async function notifyDiscordEam(message: string, timestamp: string) {
+async function notifyDiscordEam(message: string, timestamp: string, pingTarget?: EamPingTarget) {
     try {
         const { data: settingsData } = await supabase.from('settings')
             .select('key, value')
             
             .in('key', ['discordConfig', 'brandingConfig']);
         type EamSettings = {
-            discordConfig?: { eamChannelId?: string };
+            discordConfig?: { eamChannelId?: string; eamPingRoleId?: string };
             brandingConfig?: { name?: string; iconUrl?: string };
         };
         const settings = ((settingsData || []) as Array<{ key: string; value: unknown }>)
@@ -1876,8 +2410,14 @@ async function notifyDiscordEam(message: string, timestamp: string) {
         };
 
         // Lazy-import to avoid a circular dep between system.ts and discord.ts.
-        const { sendDiscordChannelMessage } = await import('../discord.js');
-        await sendDiscordChannelMessage(channelId, { content: '@here', embeds: [embed], allowed_mentions: { parse: ['everyone'] } });
+        const { sendDiscordChannelMessage, buildMentionContent } = await import('../discord.js');
+        // buildMentionContent, not a hand-written allowed_mentions. This line used to
+        // be `parse: ['everyone']`, which asks Discord to parse EVERY mention out of
+        // the content — the exact fail-open shape lib/discord.ts's suppression layer
+        // exists to prevent. The builder emits an explicit, minimal allowlist.
+        const ping = resolveEamPing(pingTarget, settings.discordConfig?.eamPingRoleId);
+        const mention = buildMentionContent(ping);
+        await sendDiscordChannelMessage(channelId, { ...mention, embeds: [embed] });
     } catch (err) {
         log.error('discord eam broadcast notification failed', { err });
     }
@@ -1892,34 +2432,138 @@ export async function broadcastSystemAlert(message: string) {
     sendPushToAll({ title: 'System Broadcast', body: message, tag: 'broadcast' });
 }
 
-export async function addRadioChannel(data: Partial<RadioChannel> & { sort_order?: number }) { const { error } = await supabase.from('radio_channels').insert({ id: data.id, name: data.name, color: data.color, type: data.type, sort_order: data.sort_order || 0}); handleSupabaseError({ error, message: 'Failed to add radio channel' }); }
+// `radio_channels.id` is a caller-supplied text primary key. 'unit-'/'req-' are the
+// grammar the radio resolver reserves for synthetic squad and mission nets
+// (lib/radio.ts), which it parses BEFORE the channel lookup — so a row claiming one
+// of those ids is unjoinable by construction. Refuse it at the write boundary too,
+// rather than let a radio:manage holder create a channel that renders in the widget
+// and 403s on every click.
+export async function addRadioChannel(data: Partial<RadioChannel> & { sort_order?: number }) {
+    const id = String(data.id || '').trim();
+    if (!id) throw new Error('Radio channel id is required.');
+    if (id.startsWith('unit-') || id.startsWith('req-')) {
+        throw new Error("Radio channel ids starting with 'unit-' or 'req-' are reserved for squad and mission channels.");
+    }
+    const { error } = await supabase.from('radio_channels').insert({ id, name: data.name, color: data.color, type: data.type, sort_order: data.sort_order || 0});
+    handleSupabaseError({ error, message: 'Failed to add radio channel' });
+}
 export async function updateRadioChannel(id: string, name: string, color: string, sort_order?: number) { const updates: Record<string, unknown> = { name, color }; if (sort_order !== undefined) updates.sort_order = sort_order; const { error } = await supabase.from('radio_channels').update(updates).eq('id', id); handleSupabaseError({ error, message: 'Failed to update radio channel' }); }
 export async function deleteRadioChannel(id: string) {
     const { error } = await supabase.from('radio_channels').delete().eq('id', id);
     handleSupabaseError({ error, message: 'Failed to delete radio channel' });
 }
 
+/** Columns api_keys must have for key verification to run. Named here so the preflight can
+ *  tell the operator exactly what is missing rather than "something is wrong". */
+export const API_KEY_REQUIRED_COLUMNS = ['scopes', 'expires_at', 'revoked_at', 'key_prefix'] as const;
+
+/** Set when a key read fails with 42703 (undefined column), i.e. the code is newer than the
+ *  database. Surfaced to the operator by the boot preflight, the Database Tools health check and
+ *  an admin-only banner — because the alternative is a federation blackout whose only symptom is
+ *  an ally reporting that we look down. */
+let apiKeySchemaOutdated = false;
+export function isApiKeySchemaOutdated(): boolean { return apiKeySchemaOutdated; }
+export function __resetApiKeySchemaFlagForTest(): void { apiKeySchemaOutdated = false; }
+
+/**
+ * Which of the required api_keys columns are absent?
+ *
+ * Probes each column with a bounded head-count read and reads the PostgREST error code, rather
+ * than querying information_schema — the service-role client answers this the same way the real
+ * query paths do, so the check cannot pass while the actual reads fail.
+ *
+ * Returns [] when everything is present. Throws only on an unexpected fault, so the caller can
+ * distinguish "up to date" from "could not tell".
+ */
+export async function findMissingApiKeyColumns(): Promise<string[]> {
+    // Each probe spells its column out as a LITERAL rather than looping a variable into
+    // .select(). The wildcard-select ratchet resolves const strings but cannot resolve a loop
+    // binding, so a dynamic select here would fail CI — and rightly: "the column list is a
+    // variable" is exactly the shape the ratchet exists to refuse.
+    const probes: Array<[string, () => PromiseLike<{ error: unknown }>]> = [
+        ['scopes', () => supabase.from('api_keys').select('scopes', { count: 'exact', head: true })],
+        ['expires_at', () => supabase.from('api_keys').select('expires_at', { count: 'exact', head: true })],
+        ['revoked_at', () => supabase.from('api_keys').select('revoked_at', { count: 'exact', head: true })],
+        ['key_prefix', () => supabase.from('api_keys').select('key_prefix', { count: 'exact', head: true })],
+    ];
+    const missing: string[] = [];
+    for (const [name, run] of probes) {
+        const { error } = await run();
+        const code = (error as { code?: string } | null)?.code;
+        if (code === '42703') { missing.push(name); continue; }
+        if (error) throw error;
+    }
+    apiKeySchemaOutdated = missing.length > 0;
+    return missing;
+}
+
 export async function verifyApiKey(key: string) {
     // All keys (manual + alliance) are stored as SHA-256 hashes and verified by
     // hash only — there is no plaintext fallback, so keys that predate hashing
-    // must be re-issued. Revocation is by row deletion (api:delete_key), so a
-    // revoked key no longer matches.
+    // must be re-issued.
     if (typeof key !== 'string' || !key) return null;
     const hash = createHash('sha256').update(key).digest('hex');
-    // Return the label too so callers can tell a manual feed key from an alliance
-    // key (labelled "alliance:<peerId>"). Both live in api_keys and verify the same
-    // way, so without the label the legacy feed couldn't tell them apart and an
-    // alliance key would skip the per-peer limits (the feed endpoint checks this).
-    const { data } = await supabase.from('api_keys').select('id, label').eq('key_hash', hash).maybeSingle();
-    if (data) {
-        await supabase.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', data.id);
-        return data;
+    // The label rides along so callers can tell a manual feed key from an alliance key
+    // (labelled "alliance:<peerId>"). `scopes` is the declared capability; `revoked_at` and
+    // `expires_at` are the lifecycle.
+    const { data, error } = await supabase.from('api_keys')
+        .select('id, label, scopes, expires_at, revoked_at')
+        .eq('key_hash', hash)
+        .maybeSingle();
+
+    // FAIL CLOSED on any read fault, and say so loudly. The error was previously not bound at
+    // all, so a missing column produced `data === undefined` → `return null` → every federation
+    // route and every feed pull 403'd with NO log line anywhere. A silent total outage is worse
+    // than a noisy one; a deliberate fail-OPEN would be worse than both.
+    if (error) {
+        const code = (error as { code?: string } | null)?.code;
+        if (code === '42703') {
+            apiKeySchemaOutdated = true;
+            log.error('api_keys is missing lifecycle columns — re-run schema.sql', {
+                code,
+                required: [...API_KEY_REQUIRED_COLUMNS],
+                effect: 'API key authentication is refused until the database is updated.',
+            });
+        } else {
+            log.error('api key lookup failed', { err: error });
+        }
+        return null;
     }
-    return null;
+    if (!data) return null;
+
+    // A revoked or expired key is not a key. Checked HERE rather than in SQL so the reason is
+    // greppable in the audit trail and so a clock-skewed database cannot quietly re-admit one.
+    const row = data as { id: string; label: string; scopes: unknown; expires_at: unknown; revoked_at: unknown };
+    if (row.revoked_at) {
+        auditKeyDenial('authz.api_key.revoked', { keyId: row.id, label: row.label });
+        return null;
+    }
+    if (isKeyExpired(row.expires_at)) {
+        auditKeyDenial('authz.api_key.expired', { keyId: row.id, label: row.label });
+        return null;
+    }
+
+    // Only stamp last_used_at for a key that actually authenticated, so a revoked credential
+    // being replayed does not keep looking freshly used in the admin list.
+    await supabase.from('api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', row.id);
+    return { id: row.id, label: row.label, scopes: row.scopes };
+}
+
+/** Audit a key-level denial. Real try/catch, not a bare `void`: this sits on an
+ *  unauthenticated-reachable path, and `void` protects a caller from a rejected promise but not
+ *  from an absent export in a partial test double — which would turn a 403 into a 500. */
+function auditKeyDenial(event: string, fields: Record<string, unknown>): void {
+    try {
+        void recordSecurityEvent({ event, action: 'api:verify_key', details: fields });
+    } catch (err) {
+        log.warn('security event emit threw', { err });
+    }
 }
 
 // Org-wide outbound clearance ceiling (settings: intelSharingConfig). 0 = only
 // unclassified. Shared by the legacy feed and the per-peer alliance channel.
+// The unbound .error here is deliberate and fails CLOSED: a read fault leaves
+// `setting` null, so the ceiling collapses to 0 (share nothing above unclassified).
 export async function getMaxShareableClearance(): Promise<number> {
     const { data: setting } = await supabase.from('settings').select('value').eq('key', 'intelSharingConfig').maybeSingle();
     const v = (setting?.value as { maxShareableClearance?: number } | null)?.maxShareableClearance;
@@ -1931,6 +2575,72 @@ export async function getMaxShareableClearance(): Promise<number> {
 export function intelItemPasses(classificationLevel: number | null | undefined, isRestricted: boolean, maxClearance: number): boolean {
     if (isRestricted) return false;
     return (classificationLevel || 0) <= maxClearance;
+}
+
+// Outbound-federation read caps. Deliberately NOT safeFetch(): for these reads
+// returning a fallback IS the fail-open — an empty exclusion set means "nothing is
+// restricted", which federates exactly the rows a sync_restricted marker exists to
+// withhold, silently and with a 200.
+const FEED_MARKER_LIMIT = 500;   // caveat codes an org defines: tens at most
+const FEED_ITEM_LIMIT = 500;     // per-channel page; peers page older history via ?since=
+const MARKER_ASSOC_CHUNK = 100;  // ids per .in() — keeps the PostgREST GET URL short
+
+// The only text a failed feed read may return. It reaches a peer org / API-key holder
+// and is rendered into an ally's admin UI on the same-host path (lib/db/intel.ts), so
+// it must carry no PostgREST message, column or constraint name. Same no-leak contract
+// as handleSupabaseError; thrown directly rather than through it so each site can log
+// WHICH leg failed, which the shared helper has no field for.
+const FEED_UNAVAILABLE = 'Feed temporarily unavailable';
+
+// PostgREST serialises .in() into the GET URL, so one filter carrying a whole page of
+// ids builds a ~19KB request a proxy can reject with 414/400 — a rejection that used to
+// land on an unchecked { data } destructure and empty the exclusion set. Chunk it, and
+// throw on any error so the feed 500s instead of over-sharing.
+async function fetchMarkerAssociations<T>(
+    ids: string[],
+    run: (batch: string[]) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+    const rows: T[] = [];
+    for (let i = 0; i < ids.length; i += MARKER_ASSOC_CHUNK) {
+        const { data, error } = await run(ids.slice(i, i + MARKER_ASSOC_CHUNK));
+        if (error) {
+            log.error('shareable-intel marker-association lookup failed', { err: error });
+            throw new Error(FEED_UNAVAILABLE);
+        }
+        for (const row of (data || [])) rows.push(row);
+    }
+    return rows;
+}
+
+// One channel of the outbound page. A disabled channel is never awaited (the builder
+// only fires on .then), so an unwanted channel's saturation cannot clamp the cursor
+// the enabled ones share. An error THROWS: serving an empty page would still hand the
+// peer a cursor it writes into alliance_peers.intel_synced_at (lib/db/intel.ts),
+// permanently skipping the window we failed to read.
+async function runFeedLeg<T extends { created_at: string }>(
+    enabled: boolean,
+    query: PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+    leg: string,
+): Promise<{ rows: T[]; saturated: boolean }> {
+    if (!enabled) return { rows: [], saturated: false };
+    const { data, error } = await query;
+    if (error) {
+        log.error('shareable-intel channel query failed', { leg, err: error });
+        throw new Error(FEED_UNAVAILABLE);
+    }
+    const rows = data || [];
+    return { rows, saturated: rows.length >= FEED_ITEM_LIMIT };
+}
+
+// Clamp to the last created_at strictly BELOW the final served row's, so the caller's
+// next .gt('created_at', cursor) cannot skip rows sharing the tail timestamp that fell
+// beyond the cap. null ⇒ the whole page is one timestamp ⇒ the cursor cannot advance
+// without dropping the remainder. Re-serving the trailing rows is fine — the receiver
+// dedups the replay, the same property fetchedAt's pre-query capture relies on.
+function clampCursor(rows: Array<{ created_at: string }>): string | null {
+    const lastTs = rows[rows.length - 1].created_at;
+    for (let i = rows.length - 2; i >= 0; i--) if (rows[i].created_at !== lastTs) return rows[i].created_at;
+    return null;
 }
 
 export interface ShareableIntelOpts {
@@ -1959,9 +2669,26 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
     const since = opts.since;
 
     // 1. Limiting markers (sync_restricted exclusion set + code lookup)
-    const { data: allMarkers } = await supabase.from('security_limiting_markers').select('id, code, sync_restricted');
-    type MarkerRow = { id: string; code: string; sync_restricted: boolean | null };
+    const { data: allMarkers, error: markersError } = await supabase.from('security_limiting_markers')
+        .select('id, code, sync_restricted')
+        .order('id', { ascending: true })
+        .limit(FEED_MARKER_LIMIT);
+    if (markersError) {
+        log.error('shareable-intel marker lookup failed', { err: markersError });
+        throw new Error(FEED_UNAVAILABLE);
+    }
+    // marker id / marker_id are `integer` (schema.sql), not text — the old `string`
+    // casts only worked because the Map was keyed by whatever the driver returned.
+    type MarkerRow = Pick<Tables<'security_limiting_markers'>, 'id' | 'code' | 'sync_restricted'>;
     const markerRows = (allMarkers || []) as MarkerRow[];
+    if (markerRows.length >= FEED_MARKER_LIMIT) {
+        // SATURATED ⇒ FAIL CLOSED. A marker we did not fetch is a marker that cannot
+        // exclude its rows, so truncation here degrades into exactly the silent
+        // over-share the error branch above refuses. The cap is ~25x the caveat codes
+        // an org defines, so refusing is not a denial of service on a real deployment.
+        log.error('shareable-intel marker lookup hit the cap; refusing to federate against a partial marker set', { cap: FEED_MARKER_LIMIT });
+        throw new Error(FEED_UNAVAILABLE);
+    }
     const markerMap = new Map(markerRows.map((m) => [m.id, m] as const));
     const restrictedMarkerIds = new Set(markerRows.filter((m) => m.sync_restricted).map((m) => m.id));
 
@@ -1994,9 +2721,20 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
         bulletinsQuery = bulletinsQuery.gt('created_at', since);
     }
 
-    const [reportsResult, warrantsResult, bulletinsResult] = await Promise.all([reportsQuery, warrantsQuery, bulletinsQuery]);
-    const reports = reportsResult.data || [];
-    const bulletins = bulletinsResult.data || [];
+    // Order + cap are applied HERE, not on the builders above: .order() returns a
+    // transform builder that no longer exposes .gt(), which the `since` block needs.
+    // ASCENDING, not descending: under ?since= cursor semantics a DESC-truncated page
+    // drops the OLDEST rows in the window while the cursor still advances past them —
+    // permanent loss. ASC plus an id tiebreak is a total order, so the cap always
+    // truncates the NEWEST tail, which the clamped cursor below re-serves next pull.
+    const ASC = { ascending: true } as const;
+    const [reportsLeg, warrantsLeg, bulletinsLeg] = await Promise.all([
+        runFeedLeg(wantReports, reportsQuery.order('created_at', ASC).order('id', ASC).limit(FEED_ITEM_LIMIT), 'reports'),
+        runFeedLeg(wantWarrants, warrantsQuery.order('created_at', ASC).order('id', ASC).limit(FEED_ITEM_LIMIT), 'warrants'),
+        runFeedLeg(wantBulletins, bulletinsQuery.order('created_at', ASC).order('id', ASC).limit(FEED_ITEM_LIMIT), 'bulletins'),
+    ]);
+    const reports = reportsLeg.rows;
+    const bulletins = bulletinsLeg.rows;
 
     // 3. Get marker associations for all fetched reports
     const reportIds = reports.map((r) => r.id);
@@ -2004,13 +2742,17 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
     const reportMarkersMap = new Map<string, string[]>();
 
     if (reportIds.length > 0) {
-        const { data: associations } = await supabase.from('intel_report_limiting_markers')
-            .select('report_id, marker_id')
-            .in('report_id', reportIds);
+        const associations = await fetchMarkerAssociations<{ report_id: string; marker_id: number }>(
+            reportIds,
+            (batch) => supabase.from('intel_report_limiting_markers').select('report_id, marker_id').in('report_id', batch),
+        );
 
-        for (const { report_id, marker_id } of (associations || []) as Array<{ report_id: string; marker_id: string }>) {
+        for (const { report_id, marker_id } of associations) {
             const marker = markerMap.get(marker_id);
-            if (!marker) continue;
+            // An association we cannot resolve is an UNKNOWN restriction (a marker
+            // created between the two reads). Withhold rather than share the report
+            // unmarked — deny-by-default, same as the sync_restricted set below.
+            if (!marker) { excludedReportIds.add(report_id); continue; }
 
             // Reports with sync_restricted markers are excluded from the feed entirely
             if (restrictedMarkerIds.has(marker_id)) {
@@ -2028,13 +2770,15 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
     const bulletinMarkersMap = new Map<string, string[]>();
 
     if (bulletinIds.length > 0) {
-        const { data: bAssociations } = await supabase.from('intel_bulletin_limiting_markers')
-            .select('bulletin_id, marker_id')
-            .in('bulletin_id', bulletinIds);
+        const bAssociations = await fetchMarkerAssociations<{ bulletin_id: string; marker_id: number }>(
+            bulletinIds,
+            (batch) => supabase.from('intel_bulletin_limiting_markers').select('bulletin_id, marker_id').in('bulletin_id', batch),
+        );
 
-        for (const { bulletin_id, marker_id } of (bAssociations || []) as Array<{ bulletin_id: string; marker_id: string }>) {
+        for (const { bulletin_id, marker_id } of bAssociations) {
             const marker = markerMap.get(marker_id);
-            if (!marker) continue;
+            // Unresolvable association ⇒ unknown restriction ⇒ withhold (see reports).
+            if (!marker) { excludedBulletinIds.add(bulletin_id); continue; }
 
             if (restrictedMarkerIds.has(marker_id)) {
                 excludedBulletinIds.add(bulletin_id);
@@ -2058,8 +2802,31 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
     // level 0 and pass the same intelItemPasses ceiling the reports/bulletins do.
     // This keeps the warrant leg consistent with the other channels (it can no
     // longer be a raw unfiltered passthrough) and honours a sub-zero ceiling.
-    const shareableWarrants = (warrantsResult.data || [])
-        .filter((w) => intelItemPasses(0, false, maxShareableLevel));
+    const shareableWarrants = warrantsLeg.rows
+        .filter(() => intelItemPasses(0, false, maxShareableLevel));
+
+    // Saturation: a truncated page must NOT advance the caller's cursor past rows we
+    // withheld — the receiver writes _meta.fetchedAt straight into
+    // alliance_peers.intel_synced_at (lib/db/intel.ts), so an unclamped cursor skips
+    // the remainder for good. Only the channels the caller actually asked for count:
+    // a discarded leg's saturation must not clamp the cursor the others share.
+    let effectiveFetchedAt = fetchedAt;
+    const saturatedLegs = [reportsLeg, warrantsLeg, bulletinsLeg].filter((l) => l.saturated);
+    if (saturatedLegs.length > 0) {
+        const clamped: string[] = [];
+        for (const leg of saturatedLegs) {
+            const cursor = clampCursor(leg.rows);
+            if (cursor === null) {
+                // A whole page at one created_at: the cursor cannot move forward, so
+                // any page we serve silently drops the remainder. Fail closed, loudly.
+                log.error('shareable-intel page cannot advance the cursor; refusing to serve a page that would silently drop the remainder', { cap: FEED_ITEM_LIMIT });
+                throw new Error(FEED_UNAVAILABLE);
+            }
+            clamped.push(cursor);
+        }
+        effectiveFetchedAt = clamped.reduce((a, b) => (a < b ? a : b));
+        log.warn('shareable-intel page saturated; clamping the next cursor to the last row served', { cap: FEED_ITEM_LIMIT, effectiveFetchedAt });
+    }
 
     return {
         reports: wantReports ? enrichedReports : [],
@@ -2071,7 +2838,7 @@ export async function collectShareableIntel(opts: ShareableIntelOpts) {
         // only the ceiling itself.
         _meta: {
             maxShareableLevel,
-            fetchedAt,
+            fetchedAt: effectiveFetchedAt,
         }
     };
 }
@@ -2097,6 +2864,87 @@ export async function getPublicFeedData(since?: string) {
 
 export async function runDatabaseHealthCheck() {
     const results: Array<{ check: string; status: string; count: number | null; action?: string }> = [];
+
+    // Schema drift. The single most common upgrade mistake is pulling new code and
+    // forgetting to re-run schema.sql, which used to be invisible until a feature
+    // failed oddly. schema.sql stamps settings.schema_version on every apply; this
+    // compares it to what the running build expects. Read defensively - a missing
+    // settings row or an absent table must report UNKNOWN, never a false DRIFT.
+    try {
+        const { data: verRow } = await supabase.from('settings')
+            .select('value')
+            .eq('key', 'schema_version')
+            .maybeSingle();
+        const applied = typeof verRow?.value === 'string' ? verRow.value : null;
+        const cmp = compareSchemaVersion(applied);
+        if (cmp.status === 'drift') {
+            results.push({ check: `Schema Version (found ${cmp.applied}, expected ${cmp.expected})`, status: 'WARNING', count: null, action: 'Re-run schema.sql' });
+        } else if (cmp.status === 'unknown') {
+            results.push({ check: 'Schema Version (not recorded)', status: 'WARNING', count: null, action: 'Re-run schema.sql' });
+        } else {
+            results.push({ check: `Schema Version (${cmp.expected})`, status: 'OK', count: null });
+        }
+    } catch {
+        results.push({ check: 'Schema Version (unreadable)', status: 'WARNING', count: null, action: 'Re-run schema.sql' });
+    }
+
+    // Secret encryption-at-rest: which key is each stored credential under? Counts only —
+    // this uses the discriminator-only probe, so no live credential is ever decrypted into
+    // memory on this path. Same fail-safe shape as the schema-drift block above: unreadable
+    // reports a WARNING, never a false alarm and never a false all-clear.
+    try {
+        const inv = await inventorySecretCiphertexts();
+        if (inv.noKey > 0) {
+            results.push({ check: `Secret Encryption (${inv.noKey} encrypted value(s), no key configured)`, status: 'ERROR', count: inv.noKey, action: 'Set SECRETS_ENCRYPTION_KEY and restart' });
+        } else if (inv.undecryptable > 0) {
+            results.push({ check: `Secret Encryption (${inv.undecryptable} value(s) decrypt under NEITHER key)`, status: 'ERROR', count: inv.undecryptable, action: 'Set SECRETS_ENCRYPTION_KEY_PREVIOUS to the old key and restart' });
+        } else if (inv.underPrevious > 0) {
+            results.push({ check: `Secret Encryption (${inv.underPrevious} value(s) still under the previous key)`, status: 'WARNING', count: inv.underPrevious, action: 'Rotate Encryption Key' });
+        } else if (hasPreviousKey()) {
+            results.push({ check: `Secret Encryption (${inv.underCurrent} current; previous key no longer needed)`, status: 'WARNING', count: inv.underCurrent, action: 'Remove SECRETS_ENCRYPTION_KEY_PREVIOUS' });
+        } else {
+            results.push({ check: `Secret Encryption (${inv.underCurrent} value(s) current)`, status: 'OK', count: inv.underCurrent });
+        }
+    } catch {
+        results.push({ check: 'Secret Encryption (unreadable)', status: 'WARNING', count: null });
+    }
+
+    // API-key lifecycle columns. Named individually so the operator is told WHICH columns are
+    // missing rather than "something is wrong" — this is the check that turns a silent
+    // federation blackout into a sentence they can act on.
+    try {
+        const missing = await findMissingApiKeyColumns();
+        if (missing.length > 0) {
+            results.push({
+                check: `Database Update Required — api_keys is missing: ${missing.join(', ')}`,
+                status: 'ERROR',
+                count: missing.length,
+                action: 'Re-run schema.sql — API key authentication is refused until you do',
+            });
+        } else {
+            results.push({ check: 'API Key Lifecycle Columns', status: 'OK', count: null });
+        }
+    } catch {
+        results.push({ check: 'API Key Lifecycle Columns (unreadable)', status: 'WARNING', count: null });
+    }
+
+    // Rotating the key changes computeVoterHash's output, and for a SECRET-BALLOT motion that
+    // hash is the only one-vote guard. Warn only while a rotation is actually in flight, and
+    // only for motions in 'Voting' — a motion at 'Open' has no votes cast yet, so it is
+    // precisely the status where the risk cannot exist. Its own try/catch: a fault here must
+    // not take down the whole diagnostic.
+    if (hasPreviousKey()) {
+        try {
+            const { count: openSecret } = await supabase.from('government_motions')
+                .select('id', { count: 'exact', head: true })
+                .eq('is_secret_ballot', true)
+                .eq('status', 'Voting');
+            if (openSecret && openSecret > 0) {
+                results.push({ check: 'Secret-Ballot Motions Mid-Vote During Key Change', status: 'WARNING', count: openSecret, action: 'Set BALLOT_PEPPER or conclude the vote' });
+            }
+        } catch { /* diagnostic only — never fail the health check on it */ }
+    }
+
     const { count: requests } = await supabase.from('service_requests')
         .select('id', { count: 'exact', head: true })
         ;

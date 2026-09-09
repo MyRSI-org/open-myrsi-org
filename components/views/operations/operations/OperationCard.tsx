@@ -58,6 +58,18 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
         ? operationCountdown(operation.scheduledStart)
         : null;
 
+    // The whole card is the click target, so without this it is unreachable by keyboard —
+    // there is no <button> or <a> anywhere inside either variant (verified), which is also
+    // why role="button" here creates no nested-widget conflict and the handler cannot
+    // double-fire. Named and coloured to match the hosted build so the next parity diff is
+    // quiet. preventDefault on Space stops the page scrolling underneath the activation.
+    const handleCardKeyDown = (e: React.KeyboardEvent) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            viewOperationDetails(operation);
+        }
+    };
+
     const ownerName = operation.owner?.name || 'Unknown Commander';
     const ownerRank = operation.owner?.rank?.name;
     const ownerAvatar = operation.owner?.avatarUrl;
@@ -67,7 +79,11 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
         return (
             <div
                 onClick={() => viewOperationDetails(operation)}
-                className="group relative flex flex-col h-full rounded-xl overflow-hidden border border-red-600/30 hover:border-red-500/60 bg-slate-950 shadow-lg transition-all duration-300 cursor-pointer hover:shadow-red-900/20"
+                onKeyDown={handleCardKeyDown}
+                role="button"
+                tabIndex={0}
+                aria-label={`Open classified operation ${operation.name}`}
+                className="group relative flex flex-col h-full rounded-xl overflow-hidden border border-red-600/30 hover:border-red-500/60 bg-slate-950 shadow-lg transition-all duration-300 cursor-pointer hover:shadow-red-900/20 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-red-500/60"
             >
                 <div className="absolute inset-0 opacity-[0.04] bg-[repeating-linear-gradient(45deg,#dc2626,#dc2626_10px,transparent_10px,transparent_20px)] pointer-events-none" aria-hidden />
                 <div className="absolute -top-10 -right-10 w-32 h-32 bg-red-600/10 rounded-full blur-[90px] opacity-60 group-hover:opacity-100 transition-opacity" aria-hidden />
@@ -118,7 +134,11 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
     return (
         <div
             onClick={() => viewOperationDetails(operation)}
-            className="group relative flex flex-col h-full rounded-xl overflow-hidden border border-white/10 bg-linear-to-br from-slate-900/80 via-slate-900/60 to-slate-950/80 backdrop-blur-xs shadow-lg transition-all duration-300 cursor-pointer hover:border-white/20 hover:shadow-xl"
+            onKeyDown={handleCardKeyDown}
+            role="button"
+            tabIndex={0}
+            aria-label={`Open operation ${operation.name}`}
+            className="group relative flex flex-col h-full rounded-xl overflow-hidden border border-white/10 bg-linear-to-br from-slate-900/80 via-slate-900/60 to-slate-950/80 backdrop-blur-xs shadow-lg transition-all duration-300 cursor-pointer hover:border-white/20 hover:shadow-xl focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-purple-500/50"
         >
             <div className={`absolute inset-y-0 left-0 w-1 ${statusA.dot}`} aria-hidden />
 

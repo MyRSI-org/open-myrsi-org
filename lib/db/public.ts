@@ -1,4 +1,5 @@
 import { supabase, handleSupabaseError } from './common.js';
+import { escapeLikePattern } from '../pgrest.js';
 import { getPublicSettings } from './system.js';
 import { opaqueId } from '../publicId.js';
 import { tryParseTiptapJson, tiptapJsonToSafeHtml, isEmptyTiptapDoc } from '../tiptapValidate.js';
@@ -201,7 +202,11 @@ export async function getTestimonialCandidates(
 
     if (params.search && typeof params.search === 'string' && params.search.trim()) {
         const term = params.search.trim().slice(0, 100);
-        const escaped = term.replace(/[%_,()]/g, (m) => `\\${m}`);
+        // Shared helper: the local list escaped % _ , ( ) but NOT `\` (Postgres'
+        // own escape character) or `*` (PostgREST rewrites it to %). Commas and
+        // parens carry no grammar in a top-level ilike operand — only an .or()
+        // filter string parses them, and this is not one.
+        const escaped = escapeLikePattern(term);
         dataQuery = dataQuery.ilike('client_feedback', `%${escaped}%`);
         countQuery = countQuery.ilike('client_feedback', `%${escaped}%`);
     }

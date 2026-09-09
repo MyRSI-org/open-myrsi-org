@@ -4,6 +4,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // must PROVE the caller controls the RSI profile before it stamps rsi_verified=true.
 // Before the fix it flipped the flag unconditionally, so any account could bind any
 // handle (incl. a victim's) and absorb that handle's ad-hoc service requests.
+//
+// Also: initiateRsiHandleUpdate must reject a value that is not shaped like a citizen
+// handle BEFORE it lands in rsi_handle_pending, which verifyRsiUpdate promotes into
+// rsi_handle and feeds to two .ilike() identity lookups on the way.
 
 const h = vi.hoisted(() => ({
     pending: 'VictimHandle' as string | null,
@@ -13,7 +17,10 @@ const h = vi.hoisted(() => ({
     updates: [] as Array<{ table: string; values: Record<string, unknown> }>,
 }));
 
-vi.mock('../lib/rsi', () => ({
+// Only the network proof and the CSPRNG code are stubbed — the REAL isValidRsiHandle
+// stays in play, since the shape guard is part of what is under test here.
+vi.mock('../lib/rsi', async () => ({
+    ...(await vi.importActual<typeof import('../lib/rsi')>('../lib/rsi')),
     verifyRsiHandle: vi.fn(async () => h.proofOk),
     generateRsiVerificationCode: () => 'MYRSI-generated-code',
 }));
@@ -51,7 +58,7 @@ vi.mock('../lib/db/system', () => ({ getAllSettings: async () => ({}) }));
 vi.mock('../lib/discord', () => ({ getDiscordMember: async () => null, pushDiscordRolesForUser: async () => undefined, getDiscordUserById: async () => null, buildGlobalAvatarUrl: () => '' }));
 vi.mock('../lib/push', () => ({ isAllowedPushEndpoint: () => true, MAX_PUSH_SUBSCRIPTIONS_PER_USER: 10 }));
 
-import { verifyRsiUpdate } from '../lib/db/users';
+import { verifyRsiUpdate, initiateRsiHandleUpdate } from '../lib/db/users';
 import { verifyRsiHandle } from '../lib/rsi';
 
 beforeEach(() => {
@@ -84,5 +91,27 @@ describe('verifyRsiUpdate ownership proof (F1)', () => {
         h.pending = null;
         await expect(verifyRsiUpdate(7)).rejects.toThrow(/no pending verification/i);
         expect(verifyRsiHandle).not.toHaveBeenCalled();
+    });
+});
+
+describe('initiateRsiHandleUpdate shape guard', () => {
+    it('refuses a LIKE-metacharacter handle before it reaches rsi_handle_pending', async () => {
+        // '%' would be a wildcard, not a name, in the .ilike() identity lookups
+        // verifyRsiUpdate runs on promotion.
+        await expect(initiateRsiHandleUpdate(7, '%')).rejects.toThrow(/valid RSI handle/i);
+        expect(h.updates).toHaveLength(0);
+    });
+
+    it('refuses an over-long handle', async () => {
+        await expect(initiateRsiHandleUpdate(7, 'a'.repeat(61))).rejects.toThrow(/valid RSI handle/i);
+        expect(h.updates).toHaveLength(0);
+    });
+
+    it('stores a well-formed handle with a freshly minted code', async () => {
+        await expect(initiateRsiHandleUpdate(7, 'Valid_Handle-1')).resolves.toEqual({ code: 'MYRSI-generated-code' });
+        expect(h.updates[0]?.values).toMatchObject({
+            rsi_handle_pending: 'Valid_Handle-1',
+            rsi_verification_code: 'MYRSI-generated-code',
+        });
     });
 });

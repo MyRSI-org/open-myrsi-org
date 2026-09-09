@@ -34,6 +34,8 @@ vi.mock('../lib/auth', () => ({
 
 vi.mock('../lib/db', () => ({
     supabase: { auth: { getUser: async () => ({ data: { user: null }, error: 'no' }) } },
+    // The org-ban gate runs on every authenticated dispatcher request; null = not banned.
+    findActiveBan: async () => null,
     getPlatformSettings: async () => h.platformSettings,
     getUserById: async () => { h.calls.getUserById++; return h.user; },
     getUserByAuthId: async () => h.user,

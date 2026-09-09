@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { stripSecrets } from '../api/query';
 
 // Guards the secret-stripping on the client-facing state payload — including the
@@ -110,5 +112,93 @@ describe('stripSecrets', () => {
         expect(out.list[0].label).toBe('A');
         expect(out.rotation_secret).toBeUndefined();
         expect(out.note_token).toBeUndefined();
+    });
+
+    // The outbound intel-federation ceiling rides the settings blob to every
+    // authenticated member on `main` and `initial-state`. Nothing in the bundle
+    // renders it (the Admin console reads it via admin:get_intel_sharing_config),
+    // so it is dropped at the wire.
+    it('deletes intelSharingConfig — the outbound federation ceiling never reaches a member', () => {
+        const out = stripSecrets({
+            intelSharingConfig: { maxShareableClearance: 3 },
+            brandingConfig: { name: 'Jims Org', iconUrl: '/icon.svg' },
+        });
+        expect(out.intelSharingConfig).toBeUndefined();
+        // Not collateral damage on the rest of the settings blob.
+        expect(out.brandingConfig).toEqual({ name: 'Jims Org', iconUrl: '/icon.svg' });
+    });
+
+    it('the unconditional delete is what removes it — the key-name scrub never would', () => {
+        // maxShareableClearance: 0 so a truthiness-based fix would not pass, and
+        // neither `intelSharingConfig` nor `maxShareableClearance` matches SECRET_KEY.
+        const out = stripSecrets({ intelSharingConfig: { maxShareableClearance: 0 }, dutyTimeoutMinutes: 30 });
+        expect(out.intelSharingConfig).toBeUndefined();
+        expect(out.dutyTimeoutMinutes).toBe(30);
+    });
+
+    // --- Phase 3 item 8: the two named deletes behind the settings allow-list ---
+    //
+    // Both are REDUNDANT on the three merged payloads now that
+    // projectSettingsForViewer (lib/settingsProjection.ts) allow-lists the blob one layer
+    // earlier. They are kept deliberately, as the belt to the projection's braces: a
+    // future FOURTH merge site that forgets the projection still cannot ship these two.
+    // The ratchet at the bottom of this file is what makes removing one a decision
+    // rather than an accident.
+
+    it('deletes system_broadcast — the last org tasking never rides the settings blob', () => {
+        // broadcastSystemAlert persists the org's last org-wide tasking to a settings row,
+        // so a permanently-stale copy of the message body rode `main` / `initial-state` to
+        // every authenticated member, a Client included. Nothing READS the key: the live
+        // delivery path is the auth-alerts broadcast that SessionContext consumes.
+        const out = stripSecrets({
+            system_broadcast: { message: 'FLASH — all hands', id: '1' },
+            brandingConfig: { name: 'Jims Org', iconUrl: '/icon.svg' },
+        });
+        expect(out.system_broadcast).toBeUndefined();
+        expect(out.brandingConfig).toEqual({ name: 'Jims Org', iconUrl: '/icon.svg' });
+    });
+
+    it('the unconditional delete is what removes system_broadcast — the key-name scrub never would', () => {
+        // Falsy scalars so a truthiness-based fix fails, and no
+        // _api_key|_secret|_password|_webhook|_token substring anywhere in the payload.
+        const out = stripSecrets({ system_broadcast: { message: '', id: '' }, dutyTimeoutMinutes: 30 });
+        expect(out.system_broadcast).toBeUndefined();
+        expect(out.dutyTimeoutMinutes).toBe(30);
+    });
+
+    it('deletes orgFeatures — the duplicate module map — while orgMeta.features survives', () => {
+        // A DUPLICATE, not a secret. orgMeta.features is the authoritative module map and
+        // is deliberately kept for EVERY caller (HelpView is Client-reachable and reads
+        // it); this is the raw settings row it is built from, riding the blob a second
+        // time under its storage key with no consumer at all. Both directions pinned: the
+        // duplicate goes, the authoritative copy stays.
+        const out = stripSecrets({
+            orgFeatures: { academy: { enabled: true } },
+            orgMeta: { features: { academy: { enabled: true } } },
+        });
+        expect(out.orgFeatures).toBeUndefined();
+        expect(out.orgMeta).toEqual({ features: { academy: { enabled: true } } });
+    });
+
+    it('the unconditional delete is what removes orgFeatures', () => {
+        const out = stripSecrets({ orgFeatures: { academy: { enabled: false } }, dutyTimeoutMinutes: 30 });
+        expect(out.orgFeatures).toBeUndefined();
+        expect(out.dutyTimeoutMinutes).toBe(30);
+    });
+
+    it('RATCHET — the delete list is a superset of the named set', () => {
+        // Superset, not equality, so a future delete does not need this test edited — but
+        // REMOVING one fails CI. The two item-8 entries are the ones most likely to look
+        // deletable to a later reader, precisely because the allow-list makes them
+        // redundant on today's three paths.
+        const src = readFileSync(join(process.cwd(), 'api/query.ts'), 'utf8');
+        const deleted = new Set(
+            [...src.matchAll(/delete\s+cleaned\.([A-Za-z_][A-Za-z0-9_]*)\s*;/g)].map(m => m[1]),
+        );
+        for (const key of ['geminiKey', 'allianceLocalPairingCode', 'admin_setup_code', 'active_eam',
+            'intelSharingConfig', 'role_permission_backfills', 'systemConfig',
+            'system_broadcast', 'orgFeatures']) {
+            expect(deleted.has(key), `delete cleaned.${key} is missing from stripSecrets`).toBe(true);
+        }
     });
 });

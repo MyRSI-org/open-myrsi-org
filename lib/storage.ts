@@ -49,6 +49,37 @@ export const MAX_UPLOAD_BYTES = envBytes('MEDIA_MAX_UPLOAD_BYTES', 5 * 1024 * 10
 /** Total storage cap across BOTH buckets (abuse bound). Env-tunable
  *  (MEDIA_MAX_STORAGE_BYTES); default 250 MiB. An upload that would exceed it is rejected. */
 export const MAX_STORAGE_BYTES = envBytes('MEDIA_MAX_STORAGE_BYTES', 250 * 1024 * 1024);
+/** Read a positive-integer seconds value from an env var, else the default. Clamped to
+ *  [60, 86400] so a fat-fingered value cannot mint a day-long URL or a 1-second one. */
+function envSeconds(name: string, def: number): number {
+    const raw = process.env[name];
+    if (!raw) return def;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return def;
+    return Math.min(86400, Math.max(60, Math.floor(n)));
+}
+
+/** Signed-URL lifetimes, split by how the URL is CONSUMED. Both env-tunable — a self-hoster
+ *  owns their own Supabase and their own tolerance for re-signing traffic.
+ *
+ *  These are FLOORS in practice: a Supabase signed URL cannot be renewed, only re-minted,
+ *  and nothing on the client re-mints on a timer — a page left open past the TTL shows
+ *  broken images until its view refetches. Do not drop READ below ~15 minutes without first
+ *  giving the client a re-sign trigger. Note the stored objects carry a one-year
+ *  `cacheControl` (see uploadOrgMedia), so each re-sign is a new cache key and a full
+ *  re-download: that, not the round-trip, is the real cost ceiling on lowering READ.
+ *
+ *  READ   — hydrated into a document a permitted client is rendering right now. Every
+ *           consumer (wiki view mount, wiki_page_slice, government view mount, legislation
+ *           list) refetches on mount and on realtime, so a short life costs only re-signing.
+ *  EDITOR — the preview URL handed back from an upload, which sits in an open editor until
+ *           the author saves. Deliberately the longer of the two: an author can compose for
+ *           an hour. Expiry is cosmetic here — classifyOrgMediaRef parses the PATH and never
+ *           the `?token=`, so an EXPIRED preview URL still normalises to the correct key on
+ *           save. That property is load-bearing; it is pinned by a test. */
+export const SIGN_TTL_READ = envSeconds('MEDIA_SIGN_TTL_SECONDS', 900);
+export const SIGN_TTL_EDITOR = envSeconds('MEDIA_SIGN_TTL_EDITOR_SECONDS', 3600);
+
 /** Longest-edge cap applied by sharp; bounds stored bytes + downstream render cost. */
 const MEDIA_MAX_DIMENSION = 2048;
 /** Decoded-pixel cap ("decode bomb" defense — a small-COMPRESSED but huge-DIMENSION
@@ -106,6 +137,7 @@ export type OrgMediaFeature =
     | 'commendation'
     | 'alliance'
     | 'quartermaster'
+    | 'catalog'
     | 'wiki'
     | 'government'
     | 'legislation'
@@ -127,6 +159,16 @@ export const ORG_MEDIA_FEATURES: Record<OrgMediaFeature, OrgMediaFeatureDef> = {
     commendation: { bucket: PUBLIC_BUCKET, visibility: 'public' },
     alliance: { bucket: PUBLIC_BUCKET, visibility: 'public' },
     quartermaster: { bucket: PUBLIC_BUCKET, visibility: 'public' },
+    // PLATFORM item-catalog thumbnails — quartermaster_catalog WHERE source='platform',
+    // written by catalog:update_item / admin:config:catalog in the UNGATED catalog:
+    // namespace. Deliberately separate from `quartermaster` above, which feeds the org's
+    // OWN custom rows (source='custom', qm:update_catalog_item / qm:admin) and rides the
+    // GATED qm: namespace. One table, two resources, two permissions, two gates.
+    // PUBLIC is load-bearing, not stylistic: nothing signs quartermaster_catalog's
+    // thumbnail_url on read — it is mapped straight to the wire (lib/db/mappers.ts) and
+    // rendered as a bare <img src>, so a private-bucket key would render broken
+    // everywhere an item thumbnail appears.
+    catalog: { bucket: PUBLIC_BUCKET, visibility: 'public' },
     wiki: { bucket: PRIVATE_BUCKET, visibility: 'private' },
     government: { bucket: PRIVATE_BUCKET, visibility: 'private' },
     legislation: { bucket: PRIVATE_BUCKET, visibility: 'private' },
@@ -224,18 +266,68 @@ export async function uploadOrgMedia(feature: OrgMediaFeature, buf: Buffer): Pro
 }
 
 /**
+ * Extract the object key that follows `prefix` in a ref, ANCHORED. The prefix must start the
+ * URL's PATHNAME — not merely appear somewhere in the string, which is what a bare
+ * `indexOf` allowed: `https://evil.example/x/storage/v1/object/public/org-public-media/media/rank/a.webp`
+ * used to parse as one of our objects, and that string survives sanitizeImageUrl, so it is
+ * reachable from any "paste an image URL" field.
+ *
+ * `requireOwnOrigin` additionally demands the URL live on THIS deployment's Supabase origin.
+ * It is applied on the WRITE side only (classifyOrgMediaRef → normalizeDocMediaForStorage),
+ * where a foreign storage-shaped URL would otherwise collapse to a bare key that the read
+ * path later signs for anyone permitted to read that document.
+ *
+ * It is deliberately NOT applied on the read/GC side (orgMediaKeyFromUrl). getPublicUrl bakes
+ * the THEN-CURRENT origin into every stored public URL, so any later origin change — a custom
+ * domain in front of Supabase, a proxy swap, a project restore, a staging→prod dump, http↔https
+ * drift — would make every stored branding/rank/unit/certification URL classify as external,
+ * empty the GC's referenced set, and let the next nightly sweep delete every public object
+ * (all of which are past the grace window). Matching MORE strings there is the fail-safe
+ * direction: a matched ref only ever PROTECTS an object from deletion.
+ *
+ * `SUPABASE_URL` is read per call, not cached at module load, so the value cannot go stale
+ * between a test's env stub and the parse.
+ */
+function keyAfterPathPrefix(ref: string, prefix: string, requireOwnOrigin: boolean): string | null {
+    let pathname: string;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(ref)) {
+        let u: URL;
+        try { u = new URL(ref); } catch { return null; }
+        if (requireOwnOrigin) {
+            let ownOrigin: string | null;
+            try { ownOrigin = new URL(process.env.SUPABASE_URL ?? '').origin; } catch { ownOrigin = null; }
+            if (!ownOrigin || u.origin !== ownOrigin) return null;
+        }
+        // u.pathname keeps percent-encoding, so a `%2e%2e` traversal still fails the
+        // KEY_PREFIX test at the call site. Do NOT decodeURIComponent here — that would
+        // CREATE the traversal path this is guarding against.
+        pathname = u.pathname;
+    } else if (ref.startsWith('/')) {
+        pathname = ref.split('?')[0].split('#')[0];
+    } else {
+        return null;
+    }
+    if (!pathname.startsWith(prefix)) return null;
+    return pathname.slice(prefix.length) || null;
+}
+
+/**
  * Resolve a stored ref (a public-bucket URL OR a raw private-bucket key) to its
- * {bucket, key}. Returns null for anything that is not one of OUR objects (external
- * image URLs are never touched by a delete) or that smells like traversal.
+ * {bucket, key}. Returns null for anything that is not one of OUR objects or that smells
+ * like traversal. Used to build the GC's referenced-key set.
  */
 export function orgMediaKeyFromUrl(ref: string | null | undefined): { bucket: string; key: string } | null {
     if (typeof ref !== 'string' || !ref) return null;
     // Public bucket: a full `/storage/v1/object/public/org-public-media/…` URL.
-    const marker = `/storage/v1/object/public/${PUBLIC_BUCKET}/`;
-    const i = ref.indexOf(marker);
-    if (i !== -1) {
-        const key = ref.slice(i + marker.length).split('?')[0].split('#')[0];
-        if (!key || key.includes('..')) return null;
+    // NOT origin-checked, deliberately — see keyAfterPathPrefix. This parser's only consumer
+    // is the GC's reference set, where matching MORE strings is the fail-safe direction.
+    const key = keyAfterPathPrefix(ref, `/storage/v1/object/public/${PUBLIC_BUCKET}/`, false);
+    if (key !== null) {
+        // Anchored on KEY_PREFIX like every other site in this file. The public branch used
+        // to check traversal only, so a public URL naming an object outside `media/`
+        // resolved. Nothing writes such an object (uploadOrgMedia is the only writer), so
+        // this is a tightening, not a behaviour change.
+        if (!key.startsWith(`${KEY_PREFIX}/`) || key.includes('..')) return null;
         return { bucket: PUBLIC_BUCKET, key };
     }
     // Private bucket: a raw object key (no scheme/host), stored verbatim in the row.
@@ -245,27 +337,22 @@ export function orgMediaKeyFromUrl(ref: string | null | undefined): { bucket: st
     return null;
 }
 
-/**
- * Best-effort delete of a previously-uploaded object (replacement/orphan cleanup). Only
- * touches OUR objects (a `media/` key or an org-public-media URL); an external URL or a
- * traversal-smelling value is a no-op. Never throws.
- */
-export async function removeOrgMedia(ref: string | null | undefined): Promise<void> {
-    const parsed = orgMediaKeyFromUrl(ref);
-    if (!parsed) return;
-    try {
-        await supabase.storage.from(parsed.bucket).remove([parsed.key]);
-    } catch (e) {
-        log.warn('org media remove failed', { err: e });
-    }
-}
+// There is deliberately NO actor-invoked delete helper in this module. Object reclamation is
+// the job of lib/orgMediaGc.ts's daily leased sweep, which deletes an object only when (a) no
+// settings row, image column or rich-text document references it and (b) it is older than a
+// 48h grace window, and which THROWS rather than deletes on an incomplete reference set.
+//
+// A per-ref delete cannot make either guarantee: a row is not the only place a key can
+// appear — the same image can be embedded in several documents — so deleting because "this
+// field changed" orphans a live image on another page. If one is ever needed it must take an
+// actor and emit recordSecurityEvent, like the denial sites in api/orgUpload.ts.
 
 /**
  * Mint a short-lived signed URL for a PRIVATE-bucket object, for a client that has
  * already passed the page's permission gate. Fail-closed: only signs OUR `media/` keys
  * (no traversal). Returns null on any guard miss or storage error.
  */
-export async function signOrgMediaUrl(key: string, ttlSeconds = 3600): Promise<string | null> {
+export async function signOrgMediaUrl(key: string, ttlSeconds = SIGN_TTL_EDITOR): Promise<string | null> {
     if (typeof key !== 'string' || !key) return null;
     if (!key.startsWith(`${KEY_PREFIX}/`) || key.includes('..')) return null;
     const { data, error } = await supabase.storage.from(PRIVATE_BUCKET).createSignedUrl(key, ttlSeconds);
@@ -290,12 +377,11 @@ export type OrgMediaRef =
  */
 export function classifyOrgMediaRef(ref: unknown): OrgMediaRef {
     if (typeof ref !== 'string' || !ref) return { kind: 'external' };
-    let key: string | null = null;
-    const signMarker = `/storage/v1/object/sign/${PRIVATE_BUCKET}/`;
-    const i = ref.indexOf(signMarker);
-    if (i !== -1) {
-        key = ref.slice(i + signMarker.length).split('?')[0].split('#')[0];
-    } else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(ref) && ref.startsWith(`${KEY_PREFIX}/`)) {
+    // Origin-checked: this is the WRITE side. A foreign URL merely SHAPED like one of our
+    // signed URLs must not collapse to a bare key, or the read path would later sign it for
+    // every reader permitted to see the document it was pasted into.
+    let key = keyAfterPathPrefix(ref, `/storage/v1/object/sign/${PRIVATE_BUCKET}/`, true);
+    if (key === null && !/^[a-z][a-z0-9+.-]*:\/\//i.test(ref) && ref.startsWith(`${KEY_PREFIX}/`)) {
         key = ref;
     }
     if (key === null) return { kind: 'external' };
@@ -308,7 +394,7 @@ export function classifyOrgMediaRef(ref: unknown): OrgMediaRef {
  * Returns a key→signedUrl map; traversal/foreign keys or sign failures are simply absent.
  * Used by the read path to hydrate a permitted client.
  */
-export async function signOrgMediaUrls(keys: string[], ttlSeconds = 3600): Promise<Map<string, string>> {
+export async function signOrgMediaUrls(keys: string[], ttlSeconds = SIGN_TTL_READ): Promise<Map<string, string>> {
     const out = new Map<string, string>();
     const safe = [...new Set(keys)].filter(k => typeof k === 'string' && k.startsWith(`${KEY_PREFIX}/`) && !k.includes('..'));
     if (safe.length === 0) return out;

@@ -8,7 +8,10 @@ import { useNotification } from '../../../contexts/NotificationContext';
 interface HealthCheckResult {
     check: string;
     status: 'OK' | 'WARNING' | 'ERROR';
-    count: number;
+    // Nullable: the schema-version and secret-encryption rows are diagnostics, not counts,
+    // and report null. The server has always typed it this way; this side used to claim
+    // otherwise and render a blank cell.
+    count: number | null;
     action?: string;
 }
 
@@ -118,6 +121,36 @@ const DatabaseToolsTab: React.FC = () => {
         } catch (error) {
             console.error(error);
             addToast("Repair Failed", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: "The database repair operation could not be completed." });
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const runRotateSecrets = async () => {
+        const confirmed = await confirm({
+            title: 'Re-encrypt Stored Secrets',
+            message: 'This re-encrypts every stored credential (Discord, LiveKit, Gemini, alliance keys) under your current SECRETS_ENCRYPTION_KEY, so the previous key can be removed. Anything that cannot be read under either key is left untouched and reported. Safe to run more than once. Continue?',
+            confirmText: 'Re-encrypt',
+            variant: 'danger',
+        });
+        if (!confirmed) return;
+        setIsLoading(true);
+        try {
+            const result = await rpcAction('admin:db:rotate_secrets', {});
+            const parts = [`${result.rotated} re-encrypted`, `${result.alreadyCurrent} already current`];
+            if (result.failed > 0) parts.push(`${result.failed} unreadable (left untouched)`);
+            if (result.writeErrors > 0) parts.push(`${result.writeErrors} could not be saved`);
+            const bad = result.failed > 0 || result.writeErrors > 0;
+            addToast(
+                bad ? 'Re-encryption Incomplete' : 'Re-encryption Complete',
+                <i className={`fa-solid ${bad ? 'fa-triangle-exclamation' : 'fa-check'}`}></i>,
+                bad ? 'bg-amber-500/10 text-amber-400 border-amber-500/50' : 'bg-green-500/10 text-green-400 border-green-500/50',
+                { description: parts.join(' · ') },
+            );
+            runDiagnostics();
+        } catch (error) {
+            console.error(error);
+            addToast('Re-encryption Failed', <i className="fa-solid fa-xmark"></i>, 'bg-red-500/10 text-red-400 border-red-500/50', { description: 'The secrets could not be re-encrypted. No credential was changed.' });
         } finally {
             setIsLoading(false);
         }
@@ -355,6 +388,14 @@ const DatabaseToolsTab: React.FC = () => {
                             Repair Database
                         </button>
                         <button
+                            onClick={runRotateSecrets}
+                            disabled={isLoading}
+                            className="text-[10px] bg-amber-600 hover:bg-amber-500 text-white px-3 py-1 rounded-sm font-bold uppercase transition-colors disabled:opacity-50"
+                            title="Re-encrypt stored credentials under the current SECRETS_ENCRYPTION_KEY so the previous key can be removed"
+                        >
+                            Rotate Encryption Key
+                        </button>
+                        <button
                             onClick={runDiagnostics}
                             disabled={isLoading}
                             className="text-[10px] bg-slate-700 hover:bg-slate-600 border border-slate-600 text-white px-3 py-1 rounded-sm font-bold uppercase transition-colors disabled:opacity-50"
@@ -374,8 +415,12 @@ const DatabaseToolsTab: React.FC = () => {
                                         <p className="text-sm font-bold text-slate-200">{item.check}</p>
                                         <p className="text-xs text-slate-500">Records: {item.count}</p>
                                     </div>
+                                    {/* Three tones, not two. ERROR used to render in the same
+                                        amber as WARNING, so "your credentials are unrecoverable"
+                                        looked identical to "you can remove the old key now". */}
                                     <div className={`px-2 py-0.5 rounded text-[10px] font-black uppercase border ${item.status === 'OK' ? 'text-green-400 border-green-500/30 bg-green-500/10' :
-                                            'text-amber-400 border-amber-500/30 bg-amber-500/10 animate-pulse'
+                                            item.status === 'ERROR' ? 'text-red-300 border-red-500/40 bg-red-500/15 animate-pulse' :
+                                                'text-amber-400 border-amber-500/30 bg-amber-500/10 animate-pulse'
                                         }`}>
                                         {item.status}
                                     </div>

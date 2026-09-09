@@ -78,6 +78,10 @@ vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),
     getPlatformSettings: async () => h.platformSettings,
     getUserById: async () => { h.calls.getUserById++; return h.user; },
+    // The read path now runs the ORG BAN GATE above every other gate.
+    // Not banned by default; the ban tests drive the real module.
+    findActiveBan: async () => null,
+    getBanNotice: async () => null,
     getAllSettings: async () => ({ brandingConfig: {}, discordConfig: {} }),
     isSetupCompleted: async () => true,
     getState: async () => { h.calls.getState++; return { users: [], discordConfig: {} }; },

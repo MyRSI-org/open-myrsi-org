@@ -1,9 +1,11 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useConfig } from '../../../contexts/ConfigContext';
 
 import { TabPageHeader } from '../../shared/ui';
+import { useData } from '../../../contexts/DataContext';
+import DiscordChannelField, { type GuildChannelOption } from './DiscordChannelField';
 import { useNotification } from '../../../contexts/NotificationContext';
 import { useModalRegistry } from '../../../contexts/ModalRegistryContext';
 
@@ -26,15 +28,46 @@ const DiscordSettingsTab: React.FC = () => {
 
     const [activeTab, setActiveTab] = useState<SubTab>('channels');
 
+    // Channel directory for the pickers. Through the ADMIN alias action, which is the
+    // same read as the op-creator one under a different permission — re-gating the
+    // existing action would take the picker away from every op creator who is not a
+    // Discord admin. Soft-fails: DiscordChannelField drops to a raw id input, which is
+    // exactly what this tab had before.
+    const { rpcAction } = useData();
+    const [channels, setChannels] = useState<GuildChannelOption[]>([]);
+    const [channelsLoading, setChannelsLoading] = useState(false);
+    const [channelsError, setChannelsError] = useState<string | null>(null);
+    const loadChannels = useCallback(async () => {
+        setChannelsLoading(true);
+        setChannelsError(null);
+        try {
+            const res = await rpcAction('discord:list_channels_admin', {});
+            const list = Array.isArray(res?.channels) ? (res.channels as GuildChannelOption[]) : [];
+            setChannels(list);
+            if (res?.error) setChannelsError(String(res.error));
+        } catch (e) {
+            setChannelsError(e instanceof Error ? e.message : 'Could not load channels.');
+        } finally {
+            setChannelsLoading(false);
+        }
+    }, [rpcAction]);
+    useEffect(() => {
+        if (activeTab !== 'channels') return;
+        void (async () => { await loadChannels(); })();
+    }, [activeTab, loadChannels]);
+
     // The role-sync maps no longer ride the boot payload (the 'discord'
     // subset is admin:config:discord-gated) — fetch on mount.
     useEffect(() => { void refreshDiscord(); }, [refreshDiscord]);
 
     // --- Channel Settings State ---
     const [newRequestChannelId, setNewRequestChannelId] = useState('');
+    const [craftingRequestChannelId, setCraftingRequestChannelId] = useState('');
     const [intelChannelId, setIntelChannelId] = useState('');
     const [eamChannelId, setEamChannelId] = useState('');
     const [defaultOperationAnnounceChannelId, setDefaultOperationAnnounceChannelId] = useState('');
+    const [eamPingRoleId, setEamPingRoleId] = useState('');
+    const [operationAnnouncePingRoleId, setOperationAnnouncePingRoleId] = useState('');
     const [configLoaded, setConfigLoaded] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [isSaved, setIsSaved] = useState(false);
@@ -50,9 +83,12 @@ const DiscordSettingsTab: React.FC = () => {
     if (discordConfig && discordConfig !== prevDiscordConfig) {
         setPrevDiscordConfig(discordConfig);
         setNewRequestChannelId(discordConfig.newRequestChannelId || '');
+        setCraftingRequestChannelId(discordConfig.craftingRequestChannelId || '');
         setIntelChannelId(discordConfig.intelChannelId || '');
         setEamChannelId(discordConfig.eamChannelId || '');
         setDefaultOperationAnnounceChannelId(discordConfig.defaultOperationAnnounceChannelId || '');
+        setEamPingRoleId(discordConfig.eamPingRoleId || '');
+        setOperationAnnouncePingRoleId(discordConfig.operationAnnouncePingRoleId || '');
         setConfigLoaded(true);
     }
 
@@ -71,7 +107,10 @@ const DiscordSettingsTab: React.FC = () => {
     const handleUpdateConfig = async () => {
         setIsSaving(true);
         try {
-            await updateDiscordConfig({ newRequestChannelId, intelChannelId, eamChannelId, defaultOperationAnnounceChannelId });
+            await updateDiscordConfig({
+                newRequestChannelId, craftingRequestChannelId, intelChannelId, eamChannelId, defaultOperationAnnounceChannelId,
+                eamPingRoleId, operationAnnouncePingRoleId,
+            });
             setIsSaved(true);
             setTimeout(() => setIsSaved(false), 2000);
         } catch (error) {
@@ -169,61 +208,94 @@ const DiscordSettingsTab: React.FC = () => {
                     </div>
 
                     <div className="grid grid-cols-1 gap-6">
-                        <div>
-                            <label htmlFor="newRequestChannelId" className="block text-sm font-medium text-slate-300 mb-2">New Request Channel ID</label>
+                        <DiscordChannelField
+                            id="newRequestChannelId"
+                            label="New Request Channel"
+                            value={newRequestChannelId}
+                            onChange={setNewRequestChannelId}
+                            channels={channels}
+                            loading={channelsLoading}
+                            error={channelsError}
+                            disabled={!configLoaded}
+                            hint="Notifications for new Service Requests will be posted here."
+                        />
+                        <DiscordChannelField
+                            id="craftingRequestChannelId"
+                            label="Crafting Request Channel"
+                            value={craftingRequestChannelId}
+                            onChange={setCraftingRequestChannelId}
+                            channels={channels}
+                            loading={channelsLoading}
+                            error={channelsError}
+                            disabled={!configLoaded}
+                            hint="Blueprint Manager crafting requests post here. Leave empty to reuse the New Request channel. The embed carries the item, quantity and offered price only — never who asked, and never their materials note."
+                        />
+                        <DiscordChannelField
+                            id="intelChannelId"
+                            label="Intel Bulletin Channel"
+                            value={intelChannelId}
+                            onChange={setIntelChannelId}
+                            channels={channels}
+                            loading={channelsLoading}
+                            error={channelsError}
+                            disabled={!configLoaded}
+                            hint="New Intel Bulletins will be posted here as formatted embeds."
+                        />
+                        <DiscordChannelField
+                            id="eamChannelId"
+                            label="EAM Broadcast Channel"
+                            value={eamChannelId}
+                            onChange={setEamChannelId}
+                            channels={channels}
+                            loading={channelsLoading}
+                            error={channelsError}
+                            disabled={!configLoaded}
+                            hint="Emergency Action Messages issued from the dashboard will be posted here as a high-priority embed."
+                        />
+                        <DiscordChannelField
+                            id="defaultOperationAnnounceChannelId"
+                            label={<>Operation Announcement Channel <span className="text-slate-500 font-normal">(default)</span></>}
+                            value={defaultOperationAnnounceChannelId}
+                            onChange={setDefaultOperationAnnounceChannelId}
+                            channels={channels}
+                            loading={channelsLoading}
+                            error={channelsError}
+                            disabled={!configLoaded}
+                            hint={'Pre-selected in the operation create wizard\'s "Post Announcement Embed" picker. Per-op overrides win — use this to point everyday ops at the right channel without forcing it.'}
+                        />
+
+                        {/* PING ROLES. Deliberately raw id inputs, not pickers: the role
+                            directory lives behind the same admin gate as this tab, but
+                            wiring a second directory fetch for two optional fields is
+                            more surface than the convenience is worth. Both are read
+                            SERVER-SIDE at send time and never travel in a request. */}
+                        <div className="pt-2 border-t border-slate-700/60">
+                            <label htmlFor="operationAnnouncePingRoleId" className="block text-sm font-medium text-slate-300 mb-2">Operation Announcement Ping Role ID <span className="text-slate-500 font-normal">(optional)</span></label>
                             <input
                                 type="text"
-                                id="newRequestChannelId"
-                                name="newRequestChannelId"
-                                value={newRequestChannelId}
-                                onChange={e => setNewRequestChannelId(e.target.value)}
-                                placeholder={configLoaded ? "e.g., 123456789012345678" : "Loading..."}
+                                id="operationAnnouncePingRoleId"
+                                name="operationAnnouncePingRoleId"
+                                value={operationAnnouncePingRoleId}
+                                onChange={e => setOperationAnnouncePingRoleId(e.target.value)}
+                                placeholder={configLoaded ? "e.g., 123456789012345678 (blank = no ping)" : "Loading..."}
                                 disabled={!configLoaded}
                                 className="w-full bg-slate-700/50 border border-slate-600 rounded-md p-2.5 text-white font-mono disabled:opacity-50"
                             />
-                            <p className="text-xs text-slate-500 mt-1">Notifications for new Service Requests will be posted here.</p>
+                            <p className="text-xs text-slate-500 mt-1">@-mentioned when an operation announcement is first posted. Not re-pinged on an edit or a repost. Right-click the role in Discord &gt; Copy Role ID.</p>
                         </div>
                         <div>
-                            <label htmlFor="intelChannelId" className="block text-sm font-medium text-slate-300 mb-2">Intel Bulletin Channel ID</label>
+                            <label htmlFor="eamPingRoleId" className="block text-sm font-medium text-slate-300 mb-2">EAM Ping Role ID <span className="text-slate-500 font-normal">(optional)</span></label>
                             <input
                                 type="text"
-                                id="intelChannelId"
-                                name="intelChannelId"
-                                value={intelChannelId}
-                                onChange={e => setIntelChannelId(e.target.value)}
-                                placeholder={configLoaded ? "e.g., 123456789012345678" : "Loading..."}
+                                id="eamPingRoleId"
+                                name="eamPingRoleId"
+                                value={eamPingRoleId}
+                                onChange={e => setEamPingRoleId(e.target.value)}
+                                placeholder={configLoaded ? "e.g., 123456789012345678 (blank = @here only)" : "Loading..."}
                                 disabled={!configLoaded}
                                 className="w-full bg-slate-700/50 border border-slate-600 rounded-md p-2.5 text-white font-mono disabled:opacity-50"
                             />
-                            <p className="text-xs text-slate-500 mt-1">New Intel Bulletins will be posted here as formatted embeds.</p>
-                        </div>
-                        <div>
-                            <label htmlFor="eamChannelId" className="block text-sm font-medium text-slate-300 mb-2">EAM Broadcast Channel ID</label>
-                            <input
-                                type="text"
-                                id="eamChannelId"
-                                name="eamChannelId"
-                                value={eamChannelId}
-                                onChange={e => setEamChannelId(e.target.value)}
-                                placeholder={configLoaded ? "e.g., 123456789012345678" : "Loading..."}
-                                disabled={!configLoaded}
-                                className="w-full bg-slate-700/50 border border-slate-600 rounded-md p-2.5 text-white font-mono disabled:opacity-50"
-                            />
-                            <p className="text-xs text-slate-500 mt-1">Emergency Action Messages issued from the dashboard will be posted here as a high-priority embed with an @here mention.</p>
-                        </div>
-                        <div>
-                            <label htmlFor="defaultOperationAnnounceChannelId" className="block text-sm font-medium text-slate-300 mb-2">Operation Announcement Channel ID <span className="text-slate-500 font-normal">(default)</span></label>
-                            <input
-                                type="text"
-                                id="defaultOperationAnnounceChannelId"
-                                name="defaultOperationAnnounceChannelId"
-                                value={defaultOperationAnnounceChannelId}
-                                onChange={e => setDefaultOperationAnnounceChannelId(e.target.value)}
-                                placeholder={configLoaded ? "e.g., 123456789012345678" : "Loading..."}
-                                disabled={!configLoaded}
-                                className="w-full bg-slate-700/50 border border-slate-600 rounded-md p-2.5 text-white font-mono disabled:opacity-50"
-                            />
-                            <p className="text-xs text-slate-500 mt-1">Pre-selected in the operation create wizard's "Post Announcement Embed" picker. Per-op overrides win — use this to point everyday ops at the right channel without forcing it.</p>
+                            <p className="text-xs text-slate-500 mt-1">Offered as a ping option when an EAM is issued. The sender chooses none / @here / this role — they cannot choose a different one.</p>
                         </div>
                     </div>
 

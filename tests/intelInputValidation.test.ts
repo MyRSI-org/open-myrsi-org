@@ -24,6 +24,10 @@ vi.mock('../lib/db/common', () => {
         b.eq = () => b; b.is = () => b; b.in = () => b; b.not = () => b; b.order = () => b; b.limit = () => b;
         const settle = (mode: 'single' | 'many') => {
             if (state.op === 'insert' && table === 'service_requests') return Promise.resolve({ data: null, error: cap.insertError });
+            // createServiceRequest now reads the actor's standing before inserting (the server
+            // half of the reputation floor that used to live only in React), so the double has
+            // to answer it — otherwise every create test fails on 'could not verify standing'.
+            if (state.op === 'select' && table === 'users') return Promise.resolve({ data: mode === 'single' ? { reputation: 50 } : [], error: null, count: 0 });
             return Promise.resolve({ data: mode === 'single' ? null : [], error: null, count: 0 });
         };
         b.single = () => settle('single'); b.maybeSingle = () => settle('single');
@@ -39,7 +43,7 @@ vi.mock('../lib/db/common', () => {
 });
 vi.mock('../lib/push', () => ({ sendPushToStaff: () => {}, sendPushToUsers: async () => {} }));
 
-import { getIntelReportsForTarget, normalizeThreatLevel } from '../lib/db/intel';
+import { getIntelReportsForTarget, updateIntelAffiliation, normalizeThreatLevel } from '../lib/db/intel';
 import { createServiceRequest } from '../lib/db/requests';
 
 beforeEach(() => { cap.ilikeArgs = []; cap.insertError = null; });
@@ -51,6 +55,19 @@ describe('F7 — intel target lookups escape the LIKE pattern', () => {
         expect(targetCall?.[1]).toBe(escapeLikePattern('%'));
         // escaping a bare % must change it (otherwise it stays a wildcard)
         expect(targetCall?.[1]).not.toBe('%');
+    });
+
+    // The one target lookup in this file that keys a WRITE. PostgREST rewrites a
+    // bare `*` to `%` in a like/ilike operand, so before the escaper covered `*`
+    // this .update().ilike() overwrote affiliated_org on EVERY intel_reports row
+    // for any intel:manage holder. Asserted against the literal, not against
+    // escapeLikePattern's own output — comparing a helper to itself passes
+    // whatever the helper does.
+    it('updateIntelAffiliation cannot mass-overwrite via the * wildcard alias', async () => {
+        await updateIntelAffiliation('*', 'Some Org');
+        const targetCall = cap.ilikeArgs.find(([col]) => col === 'target_id');
+        expect(targetCall?.[1]).toBe('\\*');
+        expect(targetCall?.[1]).not.toBe('*');
     });
 });
 

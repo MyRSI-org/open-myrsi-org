@@ -81,6 +81,52 @@ export async function getWikiPageById(pageId: string): Promise<WikiPage | null> 
     return data ? toWikiPage(data as unknown as Parameters<typeof toWikiPage>[0]) : null;
 }
 
+// A page whose limiting markers fail to write is WIDER than the caller asked for: the
+// row is stored at its classification level with no compartmentation, and the RPC used
+// to return 200 regardless. PostgREST gives us no transaction, so both helpers below
+// compensate best-effort (logged) and then rethrow REGARDLESS — an under-compartmented
+// page must never be left live behind a successful response.
+
+/** Markers for a page that was just INSERTED: nothing references it yet, so on failure
+ *  the page itself is removed rather than published without its compartmentation. */
+async function insertPageMarkers(pageId: string, markerIds: number[]): Promise<void> {
+    if (markerIds.length === 0) return;
+    const { error } = await supabase.from('wiki_page_limiting_markers')
+        .insert(markerIds.map((mid) => ({ page_id: pageId, marker_id: mid })));
+    if (!error) return;
+    const { error: cleanupErr } = await supabase.from('wiki_pages').delete().eq('id', pageId);
+    if (cleanupErr) log.error('wiki: failed to remove a page whose limiting markers could not be applied', { pageId, err: cleanupErr });
+    handleSupabaseError({ error, message: 'Failed to apply wiki page limiting markers' });
+}
+
+/** Markers for an EXISTING page. The write is a delete-then-reinsert, so a swallowed
+ *  insert failure after a successful delete DECOMPARTMENTS the page; on failure the
+ *  previous ids are restored so the marker set can never end up wider than it started.
+ *  (The page row has already committed by then, so a restore can pair a newly-lowered
+ *  classification_level with the old markers — neither half widened, but not the exact
+ *  state the author asked for either.) */
+async function replacePageMarkers(pageId: string, markerIds: number[], previousMarkerIds: number[]): Promise<void> {
+    const { error: delErr } = await supabase.from('wiki_page_limiting_markers').delete().eq('page_id', pageId);
+    handleSupabaseError({ error: delErr, message: 'Failed to clear wiki page limiting markers' });
+    if (markerIds.length === 0) return;
+    const { error: insErr } = await supabase.from('wiki_page_limiting_markers')
+        .insert(markerIds.map((mid) => ({ page_id: pageId, marker_id: mid })));
+    if (!insErr) return;
+    if (previousMarkerIds.length > 0) {
+        const { error: restoreErr } = await supabase.from('wiki_page_limiting_markers')
+            .insert(previousMarkerIds.map((mid) => ({ page_id: pageId, marker_id: mid })));
+        if (restoreErr) log.error('wiki: failed to restore limiting markers after a failed replace — page may be under-compartmented', { pageId, err: restoreErr });
+    }
+    handleSupabaseError({ error: insErr, message: 'Failed to apply wiki page limiting markers' });
+}
+
+/** Marker ids off a live `marker:security_limiting_markers(id, name, code)` embed. */
+function markerIdsOf(markers: unknown[]): number[] {
+    return markers
+        .map((m) => (m as { id?: number } | null)?.id)
+        .filter((v): v is number => typeof v === 'number');
+}
+
 export async function createWikiPage(payload: WikiPagePayload, userId: number, actor?: ClearanceUser | null): Promise<WikiPage> {
     // The author may not label a page above their own clearance or apply a marker
     // they don't hold. Wiki has no clearance-bypass permission (read side filters
@@ -109,7 +155,7 @@ export async function createWikiPage(payload: WikiPagePayload, userId: number, a
         .select('sort_order')
         
         .is('parent_page_id', payload.parentPageId || null)
-        .order('sort_order', { ascending: false })
+        .order('sort_order', { ascending: false }).order('id', { ascending: false })
         .limit(1);
 
     const nextOrder = (siblings && siblings.length > 0) ? (siblings[0].sort_order + 1) : 0;
@@ -135,10 +181,10 @@ export async function createWikiPage(payload: WikiPagePayload, userId: number, a
 
     handleSupabaseError({ error, message: 'Failed to create wiki page' });
 
-    // Insert limiting markers
+    // Insert limiting markers. Throws (and removes the page) if they can't be applied,
+    // so no broadcast ever announces an under-compartmented page.
     if (page && payload.markerIds && payload.markerIds.length > 0) {
-        const markers = payload.markerIds.map((mid: number) => ({ page_id: page.id, marker_id: mid }));
-        await supabase.from('wiki_page_limiting_markers').insert(markers);
+        await insertPageMarkers(page.id, payload.markerIds);
     }
 
     broadcastWikiUpdate(page?.id);
@@ -153,22 +199,30 @@ export async function updateWikiPage(id: string, payload: WikiPagePayload, userI
     // dispatcher gate is only the edit permission, with no per-page clearance.
     // Fetch the LIVE classification + markers once and require visibility; Admins
     // bypass (canViewAllClassifications).
-    const { data: live } = await supabase.from('wiki_pages')
+    const { data: live, error: liveErr } = await supabase.from('wiki_pages')
         .select('classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .eq('id', id)
         .maybeSingle();
-    if (live) {
-        const liveMarkers = ((live as { wiki_page_limiting_markers?: { marker?: unknown }[] }).wiki_page_limiting_markers || [])
-            .map((m) => m.marker).filter(Boolean);
-        if (!passesClearance(actor, live.classification_level ?? 0, liveMarkers)) {
-            throw new Error('You are not cleared to edit this page.');
-        }
+    // Fail CLOSED. The guard used to be `if (live) { ... }`, so a lookup error skipped it
+    // entirely and the write went through unchecked. That window is REACHABLE: the select
+    // above carries a PostgREST embed, and an unconverged schema cache answers PGRST200
+    // with data null — while the UPDATE below carries no embed and still succeeds. Do NOT
+    // pattern-match the 42703 soft-fail further down: that one guards a non-security
+    // column, and a security guard whose input cannot be loaded must hard-fail.
+    // maybeSingle() already turns a non-existent id into a clean null with no error, so
+    // anything surfaced here is a genuine failure. Mirrors lib/db/ops.ts:updateOperationDetails.
+    handleSupabaseError({ error: liveErr, message: 'Failed to verify wiki page clearance — refusing the edit rather than applying it unchecked. If this persists, reload the database schema cache.' });
+    if (!live) throw new Error('Wiki page not found or access denied.');
+    const liveMarkers = ((live as { wiki_page_limiting_markers?: { marker?: unknown }[] }).wiki_page_limiting_markers || [])
+        .map((m) => m.marker).filter(Boolean);
+    if (!passesClearance(actor, live.classification_level ?? 0, liveMarkers)) {
+        throw new Error('You are not cleared to edit this page.');
     }
     // Changing the classification additionally requires the NEW label to be at
     // or below the author's clearance and to use only markers they hold
     // (mislabel-UP guard). Falls back to the live level for marker-only edits.
     if (payload.classificationLevel !== undefined || payload.markerIds !== undefined) {
-        assertCanClassify(actor, payload.classificationLevel ?? live?.classification_level ?? 0, payload.markerIds);
+        assertCanClassify(actor, payload.classificationLevel ?? live.classification_level ?? 0, payload.markerIds);
     }
 
     const updates: Partial<Tables<'wiki_pages'>> = {
@@ -249,13 +303,10 @@ export async function updateWikiPage(id: string, payload: WikiPagePayload, userI
     }
     handleSupabaseError({ error, message: 'Failed to update wiki page' });
 
-    // Update limiting markers (clear & re-insert)
+    // Update limiting markers (clear & re-insert), restoring the live set if the
+    // re-insert fails rather than leaving the page decompartmented.
     if (payload.markerIds !== undefined) {
-        await supabase.from('wiki_page_limiting_markers').delete().eq('page_id', id);
-        if (payload.markerIds.length > 0) {
-            const markers = payload.markerIds.map((mid: number) => ({ page_id: id, marker_id: mid }));
-            await supabase.from('wiki_page_limiting_markers').insert(markers);
-        }
+        await replacePageMarkers(id, payload.markerIds, markerIdsOf(liveMarkers));
     }
 
     broadcastWikiUpdate(id);
@@ -269,23 +320,25 @@ export async function deleteWikiPage(id: string, actor?: ClearanceUser | null) {
     // classified page's id (e.g. via the id-only wiki_update broadcast) could
     // otherwise permanently delete a Level-N / compartmented page they cannot
     // read. Fetch the LIVE classification + markers and require visibility;
-    // Admins bypass (canViewAllClassifications). Fail closed.
-    const { data: live } = await supabase.from('wiki_pages')
+    // Admins bypass (canViewAllClassifications). Fail closed — see the note on
+    // updateWikiPage's identical lookup for why a swallowed error here is a real,
+    // reachable bypass rather than a theoretical one.
+    const { data: live, error: liveErr } = await supabase.from('wiki_pages')
         .select('classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .eq('id', id)
         .maybeSingle();
-    if (live) {
-        const liveMarkers = ((live as { wiki_page_limiting_markers?: { marker?: unknown }[] }).wiki_page_limiting_markers || [])
-            .map((m) => m.marker).filter(Boolean);
-        if (!passesClearance(actor, live.classification_level ?? 0, liveMarkers)) {
-            throw new Error('You are not cleared to delete this page.');
-        }
+    handleSupabaseError({ error: liveErr, message: 'Failed to verify wiki page clearance — refusing the delete rather than applying it unchecked. If this persists, reload the database schema cache.' });
+    if (!live) throw new Error('Wiki page not found or access denied.');
+    const liveMarkers = ((live as { wiki_page_limiting_markers?: { marker?: unknown }[] }).wiki_page_limiting_markers || [])
+        .map((m) => m.marker).filter(Boolean);
+    if (!passesClearance(actor, live.classification_level ?? 0, liveMarkers)) {
+        throw new Error('You are not cleared to delete this page.');
     }
     // wiki_pages.parent_page_id is ON DELETE SET NULL — deleting a parent
     // re-roots every child ROW. A single-row slice refetch would remove the
     // parent but leave remote clients' children pointing at it (orphaned out
     // of the page tree), so check for children first.
-    const { count: childCount } = await supabase.from('wiki_pages')
+    const { count: childCount, error: childErr } = await supabase.from('wiki_pages')
         .select('id', { count: 'exact', head: true })
         .eq('parent_page_id', id);
 
@@ -294,8 +347,11 @@ export async function deleteWikiPage(id: string, actor?: ClearanceUser | null) {
     const { error } = await query;
     handleSupabaseError({ error, message: 'Failed to delete wiki page' });
     // Children re-rooted → id-less emit (clients full-refetch, picking up the
-    // children's nulled parent ids); leaf page → single-row slice removal.
-    broadcastWikiUpdate(childCount && childCount > 0 ? undefined : id);
+    // children's nulled parent ids); leaf page → single-row slice removal. A FAILED
+    // probe leaves childCount undefined, which would read as "leaf" and orphan any
+    // re-rooted children on every remote client — so an error counts as "children
+    // may exist" and takes the full-refetch branch.
+    broadcastWikiUpdate(childErr || (childCount && childCount > 0) ? undefined : id);
 }
 
 export async function reorderWikiPages(pages: { id: string; sortOrder: number }[], actor?: ClearanceUser | null) {
@@ -309,9 +365,14 @@ export async function reorderWikiPages(pages: { id: string; sortOrder: number }[
     // row is treated as not visible. Visible pages reorder exactly as before.
     const ids = pages.map((p) => p.id);
     if (ids.length === 0) return;
-    const { data: liveRows } = await supabase.from('wiki_pages')
+    const { data: liveRows, error: liveErr } = await supabase.from('wiki_pages')
         .select('id, classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .in('id', ids);
+    // The row-level default below is already fail-closed on a lookup error (an empty
+    // map skips every page), but SILENTLY: nothing would reorder and the function
+    // would still broadcast and return success. Surface it so a DB fault is an honest
+    // error rather than a reorder that appears to have worked.
+    handleSupabaseError({ error: liveErr, message: 'Failed to verify wiki page clearance for reorder' });
     const visibility = new Map<string, { level: number; markers: unknown[] }>();
     for (const row of (liveRows || []) as Array<{ id: string; classification_level: number | null; wiki_page_limiting_markers?: { marker?: unknown }[] }>) {
         visibility.set(row.id, {
@@ -323,7 +384,10 @@ export async function reorderWikiPages(pages: { id: string; sortOrder: number }[
         const v = visibility.get(p.id);
         if (!v || !passesClearance(actor, v.level, v.markers)) continue;
         const query = supabase.from('wiki_pages').update({ sort_order: p.sortOrder }).eq('id', p.id);
-        await query;
+        const { error } = await query;
+        // Same reasoning as the lookup: a discarded write error let reorder report a
+        // success it did not perform.
+        handleSupabaseError({ error, message: 'Failed to reorder wiki pages' });
     }
     broadcastWikiUpdate();
 }
@@ -398,9 +462,14 @@ export async function importWikiPages(
     // alternative. Load existing pages WITH their live classification + markers
     // (for the overwrite visibility guard) and the org's markers (to reproduce
     // compartmentation by name — the bundle ships markerNames, not ids).
-    const { data: existingRows } = await supabase
+    const { data: existingRows, error: existingErr } = await supabase
         .from('wiki_pages')
         .select('id, slug, classification_level, wiki_page_limiting_markers(marker:security_limiting_markers(id, name, code))');
+    // Fail CLOSED: on error `slugToExisting` comes back EMPTY, which turns every
+    // overwrite plan into an insert at the bundle's own slug — so the
+    // overwrite-visibility guard below never runs at all, and the import half-writes
+    // until the slug UNIQUE constraint stops it.
+    handleSupabaseError({ error: existingErr, message: 'Failed to load existing wiki pages for import' });
     interface ExistingPage { id: string; classificationLevel: number; markers: unknown[] }
     const slugToExisting = new Map<string, ExistingPage>();
     const takenSlugs = new Set<string>();
@@ -413,7 +482,11 @@ export async function importWikiPages(
         takenSlugs.add(row.slug);
     }
 
-    const { data: markerRows } = await supabase.from('security_limiting_markers').select('id, name');
+    const { data: markerRows, error: markerErr } = await supabase.from('security_limiting_markers').select('id, name');
+    // An empty map is already fail-closed (resolveMarkerIds throws for a compartmented
+    // page) but diagnoses as "marker does not exist", which sends the operator off to
+    // create markers that already exist. Surface the real cause instead.
+    handleSupabaseError({ error: markerErr, message: 'Failed to load limiting markers for import' });
     const markerNameToId = new Map<string, number>();
     for (const m of (markerRows || []) as { id: number; name: string }[]) markerNameToId.set(String(m.name), m.id);
 
@@ -435,7 +508,7 @@ export async function importWikiPages(
 
     type Plan =
         | { kind: 'insert'; targetId: string; slug: string; source: WikiExportPage; markerIds: number[] }
-        | { kind: 'update'; targetId: string; source: WikiExportPage; markerIds: number[] }
+        | { kind: 'update'; targetId: string; source: WikiExportPage; markerIds: number[]; previousMarkerIds: number[] }
         | { kind: 'skip'; targetId: string };
 
     const plans = new Map<string, Plan>();
@@ -461,7 +534,7 @@ export async function importWikiPages(
             if (!passesClearance(actor, existing.classificationLevel, existing.markers)) {
                 throw new Error(`Wiki import: not cleared to overwrite the existing page "${page.slug}".`);
             }
-            plans.set(page.id, { kind: 'update', targetId: existing.id, source: page, markerIds });
+            plans.set(page.id, { kind: 'update', targetId: existing.id, source: page, markerIds, previousMarkerIds: markerIdsOf(existing.markers) });
         } else if (mode === 'new') {
             const slug = uniqueSlug(page.slug, takenSlugs);
             takenSlugs.add(slug);
@@ -476,15 +549,9 @@ export async function importWikiPages(
     let updated = 0;
     let skipped = 0;
 
-    // Replace a page's limiting markers (clear-and-reinsert), reproducing the
-    // bundle's compartmentation from the resolved ids.
-    const writeMarkers = async (pageId: string, markerIds: number[], clearFirst: boolean) => {
-        if (clearFirst) await supabase.from('wiki_page_limiting_markers').delete().eq('page_id', pageId);
-        if (markerIds.length > 0) {
-            await supabase.from('wiki_page_limiting_markers').insert(markerIds.map((mid) => ({ page_id: pageId, marker_id: mid })));
-        }
-    };
-
+    // Marker writes reproduce the bundle's compartmentation and use the same
+    // fail-closed helpers as create/update: a page whose markers can't be applied is
+    // never left committed and readable without them.
     for (const plan of plans.values()) {
         if (plan.kind !== 'insert') continue;
         const safeTitle = stripHtmlSingleLine(plan.source.title, 200) || 'Untitled';
@@ -502,7 +569,7 @@ export async function importWikiPages(
             updated_by_id: userId,
         });
         handleSupabaseError({ error, message: 'Failed to import wiki pages' });
-        await writeMarkers(plan.targetId, plan.markerIds, false);
+        await insertPageMarkers(plan.targetId, plan.markerIds);
         inserted += 1;
     }
 
@@ -524,7 +591,7 @@ export async function importWikiPages(
             .eq('id', plan.targetId)
             ;
         handleSupabaseError({ error, message: 'Failed to overwrite wiki page during import' });
-        await writeMarkers(plan.targetId, plan.markerIds, true);
+        await replacePageMarkers(plan.targetId, plan.markerIds, plan.previousMarkerIds);
         updated += 1;
     }
 
@@ -549,7 +616,12 @@ export async function importWikiPages(
     }
 
     if (importHomeConfig && bundle.wikiHomeConfig) {
-        await updateWikiHomeConfig(bundle.wikiHomeConfig);
+        // REPLACE, not merge. updateWikiHomeConfig defaults to read-merge so the wiki home
+        // editor's partial `{ ...config, <one field> }` posts cannot blank the row
+        // (Phase 3 OD-6) — but an import posts the COMPLETE config exported from the source
+        // org, and leaving a target-only field standing there would be an import-fidelity
+        // break: after importing, the home config must BE the bundle's.
+        await updateWikiHomeConfig(bundle.wikiHomeConfig, { merge: false });
     }
 
     broadcastWikiUpdate();

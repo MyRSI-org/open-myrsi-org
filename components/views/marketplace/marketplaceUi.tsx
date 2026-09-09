@@ -3,6 +3,7 @@
 import React from 'react';
 import type { MarketplaceListing, MarketplaceContract } from '../../../types';
 import { LISTING_TYPE_META, CONTRACT_STATUS_META, fmtUec } from './marketplaceMeta';
+import { ConsiderationBadge } from './ConsiderationDisplay';
 
 export const Stars: React.FC<{ value: number; size?: string }> = ({ value, size = 'text-xs' }) => (
     <span className={`${size} text-amber-400`} aria-label={`${value} stars`}>
@@ -32,7 +33,12 @@ export const ListingCard: React.FC<{ listing: MarketplaceListing; onClick: () =>
                     {listing.location && <span className="truncate"><i className="fa-solid fa-location-dot mr-1 text-slate-500" aria-hidden />{listing.location}</span>}
                 </div>
                 <div className="flex items-center justify-between gap-2 mt-2">
-                    <span className="text-sm font-black text-lime-400 font-mono">{listing.priceUec != null ? fmtUec(listing.priceUec) : 'Negotiable'}{listing.priceType === 'per_unit' ? '/unit' : listing.priceType === 'hourly' ? '/hr' : ''}</span>
+                    <span className="flex items-center gap-1.5 min-w-0">
+                        <span className="text-sm font-black text-lime-400 font-mono">{listing.priceUec != null ? fmtUec(listing.priceUec) : 'Negotiable'}{listing.priceType === 'per_unit' ? '/unit' : listing.priceType === 'hourly' ? '/hr' : ''}</span>
+                        {/* The card has no room for the legs themselves; the chip says they
+                            exist so a cash-only headline is not misread as the whole deal. */}
+                        <ConsiderationBadge considerations={listing.considerations} />
+                    </span>
                     <span className="flex items-center gap-1.5 text-[11px] text-slate-500 truncate">
                         {listing.seller?.avatarUrl && <img src={listing.seller.avatarUrl} alt="" className="w-4 h-4 rounded-full" />}
                         {listing.seller?.name || `User #${listing.sellerId}`}

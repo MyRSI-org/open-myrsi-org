@@ -31,8 +31,19 @@ vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),
     getPlatformSettings: async () => ({}),
     getUserById: async () => h.user,
+    // The read path now runs the ORG BAN GATE above every other gate.
+    // Not banned by default; the ban tests drive the real module.
+    findActiveBan: async () => null,
+    getBanNotice: async () => null,
     getAllSettings: async () => ({}),
     getSystemRoles: async () => ({ admin: { id: 4 } }),
+    // Phase 3 item 5: the read path consults db.isClientCaller for every subset in
+    // CLIENT_DENIED_SUBSETS (lib/clientNamespaces.ts) — both academy subsets this file
+    // drives. A wholesale lib/db mock that omits it throws
+    // `db.isClientCaller is not a function` and the failure reads like a handler bug.
+    // `false` = a member, which is what memberUser below is; the client-denied direction
+    // is pinned in tests/clientNamespaceDenial.test.ts, not here.
+    isClientCaller: async () => false,
     isOptionalFeatureEnabled: async (f: string) => { h.enabledCalls.push(f); return h.enabled[f] ?? false; },
     getMarketplaceState: async (_uid: number) => { h.calls.getMarketplaceState++; return { marketplaceCategories: [{ id: 'cat' }], marketplaceListings: [{ id: 'l1' }], marketplaceContracts: [] }; },
     getMyAcademyState: async (_uid: number) => { h.calls.getMyAcademyState++; return { academyCatalog: [{ id: 'course' }], academyMyEnrollments: [] }; },

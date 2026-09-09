@@ -23,7 +23,12 @@ vi.mock('../lib/radio', () => ({
 vi.mock('../lib/db', () => ({ supabase: {}, findUserByDiscordId: vi.fn(), createUser: vi.fn() }));
 vi.mock('../lib/discord', () => ({}));
 vi.mock('../lib/auth', () => ({ signToken: vi.fn(), signAdminSetupGrant: vi.fn(), verifyAdminSetupGrant: vi.fn() }));
-vi.mock('../lib/rsi', () => ({ verifyRsiHandle: vi.fn() }));
+// Spread the real module so the action layer's isValidRsiHandle import resolves; only
+// the outbound proof is stubbed (nothing here reaches it).
+vi.mock('../lib/rsi', async () => ({
+    ...(await vi.importActual<typeof import('../lib/rsi')>('../lib/rsi')),
+    verifyRsiHandle: vi.fn(),
+}));
 vi.mock('../lib/db/userFilters', () => ({ stripSensitiveUserFields: vi.fn() }));
 vi.mock('../lib/firstBoot', () => ({ adminExists: vi.fn() }));
 

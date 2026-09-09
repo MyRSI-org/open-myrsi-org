@@ -1,4 +1,5 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
+import { hardReload } from '../../lib/hardReload';
 
 interface Props {
     children: ReactNode;
@@ -37,21 +38,7 @@ export class ErrorBoundary extends Component<Props, State> {
                         {this.state.error?.message && <span className="block mt-2 font-mono text-xs bg-black/30 p-2 rounded-sm text-red-400">{this.state.error.message}</span>}
                     </p>
                     <button
-                        onClick={async () => {
-                            try {
-                                if ('serviceWorker' in navigator) {
-                                    const regs = await navigator.serviceWorker.getRegistrations();
-                                    await Promise.all(regs.map(r => r.unregister()));
-                                }
-                                if ('caches' in window) {
-                                    const names = await caches.keys();
-                                    await Promise.all(names.map(n => caches.delete(n)));
-                                }
-                            } catch (e) {
-                                console.error('Cache clear failed:', e);
-                            }
-                            window.location.replace(window.location.href);
-                        }}
+                        onClick={() => { void hardReload(); }}
                         className="px-6 py-2 bg-red-600 hover:bg-red-500 text-white rounded-sm font-bold uppercase tracking-wider transition-colors shadow-lg"
                     >
                         Reinitialize System

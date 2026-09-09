@@ -14,6 +14,7 @@ import {
     ElectionType, ElectionStatus, LegislationStatus, MotionStatus
 } from '../../../types.js';
 import { createHmac } from 'crypto';
+import { IMPORTED_BALLOT_HASH_PREFIX } from '../importedBallot.js';
 import { log as baseLog } from '../../log.js';
 
 export const log = baseLog.child({ module: 'db.government' });
@@ -354,10 +355,20 @@ export const toGovernmentElectionCandidate = (row: NullToUndefined<Tables<'gover
 // Read at call time so a key rotation/restart is picked up without re-import.
 // ---------------------------------------------------------------------------
 
+// ROTATION CAVEAT, and the reason BALLOT_PEPPER exists.
+// This keys on SECRETS_ENCRYPTION_KEY, so ROTATING that key changes every hash this function
+// produces. For a secret-ballot MOTION mid-vote, voter_hash is the only one-vote guard, so
+// everyone who had already voted could vote a second time — the rotation would silently
+// re-open the ballot. (Elections are unaffected: voter_registry is their real guard.)
+//
+// BALLOT_PEPPER lets an operator pin the OLD value across a rotation so dedup survives it.
+// Unset, the behaviour is byte-identical to before — the same SECRETS_ENCRYPTION_KEY ||
+// JWT_SECRET chain — so this changes nothing for a deployment that never rotates. The admin
+// health check warns when a rotation is in flight while a secret ballot is in 'Voting'.
 export function computeVoterHash(electionId: number, userId: number): string {
-    const secret = process.env.SECRETS_ENCRYPTION_KEY || process.env.JWT_SECRET;
+    const secret = process.env.BALLOT_PEPPER || process.env.SECRETS_ENCRYPTION_KEY || process.env.JWT_SECRET;
     if (!secret) {
-        throw new Error('Cannot compute voter hash: SECRETS_ENCRYPTION_KEY (or JWT_SECRET) is not configured — secret ballots require a server-held key to stay non-de-anonymizable.');
+        throw new Error('Cannot compute voter hash: BALLOT_PEPPER / SECRETS_ENCRYPTION_KEY (or JWT_SECRET) is not configured — secret ballots require a server-held key to stay non-de-anonymizable.');
     }
     return createHmac('sha256', secret)
         .update(`${electionId}:${userId}`)
@@ -382,19 +393,67 @@ interface ElectionVoteRow {
     rank_order: number | null;
 }
 
-export async function getVotesForElection(electionId: number) {
-    const { data, error } = await supabase.from('government_election_votes')
-        .select('candidate_id, rank_order')
-        .eq('election_id', electionId);
-    handleSupabaseError({ error, message: 'Failed to fetch votes' });
-    return data || [];
-}
+/**
+ * EVERY BALLOT, or none — a tally is the one read in this codebase where a partial
+ * result is worse than an error.
+ *
+ * This was a single unbounded, unordered select. PostgREST answers an unbounded
+ * select with its server-side maximum and a 200, so on an election larger than that
+ * cap the tally silently ran over a SUBSET of ballots and returned a winner. Not a
+ * degraded read — a wrong result, presented with the same confidence as a right one,
+ * in the one module whose entire purpose is that the count can be trusted. This build
+ * is deliberately ahead of hosted on election integrity (HMAC voter hashing, enforced
+ * quorum, ballot dedup); none of it survives counting the wrong rows.
+ *
+ * So: page to exhaustion on a total order, then VERIFY the total against an exact
+ * count and refuse if they disagree. The count is taken after the pages, so a ballot
+ * cast mid-read shows up as a mismatch and refuses rather than being half-counted.
+ * concludeElection surfaces the throw; a refused tally is re-runnable, a wrong one is
+ * not.
+ */
+const BALLOT_PAGE = 1000;
+const BALLOT_MAX_PAGES = 500;   // 500k ballots, far past any org, then refuse
 
-export async function getVoterCount(electionId: number): Promise<number> {
-    const { count } = await supabase.from('government_election_voter_registry')
+export async function getVotesForElection(electionId: number) {
+    const out: Array<{ candidate_id: number; rank_order: number | null }> = [];
+    for (let page = 0; page < BALLOT_MAX_PAGES; page++) {
+        const from = page * BALLOT_PAGE;
+        const { data, error } = await supabase.from('government_election_votes')
+            .select('candidate_id, rank_order, id')
+            .eq('election_id', electionId)
+            .order('id', { ascending: true })
+            .range(from, from + BALLOT_PAGE - 1);
+        handleSupabaseError({ error, message: 'Failed to fetch votes' });
+        const rows = (data || []) as Array<{ candidate_id: number; rank_order: number | null }>;
+        out.push(...rows);
+        if (rows.length < BALLOT_PAGE) break;
+        if (page === BALLOT_MAX_PAGES - 1) throw new Error('Too many ballots to tally safely — refusing to report a partial count.');
+    }
+
+    const { count, error: countErr } = await supabase.from('government_election_votes')
         .select('id', { count: 'exact', head: true })
         .eq('election_id', electionId);
-    return count || 0;
+    handleSupabaseError({ error: countErr, message: 'Failed to verify the ballot count' });
+    if (count == null || count !== out.length) {
+        throw new Error('The ballot count changed while tallying — re-run the count.');
+    }
+    return out;
+}
+
+/**
+ * The turnout-quorum DENOMINATOR. The error was discarded and `count || 0` turned any
+ * read fault into "nobody was eligible to vote", which makes the min_voter_turnout_pct
+ * check compare against zero — the branch either divides by nothing or passes
+ * trivially, and an election is certified on a quorum that was never actually tested.
+ * Fails closed instead.
+ */
+export async function getVoterCount(electionId: number): Promise<number> {
+    const { count, error } = await supabase.from('government_election_voter_registry')
+        .select('id', { count: 'exact', head: true })
+        .eq('election_id', electionId);
+    handleSupabaseError({ error, message: 'Failed to count the electorate' });
+    if (count == null) throw new Error('Could not determine the electorate size — refusing to judge turnout.');
+    return count;
 }
 
 export function tallySimpleMajority(votes: ElectionVoteRow[], maxWinners: number): TallyResult {
@@ -416,6 +475,9 @@ export function tallySimpleMajority(votes: ElectionVoteRow[], maxWinners: number
         allResults: results,
         totalVotes,
         isConclusive: results.length > 0,
+        // Nothing to count is not a NORMAL conclusion — concludeElection keys off
+        // `reason` to record WHY instead of "Election concluded normally".
+        ...(results.length === 0 ? { reason: 'No votes cast' } : {}),
     };
 }
 
@@ -445,6 +507,21 @@ export async function tallyPreferentialFull(electionId: number, maxWinners: numb
 
     if (!allVotes || allVotes.length === 0) {
         return { winners: [], allResults: [], totalVotes: 0, isConclusive: false, reason: 'No votes cast' };
+    }
+
+    // Fail CLOSED on imported ballots. The importer stamps a UNIQUE
+    // IMPORTED_BALLOT_HASH_PREFIX hash on every ballot whose per-voter linkage the
+    // source export withheld, so each row would otherwise read as its own
+    // single-preference ballot: a rank-3 row would count as a FIRST preference and
+    // totalVotes would be the ROW count, not the voter count. There is no correct
+    // grouping left to recover (see SYNTHESIZED_NOT_NULL in ../importer.ts), and no
+    // number of ballots cast HERE afterwards repairs the imported ones — so refuse,
+    // rather than crown a wrong winner into a government office.
+    if (allVotes.some((v) => typeof v.voter_hash === 'string' && v.voter_hash.startsWith(IMPORTED_BALLOT_HASH_PREFIX))) {
+        return {
+            winners: [], allResults: [], totalVotes: 0, isConclusive: false,
+            reason: 'Ranked-choice ballots imported from another deployment cannot be re-tallied here — an org export withholds the per-voter grouping, and ballots cast here afterwards do not repair it. Record the result from the source deployment.',
+        };
     }
 
     // Build ballots grouped by voter
@@ -556,6 +633,7 @@ export function tallyProportional(votes: ElectionVoteRow[], maxWinners: number):
         allResults: results,
         totalVotes,
         isConclusive: uniqueWinners.length > 0,
+        ...(totalVotes === 0 ? { reason: 'No votes cast' } : {}),
     };
 }
 

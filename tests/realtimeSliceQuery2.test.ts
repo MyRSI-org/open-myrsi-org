@@ -39,6 +39,10 @@ vi.mock('../lib/db', async () => {
     return {
         getPlatformSettings: async () => ({}),
         getUserById: async () => h.user,
+        // The read path now runs the ORG BAN GATE above every other gate.
+        // Not banned by default; the ban tests drive the real module.
+        findActiveBan: async () => null,
+        getBanNotice: async () => null,
         getAllSettings: async () => ({}),
         // HR — real redaction, controllable rows
         isHrRecruiter: hr.isHrRecruiter,

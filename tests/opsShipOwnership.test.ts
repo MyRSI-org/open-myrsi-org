@@ -43,7 +43,11 @@ vi.mock('../lib/db/operations-federation', () => ({
     scheduleAlliedPush: vi.fn(() => undefined),
 }));
 vi.mock('../lib/push', () => ({ sendPushToUsers: vi.fn(async () => undefined) }));
-vi.mock('../lib/db/users', () => ({ getUserById: vi.fn(async () => ({ id: 1, name: 'Actor' })) }));
+vi.mock('../lib/db/users', () => ({
+    getUserById: vi.fn(async () => ({ id: 1, name: 'Actor' })),
+    // ops.ts reads the LABEL, not the user, for post-commit log attribution.
+    getActorLabel: vi.fn(async () => 'Actor'),
+}));
 
 import { rsvpOperation, joinOperation, updateOperationParticipant, createOperation } from '../lib/db/ops';
 

@@ -17,6 +17,15 @@ import { LISTING_TYPE_META } from './marketplaceMeta';
 import { CreateListingModal, ListingDetailModal } from './MarketplaceModals';
 import ContractDetailModal from './ContractDetailModal';
 
+// Status chips for the seller's own listings. The board never shows anything but
+// 'active', so these labels exist only on the My Listings panel.
+const LISTING_STATUS_META: Record<string, { label: string; cls: string }> = {
+    active: { label: 'Live', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
+    paused: { label: 'Paused', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40' },
+    closed: { label: 'Closed', cls: 'bg-slate-600/20 text-slate-400 border-slate-600/40' },
+    expired: { label: 'Expired', cls: 'bg-slate-600/20 text-slate-400 border-slate-600/40' },
+};
+
 const TYPE_FILTERS: { key: 'all' | MarketplaceListingType; label: string }[] = [
     { key: 'all', label: 'All' },
     { key: 'sell', label: 'Selling' },
@@ -36,6 +45,9 @@ const MarketplaceView: React.FC = () => {
     const [categories, setCategories] = useState<MarketplaceCategory[]>([]);
     const [listings, setListings] = useState<MarketplaceListing[]>([]);
     const [contracts, setContracts] = useState<MarketplaceContract[]>([]);
+    // The seller's OWN listings in every status. The board is active-only, so without
+    // this a paused or closed listing has no surface at all and could never be resumed.
+    const [myListings, setMyListings] = useState<MarketplaceListing[]>([]);
     const [loading, setLoading] = useState(true);
 
     const [typeFilter, setTypeFilter] = useState<'all' | MarketplaceListingType>('all');
@@ -53,6 +65,7 @@ const MarketplaceView: React.FC = () => {
             setCategories(data?.marketplaceCategories || []);
             setListings(data?.marketplaceListings || []);
             setContracts(data?.marketplaceContracts || []);
+            setMyListings(data?.marketplaceMyListings || []);
         } catch {
             /* keep current */
         } finally {
@@ -102,7 +115,11 @@ const MarketplaceView: React.FC = () => {
         }
     }, [rpcAction, addToast, load]);
 
-    const selectedListing = listings.find((l) => l.id === selectedListingId) || null;
+    // Look in BOTH arrays: a paused/closed listing is only ever in myListings, and the
+    // detail modal is how its owner reopens it.
+    const selectedListing = listings.find((l) => l.id === selectedListingId)
+        || myListings.find((l) => l.id === selectedListingId)
+        || null;
     const selectedContract = contracts.find((c) => c.id === selectedContractId) || null;
 
     return (
@@ -118,7 +135,7 @@ const MarketplaceView: React.FC = () => {
                 ) : undefined}
                 stats={<>
                     <HeroStat icon="fa-store" label="Listings" value={listings.length} accent="indigo" emphasize={listings.length > 0} />
-                    <HeroStat icon="fa-file-signature" label="My Listings" value={listings.filter((l) => l.sellerId === meId).length} accent="purple" />
+                    <HeroStat icon="fa-file-signature" label="My Listings" value={myListings.length} accent="purple" />
                     <HeroStat icon="fa-clipboard-list" label="Active Contracts" value={activeContracts.length} accent="amber" emphasize={activeContracts.length > 0} />
                     <HeroStat icon="fa-circle-check" label="Completed" value={historyContracts.filter((c) => c.status === 'completed').length} accent="emerald" />
                 </>}
@@ -160,6 +177,28 @@ const MarketplaceView: React.FC = () => {
                 </div>
 
                 <div className="space-y-3">
+                    {canList && (
+                        <div className="bg-slate-900/40 rounded-xl border border-slate-700/50 overflow-hidden">
+                            <div className="px-4 py-3 bg-slate-800/50 border-b border-slate-700/50">
+                                <h3 className="text-xs font-black uppercase tracking-wider text-white"><i className="fa-solid fa-file-signature mr-2 text-purple-400"></i>My Listings</h3>
+                            </div>
+                            <div className="p-3 space-y-1.5 max-h-[40vh] overflow-y-auto">
+                                {myListings.length === 0 ? (
+                                    <p className="text-center text-slate-600 text-xs py-6 italic">You have no listings yet.</p>
+                                ) : myListings.map((l) => (
+                                    <button key={l.id} onClick={() => setSelectedListingId(l.id)}
+                                        className="w-full text-left p-2 rounded-md bg-slate-800/30 border border-slate-700/40 hover:border-indigo-500/40 transition-colors">
+                                        <div className="flex items-center gap-2">
+                                            <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-sm border ${LISTING_STATUS_META[l.status]?.cls || 'bg-slate-700/30 text-slate-300 border-slate-600/40'}`}>
+                                                {LISTING_STATUS_META[l.status]?.label || l.status}
+                                            </span>
+                                            <span className="text-xs text-slate-200 truncate flex-1">{l.title}</span>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                     <div className="bg-slate-900/40 rounded-xl border border-slate-700/50 overflow-hidden">
                         <div className="px-4 py-3 bg-slate-800/50 border-b border-slate-700/50 flex items-center justify-between">
                             <h3 className="text-xs font-black uppercase tracking-wider text-white"><i className="fa-solid fa-clipboard-list mr-2 text-indigo-400"></i>My Contracts</h3>
@@ -195,11 +234,12 @@ const MarketplaceView: React.FC = () => {
             )}
             {selectedListing && (
                 <ListingDetailModal
-                    listing={selectedListing} meId={meId} canContract={canContract}
+                    listing={selectedListing} meId={meId} canContract={canContract} rpcAction={rpcAction}
                     onClose={() => setSelectedListingId(null)}
                     onPropose={async (payload) => { const ok = await runAction('marketplace:propose', payload, 'Contract proposed'); if (ok) setSelectedListingId(null); }}
                     onDelete={async () => { const ok = await runAction('marketplace:delete_listing', { id: selectedListing.id }, 'Listing removed'); if (ok) setSelectedListingId(null); }}
                     onReport={async (payload) => { await runAction('marketplace:report', { listingId: selectedListing.id, ...payload }, 'Report submitted'); }}
+                    onUpdate={async (updates) => runAction('marketplace:update_listing', { id: selectedListing.id, updates }, 'Listing updated')}
                 />
             )}
             {selectedContract && (

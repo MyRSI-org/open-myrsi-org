@@ -37,6 +37,7 @@ const OrgPublicPage = React.lazy(() => import('./components/public/OrgPublicPage
 const OnboardingWizard = React.lazy(() => import('./components/views/onboarding/OnboardingWizard'));
 import TriageRequestModal from './components/modals/TriageRequestModal';
 import FirstTimeSetupView from './components/views/auth/FirstTimeSetupView';
+import BannedView from './components/views/BannedView';
 import NewUserSetupView from './components/views/auth/NewUserSetupView';
 import DispatchModal from './components/modals/DispatchModal';
 import EamModal from './components/modals/EamModal';
@@ -72,7 +73,7 @@ import ApplyJobModal from './components/modals/hr/ApplyJobModal';
 import ManageSpecializationsModal from './components/modals/ManageSpecializationsModal';
 import RequestClearanceModal from './components/modals/RequestClearanceModal';
 import CaseDetailsModal from './components/modals/hr/CaseDetailsModal';
-const WikiView = lazyWithRetry(() => import('./components/views/wiki/WikiView'));
+const WikiView = lazyWithRetry('WikiView', () => import('./components/views/wiki/WikiView'));
 import ConfirmDialog from './components/modals/ConfirmDialog';
 import CreateIntelReportModal from './components/modals/CreateIntelReportModal';
 import IntelReportDetailModal from './components/modals/IntelReportDetailModal';
@@ -83,6 +84,7 @@ import RadioOverlay from './components/ui/RadioOverlay';
 import RadioWidget from './components/ui/RadioWidget';
 import WindowTaskbar from './components/layout/WindowTaskbar';
 import NotificationListener from './components/utility/NotificationListener';
+import BuildUpdateWatcher from './components/utility/BuildUpdateWatcher';
 import { initializeSupabase } from './lib/supabaseClient';
 import { ErrorBoundary } from './components/utility/ErrorBoundary';
 import { useConfig } from './contexts/ConfigContext';
@@ -93,18 +95,27 @@ import { accentRampVars, SKY_VAR_NAMES } from './lib/orgTheme';
 // (e.g. Safari module preload quirks) and stale-chunk errors after deploys.
 // Retry once after 1.5s; if that also fails, force a full page reload (once)
 // so the browser fetches the new index.html with correct chunk references.
-function lazyWithRetry(importFn: () => Promise<any>) {
+//
+// This ladder was unreachable until now: index.tsx called preventDefault() on
+// `vite:preloadError`, which made a failed chunk RESOLVE with undefined instead of
+// rejecting, so this .catch never ran. See the note in index.tsx.
+//
+// `key` identifies the view, NOT location.pathname. There is no router in this app —
+// navigation is activeView state — so pathname is '/' for every view, which made the
+// one-shot guard GLOBAL: once any view had forced a reload, no other view could, for the
+// rest of the browser session. Keyed per view it does what it always claimed to.
+function lazyWithRetry(key: string, importFn: () => Promise<any>) {
     return React.lazy(() =>
         importFn().catch(() => {
             return new Promise<void>(resolve => setTimeout(resolve, 1500))
                 .then(() => importFn())
                 .catch(() => {
-                    const reloadKey = 'chunk-reload-' + location.pathname;
+                    const reloadKey = 'chunk-reload-' + key;
                     if (!sessionStorage.getItem(reloadKey)) {
                         sessionStorage.setItem(reloadKey, '1');
                         window.location.reload();
                     }
-                    // If we already reloaded once for this path, surface the error
+                    // If we already reloaded once for this view, surface the error
                     return Promise.reject(new Error('Failed to load page module after retry and reload.'));
                 });
         })
@@ -112,42 +123,43 @@ function lazyWithRetry(importFn: () => Promise<any>) {
 }
 
 // Lazy Load Views
-const DashboardView = lazyWithRetry(() => import('./components/views/operations/DashboardView'));
-const ServiceRequestsView = lazyWithRetry(() => import('./components/views/operations/ServiceRequestsView'));
-const DutyRosterView = lazyWithRetry(() => import('./components/views/personnel/DutyRosterView'));
-const OrganisationView = lazyWithRetry(() => import('./components/views/organisation/OrganisationView'));
-const UnitDetailView = lazyWithRetry(() => import('./components/views/personnel/UnitDetailView'));
-const AdminPanelView = lazyWithRetry(() => import('./components/views/admin/AdminPanelView'));
-const ProfileView = lazyWithRetry(() => import('./components/views/personnel/ProfileView'));
-const MyServiceRecordView = lazyWithRetry(() => import('./components/views/personnel/MyServiceRecordView'));
-const ServiceRequestDetailView = lazyWithRetry(() => import('./components/views/operations/ServiceRequestDetailView'));
-const LeaderboardView = lazyWithRetry(() => import('./components/views/personnel/LeaderboardView'));
-const HelpView = lazyWithRetry(() => import('./components/views/help/HelpView'));
-const TermsOfServiceView = lazyWithRetry(() => import('./components/views/help/TermsOfServiceView'));
-const ChangeLogView = lazyWithRetry(() => import('./components/views/help/ChangeLogView'));
-const OperationsCenterView = lazyWithRetry(() => import('./components/views/operations/OperationsCenterView'));
-const OperationDetailView = lazyWithRetry(() => import('./components/views/operations/OperationDetailView'));
-const WarrantsView = lazyWithRetry(() => import('./components/views/operations/WarrantsView'));
-const ExternalToolsView = lazyWithRetry(() => import('./components/views/tools/ExternalToolsView'));
-const RadioControlView = lazyWithRetry(() => import('./components/views/tools/RadioControlView'));
-const DispatchCenterView = lazyWithRetry(() => import('./components/views/operations/DispatchCenterView'));
-const IntelligenceView = lazyWithRetry(() => import('./components/views/intel/IntelligenceView'));
-const AllianceDirectoryView = lazyWithRetry(() => import('./components/views/alliances/AllianceDirectoryView'));
-const MirroredOperationDetailView = lazyWithRetry(() => import('./components/views/operations/MirroredOperationDetailView'));
-const HRHubView = lazyWithRetry(() => import('./components/views/hr/HRHubView'));
-const ApplicantDetailView = lazyWithRetry(() => import('./components/views/hr/ApplicantDetailView'));
-const SecurityVettingView = lazyWithRetry(() => import('./components/views/hr/SecurityVettingView'));
-const UnifiedCaseFileView = lazyWithRetry(() => import('./components/views/hr/UnifiedCaseFileView'));
-const InternalTransferView = lazyWithRetry(() => import('./components/views/hr/InternalTransferView'));
-const InternalJobView = lazyWithRetry(() => import('./components/views/hr/InternalJobView'));
-const SearchCenterView = lazyWithRetry(() => import('./components/views/tools/SearchCenterView'));
-const FleetManagerView = lazyWithRetry(() => import('./components/views/fleet/FleetManagerView'));
-const GovernmentView = lazyWithRetry(() => import('./components/views/government/GovernmentView'));
-const FinancesView = lazyWithRetry(() => import('./components/views/finances/FinancesView'));
-const QuartermasterView = lazyWithRetry(() => import('./components/views/quartermaster/QuartermasterView'));
-const WarehouseView = lazyWithRetry(() => import('./components/views/warehouse/WarehouseView'));
-const MarketplaceView = lazyWithRetry(() => import('./components/views/marketplace/MarketplaceView'));
-const AcademyHubView = lazyWithRetry(() => import('./components/views/academy/AcademyHubView'));
+const DashboardView = lazyWithRetry('DashboardView', () => import('./components/views/operations/DashboardView'));
+const ServiceRequestsView = lazyWithRetry('ServiceRequestsView', () => import('./components/views/operations/ServiceRequestsView'));
+const DutyRosterView = lazyWithRetry('DutyRosterView', () => import('./components/views/personnel/DutyRosterView'));
+const OrganisationView = lazyWithRetry('OrganisationView', () => import('./components/views/organisation/OrganisationView'));
+const UnitDetailView = lazyWithRetry('UnitDetailView', () => import('./components/views/personnel/UnitDetailView'));
+const AdminPanelView = lazyWithRetry('AdminPanelView', () => import('./components/views/admin/AdminPanelView'));
+const ProfileView = lazyWithRetry('ProfileView', () => import('./components/views/personnel/ProfileView'));
+const MyServiceRecordView = lazyWithRetry('MyServiceRecordView', () => import('./components/views/personnel/MyServiceRecordView'));
+const ServiceRequestDetailView = lazyWithRetry('ServiceRequestDetailView', () => import('./components/views/operations/ServiceRequestDetailView'));
+const LeaderboardView = lazyWithRetry('LeaderboardView', () => import('./components/views/personnel/LeaderboardView'));
+const HelpView = lazyWithRetry('HelpView', () => import('./components/views/help/HelpView'));
+const TermsOfServiceView = lazyWithRetry('TermsOfServiceView', () => import('./components/views/help/TermsOfServiceView'));
+const ChangeLogView = lazyWithRetry('ChangeLogView', () => import('./components/views/help/ChangeLogView'));
+const OperationsCenterView = lazyWithRetry('OperationsCenterView', () => import('./components/views/operations/OperationsCenterView'));
+const OperationDetailView = lazyWithRetry('OperationDetailView', () => import('./components/views/operations/OperationDetailView'));
+const WarrantsView = lazyWithRetry('WarrantsView', () => import('./components/views/operations/WarrantsView'));
+const ExternalToolsView = lazyWithRetry('ExternalToolsView', () => import('./components/views/tools/ExternalToolsView'));
+const RadioControlView = lazyWithRetry('RadioControlView', () => import('./components/views/tools/RadioControlView'));
+const DispatchCenterView = lazyWithRetry('DispatchCenterView', () => import('./components/views/operations/DispatchCenterView'));
+const IntelligenceView = lazyWithRetry('IntelligenceView', () => import('./components/views/intel/IntelligenceView'));
+const AllianceDirectoryView = lazyWithRetry('AllianceDirectoryView', () => import('./components/views/alliances/AllianceDirectoryView'));
+const MirroredOperationDetailView = lazyWithRetry('MirroredOperationDetailView', () => import('./components/views/operations/MirroredOperationDetailView'));
+const HRHubView = lazyWithRetry('HRHubView', () => import('./components/views/hr/HRHubView'));
+const ApplicantDetailView = lazyWithRetry('ApplicantDetailView', () => import('./components/views/hr/ApplicantDetailView'));
+const SecurityVettingView = lazyWithRetry('SecurityVettingView', () => import('./components/views/hr/SecurityVettingView'));
+const UnifiedCaseFileView = lazyWithRetry('UnifiedCaseFileView', () => import('./components/views/hr/UnifiedCaseFileView'));
+const InternalTransferView = lazyWithRetry('InternalTransferView', () => import('./components/views/hr/InternalTransferView'));
+const InternalJobView = lazyWithRetry('InternalJobView', () => import('./components/views/hr/InternalJobView'));
+const SearchCenterView = lazyWithRetry('SearchCenterView', () => import('./components/views/tools/SearchCenterView'));
+const FleetManagerView = lazyWithRetry('FleetManagerView', () => import('./components/views/fleet/FleetManagerView'));
+const GovernmentView = lazyWithRetry('GovernmentView', () => import('./components/views/government/GovernmentView'));
+const FinancesView = lazyWithRetry('FinancesView', () => import('./components/views/finances/FinancesView'));
+const QuartermasterView = lazyWithRetry('QuartermasterView', () => import('./components/views/quartermaster/QuartermasterView'));
+const WarehouseView = lazyWithRetry('WarehouseView', () => import('./components/views/warehouse/WarehouseView'));
+const MarketplaceView = lazyWithRetry('MarketplaceView', () => import('./components/views/marketplace/MarketplaceView'));
+const AcademyHubView = lazyWithRetry('AcademyHubView', () => import('./components/views/academy/AcademyHubView'));
+const BlueprintsView = lazyWithRetry('BlueprintsView', () => import('./components/views/blueprints/BlueprintsView'));
 
 const LoadingFallback = () => (
     <div className="flex items-center justify-center h-64">
@@ -206,9 +218,34 @@ const PushNotificationBanner = () => {
 };
 
 
+/**
+ * ADMIN-ONLY. The running code needs `api_keys` columns this database does not have, so API-key
+ * authentication is being refused — which from the outside looks like "our ally is down", with
+ * nothing in the app to say otherwise. The server only sends this flag to admin:db:destroy
+ * holders, so a member can never see it.
+ *
+ * Deliberately NOT dismissable: it names a live outage the operator can fix in two minutes, and
+ * it disappears by itself the moment the schema is re-run.
+ */
+const SchemaUpdateBanner = () => {
+    const { schemaUpdateRequired } = useConfig();
+    if (!schemaUpdateRequired) return null;
+    return (
+        <div className="fixed top-0 left-0 right-0 z-200 bg-red-950/95 backdrop-blur-md border-b border-red-500/40 px-4 py-2.5 flex items-center justify-center gap-3 text-center">
+            <i className="fa-solid fa-database text-red-400" />
+            <p className="text-xs sm:text-sm text-red-100">
+                <strong className="font-bold uppercase tracking-wider">Database update required.</strong>{' '}
+                Your database is missing columns this version needs, so API keys and alliance connections are being refused.
+                Re-run <code className="font-mono bg-black/30 px-1 rounded-sm">schema.sql</code> in your Supabase SQL editor, then check
+                Admin → Database Tools → Run Diagnostics.
+            </p>
+        </div>
+    );
+};
+
 const AppContent: React.FC = () => {
     const {
-        currentUser, pendingUser, isLoadingAuth, isInitialized, needsSetup, setupCompleted, bootResolved,
+        currentUser, pendingUser, isLoadingAuth, isInitialized, needsSetup, setupCompleted, bootResolved, banNotice,
         authError, clearAuthError,
         handleLogin, handleFinalizeAdminSetup,
         handleNewUserSetup, config,
@@ -466,6 +503,10 @@ const AppContent: React.FC = () => {
             case 'warehouse': return <WarehouseView />;
             case 'marketplace': return <MarketplaceView />;
             case 'academy': return <AcademyHubView />;
+            // MUST exist for as long as any notification carries link: 'blueprints'.
+            // HeaderNotificationsBell casts the link straight into setActiveView, so a
+            // link with no case here fails silently to a blank view.
+            case 'blueprints': return <BlueprintsView />;
             case 'help': return <HelpView />;
             case 'tos': return <TermsOfServiceView onBack={() => setActiveView('help')} />;
             case 'changelog': return <ChangeLogView onBack={() => setActiveView('help')} />;
@@ -516,6 +557,12 @@ const AppContent: React.FC = () => {
 
     if (pendingUser) return <NewUserSetupView pendingUser={pendingUser} onSetupComplete={handleNewUserSetup} isAdminSetup={pendingUser.isAdminSetup} brandingConfig={brandingConfig} />;
     if (needsSetup) return <FirstTimeSetupView onFinalizeAdminSetup={handleFinalizeAdminSetup} />;
+    // ORG BAN — above maintenance so the more specific answer wins (a banned member
+    // is not "come back after maintenance"), and above the !currentUser login gate
+    // because the boot payload deliberately withholds currentUser from a banned
+    // session. An early RETURN, not an overlay: nothing below this line mounts, so
+    // no context, realtime channel or subset fetch runs underneath it.
+    if (banNotice) return <BannedView notice={banNotice} brandingConfig={brandingConfig} />;
     // Maintenance Mode — block all non-admin members (toggled by an Admin in the
     // Admin Console → Database Tools; enforced server-side in services.ts/query.ts).
     if (platformSettings?.maintenance_mode === true && currentUser?.role !== 'Admin') {
@@ -550,7 +597,7 @@ const AppContent: React.FC = () => {
                     </button>
                 </div>
                 <div className="absolute bottom-8 text-[10px] text-slate-600 font-mono uppercase tracking-[0.3em]">
-                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.4.1-open
+                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.7.0-open
                 </div>
             </div>
         );
@@ -642,6 +689,17 @@ const AppContent: React.FC = () => {
                             {/* Accent stripe — variant severity */}
                             <div className={`absolute top-0 left-0 bottom-0 w-1 ${stripeCls}`} aria-hidden />
 
+                            {/* Explicit action affordance. stopPropagation so it never also fires
+                                the whole-toast requestId navigation. */}
+                            {toast.action && (
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); toast.action?.onClick(); }}
+                                    className="absolute bottom-3 right-3 text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-sm bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition-colors"
+                                >
+                                    {toast.action.label}
+                                </button>
+                            )}
+
                             {/* Progress bar — skipped for persistent toasts */}
                             {!toast.persistent && (
                                 <div className="absolute bottom-0 left-0 h-0.5 w-full bg-white/5">
@@ -673,6 +731,7 @@ const AppContent: React.FC = () => {
                     );
                 })}
             </div>
+            <SchemaUpdateBanner />
             <PushNotificationBanner />
 
             {/* Global Modals */}
@@ -789,11 +848,12 @@ const AppContent: React.FC = () => {
             <RadioWidget />
             <WindowTaskbar />
             <NotificationListener />
+            <BuildUpdateWatcher />
         </div>
     );
 }
 
-const fullScreenViews = ['admin', 'applicant-detail', 'security-vetting', 'case-file-detail', 'search', 'internal-transfer-detail', 'internal-job-detail', 'intel', 'member-record', 'operation-detail', 'mirrored-operation-detail', 'operations', 'request-detail', 'dispatch', 'wiki', 'government', 'finances', 'quartermaster', 'warehouse', 'marketplace', 'academy', 'alliances', 'requests', 'warrants', 'roster', 'leaderboard', 'external-tools', 'radio-control', 'profile', 'help', 'tos', 'changelog', 'hr', 'fleet', 'org-chart', 'unit-detail'];
+const fullScreenViews = ['admin', 'applicant-detail', 'security-vetting', 'case-file-detail', 'search', 'internal-transfer-detail', 'internal-job-detail', 'intel', 'member-record', 'operation-detail', 'mirrored-operation-detail', 'operations', 'request-detail', 'dispatch', 'wiki', 'government', 'finances', 'quartermaster', 'warehouse', 'marketplace', 'academy', 'blueprints', 'alliances', 'requests', 'warrants', 'roster', 'leaderboard', 'external-tools', 'radio-control', 'profile', 'help', 'tos', 'changelog', 'hr', 'fleet', 'org-chart', 'unit-detail'];
 
 const OperationDetailViewWrapper = () => {
     const { selectedOperation, setActiveView } = useUI();

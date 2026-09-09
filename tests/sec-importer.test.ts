@@ -45,9 +45,32 @@ import { importOrgData } from '../lib/db/importer';
 const RAW_TOS = '<img src=x onerror="alert(1)"><script>alert(2)</script>hello';
 const LONG_MOTTO = 'A'.repeat(500);
 
+// The seeded shipped defaults (lib/db/seeder.ts): a SAME-ORIGIN icon path and an
+// https .mp3 chime. Neither may be cleared by the import sanitizers.
+const SEEDED_ICON = '/media/cross-swords.png';
+const SEEDED_SOUND = 'https://www.myinstants.com/media/sounds/rto.mp3';
+
 const NDJSON = [
-    '{"kind":"header","version":1,"tableOrder":["settings"],"manifest":{"settings":2}}',
-    JSON.stringify({ kind: 'row', t: 'settings', r: { key: 'brandingConfig', value: { name: 'Org', termsOfService: RAW_TOS } } }),
+    '{"kind":"header","version":1,"tableOrder":["settings"],"manifest":{"settings":3}}',
+    JSON.stringify({
+        kind: 'row', t: 'settings', r: {
+            key: 'brandingConfig', value: {
+                name: 'Org',
+                termsOfService: RAW_TOS,
+                iconUrl: SEEDED_ICON,                        // same-origin asset → kept
+                eamSoundUrl: 'http://evil.example/a.mp3',     // not https → cleared
+                bootSoundUrl: SEEDED_SOUND,                  // public https → kept
+            },
+        },
+    }),
+    JSON.stringify({
+        kind: 'row', t: 'settings', r: {
+            key: 'heroCardConfig', value: {
+                discordUrl: 'javascript:alert(1)',                            // dangerous scheme → cleared
+                organizationUrl: 'https://robertsspaceindustries.com/orgs/X',  // public https → kept
+            },
+        },
+    }),
     JSON.stringify({
         kind: 'row', t: 'settings', r: {
             key: 'publicPageConfig', value: {
@@ -108,6 +131,26 @@ describe('importOrgData re-applies write-boundary sanitizers to imported setting
             expect(l.url).not.toMatch(/^javascript:/i);
             expect(l.url).not.toContain('127.0.0.1');
         }
+    });
+
+    // This is the test that fails if lib/db/system.ts is fixed and lib/db/importer.ts
+    // is not: a crafted NDJSON export would otherwise re-seed exactly the icon / audio /
+    // href values the admin write path now refuses.
+    it('re-applies the branding + hero URL sanitizers exactly like the admin write path', async () => {
+        await importOrgData(NDJSON);
+        const branding = settingsValue('brandingConfig');
+        // Same-origin shipped icon survives — importIconUrl (OrLocalPath), not the
+        // https-only importImageUrl, or every deployment's logo blanks on import.
+        expect(branding!.iconUrl).toBe(SEEDED_ICON);
+        // http:// audio host cleared; the seeded https chime survives (an image
+        // sanitizer here would have blanked both).
+        expect(branding!.eamSoundUrl).toBe('');
+        expect(branding!.bootSoundUrl).toBe(SEEDED_SOUND);
+
+        const hero = settingsValue('heroCardConfig');
+        expect(hero, 'heroCardConfig row must be inserted').toBeDefined();
+        expect(hero!.discordUrl).toBe('');
+        expect(hero!.organizationUrl).toBe('https://robertsspaceindustries.com/orgs/X');
     });
 
     it('leaves a settings key with no sanitizing write path untouched', async () => {

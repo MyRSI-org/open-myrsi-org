@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useConfig } from '../../../contexts/ConfigContext';
+import { useAuth } from '../../../contexts/AuthContext';
 import { PublicPageConfig, PublicPageExternalLink, TestimonialCandidate } from '../../../types';
 import MinimalRichEditor from '../../shared/editor/MinimalRichEditor';
 import { tryParseTiptapJson } from '../../../lib/tiptapValidate';
@@ -171,6 +172,15 @@ const TestimonialPickerModal: React.FC<{
 const OrgPublicPageTab: React.FC = () => {
     const { publicPageConfig, updatePublicPageConfig, listTestimonialCandidates } = useConfig();
     const { addToast } = useNotification();
+    const { hasPermission } = useAuth();
+
+    // admin:list_testimonial_candidates and the ADD half of admin:update_public_page_config
+    // additionally require request:view:feedback server-side (the candidate list is a
+    // searchable dump of the same client_feedback column every other read path redacts,
+    // and publishing an id makes that text readable off the public page). Mirror the gate
+    // here so a branding-only delegate gets an explanation instead of a 403 toast plus
+    // permanently-blank previews. Cosmetic only — the dispatcher is the security control.
+    const canReadFeedback = hasPermission('request:view:feedback');
 
     const [config, setConfig] = useState<PublicPageConfig>(publicPageConfig);
     const [isSaving, setIsSaving] = useState(false);
@@ -197,6 +207,7 @@ const OrgPublicPageTab: React.FC = () => {
     useEffect(() => {
         const missing = (config.featuredTestimonialIds || []).filter((id) => !previewById[id]);
         if (missing.length === 0) return;
+        if (!canReadFeedback) return;
         let cancelled = false;
         (async () => {
             try {
@@ -211,7 +222,7 @@ const OrgPublicPageTab: React.FC = () => {
             }
         })();
         return () => { cancelled = true; };
-    }, [config.featuredTestimonialIds, listTestimonialCandidates, previewById]);
+    }, [config.featuredTestimonialIds, listTestimonialCandidates, previewById, canReadFeedback]);
 
     const update = <K extends keyof PublicPageConfig>(key: K, value: PublicPageConfig[K]) => setConfig((prev) => ({ ...prev, [key]: value }));
 
@@ -407,13 +418,16 @@ const OrgPublicPageTab: React.FC = () => {
                             <p className="text-xs text-slate-400 font-mono uppercase tracking-widest">{config.featuredTestimonialIds.length} / 6 featured</p>
                             <button
                                 type="button"
-                                disabled={config.featuredTestimonialIds.length >= 6}
+                                disabled={config.featuredTestimonialIds.length >= 6 || !canReadFeedback}
                                 onClick={() => setPickerOpen(true)}
                                 className="px-3 py-2 text-xs font-bold uppercase tracking-widest rounded-sm border border-sky-500/40 text-sky-300 hover:bg-sky-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                             >
                                 <i className="fa-solid fa-plus mr-1.5" /> Add Testimonial
                             </button>
                         </div>
+                        {!canReadFeedback && (
+                            <p className="text-xs text-amber-300/80">Selecting and previewing testimonials requires the View Client Feedback permission. Reordering and removing already-published quotes still works.</p>
+                        )}
                         {config.featuredTestimonialIds.length === 0 && (
                             <p className="text-sm text-slate-500 italic">No testimonials selected yet.</p>
                         )}
@@ -438,7 +452,9 @@ const OrgPublicPageTab: React.FC = () => {
                                                 <p className="text-sm text-slate-200 leading-relaxed wrap-break-word">{truncate(preview.quote, 240)}</p>
                                             </>
                                         ) : (
-                                            <p className="text-sm text-slate-500 italic">Preview unavailable. Testimonial may have been deleted — the public page will silently skip it.</p>
+                                            <p className="text-sm text-slate-500 italic">{canReadFeedback
+                                                ? 'Preview unavailable. Testimonial may have been deleted — the public page will silently skip it.'
+                                                : 'Preview hidden — reading testimonial text requires the View Client Feedback permission.'}</p>
                                         )}
                                     </div>
                                     <button
@@ -494,7 +510,7 @@ const OrgPublicPageTab: React.FC = () => {
                 </button>
             </div>
 
-            {pickerOpen && (
+            {pickerOpen && canReadFeedback && (
                 <TestimonialPickerModal
                     currentIds={config.featuredTestimonialIds}
                     onAdd={(id) => {

@@ -62,9 +62,13 @@ describe('getAnnouncementsState audience scoping', () => {
         const out = await getAnnouncementsState({ role: 'Dispatcher', permissions: [] });
         expect(ids(out)).toEqual(['a1', 'a3']);
     });
-    it('an Admin sees everything', async () => {
+    // The management bypass is now admin:config:notices ALONE — the seeded Admin and
+    // Dispatcher both hold it. A role NAMED 'Admin' with no permissions falls to the
+    // audience filter, which is stored DATA and still keys on the tier string, so it
+    // sees the Admin-audience notice and nothing else.
+    it('a permissionless Admin-tier viewer sees only Admin-audience notices, not everything', async () => {
         const out = await getAnnouncementsState({ role: 'Admin', permissions: [] });
-        expect(ids(out)).toEqual(['a1', 'a2', 'a3']);
+        expect(ids(out)).toEqual(['a2']);
     });
     it('admin:config:notices manager sees everything', async () => {
         const out = await getAnnouncementsState({ role: 'Member', permissions: ['admin:config:notices'] });

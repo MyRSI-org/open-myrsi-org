@@ -108,12 +108,21 @@ describe('getDossier viewer-scoped filtering (H1/H2/H3)', () => {
         expect(d.cachedSummaryDate).toBeUndefined();
     });
 
-    it('Admin sees every affiliate + op + the cached summary', async () => {
+    // The system Admin by role IDENTITY. A forged 'Admin' tier (name-derived, zero
+    // permissions) gets the ordinary clearance ceiling — asserted below.
+    it('the stamped system Admin sees every affiliate + op + the cached summary', async () => {
         personDossierFixture();
-        const d = await getDossier('jdoe', viewer({ role: 'Admin' }));
+        const d = await getDossier('jdoe', viewer({ isSystemAdmin: true }));
         expect((d.affiliates ?? []).map(a => a.targetId)).toEqual(expect.arrayContaining(['OPENORG', 'SECRETORG']));
         expect((d.operations ?? []).map((o: { id: string }) => o.id)).toEqual(expect.arrayContaining(['op-open', 'op-secret']));
         expect(d.cachedSummary).toBe('CLASSIFIED SYNTHESIS');
+    });
+
+    it('a forged Admin role NAME with no permissions gets NO dossier bypass', async () => {
+        personDossierFixture();
+        const d = await getDossier('jdoe', viewer({ role: 'Admin' }));
+        expect((d.affiliates ?? []).map(a => a.targetId)).not.toContain('SECRETORG');
+        expect(d.cachedSummary).toBeUndefined();
     });
 
     it('per-surface bypass: intel:manage unlocks affiliates+summary but NOT ops clearance', async () => {
@@ -257,6 +266,11 @@ describe('generateRadioToken restricted-unit voice gate (G1)', () => {
     // Drives generateRadioToken -> assertUnitAccess through the same mock. A
     // viewer that PASSES the gate falls through to the nulled LiveKit secrets and
     // fails on 'configuration missing', so that string means "gate passed".
+    //
+    // Every caller here carries a STAFF permission: base channels are staff-only
+    // (lib/staffPerms hasAnyStaffViewPerm) and that gate runs before the linked-unit
+    // check, so a permissionless caller would now be refused for the wrong reason.
+    // `viewerPerms` is separate — it seeds the users row assertUnitAccess reads.
     function radioFixture(opts: { linkedUnit: number | null; restricted: boolean; viewerUnitId: number | null; viewerPerms?: string[] }) {
         h.resolveQuery = ({ table, calls }) => {
             if (table === 'radio_channels') return { data: { id: 'chan-1' }, error: null };
@@ -279,26 +293,38 @@ describe('generateRadioToken restricted-unit voice gate (G1)', () => {
 
     it('a non-member is denied a token for a restricted unit channel', async () => {
         radioFixture({ linkedUnit: 5, restricted: true, viewerUnitId: 99, viewerPerms: [] });
-        await expect(generateRadioToken({ id: 6, permissions: [] }, 'radio-chan-1'))
+        await expect(generateRadioToken({ id: 6, permissions: ['operations:view'] }, 'radio-chan-1'))
             .rejects.toThrow(/restricted/i);
     });
 
     it('a unit member PASSES the gate (then fails on missing LiveKit config)', async () => {
         radioFixture({ linkedUnit: 5, restricted: true, viewerUnitId: 5, viewerPerms: [] });
-        await expect(generateRadioToken({ id: 5, permissions: [] }, 'radio-chan-1'))
+        await expect(generateRadioToken({ id: 5, permissions: ['operations:view'] }, 'radio-chan-1'))
             .rejects.toThrow(/configuration missing/i);
     });
 
     it('a member holding units:view_all PASSES the gate for a restricted channel', async () => {
+        // units:view_all is deliberately NOT a staff-view perm (it is grantable to
+        // customers), so the caller also carries operations:view to clear the base
+        // gate — units:view_all is what assertUnitAccess reads off the users row.
         radioFixture({ linkedUnit: 5, restricted: true, viewerUnitId: 99, viewerPerms: ['units:view_all'] });
-        await expect(generateRadioToken({ id: 6, permissions: ['units:view_all'] }, 'radio-chan-1'))
+        await expect(generateRadioToken({ id: 6, permissions: ['units:view_all', 'operations:view'] }, 'radio-chan-1'))
             .rejects.toThrow(/configuration missing/i);
     });
 
-    it('a general channel not linked to any unit stays open to all members', async () => {
+    it('a general channel not linked to any unit stays open to all STAFF', async () => {
         radioFixture({ linkedUnit: null, restricted: false, viewerUnitId: 99, viewerPerms: [] });
-        await expect(generateRadioToken({ id: 6, permissions: [] }, 'radio-chan-1'))
+        await expect(generateRadioToken({ id: 6, permissions: ['operations:view'] }, 'radio-chan-1'))
             .rejects.toThrow(/configuration missing/i);
+    });
+
+    it('a caller holding only client-default perms is denied a base channel outright', async () => {
+        // The base-channel gate used to live ONLY in RadioWidget's render filter, so a
+        // Client could POST radio:auth for the org's dispatch net and get a 6h grant.
+        // They must be refused before the LiveKit config sentinel is ever reached.
+        radioFixture({ linkedUnit: null, restricted: false, viewerUnitId: 99, viewerPerms: [] });
+        await expect(generateRadioToken({ id: 6, permissions: ['request:create', 'request:cancel', 'request:rate'] }, 'radio-chan-1'))
+            .rejects.toThrow(/not authorized/i);
     });
 
     it('denies a non-member even when an OPEN unit is also linked to the restricted channel (multi-unit dodge closed)', async () => {
@@ -318,7 +344,7 @@ describe('generateRadioToken restricted-unit voice gate (G1)', () => {
             if (table === 'users') return { data: { unit_id: 6, role: { role_permissions: [] } }, error: null }; // member of the OPEN unit only
             return { data: null, error: null };
         };
-        await expect(generateRadioToken({ id: 9, permissions: [] }, 'radio-chan-1'))
+        await expect(generateRadioToken({ id: 9, permissions: ['operations:view'] }, 'radio-chan-1'))
             .rejects.toThrow(/restricted/i);
     });
 });
@@ -341,8 +367,13 @@ describe('assertCanClassify (H8)', () => {
     it('allows markers the author holds', () => {
         expect(() => assertCanClassify(u(5, [{ id: 1 }, { id: 2 }]), 0, [1, 2])).not.toThrow();
     });
-    it('Admin classifies anything', () => {
-        expect(() => assertCanClassify(u(0, [], { role: 'Admin' }), 5, [9])).not.toThrow();
+    it('the stamped system Admin classifies anything', () => {
+        expect(() => assertCanClassify(u(0, [], { isSystemAdmin: true }), 5, [9])).not.toThrow();
+    });
+    // ROLE NAME IS NOT AUTHORITY: `role` is inferred from the role row's free-text
+    // name, so a permissionless custom role called 'Commander' classified anything.
+    it('a forged Admin role NAME does NOT classify above its own clearance', () => {
+        expect(() => assertCanClassify(u(0, [], { role: 'Admin' }), 5, [9])).toThrow(/above your own clearance/i);
     });
     it('a domain-manage bypass holder classifies anything', () => {
         expect(() => assertCanClassify(u(0, [], { permissions: ['intel:manage'] }), 5, [9], ['intel:manage'])).not.toThrow();

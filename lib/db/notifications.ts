@@ -62,7 +62,7 @@ export async function getUserNotifications(
         .select(NOTIFICATION_COLS)
         .eq('user_id', userId);
     if (opts.unreadOnly) query = query.is('read_at', null);
-    query = query.order('created_at', { ascending: false }).limit(limit);
+    query = query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(limit);
     if (opts.offset) query = query.range(opts.offset, opts.offset + limit - 1);
     const rows = await safeFetch<NotificationRow[]>(query, [], 'getUserNotifications');
     return (rows || []).map(toNotification);
@@ -227,7 +227,7 @@ export async function pruneOldNotifications(days = 90): Promise<number> {
             const { data, error } = await supabase.from('notifications')
                 .select('id')
                 .lt('created_at', cutoff)
-                .limit(SELECT_BATCH);
+                .order('id', { ascending: true }).limit(SELECT_BATCH);
             if (error) {
                 if (error.code !== '42P01') log.warn('pruneOldNotifications select failed', { code: error.code });
                 break;

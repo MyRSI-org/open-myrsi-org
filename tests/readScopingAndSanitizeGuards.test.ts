@@ -47,17 +47,23 @@ const lte = () => h.calls.filter(c => c.method === 'lte');
 
 describe('listIntelReports clearance-level ceiling', () => {
     it('applies classification_level <= viewer level for a non-manager', async () => {
-        await listIntelReports({ viewer: { clearanceLevel: { level: 2 }, permissions: [], role: 'Member' } });
+        await listIntelReports({ viewer: { clearanceLevel: { level: 2 }, permissions: [] } });
         const ceiling = lte().find(c => c.args[0] === 'classification_level');
         expect(ceiling).toBeDefined();
         expect(ceiling!.args[1]).toBe(2);
     });
     it('does NOT apply a ceiling for an intel:manage holder', async () => {
-        await listIntelReports({ viewer: { clearanceLevel: { level: 0 }, permissions: ['intel:manage'], role: 'Member' } });
+        await listIntelReports({ viewer: { clearanceLevel: { level: 0 }, permissions: ['intel:manage'] } });
         expect(lte().some(c => c.args[0] === 'classification_level')).toBe(false);
     });
-    it('does NOT apply a ceiling for an Admin', async () => {
-        await listIntelReports({ viewer: { clearanceLevel: { level: 0 }, permissions: [], role: 'Admin' } });
+    // Role IDENTITY, not the name-derived tier: a forged 'Admin' tier with no perms
+    // must now take the ceiling, and the stamped system Admin must not.
+    it('DOES apply a ceiling for a forged Admin role NAME with no permissions', async () => {
+        await listIntelReports({ viewer: { clearanceLevel: { level: 0 }, permissions: [], role: 'Admin' } as unknown as Parameters<typeof listIntelReports>[0]['viewer'] });
+        expect(lte().some(c => c.args[0] === 'classification_level')).toBe(true);
+    });
+    it('does NOT apply a ceiling for the stamped system Admin', async () => {
+        await listIntelReports({ viewer: { clearanceLevel: { level: 0 }, permissions: [], isSystemAdmin: true } });
         expect(lte().some(c => c.args[0] === 'classification_level')).toBe(false);
     });
 });

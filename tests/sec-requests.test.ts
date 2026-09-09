@@ -49,7 +49,8 @@ vi.mock('../lib/push', () => ({
 }));
 
 import { getRequestsState, getRequestDetail } from '../lib/db';
-import { redactRequestFeedbackForViewer, acceptRequest } from '../lib/db/requests';
+import { redactRequestFeedbackForViewer, acceptRequest, createAdHocServiceRequest } from '../lib/db/requests';
+import { SecurityDenial } from '../lib/errors';
 
 beforeEach(() => { h.resolveQuery = () => ({ data: null, error: null }); });
 
@@ -61,23 +62,27 @@ describe('redactRequestFeedbackForViewer (request:view:feedback gate)', () => {
     const base = { id: 'SR-1', clientId: 7, clientRating: 4, clientFeedback: 'candid text' };
 
     it('nulls feedback for a plain member lacking the permission (rating kept)', () => {
-        const out = redactRequestFeedbackForViewer(base, { id: 99, role: 'Member', permissions: ['request:accept'] });
+        const out = redactRequestFeedbackForViewer(base, { id: 99, permissions: ['request:accept'] });
         expect(out.clientFeedback).toBeNull();
         expect(out.clientRating).toBe(4);
     });
 
     it('keeps feedback for a request:view:feedback holder', () => {
-        const out = redactRequestFeedbackForViewer(base, { id: 1, role: 'Dispatcher', permissions: ['request:accept', 'request:view:feedback'] });
+        const out = redactRequestFeedbackForViewer(base, { id: 1, permissions: ['request:accept', 'request:view:feedback'] });
         expect(out.clientFeedback).toBe('candid text');
     });
 
-    it('keeps feedback for Admin', () => {
-        const out = redactRequestFeedbackForViewer(base, { id: 2, role: 'Admin', permissions: [] });
-        expect(out.clientFeedback).toBe('candid text');
+    // NO ROLE-NAME BYPASS. `role` is inferred from the role row's free-text name, so
+    // a permissionless custom role called 'Commander' read every client's candid
+    // feedback here and through the testimonial listing.
+    it('nulls feedback for a forged Admin role NAME with no permissions', () => {
+        const out = redactRequestFeedbackForViewer(base, { id: 2, role: 'Admin', permissions: [] } as unknown as Parameters<typeof redactRequestFeedbackForViewer>[1]);
+        expect(out.clientFeedback).toBeNull();
+        expect(out.clientRating).toBe(4);
     });
 
     it('keeps feedback for the owning client who authored it', () => {
-        const out = redactRequestFeedbackForViewer(base, { id: 7, role: 'Member', permissions: ['request:accept'] });
+        const out = redactRequestFeedbackForViewer(base, { id: 7, permissions: ['request:accept'] });
         expect(out.clientFeedback).toBe('candid text');
     });
 
@@ -158,8 +163,78 @@ describe('acceptRequest blocks self-servicing a self-originated request', () => 
         await expect(acceptRequest('r1', 5, 5, { id: 5, permissions: ['request:set_lead'] })).resolves.toBeUndefined();
     });
 
-    it('Admin may self-assign', async () => {
+    // Duty is a PERMISSION set. The seeded Admin holds request:dispatch, so a real
+    // Admin still self-assigns; a permissionless custom role called 'Commander'
+    // (name-derived Admin tier) no longer can, which is the point of the sweep.
+    it('the seeded Admin (request:dispatch) may self-assign', async () => {
         h.resolveQuery = withReq(5);
-        await expect(acceptRequest('r1', 5, 5, { id: 5, role: 'Admin', permissions: [] })).resolves.toBeUndefined();
+        await expect(acceptRequest('r1', 5, 5, { id: 5, permissions: ['request:dispatch'] })).resolves.toBeUndefined();
+    });
+
+    it('a forged Admin role NAME with no duty permission may NOT self-assign', async () => {
+        h.resolveQuery = withReq(5);
+        await expect(acceptRequest('r1', 5, 5, { id: 5, role: 'Admin', permissions: [] } as unknown as Parameters<typeof acceptRequest>[3]))
+            .rejects.toThrow(/cannot respond to your own request/i);
+    });
+});
+
+describe('the AD-HOC create path carries the same guards as its sibling', () => {
+    // request:create_adhoc is a MEMBER DEFAULT permission, and every successful create
+    // fans a push to EVERY staff member and posts a Discord embed. createServiceRequest
+    // carries a standing floor and a one-active-request cap for exactly that reason;
+    // this path carried neither, so a client sanctioned at request:create simply used
+    // request:create_adhoc instead and the sanction meant nothing.
+    const REP = (reputation: number) => (q: { table: string }) =>
+        q.table === 'users' ? { data: { id: 77, reputation }, error: null }
+            : q.table === 'service_requests' ? { data: { id: 'SR-1', client_id: null }, error: null, count: 0 }
+                : { data: null, error: null };
+
+    it('refuses a caller whose standing is below the floor', async () => {
+        h.resolveQuery = REP(1);
+        await expect(createAdHocServiceRequest({ unregisteredClientRsiHandle: 'someone' }, 5))
+            .rejects.toBeInstanceOf(SecurityDenial);
+    });
+
+    it('fails CLOSED when the standing cannot be read', async () => {
+        h.resolveQuery = (q) => (q.table === 'users' ? { data: null, error: { message: 'boom' } } : { data: null, error: null });
+        await expect(createAdHocServiceRequest({ unregisteredClientRsiHandle: 'someone' }, 5))
+            .rejects.toThrow(/could not verify your standing/i);
+    });
+
+    it('does NOT bind a resolved member to the request for an ordinary caller', async () => {
+        // The handle is caller-supplied and unverified. Linking whoever it matched put
+        // another member's name on the request, consumed their single active-request
+        // slot, and attributed a Discord post to them.
+        const inserts: Array<Record<string, unknown>> = [];
+        h.resolveQuery = (q) => {
+            const ins = q.calls.find(c => c.method === 'insert');
+            if (ins) inserts.push(ins.args[0] as Record<string, unknown>);
+            return q.table === 'users' ? { data: { id: 77, reputation: 100 }, error: null }
+                : { data: { id: 'SR-1', client_id: null }, error: null, count: 0 };
+        };
+        await createAdHocServiceRequest({ unregisteredClientRsiHandle: 'victim' }, 5, { permissions: [] });
+        const row = inserts.find(i => 'unregistered_client_rsi_handle' in i);
+        expect(row?.client_id, 'an ordinary member bound another member to the request').toBeUndefined();
+    });
+
+    it('a dispatch-duty holder MAY bind, because that is their job', async () => {
+        const inserts: Array<Record<string, unknown>> = [];
+        h.resolveQuery = (q) => {
+            const ins = q.calls.find(c => c.method === 'insert');
+            if (ins) inserts.push(ins.args[0] as Record<string, unknown>);
+            return q.table === 'users' ? { data: { id: 77, reputation: 100 }, error: null }
+                : { data: { id: 'SR-1', client_id: 77 }, error: null, count: 0 };
+        };
+        await createAdHocServiceRequest({ unregisteredClientRsiHandle: 'client' }, 5, { permissions: ['request:dispatch'] });
+        const row = inserts.find(i => 'unregistered_client_rsi_handle' in i);
+        expect(row?.client_id).toBe(77);
+    });
+
+    it('and a bound client is still subject to the one-active-request cap', async () => {
+        h.resolveQuery = (q) => q.table === 'users'
+            ? { data: { id: 77, reputation: 100 }, error: null }
+            : { data: { id: 'SR-1' }, error: null, count: 1 };
+        await expect(createAdHocServiceRequest({ unregisteredClientRsiHandle: 'client' }, 5, { permissions: ['request:dispatch'] }))
+            .rejects.toThrow(/already has an active service request/i);
     });
 });

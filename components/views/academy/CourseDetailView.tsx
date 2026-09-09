@@ -3,9 +3,75 @@
 // image, instructors + certification, enrol CTA (self-paced) or upcoming sessions
 // (cohort), a collapsible module/lesson curriculum, and learning outcomes.
 import React, { useMemo, useState } from 'react';
-import type { AcademyCourse, AcademySession, AcademyModule } from '../../../types';
+import type { AcademyCourse, AcademySession, AcademyModule, AcademyEnrollmentRequest } from '../../../types';
 
 type CatalogDetail = { course: AcademyCourse; sessions: AcademySession[] };
+
+// ── Gated access ─────────────────────────────────────────────────────────────
+// A gated course cannot be self-enrolled — the server refuses it outright — so the
+// button has to be a different button, not the same one that fails. What the viewer
+// sees is driven by their OWN request row: none/denied/withdrawn offers the ask,
+// pending offers a cancel, and an approved one has already become an enrolment (so
+// enrolledSessionIds wins before this is consulted).
+const SeatRequestControl: React.FC<{
+    request: AcademyEnrollmentRequest | undefined;
+    busy: boolean;
+    compact?: boolean;
+    onRequest: (message: string) => void;
+    onCancel: (requestId: string) => void;
+}> = ({ request, busy, compact, onRequest, onCancel }) => {
+    const [asking, setAsking] = useState(false);
+    const [message, setMessage] = useState('');
+    const btn = compact
+        ? 'shrink-0 px-4 py-2 text-[11px] font-black uppercase tracking-widest rounded-lg'
+        : 'shrink-0 px-5 py-2.5 text-xs font-black uppercase tracking-widest rounded-lg';
+
+    if (request?.status === 'pending') {
+        return (
+            <div className="shrink-0 flex items-center gap-2">
+                <span className="text-[11px] font-bold uppercase tracking-widest text-amber-400"><i className="fa-solid fa-hourglass-half mr-1.5" aria-hidden />Requested</span>
+                <button type="button" disabled={busy} onClick={() => onCancel(request.id)}
+                    className="text-[11px] font-bold uppercase tracking-widest text-slate-500 hover:text-red-400 disabled:opacity-40">Cancel</button>
+            </div>
+        );
+    }
+
+    if (!asking) {
+        return (
+            <div className="shrink-0 text-right">
+                <button type="button" disabled={busy} onClick={() => setAsking(true)}
+                    className={`${btn} bg-purple-600 hover:bg-purple-500 text-white disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed`}>
+                    Request Seat
+                </button>
+                {request?.status === 'denied' && (
+                    // The reason is shown because the student is its subject and the
+                    // alternative is a silent refusal they cannot act on.
+                    <p className="text-[10px] text-red-400/80 mt-1 max-w-[16rem]">
+                        Previously declined{request.decisionReason ? `: ${request.decisionReason}` : '.'}
+                    </p>
+                )}
+            </div>
+        );
+    }
+
+    return (
+        <div className="shrink-0 w-full sm:w-72 space-y-2">
+            <textarea
+                value={message} onChange={(e) => setMessage(e.target.value)} rows={2} maxLength={500} disabled={busy}
+                placeholder="Why you'd like a seat (optional)" aria-label="Message to the instructors"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-white placeholder:text-slate-600 outline-hidden focus:border-purple-500/50 resize-none disabled:opacity-50"
+            />
+            <div className="flex items-center justify-end gap-2">
+                <button type="button" disabled={busy} onClick={() => { setAsking(false); setMessage(''); }}
+                    className="text-[11px] font-bold uppercase tracking-widest text-slate-400 hover:text-white disabled:opacity-40">Cancel</button>
+                <button type="button" disabled={busy} onClick={() => { setAsking(false); onRequest(message.trim()); setMessage(''); }}
+                    className="px-4 py-1.5 text-[11px] font-black uppercase tracking-widest rounded-lg bg-purple-600 hover:bg-purple-500 text-white disabled:bg-slate-700 disabled:text-slate-500">
+                    Send Request
+                </button>
+            </div>
+        </div>
+    );
+};
 
 const ModuleAccordion: React.FC<{ modules: AcademyModule[] }> = ({ modules }) => {
     // Expand the first module by default; the rest collapse so a long course stays scannable.
@@ -61,13 +127,18 @@ export const CourseDetailView: React.FC<{
     detail: CatalogDetail;
     busy: boolean;
     enrolledSessionIds: Set<string>;
+    /** The viewer's OWN request per session — never anyone else's. */
+    myRequests: Map<string, AcademyEnrollmentRequest>;
     onEnrol: (sessionId: string) => void;
+    onRequest: (sessionId: string, message: string) => void;
+    onCancelRequest: (requestId: string) => void;
     onBack: () => void;
-}> = ({ detail, busy, enrolledSessionIds, onEnrol, onBack }) => {
+}> = ({ detail, busy, enrolledSessionIds, myRequests, onEnrol, onRequest, onCancelRequest, onBack }) => {
     const { course, sessions } = detail;
     const totalLessons = useMemo(() => course.modules.reduce((n, m) => n + m.lessons.length, 0), [course.modules]);
     const selfPacedSession = course.delivery === 'self_paced' ? sessions[0] : null;
     const alreadySelfEnrolled = selfPacedSession ? enrolledSessionIds.has(selfPacedSession.id) : false;
+    const gated = course.access === 'gated';
 
     return (
         // Full-bleed: cancel the hub content area's p-4 sm:p-6 so the hero sits flush
@@ -122,11 +193,18 @@ export const CourseDetailView: React.FC<{
                 {course.delivery === 'self_paced' ? (
                     <div className="rounded-xl border border-purple-500/25 bg-purple-500/5 p-4 flex items-center gap-4">
                         <div className="min-w-0 flex-1">
-                            <p className="text-sm font-bold text-white">{alreadySelfEnrolled ? 'You are enrolled' : 'Learn at your own pace'}</p>
-                            <p className="text-[11px] text-slate-500 mt-0.5">{alreadySelfEnrolled ? 'Continue from My Learning whenever suits you.' : 'Enrol any time and work through the curriculum at your own pace.'}</p>
+                            <p className="text-sm font-bold text-white">{alreadySelfEnrolled ? 'You are enrolled' : gated ? 'Enrolment by approval' : 'Learn at your own pace'}</p>
+                            <p className="text-[11px] text-slate-500 mt-0.5">{alreadySelfEnrolled ? 'Continue from My Learning whenever suits you.' : gated ? 'Ask the instructors for a seat; you will be notified when they decide.' : 'Enrol any time and work through the curriculum at your own pace.'}</p>
                         </div>
                         {alreadySelfEnrolled ? (
                             <span className="shrink-0 text-xs font-bold uppercase tracking-widest text-emerald-400"><i className="fa-solid fa-circle-check mr-1.5" aria-hidden />Enrolled</span>
+                        ) : gated ? (
+                            <SeatRequestControl
+                                request={selfPacedSession ? myRequests.get(selfPacedSession.id) : undefined}
+                                busy={busy || !selfPacedSession}
+                                onRequest={(m) => selfPacedSession && onRequest(selfPacedSession.id, m)}
+                                onCancel={onCancelRequest}
+                            />
                         ) : (
                             <button type="button" disabled={!selfPacedSession || busy} onClick={() => selfPacedSession && onEnrol(selfPacedSession.id)}
                                 className="shrink-0 px-5 py-2.5 text-xs font-black uppercase tracking-widest rounded-lg bg-purple-600 hover:bg-purple-500 text-white disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed">
@@ -155,6 +233,12 @@ export const CourseDetailView: React.FC<{
                                     </div>
                                     {enrolled ? (
                                         <span className="shrink-0 text-[11px] font-bold uppercase tracking-widest text-emerald-400"><i className="fa-solid fa-circle-check mr-1" aria-hidden />Enrolled</span>
+                                    ) : gated ? (
+                                        // Capacity still applies to a gated seat, but it is the
+                                        // APPROVER who is stopped by it, not the asker — a full
+                                        // session can still take requests against a later drop-out.
+                                        <SeatRequestControl request={myRequests.get(s.id)} busy={busy || !s.enrollmentOpen} compact
+                                            onRequest={(m) => onRequest(s.id, m)} onCancel={onCancelRequest} />
                                     ) : (
                                         <button type="button" onClick={() => canEnrol && !busy && onEnrol(s.id)} disabled={!canEnrol || busy}
                                             className="shrink-0 px-4 py-2 text-[11px] font-black uppercase tracking-widest rounded-lg bg-purple-600 hover:bg-purple-500 text-white disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed">

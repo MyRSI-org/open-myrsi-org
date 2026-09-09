@@ -129,6 +129,9 @@ import {
     buildOperationSnapshot, projectOperationSnapshot,
 } from '../lib/db/operations-federation';
 import type { HydratedOperation } from '../types';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { stripComments } from './stripComments';
 
 beforeEach(() => {
     h.orgEmits = [];
@@ -295,5 +298,73 @@ describe('projectOperationSnapshot drops all allies when recipientPeerId is omit
         expect((snap.alliedOrgs ?? []).every((o) => o.peerId === '')).toBe(true);
         expect((snap.alliedParticipants ?? []).every((p) => p.peerId === '')).toBe(true);
         expect(JSON.stringify(snap)).not.toContain('peer-B');
+    });
+});
+
+describe('an inbound manifest may not raise our own `accepted` flag', () => {
+    // The reconcile loop treats the host's manifest.accepted map as authoritative
+    // "because only our own /accept sets it". True of the host's bookkeeping, false as
+    // a trust statement: the MANIFEST IS SERVED BY THE HOST, so a hostile or
+    // compromised peer lists any op id under accepted and we latch it.
+    //
+    // `accepted` is the local alliance:manage admin's decision — it gates whether a
+    // mirror is visible to members or sits in the admin-only pending queue — so the
+    // counterparty setting it is the guest's accept/decline gate being decided by the
+    // party it exists to decide about. Worse on the resurrect path: a revoke is often a
+    // deliberate DECLINE, and the peer could un-revoke it on every reconcile tick.
+    const src = stripComments(readFileSync(resolve(__dirname, '..', 'lib', 'db', 'operations-federation.ts'), 'utf8'));
+    const fn = src.slice(src.indexOf('async function pullMirrorFromHost'));
+
+    it('a healed mirror lands as a PENDING invite, never pre-accepted', () => {
+        const heal = fn.slice(fn.indexOf("kind === 'missing-accepted' || kind === 'missing-invite'"), fn.indexOf("kind === 'regression'"));
+        expect(heal).toMatch(/accepted: false/);
+        expect(heal, 'the manifest can set accepted again').not.toMatch(/accepted,/);
+        expect(heal).toMatch(/accepted_at: null/);
+    });
+
+    it('a resurrect restores the ROW without answering the accept question', () => {
+        const res = fn.slice(fn.indexOf("kind === 'resurrect'"), fn.indexOf("kind === 'reinvite'"));
+        expect(res, 'the peer can force-accept a mirror this org declined').not.toMatch(/accepted: true/);
+        expect(res).toMatch(/revoked_at: null/);
+    });
+
+    it('the reinvite branch still explicitly clears it, as it always did', () => {
+        const re = fn.slice(fn.indexOf("kind === 'reinvite'"));
+        expect(re.slice(0, 400)).toMatch(/accepted: false/);
+    });
+});
+
+describe('the per-peer allied-participant cap counts a column that exists', () => {
+    // It counted `id`. operation_allied_participants has no id column — its primary key
+    // is composite (operation_id, peer_id, remote_user_handle), and lib/database.types.ts,
+    // generated from the live project, agrees. PostgREST answers an unknown column with a
+    // 400, supabase-js returns { count: null, error }, the error was discarded, and
+    // (null || 0) is 0 — so MAX_ALLIED_PARTICIPANTS_PER_PEER never fired anywhere.
+    //
+    // The write it guards is reached from the inbound /api/alliance RSVP route,
+    // authenticated by a PEER's api key, and every row it admits is rendered in our
+    // operation detail and re-forwarded to other allies.
+    const fed = stripComments(readFileSync(resolve(__dirname, '..', 'lib', 'db', 'operations-federation.ts'), 'utf8'));
+    const fn = fed.slice(fed.indexOf('MAX_ALLIED_PARTICIPANTS_PER_PEER', fed.indexOf('async function upsertAlliedParticipant')) - 1200);
+
+    it('counts remote_user_handle, not a column that does not exist', () => {
+        expect(fn).toMatch(/from\('operation_allied_participants'\)\s*\n?\s*\.select\('remote_user_handle', \{ count: 'exact', head: true \}\)/);
+        expect(fn, 'back to counting a column the table does not have').not.toMatch(/\.select\('id', \{ count: 'exact'/);
+    });
+
+    it('binds the error so a read fault refuses the write', () => {
+        // A volume cap that degrades to "0 so far" on a database blip is not a cap.
+        // The error bind IS the fix: a bogus column now throws here instead of
+        // degrading to "0 so far". Same contract as slotAssignedCount in lib/db/ops.ts,
+        // which binds the error and then falls back to 0 — one house rule, not two.
+        expect(fn).toMatch(/handleSupabaseError\(\{ error: countErr/);
+    });
+
+    it('the schema really has no id column, so this cannot regress by adding one back', () => {
+        const schema = readFileSync(resolve(__dirname, '..', 'schema.sql'), 'utf8');
+        const table = schema.slice(schema.indexOf('CREATE TABLE IF NOT EXISTS public.operation_allied_participants'));
+        const body = table.slice(0, table.indexOf(');'));
+        expect(body).toMatch(/PRIMARY KEY \(operation_id, peer_id, remote_user_handle\)/);
+        expect(body, 'the table gained an id column — revisit the count above').not.toMatch(/^\s+id\s+/m);
     });
 });

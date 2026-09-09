@@ -3,6 +3,7 @@ import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
 import { useAuth } from '../../contexts/AuthContext';
 import { useDebouncedValue } from '../../hooks/useDebouncedValue';
+import { isSyncRestrictedWithheld } from '../../lib/markerSyncVisibility';
 import { User, UserRole } from '../../types';
 import WindowFrame from '../layout/WindowFrame';
 import { VirtualizedList } from '../ui/VirtualizedList';
@@ -398,6 +399,15 @@ const BulkAssignClearanceModal: React.FC<BulkAssignClearanceModalProps> = ({ isO
                                     );
                                 })}
                             </div>
+                        )}
+                        {isSyncRestrictedWithheld(limitingMarkers) && (
+                            // See lib/markerSyncVisibility.ts. Owner decision D10 keeps
+                            // `syncRestricted` above admin:access, so the "No Sync" chips never
+                            // render for a clearance manager who lacks it. Stating the omission
+                            // beats letting the grid imply no marker blocks federation.
+                            <p className="text-[10px] text-slate-500 italic mt-2">
+                                Joint Operation sharing restrictions are not shown at your permission level.
+                            </p>
                         )}
                     </div>
                 </div>

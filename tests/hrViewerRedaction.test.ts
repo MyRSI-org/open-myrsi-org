@@ -32,8 +32,7 @@ vi.mock('../lib/db/common', () => {
 import {
     redactInterviewsForViewer,
     redactApplicantsForViewer,
-    isHrRecruiter,
-} from '../lib/db/hr';
+    isHrRecruiter, redactTransfersForViewer } from '../lib/db/hr';
 import { ApplicationStatus } from '../types';
 import type { HydratedHRInterview, HydratedHRApplication } from '../types';
 
@@ -158,12 +157,55 @@ describe('HR non-recruiter redaction', () => {
         });
     });
 
-    describe('isHrRecruiter gating (unchanged — sanity)', () => {
-        it('treats Admin and hr:recruiter holders as recruiters, plain hr:view as not', () => {
-            expect(isHrRecruiter({ role: 'Admin' })).toBe(true);
+    describe('isHrRecruiter gating (permission only — no role-name bypass)', () => {
+        it('treats hr:recruiter holders as recruiters, plain hr:view as not', () => {
             expect(isHrRecruiter({ permissions: ['hr:recruiter'] })).toBe(true);
             expect(isHrRecruiter({ permissions: ['hr:view'] })).toBe(false);
             expect(isHrRecruiter(null)).toBe(false);
         });
+        // The Admin role NAME is not authority: `role` is inferred from the role
+        // row's free-text name, so a permissionless custom role called 'Commander'
+        // read every case file through the bundle AND the hr_* slices.
+        it('does NOT treat a forged Admin role NAME with no permissions as a recruiter', () => {
+            expect(isHrRecruiter({ role: 'Admin', permissions: [] } as unknown as Parameters<typeof isHrRecruiter>[0])).toBe(false);
+        });
+    });
+});
+
+describe('transfer requests are PROJECTED for a non-recruiter, not merely blanked', () => {
+    // Blanking reason/adminNotes left everything that identifies the request: who asked
+    // (the user embed carries name, avatar and rsi_handle), their current unit, the
+    // unit they want, and the outcome. hr:view is a seeded Member permission, so every
+    // member could read the org's whole internal-mobility picture — who is trying to
+    // leave which unit, and whether it was approved.
+    const rows = [
+        { id: 't1', userId: 7, reason: 'Want ops', adminNotes: 'officer note', status: 'Pending' },
+        { id: 't2', userId: 99, reason: 'Personal', adminNotes: 'do not approve', status: 'Denied' },
+    ];
+
+    it('a recruiter still sees everything', () => {
+        expect(redactTransfersForViewer(rows, true, 7)).toEqual(rows);
+    });
+
+    it('a non-recruiter sees ONLY their own request', () => {
+        const out = redactTransfersForViewer(rows, false, 7);
+        expect(out).toHaveLength(1);
+        expect(out[0].id).toBe('t1');
+        expect(JSON.stringify(out), "another member's transfer reached the wire").not.toContain('Personal');
+        expect(JSON.stringify(out)).not.toContain('do not approve');
+    });
+
+    it("the officer's private note is stripped even on your own row", () => {
+        expect(redactTransfersForViewer(rows, false, 7)[0].adminNotes).toBeUndefined();
+    });
+
+    it('your own reason survives — you wrote it', () => {
+        expect(redactTransfersForViewer(rows, false, 7)[0].reason).toBe('Want ops');
+    });
+
+    it('an unidentified viewer gets nothing, not everything', () => {
+        expect(redactTransfersForViewer(rows, false, undefined)).toEqual([]);
+        expect(redactTransfersForViewer(rows, false, 0)).toEqual([]);
+        expect(redactTransfersForViewer(rows, false, NaN)).toEqual([]);
     });
 });

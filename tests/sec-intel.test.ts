@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { sanitizePublicLinkUrl } from '../lib/linkUrl';
 
 // Intel write-boundary hygiene:
@@ -133,5 +135,32 @@ describe('own-org intel/warrant writes get stripHtml + length-cap + normalisatio
         await bulkUpdateIntelAffiliation(['00000000-0000-0000-0000-000000000002'], 'z'.repeat(5000));
         const payload = lastUpdate('intel_reports');
         expect(payload.affiliated_org.length).toBeLessThanOrEqual(200);
+    });
+});
+
+describe('warrantsOnly is a WARRANT read, and needs warrant:view', () => {
+    // intel:get_dossier withholds the warrant array unless the caller holds
+    // warrant:view. The warrantsOnly FILTER discloses the same fact by another route:
+    // it narrows the list to subjects carrying an active warrant, so the result set
+    // itself is the answer to "who is under warrant". Reached through a filter rather
+    // than a field, it bypassed the gate entirely — any intel:view holder could set it.
+    const src = readFileSync(resolve(__dirname, '..', 'api', 'actions', 'intel.ts'), 'utf8');
+    const handler = src.slice(src.indexOf("'intel:list':"), src.indexOf("'intel:hub_stats':"));
+
+    it('the flag is gated on warrant:view, not passed through from the payload', () => {
+        expect(handler, 'the raw payload flag reaches the db layer again').not.toMatch(/warrantsOnly:\s*payload\.warrantsOnly/);
+        expect(handler).toMatch(/canViewWarrants \? payload\.warrantsOnly : undefined/);
+        expect(handler).toMatch(/includes\('warrant:view'\)/);
+    });
+
+    it('uses the same predicate shape as the dossier handler, so the two cannot drift', () => {
+        const dossier = src.slice(src.indexOf("'intel:get_dossier'"), src.indexOf("'intel:get_recent'"));
+        expect(dossier).toMatch(/includes\('warrant:view'\)/);
+    });
+
+    it('is DROPPED rather than refused, so an unentitled caller still gets their list', () => {
+        // Refusing would turn a filter nobody is entitled to into a broken action; the
+        // ordinary intel list is the right degraded result.
+        expect(handler).not.toMatch(/throw new SecurityDenial/);
     });
 });

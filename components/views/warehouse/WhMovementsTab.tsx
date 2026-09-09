@@ -164,6 +164,15 @@ export default function WhMovementsTab({ movements, isLoading, onRefresh }: Prop
                                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm text-amber-300 bg-amber-500/10 border border-amber-500/30 font-mono uppercase tracking-widest">
                                                     <i className="fa-solid fa-file-pen text-[9px]" /> Request
                                                 </span>
+                                            ) : m.fromContract ? (
+                                                // The BOOLEAN is what every ledger viewer gets. relatedContractId is
+                                                // present only for a party to that contract (scoped in db.toMovement),
+                                                // so the title attribute shows an id when there is one and nothing
+                                                // when there is not — this is presentation, never the boundary.
+                                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm text-indigo-300 bg-indigo-500/10 border border-indigo-500/30 font-mono uppercase tracking-widest"
+                                                    title={m.relatedContractId ? `Contract ${m.relatedContractId}` : 'A marketplace contract you are not a party to'}>
+                                                    <i className="fa-solid fa-handshake text-[9px]" /> Contract
+                                                </span>
                                             ) : (
                                                 <span className="text-slate-600">—</span>
                                             )}

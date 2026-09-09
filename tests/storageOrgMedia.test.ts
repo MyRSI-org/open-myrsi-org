@@ -99,10 +99,60 @@ describe('orgMediaKeyFromUrl / classifyOrgMediaRef / signOrgMediaUrl — only to
     });
 
     it('classifies a private signed URL / bare key as own-private, everything else as external', () => {
-        expect(classifyOrgMediaRef(`https://x/storage/v1/object/sign/${PRIVATE_BUCKET}/media/wiki/c.webp?token=t`)).toEqual({ kind: 'own-private', key: 'media/wiki/c.webp' });
-        expect(classifyOrgMediaRef('media/government/d.webp')).toEqual({ kind: 'own-private', key: 'media/government/d.webp' });
-        expect(classifyOrgMediaRef('https://cdn.example.com/x.png')).toEqual({ kind: 'external' });
-        expect(classifyOrgMediaRef('media/../etc/passwd')).toEqual({ kind: 'external' });
+        // Host pinned to SUPABASE_URL, not a bare literal: classifyOrgMediaRef is the WRITE
+        // side and demands our own origin. Set explicitly rather than leaning on the
+        // ambient value, so a dev machine with a real .env sourced does not change the result.
+        const prev = process.env.SUPABASE_URL;
+        process.env.SUPABASE_URL = 'https://proj.supabase.co';
+        try {
+            expect(classifyOrgMediaRef(`https://proj.supabase.co/storage/v1/object/sign/${PRIVATE_BUCKET}/media/wiki/c.webp?token=t`)).toEqual({ kind: 'own-private', key: 'media/wiki/c.webp' });
+            expect(classifyOrgMediaRef('media/government/d.webp')).toEqual({ kind: 'own-private', key: 'media/government/d.webp' });
+            expect(classifyOrgMediaRef('https://cdn.example.com/x.png')).toEqual({ kind: 'external' });
+            expect(classifyOrgMediaRef('media/../etc/passwd')).toEqual({ kind: 'external' });
+        } finally {
+            process.env.SUPABASE_URL = prev;
+        }
+    });
+
+    // The write side must refuse a foreign URL merely SHAPED like one of ours. Without this,
+    // an attacker-hosted string collapses to a bare `media/` key on save, and the read path
+    // then signs it for every reader permitted to see the document it was pasted into.
+    it('classifyOrgMediaRef refuses a storage-shaped URL on a foreign origin, and an unanchored marker', () => {
+        const prev = process.env.SUPABASE_URL;
+        process.env.SUPABASE_URL = 'https://proj.supabase.co';
+        try {
+            expect(classifyOrgMediaRef(`https://evil.example.com/storage/v1/object/sign/${PRIVATE_BUCKET}/media/wiki/c.webp?token=t`)).toEqual({ kind: 'external' });
+            // Marker present but NOT at the start of the pathname — what a bare indexOf allowed.
+            expect(classifyOrgMediaRef(`https://proj.supabase.co/x/storage/v1/object/sign/${PRIVATE_BUCKET}/media/wiki/c.webp?token=t`)).toEqual({ kind: 'external' });
+            // Percent-encoded traversal must not be decoded into a traversal.
+            expect(classifyOrgMediaRef(`https://proj.supabase.co/storage/v1/object/sign/${PRIVATE_BUCKET}/media/%2e%2e/secret.webp`)).toEqual({ kind: 'external' });
+        } finally {
+            process.env.SUPABASE_URL = prev;
+        }
+    });
+
+    // The READ/GC side is deliberately NOT origin-checked, and that asymmetry is a safety
+    // property, not an oversight. orgMediaKeyFromUrl's only consumer is the GC's referenced-key
+    // set, where matching MORE strings only ever PROTECTS an object from deletion. Origin-
+    // checking it would mean that any later origin change (custom domain, proxy swap, project
+    // restore, staging->prod dump) stops every stored public URL from resolving, empties the
+    // referenced set, and lets the nightly sweep delete every public object. Do not "fix" this.
+    it('orgMediaKeyFromUrl still resolves a public URL on a DIFFERENT origin (fail-safe for the GC)', () => {
+        const prev = process.env.SUPABASE_URL;
+        process.env.SUPABASE_URL = 'https://proj.supabase.co';
+        try {
+            expect(orgMediaKeyFromUrl(`https://old-host.example.com/storage/v1/object/public/${PUBLIC_BUCKET}/media/rank/a.webp`))
+                .toEqual({ bucket: PUBLIC_BUCKET, key: 'media/rank/a.webp' });
+        } finally {
+            process.env.SUPABASE_URL = prev;
+        }
+    });
+
+    it('orgMediaKeyFromUrl anchors the marker to the pathname and the key to media/', () => {
+        // Marker mid-path: the substring match used to accept this from any host.
+        expect(orgMediaKeyFromUrl(`https://evil.example.com/x/storage/v1/object/public/${PUBLIC_BUCKET}/media/rank/a.webp`)).toBeNull();
+        // Public branch was the one site that checked traversal but not the media/ namespace.
+        expect(orgMediaKeyFromUrl(`https://x/storage/v1/object/public/${PUBLIC_BUCKET}/outside/a.webp`)).toBeNull();
     });
 
     it('signOrgMediaUrl refuses a key outside our namespace or with traversal', async () => {

@@ -29,19 +29,28 @@ function sbBuilder() {
 }
 
 vi.mock('../lib/context', () => ({ resolveContext: async () => h.ctx }));
-vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0), isSessionRevokedByWatermark: () => false }));
+// signRealtimeToken MUST be stubbed: handleInitialState calls it, and without it the
+// authenticated boot path lands in the api/query.ts catch and returns the 200 ERROR
+// FALLBACK — which made every res.body assertion on that path pass vacuously.
+vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () => new Date(0), isSessionRevokedByWatermark: () => false, signRealtimeToken: () => 'rt-token' }));
 vi.mock('../lib/db/organizations', () => ({ getAllPricingTiers: async () => [] }));
 vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),
     getPlatformSettings: async () => ({}),
     getUserById: async () => h.user,
-    getAllSettings: async () => ({}),
+    // The read path now runs the ORG BAN GATE above every other gate.
+    // Not banned by default; the ban tests drive the real module.
+    findActiveBan: async () => null,
+    getBanNotice: async () => null,
+    // getAllSettings reduces EVERY settings row into one blob, so the outbound
+    // federation ceiling rides `main` unless stripSecrets deletes it.
+    getAllSettings: async () => ({ intelSharingConfig: { maxShareableClearance: 3 }, brandingConfig: { name: 'Org', iconUrl: '/i.svg' } }),
     getSystemRoles: async () => ({ admin: { id: 4 } }),
     getWarrantsState: async (_oid: string) => { h.calls.getWarrantsState++; return { warrants: [{ id: 'w1' }] }; },
     getMainState: async (_oid: string) => { h.calls.getMainState++; return { users: [] }; },
-    getState: async (_oid: string) => { h.calls.getState++; return { warrants: [], users: [] }; },
+    getState: async (_oid: string) => { h.calls.getState++; return { warrants: [], users: [], intelSharingConfig: { maxShareableClearance: 3 } }; },
     verifyApiKey: async (_k: string) => h.apiKey,
-    getPublicFeedData: async (_since?: string) => { h.calls.getPublicFeedData++; return { reports: [], warrants: [], bulletins: [], _meta: { maxShareableLevel: 0 } }; },
+    getPublicFeedData: async (_since?: string) => { h.calls.getPublicFeedData++; return { reports: [], warrants: [], bulletins: [], _meta: { maxShareableLevel: 0, fetchedAt: 'CLAMPED' } }; },
 }));
 
 import handler from '../api/query';
@@ -112,6 +121,11 @@ describe('GET /api/query — per-subset permission gate', () => {
         await handler(mockReq({ target: 'state', subset: 'main' }, 'tok'), res);
         expect(res.statusCode).toBe(200);
         expect(h.calls.getMainState).toBe(1);
+        // A Client with zero permissions is the strongest witness: the org's outbound
+        // intel-federation ceiling must not ride the settings blob to them.
+        expect(res.body.intelSharingConfig).toBeUndefined();
+        // …and the rest of the blob still arrives.
+        expect(res.body.brandingConfig).toBeDefined();
     });
 });
 
@@ -138,6 +152,11 @@ describe('GET /api/query?target=initial-state — never dumps full state without
         await handler(mockReq({ target: 'initial-state' }, 'tok'), res);
         expect(h.calls.getState).toBe(1);
         expect(res.statusCode).toBe(200);
+        // Assert we are on the REAL boot payload, not the 200 error fallback — every
+        // body assertion below is vacuous otherwise.
+        expect(res.body.error).toBeUndefined();
+        expect(res.body.realtimeToken).toBe('rt-token');
+        expect(res.body.intelSharingConfig).toBeUndefined();
     });
 });
 
@@ -149,6 +168,11 @@ describe('GET /api/query?target=feed — alliance key must not bypass per-peer s
         expect(res.statusCode).toBe(200);
         expect(h.calls.getPublicFeedData).toBe(1);
         expect(Array.isArray(res.body.reports)).toBe(true);
+        // The top-level cursor MIRRORS _meta (a consumer may read either — see
+        // lib/db/intel.ts). A wall-clock value here would advance the consumer past
+        // the rows a saturated/clamped page deliberately withheld.
+        expect(res.body.fetchedAt).toBe('CLAMPED');
+        expect(res.body._meta.fetchedAt).toBe('CLAMPED');
     });
 
     it('an alliance directional key (label alliance:<peerId>) → 403, feed never built', async () => {

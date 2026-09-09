@@ -328,14 +328,17 @@ const HOLDER_COLUMNS = 'id, position_id, user_id, appointed_by_id, election_id, 
 
 // The authenticated actor the dispatcher injects, as far as the government
 // authority checks care about it.
-export interface GovActor { id?: number; role?: string; permissions?: string[] }
+export interface GovActor { id?: number; isSystemAdmin?: boolean; permissions?: string[] }
 
 // Apex government seats (veto / call-elections) may only be hand-filled or cleared by a
-// real org admin. Gate on the Admin role itself, not the admin:access permission: the
-// seeded Dispatcher carries gov:manage and admin:access, so checking the permission
-// would let through the exact role this ceiling is meant to stop.
+// real org admin. Gate on role IDENTITY (isSystemAdmin, stamped by getUserById from
+// users.role_id) — not the admin:access permission and not the name-inferred tier. The
+// seeded Dispatcher carries gov:manage and admin:access, so a permission test would let
+// through the exact role this ceiling is meant to stop; and `role` is derived from the
+// role row's free-text NAME, so any role called "Commander" cleared it. Unstamped ⇒
+// false ⇒ the ceiling holds (fail closed).
 function isOrgAdmin(actor?: GovActor): boolean {
-    return actor?.role === 'Admin';
+    return actor?.isSystemAdmin === true;
 }
 
 // Authority ceiling for the manual appointment path (gov:appoint_holder). Two rules, so
@@ -442,11 +445,25 @@ async function appointPositionHolderFallback(data: Partial<GovernmentPositionHol
 export async function removePositionHolder(holderId: number, reason: string, actor?: GovActor) {
     // Evicting the holder of an apex office (veto or call-elections) is admin-only, so a
     // gov:manage holder can't clear opposition out of powerful seats.
-    const { data: holder } = await supabase.from('government_position_holders')
+    // FAILS CLOSED, in three places that all used to fail open.
+    //
+    // The error was discarded, so any read fault (a statement timeout, a schema-cache
+    // miss) yielded holder = null -> pos = undefined -> the apex-office guard was
+    // skipped entirely, and a gov:manage holder could evict the org's veto-holder or
+    // election-caller on exactly the blip that made the check unverifiable. A guard
+    // that exists to stop opposition being cleared out of powerful seats must not be
+    // the thing that switches itself off.
+    //
+    // A missing holder row and an unreadable POSITION are refused for the same reason:
+    // "I could not tell whether this is an apex office" must never read as "it is not".
+    const { data: holder, error: holderErr } = await supabase.from('government_position_holders')
         .select('position:government_positions(can_veto_legislation, can_call_elections)')
         .eq('id', holderId).is('ended_at', null).maybeSingle();
+    handleSupabaseError({ error: holderErr, message: 'Failed to load position holder' });
+    if (!holder) throw new Error('Position holder not found.');
     const pos = (holder as { position?: { can_veto_legislation?: boolean; can_call_elections?: boolean } | null } | null)?.position;
-    if (pos && (pos.can_veto_legislation || pos.can_call_elections) && !isOrgAdmin(actor)) {
+    if (!pos) throw new Error('Cannot verify which office this holder occupies — try again.');
+    if ((pos.can_veto_legislation || pos.can_call_elections) && !isOrgAdmin(actor)) {
         throw new Error('Removing the holder of an office that can veto legislation or call elections requires an administrator.');
     }
 

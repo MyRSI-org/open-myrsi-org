@@ -60,7 +60,22 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
  * force-logout timestamp). Admin-only — gated in api/services.ts.
  */
 export async function updatePlatformSettings(patch: Partial<PlatformSettings>): Promise<PlatformSettings> {
-    const { data } = await supabase.from('settings').select('value').eq('key', SETTINGS_KEY).maybeSingle();
+    // BIND THE READ ERROR. This is a read-merge-write, and the merge is what preserves every
+    // setting the caller did not name. Unbound, a failed read yielded `data === undefined`,
+    // `current = {}`, and a write of `{...DEFAULTS, ...patch}` — silently resetting everything
+    // outside the patch to its default.
+    //
+    // The consequence is worse than "the toggle does nothing". An admin turning maintenance
+    // mode ON during a database hiccup would have written a row with maintenance_mode set and
+    // `force_logout_timestamp` GONE — quietly revoking a force-logout at exactly the moment
+    // someone was using it to respond to an incident. These two are the product's only
+    // emergency levers, and a lever that silently disarms the other one is the worst kind of
+    // defect this file can hold.
+    //
+    // Fail CLOSED: refuse the write. The caller sees an error and can retry; the stored
+    // settings are untouched.
+    const { data, error: readError } = await supabase.from('settings').select('value').eq('key', SETTINGS_KEY).maybeSingle();
+    handleSupabaseError({ error: readError, message: 'Failed to read platform settings — no change was made' });
     const current = (data?.value as Partial<PlatformSettings>) || {};
     const next: PlatformSettings = { ...PLATFORM_SETTINGS_DEFAULTS, ...current, ...patch };
     const { error } = await supabase.from('settings').upsert({ key: SETTINGS_KEY, value: next }, { onConflict: 'key' });

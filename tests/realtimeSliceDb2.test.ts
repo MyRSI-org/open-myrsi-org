@@ -56,7 +56,7 @@ import {
     updateWarrant, bulkDeleteWarrants, saveDossierSummary, deleteIntelBulletin,
 } from '../lib/db/intel';
 import { getWikiPageById } from '../lib/db/wiki';
-import { reverseLedgerEntry, getTreasuryAccount } from '../lib/db/finances';
+import { reverseLedgerEntry, getTreasuryAccount, getLedgerEntry } from '../lib/db/finances';
 import { redactApplicantsForViewer, isHrRecruiter } from '../lib/db/hr';
 import type { User } from '../types';
 
@@ -83,12 +83,24 @@ describe('single-row fetchers throw on query error (eviction safety)', () => {
         h.resolveQuery = () => ({ data: null, error: { message: 'blip' } });
         await expect(getTreasuryAccount(1)).rejects.toThrow(/account slice/i);
     });
+    it('getLedgerEntry', async () => {
+        h.resolveQuery = () => ({ data: null, error: { message: 'blip' } });
+        await expect(getLedgerEntry('e1')).rejects.toThrow(/ledger entry/i);
+    });
+    it('getLedgerEntry — 42P01 too (a missing table is not a deleted entry)', async () => {
+        // The one code this fetcher used to map to null. FinancesView feeds the
+        // result to mergeRowSlice, where null EVICTS the row, so the exemption
+        // bought a wrong eviction and nothing else.
+        h.resolveQuery = () => ({ data: null, error: { code: '42P01', message: 'relation does not exist' } });
+        await expect(getLedgerEntry('e1')).rejects.toThrow(/ledger entry/i);
+    });
     it('all return null on genuine absence', async () => {
         h.resolveQuery = () => ({ data: null, error: null });
         expect(await getWarrantByIdHydrated('w1')).toBeNull();
         expect(await getBulletinByIdForViewer('b1', null)).toBeNull();
         expect(await getWikiPageById('p1')).toBeNull();
         expect(await getTreasuryAccount(1)).toBeNull();
+        expect(await getLedgerEntry('e1')).toBeNull();
     });
 });
 
@@ -191,11 +203,12 @@ describe('HR redaction helpers (pure)', () => {
         expect(i.responses).toEqual([]);
     });
 
-    it('recruiter passthrough; Admin role counts as recruiter', () => {
+    it('recruiter passthrough; hr:recruiter (not the role NAME) is what counts', () => {
         const [a] = redactApplicantsForViewer([applicant], true) as unknown as Array<Record<string, unknown>>;
         expect(a.applicantName).toBe('Real Name');
-        expect(isHrRecruiter({ role: 'Admin', permissions: [] })).toBe(true);
-        expect(isHrRecruiter({ role: 'Member', permissions: ['hr:recruiter'] })).toBe(true);
-        expect(isHrRecruiter({ role: 'Member', permissions: ['hr:view'] })).toBe(false);
+        expect(isHrRecruiter({ permissions: ['hr:recruiter'] })).toBe(true);
+        expect(isHrRecruiter({ permissions: ['hr:view'] })).toBe(false);
+        // A forged Admin tier (name-derived, zero permissions) is NOT a recruiter.
+        expect(isHrRecruiter({ role: 'Admin', permissions: [] } as unknown as Parameters<typeof isHrRecruiter>[0])).toBe(false);
     });
 });

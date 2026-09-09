@@ -29,7 +29,7 @@ function clampUec(v: unknown): number | null {
 import type {
     MarketplaceCategory, MarketplaceListing, MarketplaceContract, MarketplaceMilestone,
     MarketplaceRating, MarketplaceReputation, MarketplaceTrader, MarketplaceTraderProfile,
-    MarketplaceListingType, MarketplaceReport,
+    MarketplaceListingType, MarketplaceReport, MarketplaceConsideration, MarketplaceConsiderationInput,
 } from '../../types.js';
 
 const log = baseLog.child({ module: 'db.marketplace' });
@@ -38,17 +38,33 @@ const nowIso = () => new Date().toISOString();
 // --- generic, no-existence-disclosure errors (BOLA) ---
 const ERR_LISTING = 'Listing not found or access denied.';
 const ERR_CONTRACT = 'Contract not found or access denied.';
+const ERR_MODERATION_CLOSED = 'This listing was closed by a moderator and cannot be reopened.';
 
 // =============================================================================
 // Selects (explicit columns + public-only embeds — no wildcard, no PII)
 // =============================================================================
 const TRADER_FIELDS = 'id, name, rsi_handle, avatar_url';
+// Barter legs. Explicit columns, and DELIBERATELY no catalog embed — see the
+// schema comment on marketplace_listing_considerations for why a pin would route
+// qm:view-gated reference data onto a customer-grantable surface.
+const CONSIDERATION_FIELDS = 'id, component_type, label, quantity, notes, sort_order';
+
+// ONE statement, and it must stay one: tests/marketplaceSecurity.test.ts slices this
+// const to the FIRST `;` to prove the projection carries no PII. Appending inside the
+// same +-concatenated expression is safe; splitting it into two statements would hide
+// the second half from that check.
 const LISTING_SELECT =
     'id, seller_id, kind, listing_type, category_id, title, description, quantity, quantity_claimed, price_uec, price_type, location, tags, status, expires_at, warehouse_stock_id, created_at, updated_at, ' +
-    `seller:users!marketplace_listings_seller_id_fkey(${TRADER_FIELDS}), category:marketplace_categories(name, icon)`;
+    `seller:users!marketplace_listings_seller_id_fkey(${TRADER_FIELDS}), category:marketplace_categories(name, icon), ` +
+    `considerations:marketplace_listing_considerations(${CONSIDERATION_FIELDS})`;
+// CONTRACT_SELECT is reached ONLY through the two party-gated reads
+// (getMarketplaceContract, getMyMarketplaceContracts). REPORT_SELECT deliberately
+// does NOT use it — a marketplace:admin moderator is not a party to the contract,
+// and the agreed barter terms are not theirs to see.
 const CONTRACT_SELECT =
     'id, listing_id, seller_id, buyer_id, kind, title, quantity, agreed_price_uec, terms_note, status, proposed_by_id, cancel_reason, warehouse_stock_id, proposed_at, accepted_at, delivered_at, completed_at, cancelled_at, created_at, updated_at, ' +
-    `seller:users!marketplace_contracts_seller_id_fkey(${TRADER_FIELDS}), buyer:users!marketplace_contracts_buyer_id_fkey(${TRADER_FIELDS})`;
+    `seller:users!marketplace_contracts_seller_id_fkey(${TRADER_FIELDS}), buyer:users!marketplace_contracts_buyer_id_fkey(${TRADER_FIELDS}), ` +
+    `considerations:marketplace_contract_considerations(${CONSIDERATION_FIELDS})`;
 const RATING_SELECT =
     `id, contract_id, rater_id, ratee_id, rater_role, stars, feedback, created_at, rater:users!marketplace_ratings_rater_id_fkey(${TRADER_FIELDS})`;
 
@@ -60,6 +76,67 @@ const toTrader = (e: TraderEmbed | TraderEmbed[]): MarketplaceTrader | undefined
     const r = Array.isArray(e) ? e[0] : e;
     return r ? { id: r.id, name: r.name, rsiHandle: r.rsi_handle, avatarUrl: r.avatar_url } : undefined;
 };
+
+/** Max legs on one side of a trade. Bounded so a listing cannot become a payload. */
+const MAX_CONSIDERATIONS = 10;
+const MAX_CONSIDERATION_QTY = 1_000_000_000;
+
+interface ConsiderationRow {
+    id: number; component_type: string; label: string;
+    quantity: number; notes: string | null; sort_order: number;
+}
+const toConsiderations = (rows?: ConsiderationRow[] | null): MarketplaceConsideration[] =>
+    (rows || [])
+        // PostgREST does not order a to-many embed, so the display order is imposed
+        // here rather than left to whatever the planner returned.
+        .slice()
+        .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id))
+        .map((r) => ({
+            id: r.id,
+            componentType: (r.component_type === 'offer' ? 'offer' : 'want') as MarketplaceConsideration['componentType'],
+            label: r.label,
+            quantity: r.quantity,
+            notes: r.notes,
+            sortOrder: r.sort_order,
+        }));
+
+/**
+ * Validate and normalise an inbound barter bundle.
+ *
+ * PURE AND SYNCHRONOUS on purpose: every caller runs it BEFORE the write it gates,
+ * so an invalid bundle refuses with nothing committed. Hosted validates the legs
+ * after the parent row is already updated, which leaves a half-applied listing and
+ * tells the caller it failed.
+ *
+ * Sanitised like every other free-text field on this board. Hosted only trims and
+ * slices — but a label and a note are member-authored strings rendered on a surface
+ * external customers can read, which is exactly the class tests/marketplaceSecurity
+ * already pins for titles, descriptions and cancel reasons.
+ */
+function buildConsiderationRows(input: unknown): Array<{ component_type: string; label: string; quantity: number; notes: string | null; sort_order: number }> {
+    if (!Array.isArray(input) || input.length === 0) return [];
+    if (input.length > MAX_CONSIDERATIONS) throw new Error(`A trade can include at most ${MAX_CONSIDERATIONS} barter items.`);
+    const out: Array<{ component_type: string; label: string; quantity: number; notes: string | null; sort_order: number }> = [];
+    for (const raw of input) {
+        const r = (raw ?? {}) as { componentType?: unknown; label?: unknown; quantity?: unknown; notes?: unknown };
+        const label = stripHtmlSingleLine(r.label, 120);
+        if (!label) throw new Error('Every barter item needs a name.');
+        const qty = Number(r.quantity);
+        if (!Number.isFinite(qty) || !Number.isInteger(qty) || qty < 1 || qty > MAX_CONSIDERATION_QTY) {
+            throw new Error(`Barter quantity must be a whole number between 1 and ${MAX_CONSIDERATION_QTY.toLocaleString()}.`);
+        }
+        out.push({
+            component_type: r.componentType === 'offer' ? 'offer' : 'want',
+            label,
+            quantity: qty,
+            // Capped at 200, not hosted's 500: up to 10 legs ride every listing on a
+            // 200-listing board, refetched on every realtime nudge.
+            notes: stripHtml(r.notes, 200) || null,
+            sort_order: out.length,
+        });
+    }
+    return out;
+}
 
 interface CategoryRow { id: number; slug: string; name: string; parent_id: number | null; listing_kind: string; icon: string | null; sort_order: number; active: boolean }
 const toCategory = (r: CategoryRow): MarketplaceCategory => ({
@@ -75,6 +152,7 @@ interface ListingRow {
     status: string; expires_at: string | null; warehouse_stock_id: number | null;
     created_at: string; updated_at: string;
     seller?: TraderEmbed | TraderEmbed[]; category?: { name: string; icon: string | null } | { name: string; icon: string | null }[] | null;
+    considerations?: ConsiderationRow[] | null;
 }
 const toListing = (r: ListingRow): MarketplaceListing => {
     const cat = Array.isArray(r.category) ? r.category[0] : r.category;
@@ -86,6 +164,7 @@ const toListing = (r: ListingRow): MarketplaceListing => {
         priceUec: r.price_uec, priceType: r.price_type as MarketplaceListing['priceType'],
         location: r.location, tags: r.tags ?? [], status: r.status as MarketplaceListing['status'],
         expiresAt: r.expires_at, warehouseStockId: r.warehouse_stock_id,
+        considerations: toConsiderations(r.considerations),
         createdAt: r.created_at, updatedAt: r.updated_at,
     };
 };
@@ -97,6 +176,7 @@ interface ContractRow {
     proposed_at: string; accepted_at: string | null; delivered_at: string | null; completed_at: string | null;
     cancelled_at: string | null; created_at: string; updated_at: string;
     seller?: TraderEmbed | TraderEmbed[]; buyer?: TraderEmbed | TraderEmbed[];
+    considerations?: ConsiderationRow[] | null;
 }
 const toContract = (r: ContractRow): MarketplaceContract => ({
     id: r.id, listingId: r.listing_id, sellerId: r.seller_id, seller: toTrader(r.seller ?? null),
@@ -105,6 +185,7 @@ const toContract = (r: ContractRow): MarketplaceContract => ({
     status: r.status as MarketplaceContract['status'], proposedById: r.proposed_by_id, cancelReason: r.cancel_reason,
     warehouseStockId: r.warehouse_stock_id, proposedAt: r.proposed_at, acceptedAt: r.accepted_at,
     deliveredAt: r.delivered_at, completedAt: r.completed_at, cancelledAt: r.cancelled_at,
+    considerations: toConsiderations(r.considerations),
     createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
@@ -231,8 +312,31 @@ export async function browseMarketplaceListings(filters: BrowseFilters = {}): Pr
         const safe = escapeLikePattern(String(filters.search).slice(0, 80));
         if (safe) q = q.ilike('title', `%${safe}%`);
     }
-    const { data, error } = await q.order('created_at', { ascending: false }).limit(200);
+    const { data, error } = await q.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(200);
     handleSupabaseError({ error, message: 'Failed to browse marketplace' });
+    return ((data as unknown as ListingRow[]) || []).map(toListing);
+}
+
+/**
+ * The caller's OWN listings, in every status — the board (browseMarketplaceListings) is
+ * `status = 'active'` only, so without this a seller who pauses or closes a listing loses
+ * the only surface that showed it and can never reopen it. Owner-scoped server-side by
+ * seller_id; there is no parameter that widens it to anyone else's listings.
+ *
+ * Deliberately does NOT project moderation_closed_at. Surfacing it would mean adding the
+ * column to the shared LISTING_SELECT/toListing/MarketplaceListing triple, which puts it on
+ * every listing read including the public board — and marketplace:view is customer-grantable
+ * (lib/clientRolePermissions.ts), so every viewer would learn which listings a moderator had
+ * actioned. The seller learns it the only way that leaks nothing: their reopen is refused,
+ * with the reason.
+ */
+export async function listMyMarketplaceListings(userId: number): Promise<MarketplaceListing[]> {
+    const { data, error } = await supabase.from('marketplace_listings').select(LISTING_SELECT)
+        .eq('seller_id', userId)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(200);
+    handleSupabaseError({ error, message: 'Failed to load your listings' });
     return ((data as unknown as ListingRow[]) || []).map(toListing);
 }
 
@@ -251,6 +355,8 @@ export interface CreateListingInput {
     title: string; description?: string; quantity?: number | null; priceUec?: number | null;
     priceType?: string; location?: string; tags?: string[]; expiresAt?: string | null;
     warehouseStockId?: number | null;
+    /** Barter legs. `null` on an update means "unchanged"; `[]` means "clear them". */
+    considerations?: MarketplaceConsiderationInput[] | null;
 }
 
 // warehouse_stock is a shared org resource with no per-user owner. Linking it to
@@ -259,10 +365,15 @@ export interface CreateListingInput {
 // warehouse:manage. So linking/moving stock through the marketplace must require
 // the SAME bar; otherwise any Member (who holds marketplace:list + :contract by
 // default) could draw down shared stock.
-type WarehouseActor = { role?: string; permissions?: string[] } | null | undefined;
+// This is the WAREHOUSE module's authority, re-checked at the marketplace boundary —
+// NOT a role gate on the marketplace, which keeps per-user ownership /
+// contract-party membership as its only authz boundary. The `role === 'Admin'`
+// disjunct is gone: `role` is NAME-derived, so a permissionless custom role called
+// "Commander" could draw down shared org stock. The message at the call site
+// ("You need the warehouse:manage permission…") is now literally true.
+type WarehouseActor = { permissions?: string[] } | null | undefined;
 function canMoveWarehouseStock(actor: WarehouseActor): boolean {
     if (!actor) return false;
-    if (actor.role === 'Admin') return true;
     return Array.isArray(actor.permissions) && actor.permissions.includes('warehouse:manage');
 }
 
@@ -273,6 +384,8 @@ export async function createMarketplaceListing(input: CreateListingInput, userId
     if (isItem && (!Number.isFinite(qty as number) || (qty as number) <= 0)) throw new Error('Item listings require a positive quantity.');
     const title = stripHtmlSingleLine(input.title, 160);   // strip markup
     if (!title) throw new Error('A title is required.');
+    // BEFORE the insert, so an invalid bundle refuses with nothing written.
+    const legs = buildConsiderationRows(input.considerations);
     // Validate the optional warehouse link exists (a member can't link an
     // arbitrary stock id to fabricate a movement later), AND that the caller is
     // authorized to move shared org stock.
@@ -295,23 +408,60 @@ export async function createMarketplaceListing(input: CreateListingInput, userId
         status: 'active', expires_at: input.expiresAt ?? null, warehouse_stock_id: warehouseStockId,
     }).select(LISTING_SELECT).single();
     handleSupabaseError({ error, message: 'Failed to create listing' });
-    emit({ listingId: (data as unknown as ListingRow).id });
-    return toListing(data as unknown as ListingRow);
+    const created = data as unknown as ListingRow;
+    if (legs.length > 0) {
+        // The insert's own returning projection, NOT a second read of the listing:
+        // the rows are the ones just written, so re-querying would be a round-trip
+        // that can only tell us what we already know.
+        const { data: ins, error: cErr } = await supabase.from('marketplace_listing_considerations')
+            .insert(legs.map((r) => ({ ...r, listing_id: created.id })))
+            .select(CONSIDERATION_FIELDS);
+        handleSupabaseError({ error: cErr, message: 'Failed to save barter items' });
+        created.considerations = (ins || []) as unknown as ConsiderationRow[];
+    }
+    emit({ listingId: created.id });
+    return toListing(created);
 }
 
 export async function updateMarketplaceListing(id: string, patch: Partial<CreateListingInput> & { status?: string }, userId: number): Promise<void> {
+    // HOISTED ABOVE EVERY WRITE. buildConsiderationRows throws on a malformed bundle,
+    // and a check placed after the parent UPDATE would commit the title change and
+    // then report failure — a half-applied listing the caller believes was rejected.
+    //
+    // `!= null`, not `!== undefined`: `updates` reaches the db layer as an untyped
+    // Record, and null is a very ordinary "unchanged" encoding. Treating it as a
+    // replace-with-empty would silently wipe the seller's whole advertised bundle and
+    // report success. An explicit clear is an empty ARRAY.
+    const legs = patch.considerations != null ? buildConsiderationRows(patch.considerations) : null;
     const { data: row } = await supabase.from('marketplace_listings').select('id, seller_id, kind').eq('id', id).maybeSingle();
     if (!row || (row as { seller_id: number }).seller_id !== userId) throw new Error(ERR_LISTING);   // owner-only
     // A seller (this is the owner-only path) cannot REOPEN a listing a moderator
     // closed — moderation_closed_at is stamped by reviewMarketplaceReport on
-    // takedown. Soft-fail (treat as not-closed) when the column predates the
-    // schema redeploy, since no moderation flag can exist yet on such a DB.
+    // takedown.
+    //
+    // THIS USED TO READ `if (!modErr && ...)`, which is a precondition whose READ FAULT
+    // reads as SATISFIED: any error at all — a timeout, a reset connection, an RLS
+    // hiccup — meant "not moderator-closed" and the reopen went through. A moderation
+    // bypass triggered by a blip, on the single path a taken-down seller is most
+    // motivated to retry. It was latent only because nothing in the client called
+    // marketplace:update_listing; the seller UI wired in this same change is the first
+    // caller, and its Resume button sends exactly status:'active'.
+    //
+    // Only the SCHEMA-DRIFT codes are soft-failed, and only because no moderation flag
+    // can exist on a database whose column predates the redeploy. That narrowing is the
+    // idiom reviewMarketplaceReport already uses further down this file.
+    let moderationColumnPresent = false;
     if (patch.status === 'active') {
         const { data: modRow, error: modErr } = await supabase.from('marketplace_listings')
             .select('moderation_closed_at').eq('id', id).maybeSingle();
-        if (!modErr && (modRow as { moderation_closed_at?: string | null } | null)?.moderation_closed_at) {
-            throw new Error('This listing was closed by a moderator and cannot be reopened.');
+        const modCode = (modErr as { code?: string } | null)?.code;
+        if (modErr && modCode !== '42703' && modCode !== 'PGRST204') {
+            handleSupabaseError({ error: modErr, message: 'Failed to verify listing moderation state' });
         }
+        if ((modRow as { moderation_closed_at?: string | null } | null)?.moderation_closed_at) {
+            throw new Error(ERR_MODERATION_CLOSED);
+        }
+        moderationColumnPresent = !modErr;
     }
     const db: Record<string, unknown> = { updated_at: nowIso() };
     if (patch.title !== undefined) db.title = stripHtmlSingleLine(patch.title, 160);
@@ -323,8 +473,59 @@ export async function updateMarketplaceListing(id: string, patch: Partial<Create
     if (patch.tags !== undefined) db.tags = Array.isArray(patch.tags) ? patch.tags.slice(0, 12).map((t) => stripHtmlSingleLine(t, 40)).filter(Boolean) : [];
     if (patch.expiresAt !== undefined) db.expires_at = patch.expiresAt;
     if (patch.status !== undefined && ['active', 'paused', 'closed'].includes(patch.status)) db.status = patch.status;
-    const { error } = await supabase.from('marketplace_listings').update(db).eq('id', id).eq('seller_id', userId);
+    // OPTIMISTIC PREDICATE, not just the read above. The read and this UPDATE are two
+    // statements: a moderator takedown landing between them would be silently clobbered
+    // by the seller's reopen. Every sibling lifecycle path in this module already closes
+    // that window this way (markMarketplaceDelivered, confirmMarketplaceReceived,
+    // cancelMarketplaceContract all carry an optimistic status predicate) — the listing
+    // path was the one that did not. Applied ONLY when reopening: a seller must still be
+    // able to edit or close a listing a moderator took down.
+    let q = supabase.from('marketplace_listings').update(db).eq('id', id).eq('seller_id', userId);
+    if (db.status === 'active' && moderationColumnPresent) q = q.is('moderation_closed_at', null);
+    const { data: updated, error } = await q.select('id');
     handleSupabaseError({ error, message: 'Failed to update listing' });
+    // Zero rows means the WHERE stopped matching between the checks above and this write:
+    // the moderation flag was set, or ownership moved. Either way it is a refusal, and
+    // reporting success would tell a seller their takedown had been undone.
+    if (!Array.isArray(updated) || updated.length === 0) {
+        throw new Error(db.status === 'active' ? ERR_MODERATION_CLOSED : ERR_LISTING);
+    }
+
+    // REPLACE THE BARTER LEGS — insert first, then delete BY EXCLUSION.
+    //
+    // The obvious shape (read the old ids, insert, delete those ids) needs a capped
+    // read to satisfy the absolute order rule, and a capped delete is an INCOMPLETE
+    // delete: this function holds no lock, so two concurrent updates both read the
+    // same <=10 old ids, both insert <=10 new, and both delete the same 10 — leaving
+    // 20 behind, permanently, growing with every burst. MAX_CONSIDERATIONS would stop
+    // being a bound at all, on a surface reachable with a CUSTOMER-GRANTABLE
+    // permission and re-read by every board refresh.
+    //
+    // Deleting by exclusion is complete regardless of how many stale rows exist, and
+    // adds no read to cap.
+    //
+    // OWNERSHIP: these child writes are keyed on listing_id, OUTSIDE the parent
+    // update's `.eq('seller_id', userId)` predicate. They are safe because the entry
+    // guard above proved ownership and nothing in this module ever reassigns
+    // seller_id. If a listing-transfer feature is ever added, this is the line that
+    // has to change with it.
+    if (legs !== null) {
+        if (legs.length === 0) {
+            const { error: delErr } = await supabase.from('marketplace_listing_considerations')
+                .delete().eq('listing_id', id);
+            handleSupabaseError({ error: delErr, message: 'Failed to clear barter items' });
+        } else {
+            const { data: ins, error: insErr } = await supabase.from('marketplace_listing_considerations')
+                .insert(legs.map((r) => ({ ...r, listing_id: id })))
+                .select('id');
+            handleSupabaseError({ error: insErr, message: 'Failed to save barter items' });
+            const keep = ((ins || []) as Array<{ id: number }>).map((r) => r.id);
+            const { error: delErr } = await supabase.from('marketplace_listing_considerations')
+                .delete().eq('listing_id', id).not('id', 'in', `(${keep.join(',')})`);
+            handleSupabaseError({ error: delErr, message: 'Failed to replace barter items' });
+        }
+    }
+
     emit({ listingId: id });
 }
 
@@ -358,7 +559,7 @@ function deriveParties(listingType: string, ownerId: number, proposerId: number)
 // from the dedup query).
 const NON_TERMINAL_CONTRACT_STATUSES: string[] = ['proposed', 'accepted', 'in_progress', 'delivered'];
 
-export interface ProposeContractInput { listingId: string; quantity?: number | null; agreedPriceUec?: number | null; termsNote?: string; milestones?: { title: string; description?: string }[] }
+export interface ProposeContractInput { listingId: string; quantity?: number | null; agreedPriceUec?: number | null; termsNote?: string; milestones?: { title: string; description?: string }[]; considerations?: MarketplaceConsiderationInput[] | null }
 export async function proposeMarketplaceContract(input: ProposeContractInput, userId: number): Promise<MarketplaceContract> {
     const { data: l } = await supabase.from('marketplace_listings')
         .select('id, seller_id, kind, listing_type, title, quantity, quantity_claimed, status').eq('id', input.listingId).maybeSingle();
@@ -385,6 +586,9 @@ export async function proposeMarketplaceContract(input: ProposeContractInput, us
         if (!Number.isFinite(qty) || qty <= 0) throw new Error('A positive quantity is required.');
         if (qty > remaining) throw new Error(`Only ${remaining} remaining on this listing.`);   // no over-claim
     }
+    // Before the contract insert, same all-or-nothing reason as the create path.
+    const legs = buildConsiderationRows(input.considerations);
+
     const { sellerId, buyerId } = deriveParties(listing.listing_type, listing.seller_id, userId);
 
     const { data, error } = await supabase.from('marketplace_contracts').insert({
@@ -395,6 +599,18 @@ export async function proposeMarketplaceContract(input: ProposeContractInput, us
     }).select(CONTRACT_SELECT).single();
     handleSupabaseError({ error, message: 'Failed to propose contract' });
     const contract = data as unknown as ContractRow;
+
+    // FREEZE the proposer's barter legs onto the contract. Copied, not referenced:
+    // the listing can be edited or deleted afterwards, and a signed deal cannot.
+    // Only the PROPOSER's side is recorded — see the schema comment for the known
+    // asymmetry this inherits from hosted.
+    if (legs.length > 0) {
+        const { data: ins, error: cErr } = await supabase.from('marketplace_contract_considerations')
+            .insert(legs.map((r) => ({ ...r, component_type: 'offer', contract_id: contract.id })))
+            .select(CONSIDERATION_FIELDS);
+        handleSupabaseError({ error: cErr, message: 'Failed to record barter items' });
+        contract.considerations = (ins || []) as unknown as ConsiderationRow[];
+    }
 
     // Optional service milestones (cap 20).
     if (Array.isArray(input.milestones) && input.milestones.length > 0) {
@@ -590,11 +806,17 @@ export async function rateMarketplaceContract(id: string, input: RateContractInp
 // =============================================================================
 export async function getMyMarketplaceContracts(userId: number): Promise<MarketplaceContract[]> {
     const { data, error } = await supabase.from('marketplace_contracts').select(CONTRACT_SELECT)
-        .or(`seller_id.eq.${userId},buyer_id.eq.${userId}`).order('updated_at', { ascending: false }).limit(200);
+        .or(`seller_id.eq.${userId},buyer_id.eq.${userId}`).order('updated_at', { ascending: false }).order('id', { ascending: false }).limit(200);
     handleSupabaseError({ error, message: 'Failed to load contracts' });
     return ((data as unknown as ContractRow[]) || []).map(toContract);
 }
 
+// NO RPC CALLER. marketplace:get_contract was removed — the client already holds every
+// contract it can see from my_contracts, which refetches on the realtime nudge, so a
+// single-contract read was an exposed action nobody called. The FUNCTION stays: it is the
+// canonical party gate for a contract id (returns null rather than disclosing existence to
+// a non-party), and tests/marketplaceSecurity.test.ts pins that. Rewire it rather than
+// re-deriving the check if a contract-detail fetch is ever needed.
 export async function getMarketplaceContract(id: string, userId: number): Promise<MarketplaceContract | null> {
     const { data } = await supabase.from('marketplace_contracts').select(CONTRACT_SELECT).eq('id', id).maybeSingle();
     if (!data) return null;
@@ -685,13 +907,35 @@ export async function getMarketplaceReputation(userId: number): Promise<Marketpl
     return { userId, averageStars: Math.round(avg * 10) / 10, ratingCount: count, tier: reputationTier(avg, count) };
 }
 
-export async function getMarketplaceTraderProfile(userId: number): Promise<MarketplaceTraderProfile | null> {
+/**
+ * SCOPED TO ACTUAL TRADERS, not to the whole users table.
+ *
+ * marketplace:get_profile takes a caller-chosen targetUserId, and this used to answer
+ * it for ANY live member — name, RSI handle and avatar — which made it a directory
+ * side door: walk the id space and rebuild the roster, from a module whose entire
+ * authz model is per-user ownership with no role gate. Phase 3 took the roster off
+ * the boot bundle for exactly this reason; leaving an id-addressed identity lookup in
+ * the marketplace hands it straight back.
+ *
+ * The market's own boundary is the right one: a profile exists for somebody who is IN
+ * the market — they have an active listing or a rating history — or for the caller
+ * themselves. Everyone else reads as not found, which is also the honest answer.
+ *
+ * `viewerId` is threaded from the dispatcher-forced actor id, never the payload.
+ */
+export async function getMarketplaceTraderProfile(userId: number, viewerId?: number): Promise<MarketplaceTraderProfile | null> {
     const { data: u } = await supabase.from('users').select(TRADER_FIELDS).eq('id', userId).is('deleted_at', null).maybeSingle();
     const trader = toTrader(u as unknown as TraderEmbed);
     if (!trader) return null;
     const reputation = await getMarketplaceReputation(userId);
     const { data: listingRows } = await supabase.from('marketplace_listings').select(LISTING_SELECT)
-        .eq('seller_id', userId).eq('status', 'active').order('created_at', { ascending: false }).limit(50);
+        .eq('seller_id', userId).eq('status', 'active').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50);
+
+    // Participation is judged AFTER both reads, so the decision uses the same data the
+    // response would have carried — no extra query, and no way for the two to disagree.
+    const isSelf = viewerId != null && Number(viewerId) === Number(userId);
+    const inMarket = ((listingRows as unknown as ListingRow[]) || []).length > 0 || reputation.ratingCount > 0;
+    if (!isSelf && !inMarket) return null;
     // NO recentRatings here. A trader profile is enumerable by any
     // marketplace:view holder via targetUserId, but the free-text feedback +
     // rater identities are party-confidential (the sibling getContractRatings
@@ -701,6 +945,40 @@ export async function getMarketplaceTraderProfile(userId: number): Promise<Marke
         trader, reputation,
         activeListings: ((listingRows as unknown as ListingRow[]) || []).map(toListing),
     };
+}
+
+/**
+ * Of the given contract ids, which is `userId` a PARTY to (seller or buyer)?
+ *
+ * Exported because the warehouse ledger needs the answer and must not re-derive
+ * seller_id/buyer_id itself — this module owns the marketplace authz boundary, and a
+ * second copy of the predicate is a second thing to forget to update.
+ *
+ * Fails CLOSED to the empty set: if the lookup errors, nothing is treated as visible, so
+ * the ledger renders without contract detail rather than failing outright or, worse,
+ * showing it to everyone.
+ */
+export async function filterContractIdsForParty(contractIds: string[], userId: number): Promise<Set<string>> {
+    // FIRST statement, deliberately: with no ids there is nothing to ask, and callers rely
+    // on this short-circuit to avoid issuing a query at all.
+    if (contractIds.length === 0) return new Set();
+    const uid = Number(userId);
+    // The dispatcher guarantees a number for payload.userId, but this is exported for
+    // cross-module use and its next caller may not be the dispatcher.
+    if (!Number.isInteger(uid)) return new Set();
+
+    const unique = [...new Set(contractIds)].slice(0, 500);
+    const { data, error } = await supabase.from('marketplace_contracts')
+        .select('id, seller_id, buyer_id')
+        .in('id', unique)
+        .or(`seller_id.eq.${uid},buyer_id.eq.${uid}`)
+        .order('id', { ascending: true })
+        .limit(500);
+    if (error) {
+        log.warn('contract-party filter failed; treating every contract as not visible', { err: error });
+        return new Set();
+    }
+    return new Set(((data as unknown as Array<{ id: string }>) || []).map((r) => r.id));
 }
 
 // =============================================================================
@@ -785,7 +1063,7 @@ export async function listMarketplaceReports(statusFilter?: string): Promise<Mar
     let q = supabase.from('marketplace_reports').select(REPORT_SELECT);
     if (statusFilter && statusFilter !== 'all') q = q.eq('status', statusFilter);
     else if (!statusFilter) q = q.in('status', ['open', 'reviewing']);
-    const { data, error } = await q.order('created_at', { ascending: false }).limit(200);
+    const { data, error } = await q.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(200);
     handleSupabaseError({ error, message: 'Failed to load marketplace reports' });
     return ((data as unknown as ReportRow[]) || []).map(toReport);
 }
@@ -838,10 +1116,18 @@ export async function reviewMarketplaceReport(id: number, decision: 'actioned' |
 // Aggregate state (folded into getState, gated marketplace:view)
 // =============================================================================
 export async function getMarketplaceState(userId: number) {
-    const [categories, listings, contracts] = await Promise.all([
+    const [categories, listings, contracts, myListings] = await Promise.all([
         getMarketplaceCategories(),
         browseMarketplaceListings({}),
         getMyMarketplaceContracts(userId),
+        // Rides this subset rather than a new action: the seller panel renders on the same
+        // screen, refreshes on the same realtime nudge, and needs no second round-trip.
+        listMyMarketplaceListings(userId),
     ]);
-    return { marketplaceCategories: categories, marketplaceListings: listings, marketplaceContracts: contracts };
+    return {
+        marketplaceCategories: categories,
+        marketplaceListings: listings,
+        marketplaceContracts: contracts,
+        marketplaceMyListings: myListings,
+    };
 }

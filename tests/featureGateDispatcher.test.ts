@@ -32,6 +32,8 @@ vi.mock('../lib/auth', () => ({
 
 vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),
+    // The org-ban gate runs on every authenticated dispatcher request; null = not banned.
+    findActiveBan: async () => null,
     getPlatformSettings: async () => ({}),
     getUserById: async () => h.user,
     isOptionalFeatureEnabled: async (f: string) => { h.enabledCalls.push(f); return h.enabled[f] ?? false; },

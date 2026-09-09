@@ -480,6 +480,16 @@ export interface User {
     rsiHandle: string;
     role: UserRole;
     roleId: number;
+    /**
+     * SERVER-INTERNAL. True when the actor holds the org's system Admin role,
+     * resolved by role IDENTITY (lib/db/adminIdentity.ts) and stamped by
+     * getUserById / findUserByDiscordId on the session actor only. Never inferred
+     * from `role` (which is a name-derived DISPLAY tier), never client-supplied,
+     * and scrubbed by stripSensitiveUserFields / blankSensitiveUserFields so it
+     * does not cross the wire — the browser must not gate on it (client filters
+     * are cosmetic). Absent ⇒ not Admin, which is the deny answer everywhere.
+     */
+    isSystemAdmin?: boolean;
     rank?: Rank;
     unit?: OrganizationalUnit;
     position?: PersonnelPosition;
@@ -622,6 +632,11 @@ export interface HydratedOperation {
     locationText?: string;
     additionalLocationTexts?: string[];
     discordEventId?: string;
+    /**
+     * Opt-in to the T-15 "starting soon" Discord notice. Defaults FALSE — it is the
+     * org's consent to publish this operation to a channel, so it is never inferred.
+     */
+    discordStartNotice?: boolean;
     // Channel + message IDs for the optional embed announcement (separate from
     // the Guild Scheduled Event above). Channel ID is set on create when the
     // wizard's "Post Announcement Embed" toggle is on; message ID is back-filled
@@ -675,6 +690,7 @@ export interface HydratedOperation {
     scheduleEntries?: OperationScheduleEntry[];
     tasks?: OperationTask[];
     commandNodes?: OperationCommandNode[];
+    shipSlots?: OperationShipSlot[];
     boardElements?: OperationBoardElement[];
     logistics?: OperationLogisticsItem[];
     aarEntries?: AAREntry[];
@@ -873,6 +889,44 @@ export interface OperationCommandNode {
     liveStatus?: string;
     createdAt: string;
     children?: OperationCommandNode[];
+}
+
+/**
+ * A designated ship (top-level) with named seats (children via parentSlotId), or a
+ * flat capacity slot ("Solo Fighters" x10). Max depth 2, enforced server-side.
+ */
+export interface OperationShipSlot {
+    id: number;
+    operationId: string;
+    parentSlotId?: number;
+    shipId?: number;
+    ship?: { id: number; name: string; imageUrl?: string };
+    label: string;
+    seatRole?: string;
+    capacity: number;
+    sortOrder: number;
+    notes?: string;
+    assignments: OperationSlotAssignment[];
+    createdAt: string;
+}
+
+/**
+ * Who holds (or has applied for) a seat.
+ *
+ * Deliberately carries NO applicant user object and NO assignedBy. The seats panel
+ * resolves a holder's name from the operation's own participant roster it renders
+ * beside, so an embedded user here would be a second identity egress path for data
+ * already on the page; and "which manager seated whom" is not rendered anywhere, so
+ * under rule 1 it never reaches the wire.
+ */
+export interface OperationSlotAssignment {
+    id: number;
+    operationId: string;
+    slotId: number;
+    userId: number;
+    status: 'applied' | 'assigned';
+    userShipId?: number;
+    createdAt: string;
 }
 
 export interface OperationBoardElement {
@@ -1105,8 +1159,14 @@ export interface TestimonialCandidate {
 }
 
 export interface DiscordConfig {
+    /** Role @-mentioned alongside an operation announcement. Read server-side at send time. */
+    operationAnnouncePingRoleId?: string;
+    /** Role offered as a ping target when an EAM is broadcast. Read server-side at send time. */
+    eamPingRoleId?: string;
     clientId?: string;
     newRequestChannelId?: string;
+    /** Channel for the crafting-request embed. Falls back to newRequestChannelId. */
+    craftingRequestChannelId?: string;
     intelChannelId?: string;
     eamChannelId?: string;
     /** Org-wide default channel ID for the optional Operation Announcement
@@ -1561,6 +1621,14 @@ export interface ApiKey {
     keyPrefix: string;
     createdAt: string;
     lastUsedAt?: string;
+    /** Which key-authenticated surfaces this key may reach. null = issued before scopes
+     *  existed and grandfathered to all of them; see lib/apiKeyScopes.ts. */
+    scopes?: string[] | null;
+    /** null = never expires. */
+    expiresAt?: string | null;
+    /** Set = the key is dead. The row survives as the record of it. */
+    revokedAt?: string | null;
+    revokedReason?: string | null;
 }
 
 export interface TrustedIntelFeed {
@@ -1669,9 +1737,15 @@ export interface EAMData {
 }
 
 export interface OrgMeta {
-    memberCount: number;
+    // memberCount deleted (Phase 3 item 3): zero readers repo-wide, and it was derived
+    // from the roster array getMainState no longer ships to a non-staff caller. NOT the
+    // same field as AllyRosterData.memberCount above, which is the alliance federation
+    // roster and must survive.
+    //
     // Optional-module toggles (government / finances / quartermaster / warehouse /
-    // leaderboard / external tools) configured by the org admin.
+    // leaderboard / external tools) configured by the org admin. `features` is the SOLE
+    // reader of orgMeta and it ships to EVERY tier — HelpView is Client-reachable and
+    // reads it, so withholding it would silently collapse a Client's nav.
     features?: Record<string, any>;
 }
 
@@ -1751,6 +1825,23 @@ export interface QuartermasterFeatureConfig {
 }
 
 export type QmCatalogCategory = 'weapon' | 'armor' | 'component' | 'consumable' | 'misc';
+
+/**
+ * What the armoury's facet dropdowns offer.
+ *
+ * Derived from stock ON HAND rather than from the whole catalogue — a dropdown of
+ * every manufacturer in Star Citizen is a list, not a filter. `attributes` is
+ * restricted server-side to the facetable key allowlist.
+ */
+export interface QmArmouryFacets {
+    categories: string[];
+    types: string[];
+    sizes: string[];
+    manufacturers: string[];
+    hasVehicle: boolean;
+    hasPersonal: boolean;
+    attributes: Record<string, string[]>;
+}
 export type QmCatalogSource = 'platform' | 'custom';
 
 export interface QmCatalogItem {
@@ -1951,6 +2042,12 @@ export interface WarehouseMovement {
     stock?: WarehouseStockEmbed;
     relatedRequestId: string | null;
     relatedMovementId: string | null;
+    // TRUE for every viewer when this movement came from a marketplace contract; the ID is
+    // present ONLY for a party to that contract (seller or buyer). warehouse:view is a
+    // Member default and contract parties are a much smaller population, so the id is
+    // party-scoped server-side in toMovement — never filtered in the client.
+    fromContract: boolean;
+    relatedContractId: string | null;
     notes: string | null;
     createdAt: string;
 }
@@ -2015,7 +2112,34 @@ export interface MarketplaceTrader {
     avatarUrl: string | null;
 }
 
+/**
+ * One leg of a barter deal — a LABEL AND A QUANTITY.
+ *
+ * A documented term, in the same trust class as `priceUec`: the goods are handed
+ * over in-game between the members, and nothing here ever touches warehouse stock.
+ * Deliberately carries no catalog reference — see the schema comment.
+ */
+export interface MarketplaceConsideration {
+    id: number;
+    /** 'want' = what the lister is asking for, 'offer' = what they are putting up. */
+    componentType: 'want' | 'offer';
+    label: string;
+    quantity: number;
+    notes: string | null;
+    sortOrder: number;
+}
+
+/** What a client sends. No id, and no catalog pin. */
+export interface MarketplaceConsiderationInput {
+    componentType?: 'want' | 'offer';
+    label: string;
+    quantity: number;
+    notes?: string | null;
+}
+
 export interface MarketplaceListing {
+    /** Advertised barter terms alongside (or instead of) the aUEC price. */
+    considerations?: MarketplaceConsideration[];
     id: string;
     sellerId: number;
     seller?: MarketplaceTrader;
@@ -2050,6 +2174,8 @@ export interface MarketplaceMilestone {
 }
 
 export interface MarketplaceContract {
+    /** The barter terms FROZEN at propose time — copied, so editing the listing cannot rewrite a signed deal. */
+    considerations?: MarketplaceConsideration[];
     id: string;
     listingId: string | null;
     sellerId: number;
@@ -2092,6 +2218,79 @@ export interface MarketplaceReputation {
     averageStars: number;
     ratingCount: number;
     tier: 'New' | 'Reputable' | 'Trusted' | 'Elite';
+}
+
+// ── Blueprints (registry + two-sided crafting requests) ──────────────────────
+
+/**
+ * A blueprint a member owns. `offersCrafting` is a live CONSENT flag, not a
+ * property of the item: it is the only thing that admits a new crafting request
+ * against this member, which is why `blueprint:manage` cannot set it on someone
+ * else's behalf and why removing a member clears it.
+ */
+export interface Blueprint {
+    id: number;
+    ownerId: number;
+    /** Optional pin to quartermaster_catalog. `category` travels with it. */
+    qmCatalogId: number | null;
+    /** Denormalised at write time so the entry renders with Quartermaster off. */
+    itemName: string;
+    category: string | null;
+    notes: string | null;
+    offersCrafting: boolean;
+    createdAt: string;
+    updatedAt: string;
+    /** Hydrated where fetched. Absent for a DEPARTED member — the row is org
+     *  history, but a member who has left is not named and avatared indefinitely. */
+    owner?: MarketplaceTrader;
+}
+
+/**
+ * A distinct craftable item with NO owner identity. Built by a SEPARATE query
+ * rather than a filtered Blueprint, so there is no owner field to forget to
+ * strip. It is an item picker for the request flow, not a security boundary —
+ * both reads are gated `blueprint:view`.
+ */
+export interface CraftableItem {
+    qmCatalogId: number | null;
+    itemName: string;
+    category: string | null;
+}
+
+/**
+ * open      — raised, unclaimed. The only state a crafter may claim from.
+ * claimed   — a crafter has taken it. May be released back to open.
+ * ready     — the crafter says the item is made.
+ * delivered — the crafter says it has been handed over.
+ * completed — the REQUESTER confirmed receipt. Terminal, and only they can set it.
+ * cancelled — killed before completion, by the requester or blueprint:manage.
+ */
+export type BlueprintRequestStatus = 'open' | 'claimed' | 'ready' | 'delivered' | 'completed' | 'cancelled';
+
+export interface BlueprintRequest {
+    id: number;
+    requesterId: number;
+    /** Null until claimed. The first point a requester learns who owns the blueprint. */
+    crafterId: number | null;
+    /** Provenance only; null if the registry entry was since removed. */
+    blueprintId: number | null;
+    qmCatalogId: number | null;
+    /** Frozen at request time from the MATCHED registry row, never the client's string. */
+    itemName: string;
+    quantity: number;
+    materialsNote: string | null;
+    offerPriceUec: number | null;
+    status: BlueprintRequestStatus;
+    claimedAt: string | null;
+    readyAt: string | null;
+    deliveredAt: string | null;
+    completedAt: string | null;
+    cancelledAt: string | null;
+    cancelReason: string | null;
+    createdAt: string;
+    updatedAt: string;
+    requester?: MarketplaceTrader;
+    crafter?: MarketplaceTrader;
 }
 
 export interface MarketplaceTraderProfile {
@@ -2483,7 +2682,7 @@ export interface DataContextType {
     syncDiscordRoles: () => Promise<void>;
     updateRankMapping: (discordRoleId: string, rankId: string, roleId?: string) => Promise<void>;
 
-    broadcastEAM: (msg: string) => Promise<void>;
+    broadcastEAM: (msg: string, pingTarget?: 'none' | 'here' | 'role') => Promise<void>;
 
     fetchUserDetail: (userId: number) => Promise<User | null>;
     getReputationHistory: (userId: number) => Promise<any>;
@@ -2533,6 +2732,87 @@ export interface PersistentNotification {
     /** ISO timestamp when read, or null while unread. */
     readAt: string | null;
     createdAt: string;
+}
+
+// =============================================================================
+// SECURITY AUDIT TRAIL
+// =============================================================================
+// One row per SecurityDenial (lib/errors.ts) or other high-consequence action.
+// ADMIN-ONLY and PII-BEARING (actorIp, actorUserId): this type is reachable ONLY
+// through the admin:security:list_events RPC. It has no /api/query subset by design,
+// so it cannot ride the boot bundle or any realtime slice — see
+// lib/db/securityEvents.ts and tests/securityEventsEgress.test.ts.
+// ---------------------------------------------------------------------------
+// Org bans
+// ---------------------------------------------------------------------------
+// A ban is a LOCKOUT, not a removal: the user row and all its history survive,
+// and lifting restores access.
+
+export type BanAppealStatus = 'pending' | 'accepted' | 'rejected';
+
+/**
+ * A ban as shown to STAFF in the ban console.
+ *
+ * Deliberately carries no discordId. The ban is anchored on the Discord id
+ * server-side so it survives a soft delete and a re-signup, but that id is PII
+ * with no on-screen purpose — a ban with no linked user row renders as an
+ * unlinked account rather than exposing it, and it must never reach an audit
+ * field either.
+ */
+export interface OrgBan {
+    id: number;
+    /** Null when the ban is anchored on a Discord id with no user row. */
+    userId: number | null;
+    reason: string;
+    /** Null = permanent. Always re-evaluated server-side; never trusted from the client. */
+    expiresAt: string | null;
+    bannedAt: string;
+    bannedById: number | null;
+    liftedAt: string | null;
+    liftedById: number | null;
+    liftReason: string | null;
+    /** Present only when an appeal exists for this ban. */
+    appeal?: BanAppeal | null;
+}
+
+/** What the BANNED member is shown about their own ban. Self-scoped, never another's. */
+export interface BanNotice {
+    banId: number;
+    reason: string;
+    expiresAt: string | null;
+    bannedAt: string;
+    appealStatus: BanAppealStatus | null;
+    /** False once an appeal exists — one per ban, enforced by a unique index. */
+    canAppeal: boolean;
+}
+
+export interface BanAppeal {
+    id: number;
+    banId: number;
+    statement: string;
+    status: BanAppealStatus;
+    reviewedById: number | null;
+    reviewedAt: string | null;
+    reviewNote: string | null;
+    createdAt: string;
+}
+
+export interface SecurityEvent {
+    id: number;
+    createdAt: string;
+    /** Absent once the account is deleted (ON DELETE SET NULL keeps the record). */
+    actorUserId?: number;
+    /** Human-readable trace that survives the account. */
+    actorLabel?: string;
+    actorIp?: string;
+    /** The audit slug, e.g. 'authz.denied'. Mirrors SecurityDenial.auditEvent. */
+    event: string;
+    /** The dispatcher action or route attempted. */
+    action?: string;
+    /** 'denied' overwhelmingly; 'allowed' for recorded high-consequence successes. */
+    outcome: string;
+    /** Diagnostic context, already run through the logger redactor. */
+    details: Record<string, unknown>;
 }
 
 // =============================================================================
@@ -2660,6 +2940,97 @@ export interface AcademyOutcomeResult {
     assessedAt: string;
 }
 
+/**
+ * A member's ASK for a seat on a gated session, and its decision trail.
+ *
+ * Shared because both halves of the flow render it: the student sees their own
+ * pending/denied asks in the catalogue, and an instructor sees the queue on the
+ * session. The decision fields are staff attribution — safe for the student to see
+ * BECAUSE they are the subject of it; nothing else about the approver is exposed.
+ */
+// ── Learning-Manager reports (academy:manage) ────────────────────────────────
+// Every field below is roster-safe: name, avatar, RSI handle and training facts the
+// org already shows staff. No email, no Discord id, no clearance — a report is a
+// browser-bound projection and is designed as one.
+
+/** One holder of a certification. `awardedByName` is null for a system award with
+ *  no recorded awarder; rank/unit are enriched client-side from the loaded roster. */
+export interface AcademyCertHolder {
+    userId: number;
+    name: string;
+    avatarUrl: string;
+    rsiHandle: string;
+    awardedAt: string | null;
+    awardedByName: string | null;
+}
+
+export interface AcademyCertHoldersReport {
+    certification: AcademyCertRef;
+    holders: AcademyCertHolder[];
+}
+
+export interface AcademyCompletionRow {
+    enrollmentId: string;
+    studentId: number;
+    studentName: string;
+    rsiHandle: string;
+    courseTitle: string;
+    sessionTitle: string;
+    completedAt: string | null;
+    certifiedByName: string | null;
+}
+
+export interface AcademyCourseActivityRow {
+    courseId: string;
+    courseTitle: string;
+    status: AcademyCourseStatus;
+    delivery: AcademyCourseDelivery;
+    sessions: number;
+    enrolled: number;
+    inProgress: number;
+    completed: number;
+    awaitingCertification: number;
+}
+
+export interface AcademyCourseActivityReport {
+    courses: AcademyCourseActivityRow[];
+    totalEnrollments: number;
+    /** True when the enrolment scan hit its cap — every number is then a FLOOR, not a
+     *  total, and the view must say so rather than presenting it as the answer. */
+    truncated: boolean;
+}
+
+export interface AcademyTranscriptRow {
+    enrollmentId: string;
+    courseTitle: string;
+    sessionTitle: string;
+    status: AcademyEnrollmentStatus;
+    enrolledAt: string;
+    completedAt: string | null;
+    lessonsCompleted: number;
+    lessonsTotal: number;
+    outcomes: Array<{ title: string; verdict: AcademyOutcomeVerdict | null }>;
+}
+
+export interface AcademyTranscript {
+    member: AcademyUserRef;
+    rows: AcademyTranscriptRow[];
+    certifications: Array<{ id: number; name: string; awardedAt: string | null }>;
+}
+
+export type AcademyEnrollmentRequestStatus = 'pending' | 'approved' | 'denied' | 'withdrawn';
+export interface AcademyEnrollmentRequest {
+    id: string;
+    sessionId: string;
+    studentId: number;
+    status: AcademyEnrollmentRequestStatus;
+    message: string | null;
+    decidedBy: number | null;
+    decisionReason: string | null;
+    decidedAt: string | null;
+    createdAt: string;
+}
+
 export interface AcademyEnrollment {
     id: string;
     sessionId: string;
@@ -2679,6 +3050,10 @@ export interface AcademyEnrollment {
     /** Session/course context projection for "My Sessions" rows. */
     sessionTitle?: string | null;
     courseTitle?: string | null;
+    /** Owning course id. attachEnrollmentContext already resolves it on the way to
+     *  courseTitle and lessonsTotal; surfacing it saves every consumer re-deriving the
+     *  session→course hop from data it was handed. */
+    courseId?: string | null;
     /** Curriculum progress projection (hydrated in the my-academy bundle only). */
     lessonsTotal?: number;
     lessonsCompleted?: number;

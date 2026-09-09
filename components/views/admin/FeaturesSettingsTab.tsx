@@ -40,6 +40,7 @@ const FeaturesSettingsTab: React.FC = () => {
     const warehouse = (features.warehouse || {}) as { enabled?: boolean };
     const marketplace = (features.marketplace || {}) as { enabled?: boolean };
     const academy = (features.academy || {}) as { enabled?: boolean };
+    const blueprints = (features.blueprints || {}) as { enabled?: boolean };
     // Leaderboard and External Tools default ON — absent/undefined means enabled.
     const leaderboard = (features.leaderboard || {}) as { enabled?: boolean };
     const externalTools = (features.externalTools || {}) as { enabled?: boolean };
@@ -373,6 +374,40 @@ const FeaturesSettingsTab: React.FC = () => {
                                                 next
                                                     ? undefined
                                                     : 'Disabling the Academy hides it from all members and closes its actions server-side. Courses, sessions, enrolments, and progress are preserved and will return when re-enabled.',
+                                            );
+                                        }}
+                                        activeColor="bg-purple-500"
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* BLUEPRINTS */}
+                    <div className="bg-slate-800/50 rounded-lg border border-slate-700 overflow-hidden">
+                        <div className="flex items-start gap-4 p-5">
+                            <div className="w-10 h-10 shrink-0 rounded-lg bg-purple-500/10 flex items-center justify-center">
+                                <i className="fa-solid fa-scroll text-purple-400"></i>
+                            </div>
+                            <div className="flex-1">
+                                <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                        <h3 className="font-semibold text-white">Blueprint Manager</h3>
+                                        <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                                            A registry of what your members can make, and a two-sided <span className="text-purple-300 font-semibold">crafting board</span> on top of it. A member registers a blueprint and opts in to craft it for others; anyone can then raise a request, a crafter claims it, marks it ready and delivered, and the <span className="text-purple-300 font-semibold">requester</span> confirms receipt. Offering to craft is always the owner's own choice — nobody, moderator included, can switch it on for them. Off by default.
+                                        </p>
+                                    </div>
+                                    <Toggle
+                                        enabled={!!blueprints.enabled}
+                                        disabled={savingKey === 'blueprints.enabled'}
+                                        onToggle={() => {
+                                            const next = !blueprints.enabled;
+                                            applyPatch(
+                                                'blueprints.enabled',
+                                                { blueprints: { enabled: next } },
+                                                next
+                                                    ? undefined
+                                                    : 'Disabling Blueprints hides it from all members and closes its actions server-side. The registry and every crafting request are preserved and will return when re-enabled.',
                                             );
                                         }}
                                         activeColor="bg-purple-500"

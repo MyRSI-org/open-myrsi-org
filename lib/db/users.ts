@@ -4,9 +4,13 @@ import { supabase, handleSupabaseError, broadcastToOrg, getSystemRoles } from '.
 import { escapeLikePattern } from '../pgrest.js';
 import type { Tables } from './rows.js';
 import { toUser, toReputationHistoryEntry, toRatingHistoryEntry } from './mappers.js';
+import { stampSystemAdmin } from './adminIdentity.js';
+import { withdrawCraftingOffers } from './blueprints.js';
 import { getAllSettings } from './system.js';
 import { getDiscordMember, pushDiscordRolesForUser, getDiscordUserById, buildGlobalAvatarUrl } from '../discord.js';
-import { verifyRsiHandle, generateRsiVerificationCode } from '../rsi.js';
+import { verifyRsiHandle, generateRsiVerificationCode, isValidRsiHandle } from '../rsi.js';
+import { sanitizeImageUrl } from '../imageUrl.js';
+import { stripHtmlSingleLine } from '../textSanitize.js';
 import { isValidTimezone, isValidDateFormat } from '../time.js';
 import { isAllowedPushEndpoint, MAX_PUSH_SUBSCRIPTIONS_PER_USER } from '../push.js';
 import { canViewAllClassifications, type ClearanceUser } from '../clearance.js';
@@ -65,9 +69,83 @@ export async function logHrPositionChange(
 // tags inline) and certifications/commendations as ID-only stubs (bulk-award
 // modals filter members who already hold a cert/commendation by template id;
 // names/dates render in lazy-loaded detail views).
+//
+// NOT THE ROSTER PROJECTION ANY MORE. This constant now has exactly one job: the
+// getUserById / getUserByAuthId DEGRADED FALLBACK below. The bulk roster and the
+// users_slice patch use USER_ROSTER_SELECT_QUERY instead. NEVER narrow this one —
+// see the security note on that constant for why.
 export const USER_LIST_SELECT_QUERY = `
     id, discord_id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at, admin_notes, personnel_notes, rsi_handle_pending, rsi_verification_code, rsi_verified, job_title, voice_channel_name, timezone, date_format, probation_start, probation_end, tenure_start_date, tokens_valid_from, deleted_at,
-    role:roles!inner(id, name, description, role_permissions(permission:permissions(name))),
+    role:roles!inner(id, name, description, is_system, role_permissions(permission:permissions(name))),
+    rank:ranks(id, name, icon_url, sort_order),
+    unit:units!unit_id(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted),
+    position:personnel_positions!position_id(id, name, description, icon, department),
+    secondaryPosition:personnel_positions!secondary_position_id(id, name, description, icon, department),
+    clearance_level:security_clearances(id, level, name, description),
+    specializations:user_specializations(specialization:specialization_tags(id, name, description, icon, image_url)),
+    certifications:user_certifications!user_id(certification:certifications(id)),
+    commendations:user_commendations!user_id(commendation:commendations(id))
+`;
+
+// THE ROSTER PROJECTION — the bulk `main` roster (lib/db.ts getStaffMainState) and the
+// realtime users_slice patch (getUsersByIdsLite below), and nothing else.
+//
+// MUST STAY BYTE-IDENTICAL BETWEEN ITS TWO CALL SITES. lib/sliceMerge.ts
+// mergeUsersSlice REPLACES whole rows in the client's allUsers array, so if the two call
+// sites ever pass different constants a user_update broadcast splices rows of a different
+// SHAPE into the roster and members silently lose fields until the next full `main`
+// refetch. One constant, two call sites, one commit. Pinned by
+// tests/rosterSelectProjection.test.ts.
+//
+// A THIRD CONSTANT, not an edit of USER_LIST_SELECT_QUERY, and the reason is a security
+// one rather than a tidiness one: USER_LIST_SELECT_QUERY is getUserById's DEGRADED
+// FALLBACK (below, and getUserByAuthId), i.e. the session-actor resolver for
+// /api/services, /api/query, /api/org/upload and /api/admin/import-stream whenever the
+// full USER_SELECT_QUERY fails on a half-migrated install. All four of those surfaces
+// gate on isSessionRevokedByWatermark(decoded, user.tokensValidFrom). Dropping
+// tokens_valid_from from the fallback would resolve every actor with
+// tokensValidFrom === null on exactly the degraded install the fallback exists for —
+// silently disabling per-user session revocation org-wide. Never narrow that constant.
+//
+// DROPPED vs USER_LIST_SELECT_QUERY, and why each is safe:
+//   rsi_verification_code, rsi_handle_pending — a SELF-ONLY proof-of-control secret.
+//       This repo already classifies both as secrets alongside password_hash and
+//       webhook_secret (SECRET_DROP_COLUMNS, lib/db/importer.ts). stripSensitiveUserFields
+//       blanks them for every non-self viewer, so they were never on the wire — but
+//       fetching them onto 1000 rows on every initial-state, every subset=main and every
+//       users_slice patch put a secret one line of code away from every browser for no
+//       consumer at all. Self still hydrates them from user_detail / login
+//       (USER_SELECT_QUERY). REQUIRES the SessionContext preserve that lands in the same
+//       commit — toUser emits EVERY key regardless of what the SELECT asked for, so a
+//       spread of a projection that omits a column overwrites the previous value with
+//       `undefined`.
+//   tokens_valid_from — a server-side revocation input, read off getUserById and never
+//       off the roster; zero client consumers (grepped components/ contexts/ hooks/
+//       services/). toUser maps it `?? null`, so the roster row now reads null and no
+//       gate anywhere consults it.
+//   deleted_at — both roster call sites already filter .is('deleted_at', null), so the
+//       selected value was always null on this path, and toUser never maps it.
+//
+// KEPT DELIBERATELY — do NOT "simplify" any of these out:
+//   role_permissions(permission:permissions(name)) — feeds toUser's `permissions` local,
+//       which feeds inferUserRoleTier's fallback for CUSTOM role NAMES. Dropping it
+//       re-tiers every member of a custom-named role to UserRole.Client across ~14
+//       components. A silent tier change is an AUTHORIZATION change.
+//   clearance_level — restored per-viewer by CLEARANCE_VISIBLE_PERMS in
+//       lib/db/userFilters.ts; the bulk L-badge and the dispatch rap sheet read it off
+//       this roster.
+//   admin_notes, personnel_notes — components/views/admin/AdminClientDetailView.tsx seeds
+//       its notes textarea straight off the roster row and writes that local state back
+//       on Save. Dropping the column here is not a blank textarea, it is an admin
+//       SILENTLY WIPING an existing client's notes. Prerequisite for ever dropping it:
+//       that view must lazy-load via fetchUserDetail the way AdminUserDetailView.tsx
+//       already does. Out of scope, carried as a follow-up.
+//   voice_channel_name — SessionContext's hasChanged compares it; it is the live carrier
+//       for admin remote radio control on the user's own row. Non-self viewers never
+//       receive it (it is not on ROSTER_SAFE_FIELDS and nothing restores it).
+export const USER_ROSTER_SELECT_QUERY = `
+    id, discord_id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at, admin_notes, personnel_notes, rsi_verified, job_title, voice_channel_name, timezone, date_format, probation_start, probation_end, tenure_start_date,
+    role:roles!inner(id, name, description, is_system, role_permissions(permission:permissions(name))),
     rank:ranks(id, name, icon_url, sort_order),
     unit:units!unit_id(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted),
     position:personnel_positions!position_id(id, name, description, icon, department),
@@ -81,7 +159,7 @@ export const USER_LIST_SELECT_QUERY = `
 // Full query for detail views (includes all nested relations)
 export const USER_SELECT_QUERY = `
     id, discord_id, name, display_name, avatar_url, rsi_handle, role_id, reputation, is_duty, is_affiliate, is_vip, created_at, admin_notes, personnel_notes, rsi_handle_pending, rsi_verification_code, rsi_verified, job_title, voice_channel_name, timezone, date_format, probation_start, probation_end, tenure_start_date, tokens_valid_from, deleted_at,
-    role:roles!inner(id, name, description, role_permissions(permission:permissions(name))),
+    role:roles!inner(id, name, description, is_system, role_permissions(permission:permissions(name))),
     rank:ranks(id, name, icon_url, sort_order),
     unit:units!unit_id(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted),
     position:personnel_positions!position_id(id, name, description, icon, department),
@@ -107,29 +185,39 @@ export async function findUserByDiscordId(discordId: string, includeDeleted = fa
     // Data might be null
     if (!data) return null;
 
-    const user = toUser(data as unknown as Parameters<typeof toUser>[0]);
+    const row = data as unknown as Parameters<typeof toUser>[0];
+    const user = toUser(row);
     if (user && data.deleted_at) {
         (user as User & { deletedAt?: string | null }).deletedAt = data.deleted_at;
     }
-    return user;
+    // Login resolver: stamp the Admin-identity fact so the requester context built
+    // at auth.ts (and anything else handed this result) reads role IDENTITY rather
+    // than the name-derived tier. Scrubbed before the wire by
+    // stripSensitiveUserFields / blankSensitiveUserFields.
+    return stampSystemAdmin(user, row?.role);
 }
 
 /**
  * Lite multi-row roster fetch backing the realtime `users_slice` query subset.
  * Returns rows in the SAME shape as the getMainState roster
- * (USER_LIST_SELECT_QUERY → toUser, deleted excluded) so the client can splice
+ * (USER_ROSTER_SELECT_QUERY → toUser, deleted excluded) so the client can splice
  * them into its existing users array when a user_update broadcast carries the
  * affected id(s), instead of refetching the whole 'main' bundle.
+ *
+ * "SAME shape" is LOAD-BEARING, not descriptive: mergeUsersSlice (lib/sliceMerge.ts)
+ * REPLACES whole rows, so this select and lib/db.ts getStaffMainState's must name the
+ * same constant. Pinned by tests/rosterSelectProjection.test.ts.
  *
  * THROWS on any query error rather than returning [] — the client merge
  * removes requested-but-absent ids (deleted users), so a silent [] on a
  * transient error would mass-evict live users from every connected roster.
  * The resulting 500 makes the client fall back to a full 'main' refetch.
+ * Do NOT harmonise this with the safeFetch(…, []) style the HR eligibility RPCs use.
  */
 export async function getUsersByIdsLite(userIds: number[]): Promise<User[]> {
     if (!Array.isArray(userIds) || userIds.length === 0) return [];
     const { data, error } = await supabase.from('users')
-        .select(USER_LIST_SELECT_QUERY)
+        .select(USER_ROSTER_SELECT_QUERY)
         .in('id', userIds)
         .is('deleted_at', null);
     handleSupabaseError({ error, message: 'Failed to get users slice' });
@@ -144,13 +232,60 @@ export async function getUserById(userId: number) {
     // findUserByDiscordId(includeDeleted)/reactivateUser, not this resolver, so
     // they are unaffected.
     const { data, error } = await supabase.from('users').select(USER_SELECT_QUERY).eq('id', userId).is('deleted_at', null).single();
-    if (!error) return toUser(data as unknown as Parameters<typeof toUser>[0]);
+    // Stamp the Admin-identity fact (lib/db/adminIdentity.ts) on BOTH return paths.
+    // This is the session-resolution query for the dispatcher, the read path and the
+    // import-stream route, so every actor that reaches an apex gate is stamped here;
+    // an unstamped actor reads `undefined` and is treated as not-Admin.
+    if (!error) {
+        const row = data as unknown as Parameters<typeof toUser>[0];
+        return stampSystemAdmin(toUser(row), row?.role);
+    }
+    // .single() reports zero rows as PGRST116 — the ONLY truthful "absent". The
+    // fallback below runs the SAME filters and the SAME role:roles!inner join and
+    // differs only in extra LEFT-joined embeds, so it cannot find a row this query
+    // missed. Short-circuit instead of a second round-trip (and instead of a warn
+    // on every logged-out probe). If a future embed is switched to !inner the two
+    // projections stop being equivalent and this short-circuit must go.
+    if (error.code === 'PGRST116') return null;
     // Full user query failed (possibly due to missing FK/table from a new migration).
     // Try with the lighter list query as a fallback to avoid breaking auth.
     log.warn('full user query failed, trying fallback', { userId, message: error.message });
     const { data: fallback, error: fbErr } = await supabase.from('users').select(USER_LIST_SELECT_QUERY).eq('id', userId).is('deleted_at', null).single();
-    if (!fbErr && fallback) return toUser(fallback as unknown as Parameters<typeof toUser>[0]);
+    if (!fbErr && fallback) {
+        const row = fallback as unknown as Parameters<typeof toUser>[0];
+        return stampSystemAdmin(toUser(row), row?.role);
+    }
+    // DISTINGUISH "no such row" FROM "the read failed". Returning null for both let a
+    // transient Postgres error masquerade as a deletion: api/services.ts turns null
+    // into a 401 whose only client handling is to CLEAR the session token (the whole
+    // org re-runs Discord OAuth on a DB blip), and api/query.ts turns it into a
+    // user_detail 404 that reads as "this member was deleted". PGRST116 is the only
+    // truthful "absent" — the fallback executed and proved the row is gone. Anything
+    // else propagates and fails safe (500 → the read paths' catches drop to the
+    // logged-out branch, the write path never mints a session).
+    if (fbErr && fbErr.code !== 'PGRST116') {
+        handleSupabaseError({ error: fbErr, message: 'Failed to load user' });
+    }
     return null;
+}
+
+/**
+ * Cosmetic actor-label lookup for audit-log lines. NEVER throws. getUserById is
+ * fail-closed by design (a read fault must not read as "user deleted"), but an
+ * operation-log attribution string is a LABEL, not an authorization input: the
+ * mutation it describes has ALREADY committed, so throwing here would report a
+ * successful write as an error and invite a retry — and add_uec_to_operation /
+ * add_cost_to_operation are NOT idempotent, so that retry double-counts aUEC.
+ * Anything that makes a trust decision must call getUserById directly.
+ */
+export async function getActorLabel(userId: number): Promise<string> {
+    try {
+        const u = await getUserById(userId);
+        return u?.name || 'Unknown';
+    } catch (err) {
+        log.warn('actor label lookup failed; logging attribution as Unknown', { userId, err });
+        return 'Unknown';
+    }
 }
 
 export async function getUserByAuthId(authId: string) {
@@ -163,6 +298,10 @@ export async function getUserByAuthId(authId: string) {
     const fallbackQuery = supabase.from('users').select(USER_LIST_SELECT_QUERY).eq('auth_user_id', authId).is('deleted_at', null);
     const { data: fallback, error: fbErr } = await fallbackQuery.maybeSingle();
     if (!fbErr && fallback) return toUser(fallback as unknown as Parameters<typeof toUser>[0]);
+    // Same contract as getUserById. .maybeSingle() reports zero rows as
+    // { data: null, error: null }, so ANY error that reaches here is a genuine
+    // read failure — no PGRST116 exemption is needed.
+    handleSupabaseError({ error: fbErr, message: 'Failed to load user' });
     return null;
 }
 
@@ -202,6 +341,17 @@ export async function createUser(userData: { discordId: string, name: string, av
         }
     }
 
+    // The handle arrives client-supplied from the PUBLIC_ACTION auth:finalize_setup
+    // (the identity grant binds only discordId), and it is the row's identity key:
+    // it feeds the .ilike() uniqueness check below, the ad-hoc-request re-parent, and
+    // HR case-file matching. Reject a non-handle before any of that. Unconditional —
+    // rsiHandle is a required field of this signature and the only caller rejects an
+    // empty one, so a falsy value reaching the .ilike() as an empty pattern would be
+    // a fail-open exception with nothing asking for it.
+    if (!isValidRsiHandle(userData.rsiHandle)) {
+        throw new Error('That is not a valid RSI handle. Handles are letters, numbers, underscores and hyphens.');
+    }
+
     // One RSI handle maps to one account. Refuse to bind a handle already linked to a
     // live user — blocks impersonation collisions and the absorption of another
     // user's handle-keyed ad-hoc requests (the re-parent below). escapeLikePattern
@@ -233,10 +383,18 @@ export async function createUser(userData: { discordId: string, name: string, av
     const { data: defaultClearance } = await supabase.from('security_clearances').select('id').eq('level', 1).maybeSingle();
     const clearanceId = defaultClearance ? defaultClearance.id : null;
 
+    // name and avatarUrl are echoed back by the client on the PUBLIC auth:finalize_setup
+    // call and are NOT bound by the identity grant, yet both render in every roster,
+    // member card and outbound Discord embed. Sanitize at the insert, not at the caller,
+    // so the chokepoint holds for any future caller too. A name that is nothing but
+    // markup collapses to '' — fall back to the (already shape-validated) handle rather
+    // than persist a blank row. A rejected avatar becomes null; toUser() then substitutes
+    // the default Discord avatar, so a bad URL degrades to the placeholder, never a throw
+    // (this path is pre-auth: a hard failure here is a login outage).
     const { data, error } = await supabase.from('users').insert({
         discord_id: userData.discordId,
-        name: userData.name,
-        avatar_url: userData.avatarUrl,
+        name: stripHtmlSingleLine(userData.name, 80) || userData.rsiHandle,
+        avatar_url: sanitizeImageUrl(userData.avatarUrl),
         rsi_handle: userData.rsiHandle,
         rsi_verified: userData.rsiVerified ?? true,
         role_id: roleId,
@@ -286,12 +444,12 @@ export async function reactivateUser(userId: number, updates: Partial<Tables<'us
  * Privilege-escalation guard for any code path that mutates a user's role_id.
  *
  * Rules (any failure throws):
- *   1. Actor must hold `admin:user:update_role` (or be the system Admin). The
- *      action `admin:update_user` is gated on the strictly weaker
- *      `admin:user:update` (rank/unit/notes); without this check a `roleId` on
- *      the same payload would let anyone with `admin:user:update` promote
- *      themselves or others to Admin.
- *   2. The system Admin role can only ever be assigned by another Admin.
+ *   1. Actor must hold `admin:user:update_role`. The action `admin:update_user` is
+ *      gated on the strictly weaker `admin:user:update` (rank/unit/notes); without
+ *      this check a `roleId` on the same payload would let anyone with
+ *      `admin:user:update` promote themselves or others to Admin.
+ *   2. The system Admin role can only ever be assigned by a holder of that role
+ *      (matched by role ID, never by the role's name).
  *   3. Actor cannot assign a role whose effective tier exceeds their own —
  *      including custom roles whose permissions imply a higher tier (e.g. a
  *      custom role granting `admin:access`).
@@ -299,9 +457,14 @@ export async function reactivateUser(userId: number, updates: Partial<Tables<'us
 export async function assertCanAssignRole(actor: Partial<User> | null | undefined, newRoleId: number) {
     if (!actor || !actor.id) throw new Error('Unauthorized: actor identity required to change role');
 
-    const isActorAdmin = actor.role === 'Admin';
     const actorPerms: string[] = Array.isArray(actor.permissions) ? actor.permissions : [];
-    if (!isActorAdmin && !actorPerms.includes('admin:user:update_role')) {
+    // Rule 1 is a guarded-or: the seeded Admin role holds admin:user:update_role
+    // (the seeder assigns it the whole catalogue), so requiring the permission
+    // outright takes nothing from a real admin — and it drops the `role === 'Admin'`
+    // NAME compare that let a permissionless role called "Commander" promote anyone.
+    // Rule 2 below is a restrictive CEILING and must NOT reuse this variable: it is
+    // re-derived from role identity, because deleting it would widen.
+    if (!actorPerms.includes('admin:user:update_role')) {
         throw new Error('Forbidden: missing admin:user:update_role permission');
     }
 
@@ -312,7 +475,13 @@ export async function assertCanAssignRole(actor: Partial<User> | null | undefine
     if (tErr || !targetRole) throw new Error('Target role not found');
 
     const sysRoles = await getSystemRoles();
-    if (sysRoles.admin && targetRole.id === sysRoles.admin.id && !isActorAdmin) {
+    // Role IDENTITY, matched by id — sysRoles is already loaded here, so this is
+    // free, and comparing ids does not depend on the actor having been stamped.
+    // Deliberately NOT a tier test: tierOfRole awards 4 to any custom role holding
+    // admin:access, which the seeded Dispatcher holds — a tier escape here would be
+    // a privilege WIDENING in the one guard whose job is to stop one.
+    const actorHoldsAdminRole = !!sysRoles.admin && !!actor.roleId && actor.roleId === sysRoles.admin.id;
+    if (sysRoles.admin && targetRole.id === sysRoles.admin.id && !actorHoldsAdminRole) {
         throw new Error('Forbidden: only Admins can assign the Admin role');
     }
 
@@ -321,11 +490,20 @@ export async function assertCanAssignRole(actor: Partial<User> | null | undefine
     // mappers.ts so a renamed/custom role can't sneak past by being unranked.
     const sysIds = [sysRoles.client?.id, sysRoles.member?.id, sysRoles.dispatcher?.id, sysRoles.admin?.id];
     const tierOfRole = async (roleId: number): Promise<number> => {
-        const idx = sysIds.indexOf(roleId);
+        // Fail CLOSED on an unusable id. `indexOf` over sysIds would otherwise match
+        // an UNRESOLVED slot: with sysRoles.admin missing, sysIds[3] is undefined and
+        // tierOfRole(undefined) scores 4 — the actor's own tier, in the guard whose
+        // whole job is to cap it.
+        const id = Number(roleId);
+        if (!Number.isInteger(id) || id <= 0) throw new Error('Role privilege tier could not be resolved.');
+        const idx = sysIds.findIndex((slot) => typeof slot === 'number' && slot === id);
         if (idx >= 0) return idx + 1;
-        const { data: rolePerms } = await supabase.from('role_permissions')
+        const { data: rolePerms, error } = await supabase.from('role_permissions')
             .select('permission:permissions(name)')
-            .eq('role_id', roleId);
+            .eq('role_id', id);
+        // A read fault must not silently score a custom role as tier 1 — "unknown"
+        // has to be a refusal, not the lowest tier.
+        if (error) throw new Error('Role privilege tier could not be resolved.');
         const names = ((rolePerms || []) as Array<{ permission?: { name?: string } | { name?: string }[] | null }>)
             .map((rp) => (Array.isArray(rp.permission) ? rp.permission[0]?.name : rp.permission?.name))
             .filter(Boolean);
@@ -349,13 +527,22 @@ export async function assertCanAssignRole(actor: Partial<User> | null | undefine
  * can't sneak past a tier check.
  */
 export async function roleTier(roleId: number): Promise<number> {
+    // Coerce, then fail CLOSED on an unusable id: `indexOf` would match an
+    // UNRESOLVED slot (sysIds[3] === undefined when getSystemRoles cannot find the
+    // Admin role), scoring a missing/garbage role as tier 4 — the apex.
+    const id = Number(roleId);
+    if (!Number.isInteger(id) || id <= 0) throw new Error('Role privilege tier could not be resolved.');
     const sysRoles = await getSystemRoles();
     const sysIds = [sysRoles.client?.id, sysRoles.member?.id, sysRoles.dispatcher?.id, sysRoles.admin?.id];
-    const idx = sysIds.indexOf(roleId);
+    const idx = sysIds.findIndex((slot) => typeof slot === 'number' && slot === id);
     if (idx >= 0) return idx + 1;
-    const { data: rolePerms } = await supabase.from('role_permissions')
+    const { data: rolePerms, error } = await supabase.from('role_permissions')
         .select('permission:permissions(name)')
-        .eq('role_id', roleId);
+        .eq('role_id', id);
+    // Fail CLOSED: a read fault must not silently score a custom role as tier 1 —
+    // every caller uses this to decide whether an actor may cross a privilege
+    // boundary, so "unknown" has to be a refusal, not the lowest tier.
+    if (error) throw new Error('Role privilege tier could not be resolved.');
     const names = ((rolePerms || []) as Array<{ permission?: { name?: string } | { name?: string }[] | null }>)
         .map((rp) => (Array.isArray(rp.permission) ? rp.permission[0]?.name : rp.permission?.name))
         .filter(Boolean) as string[];
@@ -363,6 +550,89 @@ export async function roleTier(roleId: number): Promise<number> {
     if (names.some((n) => n === 'request:dispatch' || n === 'request:triage')) return 3;
     if (names.some((n) => n === 'request:accept' || n === 'user:toggle_duty')) return 2;
     return 1;
+}
+
+/**
+ * Companion to assertCanAssignRole, and the half that was missing.
+ *
+ * assertCanAssignRole caps the tier of the role being GRANTED. Nothing capped the
+ * tier of the user being CHANGED, so the ceiling was one-directional: a delegated
+ * admin:user:update_role holder could not promote anyone to Admin, but could strip
+ * an Admin down to Client — single (admin:update_user) or in bulk
+ * (admin:bulk_demote_to_client) — and an operator could demote their own seat and
+ * leave the org with no Admin and no in-app way back. The roster UI hid both cases
+ * (AdminMemberManagement filters out Admins and the actor); the server did not.
+ *
+ * Tiers come from roleTier(roleId) — stored users.role_id resolved through
+ * getSystemRoles — and deliberately NOT from `actor.role`, which mappers.ts infers
+ * from the role NAME plus a five-permission ladder.
+ *
+ * The APEX case is a role-IDENTITY compare, not a tier compare, because the ladder
+ * scores ANY role holding admin:access as tier 4 — and the Admin panel itself is
+ * behind admin:access, so the realistic delegated "Deputy" role already sits at 4
+ * and would clear a pure `targetTier > actorTier` test against a genuine Admin.
+ * Same idiom as api/actions/operations.ts's `roleId === systemRoles.admin.id`.
+ *
+ * `blockPeers` additionally refuses a target at the actor's OWN tier. Both bulk
+ * paths pass it, so the server matches the roster UI, which hides the checkbox for
+ * every Admin-tier row. The single-user detail view leaves it off: one Admin
+ * deliberately demoting another from that screen is a supported flow.
+ *
+ * `actorTier` / `targetRoleId` let a bulk loop resolve each once instead of
+ * re-reading the same row per target.
+ */
+export async function assertCanChangeUsersRole(
+    actor: Partial<User> | null | undefined,
+    targetUserId: number | string,
+    newRoleId: number,
+    opts: { blockPeers?: boolean; actorTier?: number; targetRoleId?: number } = {},
+): Promise<void> {
+    if (!actor || !actor.id) throw new Error('Unauthorized: actor identity required to change role');
+    if (!actor.roleId) throw new Error('Unauthorized: actor role could not be resolved');
+
+    // Coerce before the identity compare. targetUserId is deliberately NOT in
+    // ACTOR_ID_FIELDS (admin actions act on others), so it arrives verbatim off the
+    // JSON body, and PostgREST happily resolves "7" to row 7 — an uncoerced
+    // `targetUserId === actor.id` would let `{ targetUserId: "7" }` walk the
+    // self-demotion lock straight past.
+    const targetId = Number(targetUserId);
+    if (!Number.isInteger(targetId) || targetId <= 0) throw new Error('Invalid target user id');
+
+    let targetRoleId = opts.targetRoleId;
+    if (targetRoleId === undefined) {
+        // No deleted_at filter: reactivation flows legitimately touch soft-deleted
+        // rows, and the question here is "how privileged is this row", not "does it
+        // count towards anything".
+        const { data: target, error } = await supabase.from('users')
+            .select('id, role_id')
+            .eq('id', targetId)
+            .maybeSingle();
+        if (error || !target) throw new Error('Target user not found');
+        targetRoleId = target.role_id as number;
+    }
+
+    // A write that changes nothing is not a privilege change. Both bulk paths
+    // already model this as `skipped`; without it an admin saving their own record
+    // through a caller that echoes the unchanged roleId is refused a no-op.
+    if (targetRoleId === newRoleId) return;
+
+    if (targetId === Number(actor.id)) {
+        throw new Error('Forbidden: you cannot change your own role');
+    }
+
+    const sysRoles = await getSystemRoles();
+    if (!sysRoles.admin) throw new Error('Forbidden: system roles could not be resolved');
+    if (targetRoleId === sysRoles.admin.id && actor.roleId !== sysRoles.admin.id) {
+        throw new Error("Forbidden: only a holder of the Admin role may change an Admin's role");
+    }
+
+    const targetTier = await roleTier(targetRoleId as number);
+    const actorTier = opts.actorTier ?? await roleTier(actor.roleId as number);
+    if (opts.blockPeers ? targetTier >= actorTier : targetTier > actorTier) {
+        throw new Error(opts.blockPeers
+            ? 'Forbidden: cannot change the role of a user at or above your own privilege tier'
+            : 'Forbidden: cannot change the role of a user with higher privileges than your own');
+    }
 }
 
 /**
@@ -380,7 +650,15 @@ export async function assertCanManageRolePermissions(
     permissionNames: string[],
 ) {
     if (!actor || !actor.id) throw new Error('Unauthorized: actor identity required to edit role permissions');
-    if (actor.role === 'Admin') return; // Admins have full control over role config
+    // Role IDENTITY — not the name tier and not roleTier() >= 4 (see
+    // assertCanAssignRole). This escape is what lets a real Admin edit the Admin
+    // role's own permission set: the tier ceiling below compares that role against
+    // itself and would refuse. The name compare it replaces was the escalation LOOP
+    // (mint a permissionless role called "Commander" → assign it to yourself → skip
+    // both guards → grant that role every permission). Resolved off getSystemRoles
+    // rather than the stamped flag so it survives a hand-built actor.
+    const sysRoles = await getSystemRoles();
+    if (sysRoles.admin && actor.roleId && actor.roleId === sysRoles.admin.id) return;
 
     const actorPerms: string[] = Array.isArray(actor.permissions) ? actor.permissions : [];
 
@@ -406,7 +684,6 @@ export async function assertCanManageRolePermissions(
 interface UpdateUserInput {
     name?: string;
     avatarUrl?: string;
-    rsiHandle?: string;
     roleId?: number;
     rankId?: number | null;
     unitId?: number | null;
@@ -428,7 +705,11 @@ export async function updateUser(userId: number, updates: UpdateUserInput, actor
     // actor so we can verify they're allowed to assign that specific role.
     if (updates.roleId) {
         if (!actor) throw new Error('updateUser: actor required when changing roleId');
+        // Order matters: assertCanAssignRole first, so the common "you lack
+        // admin:user:update_role" case keeps its own message. It caps the NEW role;
+        // assertCanChangeUsersRole caps the TARGET.
         await assertCanAssignRole(actor, updates.roleId);
+        await assertCanChangeUsersRole(actor, userId, updates.roleId);
     }
 
     // Get old role/rank/position for member count check, Discord sync, and HR position-history logging.
@@ -444,9 +725,26 @@ export async function updateUser(userId: number, updates: UpdateUserInput, actor
     }
 
     const dbUpdates: Partial<Tables<'users'>> = {};
-    if (updates.name) dbUpdates.name = updates.name;
-    if (updates.avatarUrl) dbUpdates.avatar_url = updates.avatarUrl;
-    if (updates.rsiHandle) dbUpdates.rsi_handle = updates.rsiHandle;
+    // Same write-boundary treatment as the createUser insert: name and avatar render
+    // in every roster / member card / Discord embed. A name that strips to nothing is
+    // a no-op rather than a blanking; a rejected avatar clears to the Discord default.
+    if (updates.name) {
+        const safeName = stripHtmlSingleLine(updates.name, 80);
+        if (safeName) dbUpdates.name = safeName;
+    }
+    if (updates.avatarUrl) dbUpdates.avatar_url = sanitizeImageUrl(updates.avatarUrl);
+    // rsi_handle is intentionally NOT writable here, exactly like clearance below.
+    // The handle is an IDENTITY claim, not a profile field: it binds the row to a Star
+    // Citizen account, it is what pending ad-hoc client requests are reconciled against
+    // (createUser and verifyRsiUpdate both .ilike() it) and what HR case files and
+    // prospects are matched on, so writing it reassigns who the row IS and absorbs
+    // another party's request history. The only supported path is
+    // initiateRsiHandleUpdate -> verifyRsiUpdate, which validates the shape, mints a
+    // CSPRNG code and requires that code in the target's PUBLIC RSI bio. Accepting it
+    // here bypassed all of that on the weaker admin:user:update perm, with no proof, no
+    // uniqueness check and no audit record. No client surface ever sent the field (every
+    // admin view renders the handle read-only), so dropping it takes no flow with it — a
+    // genuine handle-transfer override belongs behind its own permission with an audit row.
     if (updates.rankId !== undefined) dbUpdates.rank_id = updates.rankId || null;
     if (updates.unitId !== undefined) dbUpdates.unit_id = updates.unitId || null;
     if (updates.clearanceLevelId !== undefined) {
@@ -786,9 +1084,12 @@ export async function bulkUpdateUserClearances(
  * caught and counted as `skipped` rather than aborting the batch — the UI
  * surfaces the partial-success counts to the admin.
  *
- * Tier hierarchy guard: the per-user updateUser invokes assertCanAssignRole,
- * which permits demoting downward (Client is tier 1) by any actor at or above
- * tier 2 (Member) and blocks Admins demoting other Admins.
+ * Tier hierarchy guard: assertCanAssignRole is hoisted (the target role is fixed,
+ * so its answer is constant across the batch), and assertCanChangeUsersRole runs
+ * per target with blockPeers — matching the roster UI, which hides the checkbox for
+ * every Admin-tier row and for the actor. A refused target lands in the loop's
+ * existing catch and is counted as `skipped`, never written; the batch is not
+ * aborted, which is this tool's partial-success contract.
  */
 // Defensive upper bound on a single bulk call. Clients chunk at 25; 100 is
 // headroom for direct API consumers and a circuit breaker against accidental
@@ -820,6 +1121,9 @@ export async function bulkDemoteUsersToClient(
     // Hoisted role-assignment check — tier hierarchy and permission gate
     // are constant across the batch since the target role is fixed.
     await assertCanAssignRole(actor, clientRoleId);
+    // Resolve the actor's tier once; the per-target guard below re-uses it, and the
+    // row it would otherwise re-read is the one the loop already fetches.
+    const actorTier = await roleTier(actor.roleId as number);
 
     let updated = 0;
     let skipped = 0;
@@ -831,7 +1135,7 @@ export async function bulkDemoteUsersToClient(
                 .from('users')
                 .select('role_id')
                 .eq('id', userId)
-                
+
                 .maybeSingle();
             if (!user) {
                 log.warn('bulkDemoteUsersToClient skipping user not in org', { userId });
@@ -842,6 +1146,9 @@ export async function bulkDemoteUsersToClient(
                 skipped++;
                 continue;
             }
+            await assertCanChangeUsersRole(actor, userId, clientRoleId, {
+                blockPeers: true, actorTier, targetRoleId: user.role_id as number,
+            });
             const { error } = await supabase
                 .from('users')
                 .update({ role_id: clientRoleId })
@@ -870,6 +1177,10 @@ export async function bulkDemoteUsersToClient(
 
 /**
  * Promote N selected Client/lower-tier users to the org's Member role.
+ *
+ * Same two-sided ceiling as bulkDemoteUsersToClient. The Clients tab only ever
+ * lists Client-tier rows, so blockPeers never fires on the real flow — it closes
+ * the RPC-level "promote an Admin to Member", which is a demotion by another name.
  */
 export async function bulkPromoteUsersToMember(
     targetUserIds: number[],
@@ -887,6 +1198,7 @@ export async function bulkPromoteUsersToMember(
     const memberRoleId = systemRoles.member.id;
 
     await assertCanAssignRole(actor, memberRoleId);
+    const actorTier = await roleTier(actor.roleId as number);
 
     // Single-org: no member cap on bulk promotion.
     let updated = 0;
@@ -899,10 +1211,13 @@ export async function bulkPromoteUsersToMember(
                 .from('users')
                 .select('role_id')
                 .eq('id', userId)
-                
+
                 .maybeSingle();
             if (!user) { skipped++; continue; }
             if (user.role_id === memberRoleId) { skipped++; continue; }
+            await assertCanChangeUsersRole(actor, userId, memberRoleId, {
+                blockPeers: true, actorTier, targetRoleId: user.role_id as number,
+            });
             const { error } = await supabase
                 .from('users')
                 .update({ role_id: memberRoleId })
@@ -1125,6 +1440,35 @@ export async function deleteUser(userId: number) {
     }
     handleSupabaseError({ error, message: 'Failed to delete user' });
 
+    // Revoke the removed member's push delivery credentials. A subscription is a
+    // capability: whoever holds it can be pushed org content, and the soft delete
+    // above leaves both the subscription rows and the member's
+    // operation_participants rows (time_left stays NULL) intact — so without this
+    // an ejected member's device keeps receiving operation alerts and reminders.
+    // sendPushToUsers intersects deleted users out at the query as the enforcing
+    // gate; this drops the rows so nothing can push to them at all.
+    // Best-effort: the removal itself has already committed, so a cleanup failure
+    // is logged, never rethrown — the user must not stay active because a
+    // subscription row would not delete.
+    try {
+        const { error: subErr } = await supabase.from('push_subscriptions').delete().eq('user_id', userId);
+        if (subErr) log.error('failed to revoke push subscriptions for deleted user', { userId, code: subErr.code, message: subErr.message });
+    } catch (e) {
+        log.error('failed to revoke push subscriptions for deleted user', { userId, err: e });
+    }
+
+    // Stand the departing member down from the crafting board: withdraw their
+    // offers (a live consent flag, not history) and hand back anything they had
+    // claimed but not finished. Same best-effort contract as the push cleanup
+    // above — the removal has already committed, so a failure here is logged and
+    // never rethrown. A member must not stay active because an OPTIONAL module's
+    // table would not update.
+    try {
+        await withdrawCraftingOffers(userId);
+    } catch (e) {
+        log.error('failed to stand down crafting offers for deleted user', { userId, err: e });
+    }
+
     await broadcastUserUpdate(userId);
 }
 
@@ -1142,6 +1486,81 @@ export async function revokeUserSessions(targetUserId: number): Promise<void> {
         .update({ tokens_valid_from: new Date().toISOString() }).eq('id', targetUserId);
     handleSupabaseError({ error, message: 'Failed to revoke user sessions' });
     await broadcastUserUpdate(targetUserId);
+}
+
+/**
+ * "Is anyone available to take a service request?" — the single boolean the org's
+ * EXTERNAL CUSTOMERS (the Client tier) need to raise a request at all, and the only
+ * question the duty roster is asked on a surface they can reach
+ * (components/views/operations/DashboardView QuickRequestForm and
+ * components/modals/CreateRequestModal). It exists so a caller with no roster
+ * entitlement can be told yes/no without being handed the personnel list.
+ *
+ * A BOOLEAN, not a count, on purpose. Neither customer-facing consumer renders a
+ * number, and once the bundle stops carrying the roster (Phase 3 item 3) a count
+ * would hand an external customer something they cannot get today: a live, pollable
+ * reading of the org's staffing level, refreshed on every duty flip. The staff
+ * surfaces that DO render a number (DashboardMetrics, DutyRosterView, AdminPanelView)
+ * derive it from the roster they still hold.
+ *
+ * ONE definition, called from getMainState, the users_presence subset and the
+ * users_slice subset, so the page-load answer and the live answer can never disagree.
+ *
+ * "Staff" = everyone except the Client SYSTEM ROLE, keyed on role_id and NOT on the
+ * inferred role tier: inferUserRoleTier (lib/db/mappers.ts) resolves the tier from the
+ * role's NAME and falls through to UserRole.Client for anything unrecognised, so a
+ * tier-based probe would silently ignore on-duty members holding a custom role and
+ * could answer "nobody" while the org is fully crewed — blocking every customer's
+ * only flow.
+ *
+ * NULL-INCLUSIVE role filter, deliberately. `.neq('role_id', id)` is PostgREST
+ * `role_id <> $1`, which is NULL for a NULL left side, so the row is FILTERED OUT —
+ * an on-duty user with a NULL role_id would read as not-on-duty. That is the
+ * UNDER-count this whole fail-direction block forbids. users.role_id is NOT NULL only
+ * on FRESH installs: schema.sql's NOT NULL lives in a CREATE TABLE IF NOT EXISTS body
+ * (a no-op on an existing table) and there is no guarded ALTER ... SET NOT NULL, which
+ * is exactly why lib/db/system.ts repairs `.is('role_id', null)` rows and counts them
+ * as "Users Missing Role — Repairable". Counting a NULL-role row is an over-count:
+ * the documented, accepted degradation.
+ *
+ * FAIL DIRECTION, three cases, deliberately different:
+ *  - probe faults (query error, or getSystemRoles throws) -> **null**, meaning
+ *    "unknown". NOT false. A read error must never read as "nobody is on duty". The
+ *    client keeps its last known answer; on a first load it has none and its initial
+ *    null denies the form while telling the truth about why.
+ *  - Client system role unresolvable -> answer WITHOUT the exclusion and warn. The
+ *    real trigger is ANY transient roles-table read fault, not just a mid-seed org:
+ *    loadSystemRoles (lib/db/common.ts) destructures only `data` on both queries and
+ *    never checks `error`, so a plain DB blip yields four undefined slots,
+ *    slotsComplete refuses to cache it, and the unfiltered query re-runs on every duty
+ *    flip for the outage window. Over-counting degrades UX (a request raised into a
+ *    quiet room); answering "nobody" because a role lookup hiccuped kills the org's
+ *    entire customer flow.
+ *  - never THROWS. This runs inside getMainState's Promise.all; a flaky availability
+ *    probe must not take down the whole boot payload.
+ */
+export async function isAnyStaffOnDuty(): Promise<boolean | null> {
+    try {
+        const sysRoles = await getSystemRoles();
+        let q = supabase
+            .from('users')
+            .select('id')          // explicit column — never a wildcard (wildcardSelectRatchet)
+            .is('deleted_at', null)
+            .eq('is_duty', true)
+            .limit(1);             // existence probe: one row is the whole answer
+        const clientRoleId = sysRoles?.client?.id;
+        if (clientRoleId != null) q = q.or(`role_id.is.null,role_id.neq.${clientRoleId}`);
+        else log.warn('staff-on-duty probe: Client system role unresolved, customers may be counted as available');
+        const { data, error } = await q;
+        if (error) {
+            log.warn('staff-on-duty availability probe failed', { err: error });
+            return null;
+        }
+        return (data?.length ?? 0) > 0;
+    } catch (err) {
+        log.warn('staff-on-duty availability probe threw', { err });
+        return null;
+    }
 }
 
 /**
@@ -1253,8 +1672,15 @@ export async function toggleUserDutyStatus(userId: number) {
             );
     }
 
-    // Broadcast update to bypass RLS latency/restrictions
-    broadcastToOrg('duty_update', { userId, status: newStatus });
+    // Broadcast update to bypass RLS latency/restrictions.
+    // Rule 4: ids only, never content. `status` was a per-user state VALUE on the wire
+    // with no reader — the sole consumer (contexts/DataCoreContext.tsx duty_update)
+    // destructures nothing and refetches the permission-gated users_presence subset for
+    // the answer. It leaked user X's duty state to every base-channel receiver with no
+    // permission gate. The sibling emitter in cleanupInactiveDutyUsers keeps
+    // `{ cleanup: true }`: that is a SWEEP DISCRIMINATOR naming which event happened,
+    // not a per-user state value, which is why it may stay while `status` must go.
+    broadcastToOrg('duty_update', { userId });
 }
 
 export async function updateUserHeartbeat(userId: number) {
@@ -1391,6 +1817,14 @@ export async function cleanupInactiveDutyUsers() {
 }
 
 export async function initiateRsiHandleUpdate(userId: number, newHandle: string) {
+    // rsi_handle_pending is promoted to rsi_handle by verifyRsiUpdate and feeds two
+    // .ilike() identity lookups on the way, so a value like '%' is a wildcard rather
+    // than a name. escapeLikePattern contains it at the query; this keeps it out of
+    // the column in the first place.
+    if (!isValidRsiHandle(newHandle)) {
+        throw new Error('That is not a valid RSI handle. Handles are letters, numbers, underscores and hyphens.');
+    }
+
     // High-entropy, server-issued code. It must be hard to guess and unlikely to
     // already appear on a profile, so "the code is on the page" really proves the
     // caller controls that bio. (Was a short Math.random string before.)
@@ -1590,6 +2024,23 @@ export async function promoteUserToMember(userId: number) {
         ;
     handleSupabaseError({ error, message: 'Failed to promote user' });
 
+    // Tell the promoted user's own browser. This function had NO broadcast while every
+    // sibling role-writing path (updateUser, the bulk promote/demote pair,
+    // bulkUpdateUserClearances) has one — so the promotion that matters most emitted
+    // nothing. Reached from admin:promote_user (the Clients tab, api/actions/admin.ts)
+    // and from HR application approval (lib/db/hr.ts), i.e. it is the normal way a
+    // Client becomes a Member.
+    //
+    // Load-bearing from Phase 3 item 3 onward: a non-staff caller is no longer sent a
+    // roster, so SessionContext's roster reconcile cannot fire for them and this is the
+    // ONLY thing that refreshes their role, permissions and nav — and the only trigger
+    // for the staff-transition rehydrate that refills their now-empty member pickers.
+    // Id-only payload, per the realtime contract: the recipient fetches the row back
+    // through the permission-gated user_detail path.
+    //
+    // MUST sit after handleSupabaseError, so a failed write throws before any broadcast.
+    await broadcastUserUpdate(userId);
+
     // Bi-directional Discord sync
     if (oldRoleId !== memberRoleId) {
         pushDiscordRolesForUser(userId, {
@@ -1602,7 +2053,13 @@ export async function promoteUserToMember(userId: number) {
 // Cooldown duration for user-initiated sync (1 hour)
 const SYNC_COOLDOWN_MS = 60 * 60 * 1000;
 
-export async function syncUserRoles(userId: number, options?: { bypassCooldown?: boolean }) {
+/** The one return value that means "this call reached the write". The bulk caller
+ *  keys its aggregate broadcast off it, so it is a named constant rather than a
+ *  literal repeated in two places. Its VALUE is operator-facing (it surfaces in the
+ *  sync toast) — change the value only deliberately. */
+const SYNC_OK = 'Identity & Roles Synced';
+
+export async function syncUserRoles(userId: number, options?: { bypassCooldown?: boolean; suppressBroadcast?: boolean }) {
     const { data: user, error: fetchError } = await supabase.from('users').select('discord_id, role_id, discord_synced_at').eq('id', userId).single();
     handleSupabaseError({ error: fetchError, message: 'Failed to fetch user for sync' });
     if (!user) throw new Error("User not found");
@@ -1623,12 +2080,36 @@ export async function syncUserRoles(userId: number, options?: { bypassCooldown?:
     const { data: mappings, error: mappingError } = await mappingQuery;
     handleSupabaseError({ error: mappingError, message: 'Failed to fetch rank mappings' });
 
+    // Discord→platform-role mappings onto the Client or Admin system role are never
+    // applied. admin:update_rank_mapping refuses to WRITE one (assertRoleIsMappable),
+    // but a row that predates that guard — or that arrives through an org import,
+    // which carries rank_mappings verbatim — would otherwise stay a live standing
+    // grant: this sync is reachable by the target themselves (user:sync_roles) and
+    // the tier gate below promotes on any upgrade. Guarding only the write and
+    // grandfathering the rows is the combination that leaves the hole open.
+    //
+    // Fail CLOSED: if the system roles cannot be resolved, apply NO role mapping at
+    // all (rank mappings are unaffected — they grant no authority).
+    const sysRolesForMapping = await getSystemRoles();
+    const unmappableClientId = sysRolesForMapping.client?.id;
+    const unmappableAdminId = sysRolesForMapping.admin?.id;
+    const rolesResolved = unmappableClientId !== undefined && unmappableAdminId !== undefined;
+    const isMappableRole = (roleId: number): boolean =>
+        rolesResolved && roleId !== unmappableClientId && roleId !== unmappableAdminId;
+
     const rankMappingDict: Record<string, number> = {};
     const roleMappingDict: Record<string, number> = {};
+    let ignoredRoleMappings = 0;
     (mappings || []).forEach((curr: Tables<'rank_mappings'>) => {
         if (curr.rank_id) rankMappingDict[curr.discord_role_id] = curr.rank_id;
-        if (curr.role_id) roleMappingDict[curr.discord_role_id] = curr.role_id;
+        if (curr.role_id) {
+            if (isMappableRole(curr.role_id)) roleMappingDict[curr.discord_role_id] = curr.role_id;
+            else ignoredRoleMappings++;
+        }
     });
+    if (ignoredRoleMappings > 0) {
+        log.warn('sync ignoring unmappable discord role mappings', { count: ignoredRoleMappings, rolesResolved });
+    }
 
     let foundRankId = null;
     let foundRoleId = null;
@@ -1724,6 +2205,57 @@ export async function syncUserRoles(userId: number, options?: { bypassCooldown?:
     const { error: updateError } = await supabase.from('users').update(updates).eq('id', userId);
     handleSupabaseError({ error: updateError, message: 'Failed to update synced user' });
 
+    // ROUTE F (Phase 3 wave 3, owner-approved). This was the ONE user-writing path in
+    // this file with no emit. Its seven single-user siblings all have one — createUser,
+    // updateUser, updateUserClearance, deleteUser, revokeUserSessions,
+    // promoteUserToMember (all via broadcastUserUpdate) and _toggleClientFlag (a direct
+    // broadcastToOrg) — and this path writes role_id, rank_id, name and avatar_url.
+    // Reachable from user:sync_roles (self), admin:sync_user_roles (an admin syncing
+    // someone else) and admin:sync_all_member_roles. Without the emit, a sync left BOTH
+    // the stale-promotion and the stale-demotion window open on every connected browser
+    // until a hard reload — and since Phase 3 item 3 a non-staff caller holds no roster,
+    // so a promoted Client's own session had no other carrier for their new role,
+    // permissions or nav at all.
+    //
+    // ID-ONLY PAYLOAD, per CLAUDE.md rule 4: the receiver fetches the row back through
+    // the permission-gated users_slice / user_detail paths.
+    //
+    // MUST sit after handleSupabaseError, so a failed write emits nothing — the same
+    // ordering rule stated at promoteUserToMember above and pinned there by
+    // tests/userUpdateBroadcasts.test.ts.
+    //
+    // BULK CALLER — RESOLVED by the owner 2026-09-03, after wave 3 landed the per-user
+    // emit as first written and correctly escalated instead of patching around it.
+    // syncAllMemberRoles (below) loops this function with `{ bypassCooldown: true }` over
+    // every live user, so the emit as first written issued N separate broadcasts for an
+    // N-member org, bounded not by SYNC_COOLDOWN_MS (1 hour — that bound holds only for
+    // the two single-user entry points, user:sync_roles and admin:sync_user_roles) but by
+    // BULK_SYNC_COOLDOWN_MS (15 minutes) at the bulk gate. That contradicted this file's
+    // own convention, stated above bulkPromoteUsersToMember and pinned by
+    // tests/userUpdateBroadcasts.test.ts: one aggregate emit at the end, not one per user.
+    //
+    // The owner's ruling is AGGREGATE. The bulk path now passes `suppressBroadcast` and
+    // emits a single `{ bulk: true, count, userIds }` frame after the loop — the same
+    // shape the five other bulk paths in this file use. The single-user paths are
+    // unchanged and still emit here.
+    //
+    // So: `suppressBroadcast` is set by exactly ONE caller and exists for exactly that
+    // reason. Do not set it anywhere else to quieten a noisy path — a write that reaches
+    // no receiver is the stale-roster bug Route F was opened to close.
+    //
+    // GUARDED ON `updates` BEING NON-EMPTY, exactly as the owner decision is written.
+    // Stated plainly so the guard is neither mistaken for dead code nor "tidied" into
+    // something narrower: `discord_synced_at` is stamped unconditionally three lines
+    // above, and `name`/`avatar_url` whenever the Discord member carries a user object,
+    // so at this point the object always has at least one key. It is kept as written
+    // because it is the right SHAPE — if the timestamp stamp ever becomes conditional the
+    // broadcast narrows with it automatically. Hoisting the test above the stamp, or
+    // narrowing it to specific columns, CHANGES the decision and needs the owner; it is
+    // not a refactor.
+    if (Object.keys(updates).length > 0 && !options?.suppressBroadcast) {
+        await broadcastUserUpdate(userId);
+    }
+
     // avatar_refreshed_at lives on user_presence — written separately so it
     // does not end up on the realtime-published users row.
     if (discordMember.user) {
@@ -1732,7 +2264,7 @@ export async function syncUserRoles(userId: number, options?: { bypassCooldown?:
             .eq('user_id', userId);
     }
 
-    return "Identity & Roles Synced";
+    return SYNC_OK;
 }
 
 // In-memory cooldown for admin bulk sync per org (15 min)
@@ -1760,14 +2292,27 @@ export async function syncAllMemberRoles() {
         log.error('fetch users for sync failed', { err: fetchError });
         return;
     }
+    // ONE aggregate emit, not N — owner ruling 2026-09-03, and the convention this file
+    // already states above bulkPromoteUsersToMember. `suppressBroadcast` silences the
+    // per-user frame inside syncUserRoles; the single `{ bulk: true }` frame below carries
+    // the whole set. Only the ids that actually reached the write are collected: a user on
+    // cooldown, one missing from the Discord guild, or one whose sync threw contributes
+    // nothing, so a receiver never refetches a row this run did not touch.
+    const syncedIds: number[] = [];
     if (users) {
         for (const u of users) {
             try {
-                await syncUserRoles(u.id, { bypassCooldown: true });
+                const result = await syncUserRoles(u.id, { bypassCooldown: true, suppressBroadcast: true });
+                if (result === SYNC_OK) syncedIds.push(u.id);
             } catch (err) {
                 log.error('sync user failed', { userId: u.id, err });
             }
         }
+    }
+    // Emit only when something actually changed. An all-cooldown or all-failed run is a
+    // no-op and must not nudge every connected browser into a users_slice refetch.
+    if (syncedIds.length > 0) {
+        await broadcastToOrg('user_update', { bulk: true, count: syncedIds.length, userIds: syncedIds });
     }
 }
 

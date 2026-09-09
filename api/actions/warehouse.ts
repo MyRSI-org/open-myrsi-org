@@ -125,6 +125,13 @@ interface AdjustStockPayload extends ActorScopedPayload {
     notes?: string | null;
 }
 
+interface SetStockTotalPayload extends ActorScopedPayload {
+    stockId: number;
+    targetTotal: number;
+    reason: WarehouseMovementReason;
+    notes?: string | null;
+}
+
 interface TransferStockPayload extends ActorScopedPayload {
     fromStockId: number;
     toStockId: number;
@@ -134,7 +141,7 @@ interface TransferStockPayload extends ActorScopedPayload {
 
 // --- MOVEMENTS ---
 
-interface ListMovementsPayload {
+interface ListMovementsPayload extends ActorScopedPayload {
     stockId?: number;
     reason?: WarehouseMovementReason;
     actorUserId?: number;
@@ -264,14 +271,30 @@ export const warehouseActions = {
         return { movementId };
     },
 
+    // Absolute set-total. movementId is null when the row was already at the target —
+    // that is a successful no-op, not a failure. See db.setWarehouseStockTotal.
+    'warehouse:set_stock_total': async ({ userId, stockId, targetTotal, reason, notes }: SetStockTotalPayload) => {
+        const movementId = await db.setWarehouseStockTotal(stockId, targetTotal, reason, userId, notes);
+        return { movementId };
+    },
+
     'warehouse:transfer_stock': async ({ userId, fromStockId, toStockId, quantity, notes }: TransferStockPayload) => {
         const movementId = await db.transferWarehouseStock(fromStockId, toStockId, quantity, userId, notes);
         return { movementId };
     },
 
     // --- MOVEMENTS ---
-    'warehouse:list_movements': async ({ stockId, reason, actorUserId, sinceIso, untilIso, limit, offset }: ListMovementsPayload) =>
-        db.listWarehouseMovements({ stockId, reason, actorUserId, sinceIso, untilIso, limit, offset }),
+    'warehouse:list_movements': async ({ userId, stockId, reason, actorUserId, sinceIso, untilIso, limit, offset }: ListMovementsPayload) => {
+        // Cross-module gate. warehouse: and marketplace: toggle independently
+        // (OPTIONAL_FEATURE_NAMESPACES), so an org running the warehouse with the
+        // marketplace switched OFF must not receive contract-linked fields through a
+        // warehouse action. Withholding the viewer id withholds all of them.
+        const marketplaceOn = await db.isOptionalFeatureEnabled('marketplace');
+        return db.listWarehouseMovements(
+            { stockId, reason, actorUserId, sinceIso, untilIso, limit, offset },
+            marketplaceOn ? userId : undefined,
+        );
+    },
 
     'warehouse:export_csv': async ({ offset, limit }: PaginatedExportPayload) =>
         db.exportWarehouseCsv({

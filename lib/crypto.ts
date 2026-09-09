@@ -9,18 +9,103 @@ const ENCRYPTED_PREFIX = 'enc:';
 const IV_LENGTH = 16;
 const AUTH_TAG_LENGTH = 16;
 
+/** BAKED INTO EVERY EXISTING CIPHERTEXT. Changing it makes every stored secret on every
+ *  existing deployment permanently unreadable. Never change it. */
+const SCRYPT_SALT = 'myrsi-org-secrets';
+
 /**
- * Derive a 32-byte key from the env secret using scrypt.
- * Cached per process to avoid repeated key derivation.
+ * Derive a 32-byte key from a raw env secret using scrypt.
+ * Cached per RAW STRING (not a single slot) so the current and previous keys can coexist
+ * during a rotation, and so a test that mutates the env var is not served a stale key.
  */
-let derivedKey: Buffer | null = null;
+const keyCache = new Map<string, Buffer>();
+function deriveKey(raw: string): Buffer {
+    const hit = keyCache.get(raw);
+    if (hit) return hit;
+    const k = scryptSync(raw, SCRYPT_SALT, 32);
+    keyCache.set(raw, k);
+    return k;
+}
+
+/**
+ * The ENCRYPT key. Reads SECRETS_ENCRYPTION_KEY directly and is deliberately NOT "the first
+ * entry of the decrypt ring": if it were, then with only SECRETS_ENCRYPTION_KEY_PREVIOUS set
+ * the retired key would silently become the encrypt key. A decrypt-only key must never become
+ * an encrypt key — that is what keeps encryptSecret fail-closed.
+ */
 function getKey(): Buffer | null {
-    if (derivedKey) return derivedKey;
     const raw = process.env.SECRETS_ENCRYPTION_KEY;
-    if (!raw) return null;
-    // Use a fixed salt derived from the key itself (deterministic, no extra storage)
-    derivedKey = scryptSync(raw, 'myrsi-org-secrets', 32);
-    return derivedKey;
+    return raw ? deriveKey(raw) : null;
+}
+
+/** Is a previous (decrypt-only) key configured? Single source of truth — callers outside this
+ *  module must not read the env var themselves, or the ring and the health report can disagree
+ *  (notably on the empty-string value a copied .env.example produces). */
+export function hasPreviousKey(): boolean {
+    return !!process.env.SECRETS_ENCRYPTION_KEY_PREVIOUS;
+}
+
+/**
+ * The DECRYPT ring, current key first, each entry tagged with whether it is the current one.
+ * Tagged rather than positional so `underCurrentKey` cannot silently mean "index 0" in a state
+ * where index 0 is the previous key.
+ *
+ * Trial decryption is unambiguous here: AES-GCM's auth tag makes a wrong key fail `final()`
+ * with probability 1 - 2^-128, so no key identifier is needed in the envelope — which is why
+ * rotation requires no ciphertext format change and stays readable by an older build.
+ */
+function getKeyring(): Array<{ key: Buffer; isCurrent: boolean }> {
+    const cur = process.env.SECRETS_ENCRYPTION_KEY;
+    const prev = process.env.SECRETS_ENCRYPTION_KEY_PREVIOUS;
+    const ring: Array<{ key: Buffer; isCurrent: boolean }> = [];
+    if (cur) ring.push({ key: deriveKey(cur), isCurrent: true });
+    // Identical values are ONE key, not two — an operator who sets both to the same string
+    // should not get a ring that reports rotation as pending forever.
+    if (prev && prev !== cur) ring.push({ key: deriveKey(prev), isCurrent: false });
+    return ring;
+}
+
+export type DecryptProbe =
+    | { ok: true; plaintext: string; underCurrentKey: boolean }
+    | { ok: false; reason: 'no_key' | 'undecryptable' };
+
+/**
+ * Decrypt against every configured key. NEVER throws — including on a non-string input, which
+ * the rotation pass can hand it because it walks raw jsonb values rather than pre-guarded
+ * strings. Returns the plaintext, so it is reachable only from the rotation pass; anything that
+ * only needs to know WHICH key a value is under must use probeSecretKeyState instead.
+ */
+export function tryDecryptSecret(value: string): DecryptProbe {
+    if (typeof value !== 'string' || !value) return { ok: true, plaintext: value, underCurrentKey: true };
+    if (!value.startsWith(ENCRYPTED_PREFIX)) return { ok: true, plaintext: value, underCurrentKey: true };
+    const ring = getKeyring();
+    if (ring.length === 0) return { ok: false, reason: 'no_key' };
+    const payload = value.slice(ENCRYPTED_PREFIX.length);
+    const [ivB64, tagB64, dataB64] = payload.split(':');
+    for (const entry of ring) {
+        try {
+            const decipher = createDecipheriv(ALGORITHM, entry.key, Buffer.from(ivB64, 'base64'), { authTagLength: AUTH_TAG_LENGTH });
+            decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+            const out = Buffer.concat([decipher.update(Buffer.from(dataB64, 'base64')), decipher.final()]);
+            return { ok: true, plaintext: out.toString('utf8'), underCurrentKey: entry.isCurrent };
+        } catch { /* wrong key — the auth tag says so; try the next one */ }
+    }
+    return { ok: false, reason: 'undecryptable' };
+}
+
+export type SecretKeyState = 'plaintext' | 'current' | 'previous' | 'undecryptable' | 'no_key';
+
+/**
+ * Which key is a stored value under? Discards the decrypted bytes immediately and returns only
+ * the discriminator, so the health check can report rotation progress without ever
+ * materialising a live credential — a read path that has never pulled secrets into memory and
+ * must not start.
+ */
+export function probeSecretKeyState(value: unknown): SecretKeyState {
+    if (typeof value !== 'string' || !value || !value.startsWith(ENCRYPTED_PREFIX)) return 'plaintext';
+    const probe = tryDecryptSecret(value);
+    if (!probe.ok) return probe.reason === 'no_key' ? 'no_key' : 'undecryptable';
+    return probe.underCurrentKey ? 'current' : 'previous';
 }
 
 /**
@@ -55,31 +140,21 @@ export function decryptSecret(value: string): string {
     if (!value) return value;
     if (!value.startsWith(ENCRYPTED_PREFIX)) return value; // Plaintext passthrough
 
-    const key = getKey();
-    if (!key) {
+    const probe = tryDecryptSecret(value);
+    if (probe.ok) return probe.plaintext;
+
+    if (probe.reason === 'no_key') {
         log.warn('encrypted value found but SECRETS_ENCRYPTION_KEY is not set, returning raw value');
         return value;
     }
 
-    try {
-        const payload = value.slice(ENCRYPTED_PREFIX.length);
-        const [ivB64, tagB64, dataB64] = payload.split(':');
-        const iv = Buffer.from(ivB64, 'base64');
-        const authTag = Buffer.from(tagB64, 'base64');
-        const encrypted = Buffer.from(dataB64, 'base64');
-
-        const decipher = createDecipheriv(ALGORITHM, key, iv);
-        decipher.setAuthTag(authTag);
-        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-        return decrypted.toString('utf8');
-    } catch (e: any) {
-        // Throw rather than returning ciphertext — silent fallback would hand the
-        // encrypted blob to downstream callers (Discord API, LiveKit, etc.) where it
-        // fails in a confusing way far from the root cause. Most common cause: a
-        // SECRETS_ENCRYPTION_KEY mismatch against the value written at encrypt time.
-        log.error('decryption failed', { err: e });
-        throw new Error('Failed to decrypt stored secret (key mismatch or corrupted ciphertext).', { cause: e });
-    }
+    // Throw rather than returning ciphertext — silent fallback would hand the encrypted blob
+    // to downstream callers (Discord API, LiveKit, etc.) where it fails in a confusing way far
+    // from the root cause. It is also what stops a read-decrypt-merge-encrypt write path
+    // persisting an empty string over a live credential. Most common cause: the key was
+    // changed without carrying the old one across.
+    log.error('decryption failed under every configured key');
+    throw new Error('Failed to decrypt stored secret (key mismatch or corrupted ciphertext). If you changed SECRETS_ENCRYPTION_KEY, set SECRETS_ENCRYPTION_KEY_PREVIOUS to the old value and restart.');
 }
 
 // maskSecret / maskConfigSecrets were removed — they had no callers. Settings sent
@@ -87,7 +162,15 @@ export function decryptSecret(value: string): string {
 // presence flags only. Don't add a decrypt-then-mask path that would pull live
 // credentials into a response.
 
-/** List of sensitive field names within config JSONB objects */
+/** List of sensitive field names within config JSONB objects.
+ *
+ *  CAUTION for anything that iterates this table generically (e.g. the rotation pass):
+ *  `aiConfig` is DECLARED BUT DEAD. encryptConfigSecrets/decryptConfigSecrets are only ever
+ *  called with 'discordConfig' and 'radioConfig'; updateAIConfig stores the Gemini key in its
+ *  own row instead, and lib/secrets.ts reads aiConfig.apiKey WITHOUT decrypting. So nothing
+ *  writes it encrypted, and anything that "helpfully" encrypts it would start handing a raw
+ *  `enc:…` blob to the Gemini API. Never opportunistically encrypt a value found here —
+ *  re-encrypt only what already carries the `enc:` prefix. */
 export const SENSITIVE_FIELDS: Record<string, string[]> = {
     discordConfig: ['clientSecret', 'botToken'],
     radioConfig: ['apiKey', 'apiSecret'],

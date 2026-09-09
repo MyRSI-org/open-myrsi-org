@@ -1,5 +1,5 @@
 import * as db from '../../lib/db.js';
-import { sendPushToPermission, sendPushToUsers } from '../../lib/push.js';
+import { sendPushToPermission } from '../../lib/push.js';
 import { log as baseLog } from '../../lib/log.js';
 import type {
     LedgerEntryType,
@@ -165,12 +165,15 @@ export const financesActions = {
         if (ok) {
             const entry = await db.getLedgerEntry(entryId);
             if (entry && entry.createdByUserId !== userId) {
-                sendPushToUsers([entry.createdByUserId], {
+                // The amount stays: this is the recipient's OWN transaction, and the
+                // durable row is the record they came for.
+                await db.createNotification(entry.createdByUserId, {
+                    type: 'finance_confirmed',
                     title: 'Your entry was confirmed',
                     body: `${entry.entryType === 'deposit' ? 'Deposit' : 'Withdrawal'} of ${Math.abs(entry.amount).toLocaleString()} aUEC confirmed.`,
-                    tag: `finance-confirmed-${entryId}`,
-                    data: { view: 'finances', tab: 'ledger', entryId },
-                }).catch((err) => log.warn('approve push failed', { entryId, err }));
+                    link: 'finances',
+                    metadata: { entryId },
+                }).catch((err) => log.warn('approve notify failed', { entryId, err }));
             }
         }
         return { applied: ok };
@@ -181,12 +184,18 @@ export const financesActions = {
         if (ok) {
             const entry = await db.getLedgerEntry(entryId);
             if (entry && entry.createdByUserId !== userId) {
-                sendPushToUsers([entry.createdByUserId], {
+                // THE REASON IS DROPPED, deliberately. It is officer-authored free text
+                // about a member's finances, and it was riding into an OS notification tray
+                // — a surface with no permission gate, that renders on a lock screen, and
+                // that the durable row would now make permanent. The submitter reads it
+                // in-app on the permission-gated ledger, which is where it belongs.
+                await db.createNotification(entry.createdByUserId, {
+                    type: 'finance_rejected',
                     title: 'Your entry was rejected',
-                    body: reason?.slice(0, 100) || 'See the ledger for details.',
-                    tag: `finance-rejected-${entryId}`,
-                    data: { view: 'finances', tab: 'ledger', entryId },
-                }).catch((err) => log.warn('reject push failed', { entryId, err }));
+                    body: 'Your submitted entry was rejected — open the ledger for details.',
+                    link: 'finances',
+                    metadata: { entryId },
+                }).catch((err) => log.warn('reject notify failed', { entryId, err }));
             }
         }
         return { applied: ok };

@@ -74,9 +74,10 @@ describe('admin:access tier does NOT grant the Admin PII bypass', () => {
         expect(out.clearanceLevel).toBeUndefined();
     });
 
-    // A genuine Admin holds the full permission set — the full bypass is preserved.
-    it('preserves the full unstripped record for a genuine apex Admin (all perms)', () => {
-        const admin = { id: 1, role: 'Admin', permissions: ALL_APEX };
+    // A genuine Admin is the STAMPED system Admin role holding the full apex set.
+    // The `role` string is present but is not what admits it — the next test proves it.
+    it('preserves the full unstripped record for a genuine apex Admin (identity + all perms)', () => {
+        const admin = { id: 1, role: 'Admin', isSystemAdmin: true, permissions: ALL_APEX };
         const out = stripSensitiveUserFields(sensitiveTarget(), admin);
         expect(out.adminNotes).toBe('flagged in review');
         expect(out.personnelNotes).toBe('sealed personnel note');
@@ -87,14 +88,32 @@ describe('admin:access tier does NOT grant the Admin PII bypass', () => {
         expect(out.clearanceLevel).toBeTruthy();
     });
 
-    // Legacy contract guard: an Admin tier with no admin:access signal (e.g. the
-    // existing rosterCapabilityMinimization test's `{role:'Admin', permissions:[]}`)
-    // is not treated as forged and keeps the full view.
-    it('preserves the legacy Admin-tier bypass when admin:access is absent', () => {
+    // ROLE NAME IS NOT AUTHORITY. `role` is inferred from the role row's free-text
+    // name (lib/db/mappers.ts) and roles.name is operator-supplied under a
+    // CASE-SENSITIVE unique constraint, so a permissionless custom role called
+    // 'Commander' — or literally 'admin' — reached the full-record bypass here and
+    // read every member's notes/clearance/markers off the auth-only `main` subset.
+    // The admin:access defusal could not see it: no permissions at all.
+    it('strips everything for a forged Admin role NAME with no permissions and no stamped identity', () => {
         const out = stripSensitiveUserFields(sensitiveTarget(), { id: 1, role: 'Admin', permissions: [] });
-        expect(out.adminNotes).toBe('flagged in review');
-        expect(out.permissions).toEqual(['operations:create', 'intel:view']);
-        expect(out.clearanceLevel).toBeTruthy();
+        expect(out.adminNotes).toBeUndefined();
+        expect(out.personnelNotes).toBeUndefined();
+        expect(out.conductRecord).toEqual([]);
+        expect(out.limitingMarkers).toEqual([]);
+        expect(out.discordId).toBe('');
+        expect(out.permissions).toEqual([]);
+        expect(out.clearanceLevel).toBeUndefined();
+    });
+
+    // The admin:access defusal is RETAINED and still load-bearing after the identity
+    // swap: a hand-pruned Admin ROLE (real id, apex perms revoked) must not get the
+    // full record either. Deleting the defusal is the one change here that would widen.
+    it('withholds the full record from the stamped Admin role when its apex perms were pruned', () => {
+        const pruned = { id: 1, role: 'Admin', isSystemAdmin: true, permissions: ['admin:access'] };
+        const out = stripSensitiveUserFields(sensitiveTarget(), pruned);
+        expect(out.adminNotes).toBeUndefined();
+        expect(out.personnelNotes).toBeUndefined();
+        expect(out.discordId).toBe('');
     });
 
     // An admin:access role that ALSO holds explicit management perms still sees exactly
@@ -102,10 +121,12 @@ describe('admin:access tier does NOT grant the Admin PII bypass', () => {
     it('grants exactly the fields an admin:access role\'s explicit perms allow (no more)', () => {
         const viewer = { id: 7, role: 'Admin', permissions: ['admin:access', 'admin:user:update'] };
         const out = stripSensitiveUserFields(sensitiveTarget(), viewer);
-        // admin:user:update grants adminNotes + roster capability (permissions/clearance)
-        // + HR metadata, but NOT personnel notes / conduct / limiting markers / discordId.
+        // admin:user:update grants adminNotes, clearanceLevel (it is in
+        // CLEARANCE_VISIBLE_PERMS) and HR metadata — but NOT personnel notes / conduct /
+        // limiting markers / discordId, and NOT another member's permissions[], which is
+        // self-only now that no permission restores it.
         expect(out.adminNotes).toBe('flagged in review');
-        expect(out.permissions).toEqual(['operations:create', 'intel:view']);
+        expect(out.permissions).toEqual([]);
         expect(out.clearanceLevel).toBeTruthy();
         expect(out.personnelNotes).toBeUndefined();
         expect(out.conductRecord).toEqual([]);

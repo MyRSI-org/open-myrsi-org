@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import type { QmInventoryItem, QmMovementReason } from '../../../types';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { MAX_STOCK_TOTAL } from '../../../lib/stockLimits';
 
 type AdjustReasonKey = 'restock' | 'adjust' | 'loss' | 'destruction';
 
@@ -113,33 +114,62 @@ export default function AdjustStockDialog({ isOpen, inventory, onClose, onSubmit
     const itemName = inventory.catalog?.name || inventory.customName || 'Item';
     const locationName = inventory.location?.name || '—';
 
+    const targetTotal: number | null = (() => {
+        if (mode !== 'set') return null;
+        const n = parseInt(setTotalInput, 10);
+        return Number.isFinite(n) ? n : null;
+    })();
+
+    // In SET mode this is an ESTIMATE, for the preview line only — it is never submitted.
+    // `inventory` is a snapshot frozen when the dialog opened and re-synced by nothing, so
+    // (target - currentQty) is arithmetic on a possibly-stale number. The server recomputes
+    // the delta inside the transaction under the row lock (qm_set_inventory_total). Two
+    // managers each correcting 10 -> 8 used to both send -2, leaving the row on 6.
     const computedDelta: number | null = (() => {
         if (mode === 'delta') {
             const n = parseInt(deltaInput, 10);
             return Number.isFinite(n) ? n : null;
         }
-        const n = parseInt(setTotalInput, 10);
-        if (!Number.isFinite(n)) return null;
-        return n - currentQty;
+        return targetTotal == null ? null : targetTotal - currentQty;
     })();
 
-    const projectedTotal = computedDelta == null ? null : currentQty + computedDelta;
+    const projectedTotal = mode === 'set'
+        ? targetTotal
+        : (computedDelta == null ? null : currentQty + computedDelta);
 
     let validationError: string | null = null;
-    if (computedDelta == null) validationError = 'Enter a number.';
-    else if (computedDelta === 0) validationError = 'Delta must be non-zero.';
-    else if (reason.deltaSign === 'positive' && computedDelta < 0) validationError = 'Restock delta must be positive. Use "Adjust" or "Loss" to decrease.';
-    else if (reason.deltaSign === 'negative' && computedDelta > 0) validationError = `${reason.label} delta must be negative.`;
-    else if (projectedTotal != null && projectedTotal < 0) validationError = `Would take stock below zero (current ${currentQty}).`;
-    else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    if (mode === 'set') {
+        // Deliberately NO sign check and NO zero check here. Both would have to judge
+        // computedDelta, which is derived from the stale snapshot — a client gate deciding
+        // submittability from an untrusted number is the very defect this change removes,
+        // pointed the other way. Concretely: snapshot says 10, real on-hand is 8, the
+        // manager types 8 — a zero check would refuse the one correction that is needed.
+        // The server owns both rules and its error names the real current total.
+        if (targetTotal == null) validationError = 'Enter a number.';
+        else if (targetTotal < 0) validationError = 'New total cannot be negative.';
+        else if (targetTotal > MAX_STOCK_TOTAL) validationError = `New total cannot exceed ${MAX_STOCK_TOTAL.toLocaleString()}.`;
+        else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    } else {
+        if (computedDelta == null) validationError = 'Enter a number.';
+        else if (computedDelta === 0) validationError = 'Delta must be non-zero.';
+        else if (reason.deltaSign === 'positive' && computedDelta < 0) validationError = 'Restock delta must be positive. Use "Adjust" or "Loss" to decrease.';
+        else if (reason.deltaSign === 'negative' && computedDelta > 0) validationError = `${reason.label} delta must be negative.`;
+        else if (projectedTotal != null && projectedTotal < 0) validationError = `Would take stock below zero (current ${currentQty}).`;
+        else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    }
 
     const handleSubmit = async () => {
-        if (validationError || computedDelta == null) return;
+        if (validationError) return;
+        if (mode === 'set' ? targetTotal == null : computedDelta == null) return;
 
         if (reason.destructive) {
             const confirmed = await confirm({
                 title: `Confirm ${reason.label}`,
-                message: `Record ${Math.abs(computedDelta)} ${itemName} as ${reason.label.toLowerCase()}? This is logged to the movement ledger and cannot be reverted directly — you'd need an opposite restock.`,
+                message: mode === 'set'
+                    // Never quotes a browser-computed quantity: in set mode we genuinely
+                    // do not know how many units this will move until the server runs.
+                    ? `Set ${itemName} to ${targetTotal} and record the difference as ${reason.label.toLowerCase()}? The exact quantity is computed server-side against the live total and logged to the movement ledger.`
+                    : `Record ${Math.abs(computedDelta!)} ${itemName} as ${reason.label.toLowerCase()}? This is logged to the movement ledger and cannot be reverted directly — you'd need an opposite restock.`,
                 confirmText: reason.label,
                 variant: 'danger',
             });
@@ -148,17 +178,28 @@ export default function AdjustStockDialog({ isOpen, inventory, onClose, onSubmit
 
         setSubmitting(true);
         try {
-            await rpcAction('qm:adjust_inventory', {
-                inventoryId: inventory.id,
-                delta: computedDelta,
-                reason: reason.serverReason,
-                notes: notes.trim() || undefined,
-            });
+            if (mode === 'set') {
+                await rpcAction('qm:set_inventory_total', {
+                    inventoryId: inventory.id,
+                    targetTotal,
+                    reason: reason.serverReason,
+                    notes: notes.trim() || undefined,
+                });
+            } else {
+                await rpcAction('qm:adjust_inventory', {
+                    inventoryId: inventory.id,
+                    delta: computedDelta,
+                    reason: reason.serverReason,
+                    notes: notes.trim() || undefined,
+                });
+            }
             addToast(
                 'Stock adjusted',
                 <i className="fa-solid fa-check" />,
                 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50',
-                { description: `${itemName}: ${currentQty} → ${projectedTotal}` }
+                // In set mode the old "${currentQty} → ${projectedTotal}" restated the
+                // stale snapshot as fact. The target is the only figure we actually know.
+                { description: mode === 'set' ? `${itemName}: set to ${targetTotal}` : `${itemName}: ${currentQty} → ${projectedTotal}` }
             );
             onSubmitted();
             onClose();
@@ -297,6 +338,11 @@ export default function AdjustStockDialog({ isOpen, inventory, onClose, onSubmit
                             <i className="fa-solid fa-arrow-right-arrow-left mr-2" />
                             <strong>{currentQty}</strong> → <strong>{projectedTotal}</strong>
                             <span className="text-emerald-400/70 ml-2">({computedDelta != null && computedDelta > 0 ? `+${computedDelta}` : computedDelta})</span>
+                            {mode === 'set' && (
+                                <span className="block mt-1 text-[10px] text-emerald-400/60">
+                                    Change estimated from the figure loaded above; the server applies the difference against the live total.
+                                </span>
+                            )}
                         </div>
                     )}
                     {validationError && (

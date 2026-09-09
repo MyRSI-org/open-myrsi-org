@@ -146,6 +146,7 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
     const [editStatus, setEditStatus] = useState<OperationStatus>(OperationStatus.Planning);
     const [editMaxParticipants, setEditMaxParticipants] = useState<number | ''>('');
     const [editScheduledStart, setEditScheduledStart] = useState('');
+    const [editStartNotice, setEditStartNotice] = useState(false);
     const [editScheduledEnd, setEditScheduledEnd] = useState('');
     const [editClearanceLevel, setEditClearanceLevel] = useState('0');
     const [editMarkers, setEditMarkers] = useState<Set<number>>(() => new Set());
@@ -182,6 +183,7 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
         setEditStatus(operation.status);
         setEditMaxParticipants(operation.maxParticipants || '');
         setEditScheduledStart(toLocalDatetimeValue(operation.scheduledStart));
+        setEditStartNotice(!!operation.discordStartNotice);
         setEditScheduledEnd(toLocalDatetimeValue(operation.scheduledEnd));
         setEditClearanceLevel(String(operation.clearanceLevel || 0));
         setEditMarkers(new Set(operation.limitingMarkers?.map(m => m.id) || []));
@@ -206,6 +208,7 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
                 status: editStatus !== operation.status ? editStatus : undefined,
                 maxParticipants: editMaxParticipants || null,
                 scheduledStart: editScheduledStart ? new Date(editScheduledStart).toISOString() : null,
+                discordStartNotice: editStartNotice,
                 scheduledEnd: editScheduledEnd ? new Date(editScheduledEnd).toISOString() : null,
                 clearanceLevel: parseInt(editClearanceLevel),
                 markerIds: Array.from(editMarkers),
@@ -343,6 +346,33 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
                                     <input type="datetime-local" value={editScheduledEnd} onChange={e => setEditScheduledEnd(e.target.value)} className={`${inputClass} scheme-light`} />
                                 </div>
                             </div>
+
+                            <label className="flex items-start gap-3 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={editStartNotice}
+                                    onChange={e => setEditStartNotice(e.target.checked)}
+                                    className="mt-0.5 h-4 w-4 rounded-sm border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500/40"
+                                />
+                                <span className="min-w-0">
+                                    <span className="block text-sm text-slate-200">Post a 15-minute warning to Discord</span>
+                                    <span className="block text-[11px] text-slate-500 leading-relaxed">
+                                        Posts a short &ldquo;starting soon&rdquo; notice — no reactions, no ping. Changing the
+                                        start time above re-arms it.
+                                        {!operation.discordAnnouncementChannelId && (
+                                            // The notice posts ONLY to the operation's own announcement
+                                            // channel and never falls back to an org default, so an
+                                            // operation that never announced has nowhere to post. The
+                                            // channel is set at CREATE time only — say so, rather than
+                                            // leaving the operator with a ticked box that does nothing.
+                                            <span className="block text-amber-400 mt-1">
+                                                This operation has no Discord announcement channel, so nothing will be
+                                                posted. The channel is chosen when the operation is created.
+                                            </span>
+                                        )}
+                                    </span>
+                                </span>
+                            </label>
                         </div>
 
                         <div className="border-t border-slate-700/30 pt-5 space-y-4">

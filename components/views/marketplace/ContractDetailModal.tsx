@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import type { MarketplaceContract, MarketplaceMilestone, MarketplaceRating } from '../../../types';
 import { Stars } from './marketplaceUi';
 import { CONTRACT_STATUS_META, fmtUec } from './marketplaceMeta';
+import { ConsiderationList } from './ConsiderationDisplay';
 import WindowFrame from '../../layout/WindowFrame';
 import { ReportModal } from './MarketplaceModals';
 
@@ -60,6 +61,16 @@ const ContractDetailModal: React.FC<{
         await loadExtras();
     };
 
+    const removeMilestone = async (m: MarketplaceMilestone) => {
+        await onAction('marketplace:delete_milestone', { milestoneId: m.id }, 'Milestone removed');
+        await loadExtras();
+    };
+
+    // Mirrors the server gate in db.deleteMarketplaceMilestone exactly: seller only, and
+    // only while the contract is still 'proposed' or 'accepted' ("milestones are locked
+    // once work is underway"). Client-side this is presentation — the server re-checks.
+    const canRemoveMilestones = amSeller && ['proposed', 'accepted'].includes(contract.status);
+
     const iRated = ratings.some((r) => r.raterId === meId);
     const stepIdx = STEP_INDEX[contract.status] ?? 0;
     const isCancelled = contract.status === 'cancelled';
@@ -100,6 +111,14 @@ const ContractDetailModal: React.FC<{
                     <span><i className="fa-solid fa-user mr-1 text-slate-500" aria-hidden />Buyer: {contract.buyer?.name || `#${contract.buyerId}`}</span>
                     {contract.warehouseStockId && <span className="text-cyan-400"><i className="fa-solid fa-boxes-stacked mr-1" aria-hidden />Warehouse-linked</span>}
                 </div>
+                {(contract.considerations?.length ?? 0) > 0 && (
+                    <div className="bg-slate-950/30 border border-slate-800/50 rounded-lg p-3 space-y-1">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Agreed terms</p>
+                        {/* Frozen at propose time and shown WITH the disclaimer, because this
+                            is where a party looks when a deal goes wrong. */}
+                        <ConsiderationList priceUec={null} considerations={contract.considerations} showDisclaimer />
+                    </div>
+                )}
                 {contract.termsNote && <p className="text-sm text-slate-300 bg-slate-950/30 border border-slate-800/50 rounded-lg p-3">{contract.termsNote}</p>}
 
                 {milestones.length > 0 && (
@@ -111,7 +130,13 @@ const ContractDetailModal: React.FC<{
                                     className={`w-5 h-5 rounded shrink-0 border flex items-center justify-center text-[10px] ${m.completedAt ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-slate-800 border-slate-600 text-transparent'} ${amSeller && !isCancelled ? 'hover:border-indigo-500 cursor-pointer' : 'cursor-default'}`}>
                                     <i className="fa-solid fa-check" aria-hidden />
                                 </button>
-                                <span className={`text-sm ${m.completedAt ? 'text-slate-500 line-through' : 'text-slate-200'}`}>{m.title}</span>
+                                <span className={`text-sm flex-1 ${m.completedAt ? 'text-slate-500 line-through' : 'text-slate-200'}`}>{m.title}</span>
+                                {canRemoveMilestones && (
+                                    <button onClick={() => removeMilestone(m)} aria-label={`Remove milestone ${m.title}`}
+                                        className="shrink-0 w-6 h-6 rounded flex items-center justify-center text-slate-500 hover:text-red-300 hover:bg-red-500/10 transition-colors">
+                                        <i className="fa-solid fa-xmark text-xs" aria-hidden />
+                                    </button>
+                                )}
                             </div>
                         ))}
                     </div>

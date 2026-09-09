@@ -19,6 +19,9 @@ import { getSupabase } from '../lib/supabaseClient';
 // Realtime broadcast handlers below log their (own-org) payloads for debugging.
 // Routed through the DEV-only logger so payloads never reach a prod DevTools console.
 import { debugLog } from '../lib/debugLog';
+import { permissionSatisfied } from '../lib/permissionImplications';
+import { mayReceiveRoster } from '../lib/rosterGate';
+import { makeSerialRunner } from '../lib/serialRunner';
 
 /** Options passed through callFetcher to the registered fetcher.
  *  `ids`/`id` carry the affected row id(s) parsed from a broadcast payload so
@@ -135,6 +138,48 @@ const FLEET_SLICE_SUBSETS: Record<string, string> = {
     groups: 'fleet_groups',
 };
 
+/**
+ * THE ONE RESYNC SET. Both recovery paths — the SUBSCRIBED "wasDisconnected" branch and the
+ * >30s tab-visibility handler — go through resyncHotSubsets(), so they cannot drift. They used
+ * to be two hand-written lists that happened to agree; agreeing by coincidence is how they
+ * stop agreeing.
+ *
+ * The permission gates here are a ROUND-TRIP SAVER, not a boundary: every subset below has a
+ * SUBSET_REQUIRED_PERMISSION entry in api/query.ts and 403s server-side regardless. A
+ * client-side filter is cosmetic (rule 2).
+ *
+ * Fetched NON-FORCE, deliberately, and it is load-bearing: DataContext's LAZY_DOMAINS gate
+ * ADDS a domain to loadedLazyDomains on a {force:true} fetch, so forcing a lazy subset here
+ * would permanently switch on off-screen hydration for a domain the user never opened —
+ * straight through rule 3. Non-force is dropped for an unopened lazy domain and runs for an
+ * opened one, which is exactly what is wanted with no extra logic.
+ *
+ * Module scope, not component scope: react-hooks/exhaustive-deps is an ERROR here and would
+ * demand a component-scope array in the dep list, where a fresh literal each render defeats
+ * the memo. Same placement as HR_SLICE_SUBSETS / FLEET_SLICE_SUBSETS above.
+ */
+const RESYNC_SUBSETS: ReadonlyArray<{ subset: string; perm: string | null; flag: 'warehouse' | 'governments' | null }> = [
+    { subset: 'main', perm: null, flag: null },
+    { subset: 'requests', perm: null, flag: null },
+    { subset: 'announcements', perm: null, flag: null },
+    // NOT in the realtime publication, so the broadcast nudge is its only live carrier — a
+    // nudge missed while disconnected is missed until the next reload. The clearest of the
+    // four gaps.
+    { subset: 'external_tools', perm: null, flag: null },
+    { subset: 'operations', perm: 'operations:view', flag: null },
+    // The other three always-hydrated domains the two recovery paths both missed.
+    { subset: 'warrants', perm: 'warrant:view', flag: null },
+    { subset: 'intel', perm: 'intel:view', flag: null },
+    { subset: 'hr', perm: 'hr:view', flag: null },
+    // Lazy domains: LAZY_DOMAINS drops these for a user who never opened the view, so listing
+    // them recovers exactly the ones on screen and costs nothing for the rest.
+    { subset: 'wiki', perm: 'wiki:view', flag: null },
+    { subset: 'fleet', perm: 'fleet:view', flag: null },
+    { subset: 'academy', perm: 'academy:view', flag: null },
+    { subset: 'warehouse', perm: 'warehouse:view', flag: 'warehouse' },
+    { subset: 'government', perm: 'gov:view', flag: 'governments' },
+];
+
 export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [realtimeConnected, setRealtimeConnected] = useState(false);
     const realtimeConnectedRef = useRef(false);
@@ -145,6 +190,17 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     // supabase.channel(name) returns the still-leaving prior channel reference
     // and the new .on()/.subscribe() are attached to a corpse.
     const currentChannelCleanupRef = useRef<(() => Promise<void>) | null>(null);
+
+    // Monotonic build id. A subscribe callback belonging to a superseded build must not write
+    // the shared connection refs — today that is safe only by accident of phoenix's hook
+    // ordering, which is exactly the kind of accidental correctness this removes.
+    const buildGenRef = useRef(0);
+    // Set while WE are tearing the channel down to rebuild it, so the next SUBSCRIBED is not
+    // mistaken for a reconnect and does not trigger a full resync.
+    const deliberateTeardownRef = useRef(false);
+    // Serializes every channel rebuild. useState lazy initializer rather than a ref written
+    // during render — same reasoning DataContext records for its `guards`.
+    const [rebuildQueue] = useState(() => makeSerialRunner((e) => console.error('[DataCore] channel rebuild failed', e)));
 
     // Registration refs. Channel handlers read these at event-time, not at
     // channel-build-time, so registration order doesn't matter and re-renders
@@ -235,7 +291,29 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         void fn(subset, options);
     }, []);
 
-    const notifyDbConnected = useCallback(async () => {
+    // Declared ABOVE buildChannel: both are read from its body, and exhaustive-deps is an
+    // error here, so they must exist before the dep array that names them.
+    //
+    // A FUNCTION, not a captured const: the refs are read at CALL time, so handlers registered
+    // during a build consult the current values afterwards. permissionSatisfied applies the
+    // shared implication table so this cannot drift from the server's read gate.
+    const hasPermNow = useCallback(
+        (p: string) => isAdminRef.current || permissionSatisfied([...permissionsRef.current], p),
+        [],
+    );
+
+    /** Re-fetch the hot subsets after losing and regaining live updates. The single
+     *  implementation behind both recovery paths — see RESYNC_SUBSETS. */
+    const resyncHotSubsets = useCallback(() => {
+        const flags = { warehouse: warehouseEnabledRef.current, governments: governmentsEnabledRef.current };
+        for (const { subset, perm, flag } of RESYNC_SUBSETS) {
+            if (flag && !flags[flag]) continue;
+            if (perm && !hasPermNow(perm)) continue;
+            callFetcher(subset);
+        }
+    }, [callFetcher, hasPermNow]);
+
+    const buildChannel = useCallback(async () => {
         // Tear down any existing channel before building a fresh one. The
         // await is load-bearing: supabase-js's removeChannel is async, and
         // calling supabase.channel(name) before the prior leave completes
@@ -243,9 +321,21 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         // after its own .subscribe() lock). This rebuild path runs on
         // settings_update, features_update, and idle-refocus.
         if (currentChannelCleanupRef.current) {
+            // Mark the teardown as OURS before it runs. Without this, every rebuild looks like
+            // a reconnect to the SUBSCRIBED branch below (cleanup sets realtimeConnectedRef
+            // false), so the resync fired on every settings save, permission change and duty
+            // toggle — and with the widened subset list that is a real fetch storm, not a
+            // rounding error. A genuine drop still resyncs, and an idle-refocus rebuild is
+            // covered by the visibility handler (its 5-minute threshold always exceeds the
+            // 30-second one).
+            deliberateTeardownRef.current = true;
             try { await currentChannelCleanupRef.current(); } catch (e) { console.warn('[DataCore] cleanup failed', e); }
             currentChannelCleanupRef.current = null;
         }
+        // The serializer (makeSerialRunner) is what prevents two builds overlapping now; this
+        // only short-circuits a redundant rebuild of an already-live channel. It never
+        // serialized anything: realtimeConnectedRef only turns true inside the subscribe
+        // CALLBACK, which needs a server round trip, so a second caller always read false.
         if (realtimeConnectedRef.current) return;
         const supabase = getSupabase();
 
@@ -297,8 +387,37 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         // only get a listener when this user holds the permission — otherwise
         // every org mutation in that domain costs this browser a denied
         // round-trip. Admins hold everything.
-        const hasPerm = (p: string) => isAdminRef.current || permissionsRef.current.has(p);
-        const canSeeIntel = hasPerm('intel:view') || hasPerm('intel:view:clearance');
+        // permissionSatisfied applies the shared implication table
+        // (lib/permissionImplications.ts) so attachment matches the server's read
+        // gate: intel:view:clearance satisfies intel:view (this line used to be a
+        // fourth hand-inlined copy of that rule), and academy:instruct /
+        // academy:manage satisfy the academy:view handler below. The ref is read at
+        // call time — handlers registered here consult it after the channel is built.
+        const hasPerm = hasPermNow;
+        // Same predicate as the server's getMainState / users_slice / user_detail gate.
+        // Non-staff viewers hold no roster and no taxonomy, so subscribing them to
+        // roster and reference-table changes is a wasted round-trip at best and, for
+        // postgres_changes (which ships the FULL changed row), a delivery of content to
+        // a receiver who may not read it.
+        //
+        // A FUNCTION, not a captured const: the refs are read at CALL time so handlers
+        // registered here consult them after the channel is built (see hasPerm above).
+        // A frozen const would be correct only by coincidence — because
+        // registerRealtimeAuth happens to rebuild the channel — in a file whose own
+        // comment warns against exactly that.
+        //
+        // THIS IS NOT THE SECURITY BOUNDARY. Per CLAUDE.md rule 2 a client-side filter
+        // is cosmetic; the delivery authorization lives in schema.sql's
+        // authenticated_select policy, which Phase 3 item 7 narrows. What this closes is
+        // "the app stops STREAMING taxonomy rows to a customer", not "the taxonomy is
+        // closed". Do not write the stronger claim anywhere.
+        // The SAME three-part predicate the server runs (lib/rosterGate.ts), so the
+        // handler-attachment set and the server's projection cannot disagree: a
+        // roster-authority role (hr:recruiter, admin:view:roster, …) that receives the
+        // roster from getMainState must also stay subscribed to its changes.
+        const isStaffViewer = () => isAdminRef.current
+            || mayReceiveRoster({ permissions: [...permissionsRef.current] });
+        const canSeeIntel = hasPerm('intel:view');
 
         let channel = supabase.channel(channelName, { config: { private: true } })
             .on('broadcast', { event: 'duty_update' }, () => {
@@ -463,8 +582,31 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 const ids = Array.isArray(p.userIds)
                     ? p.userIds.filter((n): n is number => typeof n === 'number')
                     : (typeof p.userId === 'number' ? [p.userId] : []);
-                if (ids.length > 0) callFetcher('users_slice', { ids });
-                else callFetcher('main');
+                if (isStaffViewer()) {
+                    if (ids.length > 0) callFetcher('users_slice', { ids });
+                    // Id-less payloads are reference-data updates
+                    // (broadcastReferenceDataUpdate: rank / unit / position / award
+                    // churn, all staff-only data) and the hire of an unlinked prospect.
+                    // A non-staff viewer losing this leg is safe: service_types and
+                    // settings each keep their OWN unconditional handler below, so a
+                    // Client's service picker and branding still refresh live.
+                    else callFetcher('main');
+                } else {
+                    // A non-staff viewer holds no roster to patch (users_slice 403s and
+                    // `main` withholds it) — but a role change or a soft-delete DOES
+                    // change the availability scalar, and those emit `user_update`, never
+                    // `duty_update` (lib/db/users.ts bulkDemoteUsersToClient,
+                    // bulkPromoteUsersToMember). users_presence is the one subset that
+                    // carries anyStaffOnDuty live, and for this tier its whole payload is
+                    // one boolean and an empty array. Without this leg, demoting the last
+                    // on-duty member leaves every customer reading "available" and
+                    // raising requests into an empty room.
+                    //
+                    // It lives HERE and not in SessionContext.onUserUpdate because that
+                    // handler early-returns on !targetsMe — i.e. on exactly the
+                    // somebody-else's-role-changed case this leg exists to cover.
+                    callFetcher('users_presence');
+                }
                 // The lite roster query in `main` doesn't carry the heavy
                 // nested arrays (certifications, commendations, limitingMarkers,
                 // conductRecord). When the broadcast targets a specific user,
@@ -496,6 +638,9 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 });
         }
 
+        // academy:instruct / academy:manage satisfy academy:view through the ladder,
+        // so this now agrees with AcademyHubView's canViewStaff and with the server's
+        // 'academy' subset gate instead of demanding a separately-ticked academy:view.
         if (hasPerm('academy:view')) {
             channel = channel
                 .on('broadcast', { event: 'academy_update' }, () => {
@@ -521,31 +666,31 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 // registerFeatureFlags effect on the next render tick.
                 // Rebuild after that so the new .on(...) gating sees current
                 // values.
+                // The role-sync maps live under the same settings umbrella and have no
+                // postgres_changes carrier (see the note on the discord_config_update handler
+                // below), so refresh them here for admins who can read them.
+                if (hasPerm('admin:config:discord')) callFetcher('discord');
                 setTimeout(() => {
                     void notifyDbConnectedRef.current();
                 }, 0);
             })
-            .on('broadcast', { event: 'features_update' }, async () => {
-                // Optional-feature toggle (Finances, Warehouse,
-                // Quartermaster, etc.). The server emits this from
-                // updateOrgFeatures(). Without this
-                // handler, the originating tab relied solely on the post-RPC
-                // .then(() => fetchDataSubset('main')) chain — which can be
-                // silently swallowed by the 2-second dedupe window if anything
-                // else fetched 'main' recently (tab-focus resync, etc.).
-                //
-                // We also rebuild the channel because some feature flags
-                // (warehouse, governments) gate which conditional .on(...)
-                // handlers were attached at channel-build time. Without the
-                // rebuild, enabling Warehouse from this view wouldn't wire up
-                // its broadcast listeners until the next reload.
-                debugLog('[Realtime] Features Update Broadcast Received');
-                const fn = fetcherRef.current;
-                if (fn) await fn('main');
-                setTimeout(() => {
-                    void notifyDbConnectedRef.current();
-                }, 0);
+            // Role-sync map changes (updateRankMapping). Ids-free nudge; the receiver refetches
+            // the admin-gated `discord` subset itself. This exists because `rank_mappings` and
+            // `synced_discord_roles` are deliberately NOT in the realtime publication
+            // (private.rt_client_tables), so the postgres_changes bindings this replaces were
+            // subscribed to nothing and the tab never refreshed.
+            .on('broadcast', { event: 'discord_config_update' }, () => {
+                if (!hasPerm('admin:config:discord')) return;
+                debugLog('[Realtime] Discord Config Update Broadcast Received');
+                callFetcher('discord');
             })
+            // NOTE: a 'features_update' handler used to sit here, with a comment claiming the
+            // server emitted it from updateOrgFeatures(). It does not — that function ends with
+            // broadcastSettingsUpdate(), and a repo-wide sweep of broadcastToOrg() literals
+            // finds no emitter for 'features_update' anywhere. It was a dead binding whose
+            // comment asserted the opposite. The settings_update handler above does the
+            // identical work (refetch 'main', then rebuild so the feature-gated .on(...)
+            // handlers are re-attached), so deleting it changes no behaviour.
             .on('broadcast', { event: 'external_tools_update' }, () => {
                 // external_tools is audience-scoped, so it is excluded from the
                 // authenticated_select allowlist and its postgres_changes path is
@@ -648,27 +793,44 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         // CONTRACT: any future server-side mutation to these tables must emit
         // the corresponding broadcast via broadcastToOrg() — otherwise remote
         // clients won't see the change.
+        // Unconditional for every tier. A Client needs live service-type edits (their
+        // request form's picker), and external_tools is audience-scoped server-side.
         const tableSubsets: Array<[string, string]> = [
-            ['ranks', 'main'],
-            ['units', 'main'],
-            ['roles', 'main'],
-            ['locations', 'main'],
-            ['radio_channels', 'main'],
             // announcements + external_tools are audience-scoped (excluded from the
             // realtime publication) — driven by the announcement_update /
             // external_tools_update broadcast nudges above, not postgres_changes.
             ['external_tools', 'external_tools'],
-            // Reference / award tables that are mutated by admin:* handlers but
-            // had no broadcast — without these entries, awarded certs /
-            // commendations / clearance changes did not propagate to other
-            // clients until a manual reload.
-            ['security_clearances', 'main'],
-            ['security_limiting_markers', 'main'],
-            ['specialization_tags', 'main'],
-            ['certifications', 'main'],
-            ['commendations', 'main'],
             ['service_types', 'main'],
         ];
+        if (isStaffViewer()) {
+            // The ten personnel / reference / taxonomy tables. postgres_changes ships
+            // the FULL CHANGED ROW, so for security_clearances and
+            // security_limiting_markers this was the org's clearance ladder and its
+            // compartment codeword catalogue streaming in cleartext to a customer's
+            // browser. Mirrors the `if (hasPerm('hr:view'))` block directly below —
+            // this extends the in-file attachment pattern, it does not add a channel or
+            // a topic. registerRealtimeAuth rebuilds the channel on any permission
+            // change, so a promotion re-attaches these without a reload.
+            //
+            // Again: this stops the STREAM, it does not close the table. The SQL policy
+            // is Phase 3 item 7's.
+            tableSubsets.push(
+                ['ranks', 'main'],
+                ['units', 'main'],
+                ['roles', 'main'],
+                ['locations', 'main'],
+                ['radio_channels', 'main'],
+                // Reference / award tables that are mutated by admin:* handlers but
+                // had no broadcast — without these entries, awarded certs /
+                // commendations / clearance changes did not propagate to other
+                // clients until a manual reload.
+                ['security_clearances', 'main'],
+                ['security_limiting_markers', 'main'],
+                ['specialization_tags', 'main'],
+                ['certifications', 'main'],
+                ['commendations', 'main'],
+            );
+        }
         if (hasPerm('hr:view')) {
             // Per-array HR slice subsets — MUST match the subset names the
             // hr_update broadcast routes to, so the 2-second dedupe still
@@ -683,14 +845,17 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 ['personnel_positions', 'hr_positions'],
             );
         }
-        if (hasPerm('admin:config:discord')) {
-            // The 'discord' subset (role-sync maps) is admin-console data and
-            // gated accordingly — only attach for holders.
-            tableSubsets.push(
-                ['synced_discord_roles', 'discord'],
-                ['rank_mappings', 'discord'],
-            );
-        }
+        // NOTE: `synced_discord_roles` and `rank_mappings` used to be pushed here for
+        // admin:config:discord holders. Neither is in private.rt_client_tables(), which IS the
+        // realtime publication — so both bindings were subscribed to nothing and the role-sync
+        // tab never live-updated. They are replaced by the 'discord_config_update' broadcast
+        // above, which the server now emits from updateRankMapping.
+        //
+        // General rule worth keeping: do not add a postgres_changes binding for a table that is
+        // not in rt_client_tables(). Beyond being inert, supabase-js reconciles the server's
+        // echoed binding list POSITIONALLY and errors the WHOLE channel on the first mismatch —
+        // so a pile of bindings for unpublished tables is a latent all-realtime-down hazard,
+        // not just dead weight.
         for (const [table, subset] of tableSubsets) {
             channel.on(
                 'postgres_changes' as any,
@@ -716,17 +881,11 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             );
         }
 
-        // settings affects multiple subsets — refresh main (branding) always;
-        // the discord role-sync subset only for admins who can read it.
-        channel.on(
-            'postgres_changes' as any,
-            { event: '*', schema: 'public', table: 'settings' } as any,
-            () => {
-                debugLog('[Realtime] change on settings');
-                callFetcher('main');
-                if (hasPerm('admin:config:discord')) callFetcher('discord');
-            }
-        );
+        // NOTE: a postgres_changes binding on `settings` used to sit here, refreshing 'main'
+        // and (for admins) 'discord'. `settings` is not in private.rt_client_tables() either,
+        // so it too was inert — every settings change actually reaches the client through the
+        // 'settings_update' BROADCAST, which the server emits explicitly and which now carries
+        // the 'discord' refetch as well.
 
         // Structured log lines so log scraping can answer:
         //   - peak connections per org (count distinct tabId in event=connect)
@@ -737,22 +896,25 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         const connectedAt = Date.now();
         let lastEventAt = connectedAt;
 
+        const myGen = ++buildGenRef.current;
+
         channel.subscribe((status) => {
+            // FIRST LINE, before the status test. A superseded build's channel is already
+            // gone, and the stale-channel hazard is reached through the CLOSED branch below —
+            // supabase-js registers its own _onClose handler that calls this callback — so a
+            // guard placed inside the SUBSCRIBED branch would protect nothing.
+            if (myGen !== buildGenRef.current) return;
             if (status === 'SUBSCRIBED') {
-                const wasDisconnected = realtimeConnectedRef.current === false && wasEverConnectedRef.current === true;
+                const wasDisconnected = realtimeConnectedRef.current === false
+                    && wasEverConnectedRef.current === true
+                    && deliberateTeardownRef.current === false;
+                deliberateTeardownRef.current = false;
                 realtimeConnectedRef.current = true;
                 setRealtimeConnected(true);
                 const event = wasDisconnected ? 'reconnect' : 'connect';
                 debugLog(`[Realtime] event=${event} tab=${tabId} channel=${channelName}`);
                 lastEventAt = Date.now();
-                if (wasDisconnected) {
-                    callFetcher('main');
-                    callFetcher('requests');
-                    // Permission-filtered: the operations subset 403s for
-                    // callers without operations:view.
-                    if (hasPerm('operations:view')) callFetcher('operations');
-                    callFetcher('announcements');
-                }
+                if (wasDisconnected) resyncHotSubsets();
                 wasEverConnectedRef.current = true;
             } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
                 const wasUp = realtimeConnectedRef.current;
@@ -778,7 +940,28 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             setRealtimeConnected(false);
         };
         currentChannelCleanupRef.current = cleanup;
-    }, [callFetcher]);
+        // `cleanup` is deliberately NOT generation-guarded. A guard at the top of its body
+        // would skip `await supabase.removeChannel(channel)` for a superseded build — leaking
+        // the channel and making the rebuild path's own `await cleanup()` a no-op, which
+        // reintroduces the joining-corpse hazard that await exists to prevent. The serializer
+        // already guarantees cleanup runs to completion before the next build starts.
+    }, [callFetcher, hasPermNow, resyncHotSubsets]);
+
+    /**
+     * The exported rebuild entry point. Everything that rebuilds the channel goes through the
+     * serializer, so two builds can never overlap.
+     *
+     * Two effects in the same React commit used to race here: refreshUser() sets config,
+     * realtimeToken and currentUser in one batch, which fires DashboardApp's
+     * `[config, notifyDbConnected]` effect and SessionContext's registerRealtimeAuth effect
+     * together. Both dependencies change on every refreshUser (config is a fresh object per
+     * response; the realtime token embeds an issued-at second), and refreshUser runs on every
+     * duty toggle — so the overlap was guaranteed, not occasional. supabase-js dedupes
+     * channels by topic and lets broadcast handlers re-attach silently after subscribe, so the
+     * result was a channel with two copies of every broadcast binding: a duplicate toast and a
+     * duplicate sound for every request, status change and bulletin, until the tab was closed.
+     */
+    const notifyDbConnected = useCallback(() => rebuildQueue(buildChannel), [rebuildQueue, buildChannel]);
 
     // Keep the latest notifyDbConnected reachable from its own async rebuild
     // paths (see notifyDbConnectedRef above). Read only inside setTimeout
@@ -812,17 +995,13 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             lastVisibleAtRef.current = Date.now();
             if (awayMs < RESYNC_THRESHOLD_MS) return;
             debugLog(`[DataCore] Tab visible after ${Math.round(awayMs / 1000)}s — resyncing hot subsets.`);
-            // Same set the realtime reconnect path resyncs — keeps the two
-            // recovery paths consistent. Permission-filtered: operations 403s
-            // for callers without operations:view.
-            callFetcher('main');
-            if (isAdminRef.current || permissionsRef.current.has('operations:view')) callFetcher('operations');
-            callFetcher('requests');
-            callFetcher('announcements');
+            // The SAME function the realtime reconnect path calls, not a second hand-written
+            // list that happens to agree with it.
+            resyncHotSubsets();
         };
         document.addEventListener('visibilitychange', onVisibility);
         return () => document.removeEventListener('visibilitychange', onVisibility);
-    }, [callFetcher]);
+    }, [resyncHotSubsets]);
 
     // Idle-tab realtime disconnect. Supabase Realtime caps concurrent
     // connections per project (200 free / 500 Pro). A backgrounded tab still
@@ -837,12 +1016,20 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             if (document.visibilityState === 'hidden') {
                 if (idleDisconnectTimerRef.current) window.clearTimeout(idleDisconnectTimerRef.current);
                 idleDisconnectTimerRef.current = window.setTimeout(() => {
-                    if (currentChannelCleanupRef.current) {
+                    // Through the SAME serializer as a rebuild, and awaited inside it. The old
+                    // form fired the teardown un-awaited and nulled the ref immediately,
+                    // leaving a window where the cleanup ref was null while the connection ref
+                    // was still true — the one combination that makes the redundant-rebuild
+                    // short-circuit return without building anything.
+                    void rebuildQueue(async () => {
+                        const teardown = currentChannelCleanupRef.current;
+                        if (!teardown) return;
                         debugLog('[DataCore] Idle >5min, releasing realtime connection.');
-                        void currentChannelCleanupRef.current();
                         currentChannelCleanupRef.current = null;
                         idleDisconnectedRef.current = true;
-                    }
+                        deliberateTeardownRef.current = true;
+                        await teardown();
+                    });
                 }, IDLE_THRESHOLD_MS);
             } else {
                 if (idleDisconnectTimerRef.current) {
@@ -863,7 +1050,7 @@ export const DataCoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             document.removeEventListener('visibilitychange', onVisibility);
             if (idleDisconnectTimerRef.current) window.clearTimeout(idleDisconnectTimerRef.current);
         };
-    }, [notifyDbConnected]);
+    }, [notifyDbConnected, rebuildQueue]);
 
     const registerFetchDataSubset = useCallback((fn: FetchDataSubset | null) => {
         fetcherRef.current = fn;

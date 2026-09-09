@@ -13,6 +13,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 //    always need operations:manage, like the excluded operation:update_status).
 //  - warrant:generate_report additionally requires warrant:view, so an
 //    intel:create-only holder can't launder warrant caution text into a report.
+//  - admin:list_testimonial_candidates additionally requires request:view:feedback,
+//    so admin:config:branding is not a second, SEARCHABLE route to the free-text
+//    client_feedback column that every other read path redacts per viewer.
+//  - ADDING an id to featuredTestimonialIds (admin:update_public_page_config) is an
+//    indirect read of that same column off the unauthenticated public page, so it
+//    needs request:view:feedback too — and fails CLOSED when the stored baseline
+//    cannot be read. Reorder/remove stays open to admin:config:branding.
 // =============================================================================
 
 const h = vi.hoisted(() => ({
@@ -20,12 +27,17 @@ const h = vi.hoisted(() => ({
     user: null as Record<string, unknown> | null,
     ops: {} as Record<string, { ownerId: number }>,
     spies: {
+        // The org-ban gate runs on every authenticated dispatcher request; null = not banned.
+        findActiveBan: async () => null,
         getPlatformSettings: vi.fn(async () => ({} as Record<string, unknown>)),
         getUserById: vi.fn(async () => h.user),
         getFullOperationDetails: vi.fn(async (id: string) => (h.ops[id] ?? null)),
         updateOperationDetails: vi.fn(async (..._args: unknown[]) => ({})),
         generateReportFromWarrant: vi.fn(async () => ({ id: 'report-1' })),
         updatePlatformSettings: vi.fn(async (patch: Record<string, unknown>) => patch),
+        getTestimonialCandidates: vi.fn(async (..._args: unknown[]) => ({ items: [], total: 0 })),
+        updatePublicPageConfig: vi.fn(async (..._args: unknown[]) => {}),
+        getPublicSettings: vi.fn(async () => ({ publicPageConfig: { featuredTestimonialIds: ['SR-OLD'] } })),
     },
 }));
 
@@ -47,6 +59,8 @@ vi.mock('../lib/auth', () => ({
 }));
 
 vi.mock('../lib/db', () => ({
+    // The org-ban gate reads this on EVERY authenticated dispatcher request.
+    findActiveBan: async () => null,
     supabase: sbBuilder(),
     getPlatformSettings: h.spies.getPlatformSettings,
     getUserById: h.spies.getUserById,
@@ -54,6 +68,12 @@ vi.mock('../lib/db', () => ({
     updateOperationDetails: h.spies.updateOperationDetails,
     generateReportFromWarrant: h.spies.generateReportFromWarrant,
     updatePlatformSettings: h.spies.updatePlatformSettings,
+    getTestimonialCandidates: h.spies.getTestimonialCandidates,
+    updatePublicPageConfig: h.spies.updatePublicPageConfig,
+    getPublicSettings: h.spies.getPublicSettings,
+    // Cache-free Admin-identity re-check for the recovery family (maintenance
+    // toggle / force-logout-all). Default false: only the stamped flag admits.
+    resolveIsSystemAdminFresh: async () => false,
 }));
 
 // Import AFTER the mocks are registered.
@@ -107,22 +127,35 @@ describe('authz-core — platform-lifecycle Admin-role gate', () => {
     const updateSettings = (adminActions as Record<string, (p: unknown) => unknown>)['admin:update_platform_settings'];
     const forceLogout = (adminActions as Record<string, (p: unknown) => unknown>)['admin:force_logout_all'];
 
-    it('handlers reject a non-Admin (Dispatcher) synchronously before any DB write', () => {
-        expect(() => updateSettings({ user: { role: 'Dispatcher' }, maintenanceMode: true })).toThrow(/only an admin/i);
-        expect(() => forceLogout({ user: { role: 'Dispatcher' } })).toThrow(/only an admin/i);
+    // Both are RECOVERY controls (they can lock out or sign out the whole platform),
+    // so they re-resolve role identity CACHE-FREE on the deny path and are therefore
+    // async: they reject rather than throwing synchronously. The danger zone stays
+    // sync on the stamped flag (tests/dangerZoneAuthz.test.ts).
+    it('handlers reject a non-Admin (Dispatcher) before any DB write', async () => {
+        await expect(updateSettings({ user: { role: 'Dispatcher' }, maintenanceMode: true })).rejects.toThrow(/only an admin/i);
+        await expect(forceLogout({ user: { role: 'Dispatcher' } })).rejects.toThrow(/only an admin/i);
         expect(h.spies.updatePlatformSettings).not.toHaveBeenCalled();
     });
 
-    it('handlers reject a missing/undefined actor (fail closed)', () => {
-        expect(() => updateSettings({ maintenanceMode: true })).toThrow(/only an admin/i);
-        expect(() => forceLogout({})).toThrow(/only an admin/i);
+    // ROLE NAME IS NOT AUTHORITY: `role` is name-derived, so a permissionless custom
+    // role called 'Commander' could put the whole platform into maintenance mode —
+    // a state only a real Admin can lift.
+    it('handlers reject a forged Admin role NAME with no stamped identity', async () => {
+        await expect(updateSettings({ user: { role: 'Admin' }, maintenanceMode: true })).rejects.toThrow(/only an admin/i);
+        await expect(forceLogout({ user: { role: 'Admin' } })).rejects.toThrow(/only an admin/i);
+        expect(h.spies.updatePlatformSettings).not.toHaveBeenCalled();
     });
 
-    it('a genuine Admin is accepted and the expected patch is written', async () => {
-        await updateSettings({ user: { role: 'Admin' }, maintenanceMode: true });
+    it('handlers reject a missing/undefined actor (fail closed)', async () => {
+        await expect(updateSettings({ maintenanceMode: true })).rejects.toThrow(/only an admin/i);
+        await expect(forceLogout({})).rejects.toThrow(/only an admin/i);
+    });
+
+    it('the stamped system Admin is accepted and the expected patch is written', async () => {
+        await updateSettings({ user: { isSystemAdmin: true }, maintenanceMode: true });
         expect(h.spies.updatePlatformSettings).toHaveBeenCalledWith({ maintenance_mode: true });
 
-        await forceLogout({ user: { role: 'Admin' } });
+        await forceLogout({ user: { isSystemAdmin: true } });
         const arg = h.spies.updatePlatformSettings.mock.calls.at(-1)?.[0] as Record<string, unknown>;
         expect(typeof arg.force_logout_timestamp).toBe('string');
     });
@@ -257,18 +290,180 @@ describe('authz-core — warrant:generate_report requires warrant:view', () => {
         expect(h.spies.generateReportFromWarrant).toHaveBeenCalledTimes(1);
     });
 
-    it('an Admin (role) with intel:create satisfies the warrant-visibility gate', async () => {
+    // The gate is warrant:view ALONE — no role-name bypass. Admin, Dispatcher and
+    // Member are all seeded with warrant:view, so an intel:create holder who is a
+    // real staff member still passes; a permissionless custom role called 'Commander'
+    // can no longer launder warrant caution text into a classification-0 report.
+    it('an Admin-NAMED role with intel:create but no warrant:view is DENIED', async () => {
         h.decoded = { userId: 11 };
         h.user = { id: 11, role: 'Admin', permissions: ['intel:create'] };
 
         const res = mockRes();
         await handler(mockReq('warrant:generate_report', { warrantId: 'w1' }), asResponse(res));
 
-        expect(res.statusCode).toBe(200);
-        expect(h.spies.generateReportFromWarrant).toHaveBeenCalledTimes(1);
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.generateReportFromWarrant).not.toHaveBeenCalled();
     });
 
     it('authoring is still gated at intel:create (the report-write permission)', () => {
         expect(fullPermissionMap['warrant:generate_report']).toBe('intel:create');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// admin:list_testimonial_candidates additionally requires request:view:feedback
+// ---------------------------------------------------------------------------
+describe('authz-core — testimonial candidate listing requires request:view:feedback', () => {
+    it('admin:config:branding WITHOUT request:view:feedback is denied and no feedback is read', async () => {
+        h.decoded = { userId: 20 };
+        h.user = { id: 20, role: 'Member', permissions: ['admin:config:branding'] };
+
+        const res = mockRes();
+        await handler(mockReq('admin:list_testimonial_candidates', { search: 'refund' }), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        // Denied before the DB round-trip: the free-text column never enters process memory.
+        expect(h.spies.getTestimonialCandidates).not.toHaveBeenCalled();
+    });
+
+    it('admin:config:branding AND request:view:feedback is allowed', async () => {
+        h.decoded = { userId: 21 };
+        h.user = { id: 21, role: 'Member', permissions: ['admin:config:branding', 'request:view:feedback'] };
+
+        const res = mockRes();
+        await handler(mockReq('admin:list_testimonial_candidates', { search: 'refund' }), asResponse(res));
+
+        expect(res.statusCode).toBe(200);
+        expect(h.spies.getTestimonialCandidates).toHaveBeenCalledTimes(1);
+    });
+
+    it('an Admin-NAMED role with only the branding perm is DENIED', async () => {
+        // Matches redactRequestFeedbackForViewer's maySee, which is now the permission
+        // ALONE — the role NAME is inferred from operator-supplied free text, so it
+        // admitted a permissionless custom role called 'Commander' to a searchable
+        // dump of every client's candid feedback.
+        h.decoded = { userId: 22 };
+        h.user = { id: 22, role: 'Admin', permissions: ['admin:config:branding'] };
+
+        const res = mockRes();
+        await handler(mockReq('admin:list_testimonial_candidates', {}), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.getTestimonialCandidates).not.toHaveBeenCalled();
+    });
+
+    it('request:view:feedback WITHOUT the branding perm is still denied (AND, not a swap)', async () => {
+        // The seeded Dispatcher holds request:view:feedback; remapping the action to that
+        // perm instead of ADDING the second check would hand the whole tier a new route.
+        h.decoded = { userId: 23 };
+        h.user = { id: 23, role: 'Dispatcher', permissions: ['request:view:feedback', 'request:accept'] };
+
+        const res = mockRes();
+        await handler(mockReq('admin:list_testimonial_candidates', {}), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.getTestimonialCandidates).not.toHaveBeenCalled();
+    });
+
+    it('the primary gate stays on the branding perm (map pin)', () => {
+        expect(fullPermissionMap['admin:list_testimonial_candidates']).toBe('admin:config:branding');
+    });
+
+    it('the handler asserts it too, so an in-process caller cannot bypass the dispatcher', async () => {
+        const list = (adminActions as Record<string, (p: unknown) => Promise<unknown>>)['admin:list_testimonial_candidates'];
+
+        await expect(list({ user: { id: 24, role: 'Member', permissions: ['admin:config:branding'] } }))
+            .rejects.toThrow(/permission to read client feedback/i);
+        // Fails closed on a missing actor too.
+        await expect(list({})).rejects.toThrow(/permission to read client feedback/i);
+        expect(h.spies.getTestimonialCandidates).not.toHaveBeenCalled();
+
+        await list({ user: { id: 25, role: 'Member', permissions: ['request:view:feedback'] } });
+        expect(h.spies.getTestimonialCandidates).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// publishing a testimonial is an indirect read of the same client_feedback column
+// ---------------------------------------------------------------------------
+describe('authz-core — publishing a testimonial requires request:view:feedback', () => {
+    const brandingOnly = { id: 30, role: 'Member', permissions: ['admin:config:branding'] };
+
+    it('a branding-only delegate cannot ADD an id to the featured list', async () => {
+        h.decoded = { userId: 30 };
+        h.user = { ...brandingOnly };
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { enabled: true, featuredTestimonialIds: ['SR-OLD', 'SR-NEW'] }), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.updatePublicPageConfig).not.toHaveBeenCalled();
+        // Distinct from the generic gate message, so a stale-config save is diagnosable.
+        expect(String(res.body?.message)).toMatch(/View Client Feedback/i);
+    });
+
+    it('a branding-only delegate can still reorder/remove already-published ids', async () => {
+        h.decoded = { userId: 30 };
+        h.user = { ...brandingOnly };
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { featuredTestimonialIds: ['SR-OLD'] }), asResponse(res));
+
+        expect(res.statusCode).toBe(200);
+        expect(h.spies.updatePublicPageConfig).toHaveBeenCalledTimes(1);
+    });
+
+    it('a save that carries no featured list at all is untouched by the gate', async () => {
+        h.decoded = { userId: 30 };
+        h.user = { ...brandingOnly };
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { motto: 'Fly safe' }), asResponse(res));
+
+        expect(res.statusCode).toBe(200);
+        expect(h.spies.getPublicSettings).not.toHaveBeenCalled();
+    });
+
+    it('branding + request:view:feedback may add, and pays no baseline round-trip', async () => {
+        h.decoded = { userId: 31 };
+        h.user = { id: 31, role: 'Member', permissions: ['admin:config:branding', 'request:view:feedback'] };
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { featuredTestimonialIds: ['SR-OLD', 'SR-NEW'] }), asResponse(res));
+
+        expect(res.statusCode).toBe(200);
+        expect(h.spies.updatePublicPageConfig).toHaveBeenCalledTimes(1);
+        expect(h.spies.getPublicSettings).not.toHaveBeenCalled();
+    });
+
+    it('an EMPTY stored baseline makes every incoming id an add → denied', async () => {
+        h.decoded = { userId: 30 };
+        h.user = { ...brandingOnly };
+        h.spies.getPublicSettings.mockResolvedValueOnce({ publicPageConfig: { featuredTestimonialIds: [] } });
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { featuredTestimonialIds: ['SR-OLD'] }), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.updatePublicPageConfig).not.toHaveBeenCalled();
+    });
+
+    it('fails CLOSED with a 403 when the baseline read THROWS (not a 500, not an allow)', async () => {
+        // getPublicSettings falls back only on 42P01 and throws on every other error, so
+        // the dispatcher must catch it: an unreadable baseline can never be treated as
+        // "already contains these ids".
+        h.decoded = { userId: 30 };
+        h.user = { ...brandingOnly };
+        h.spies.getPublicSettings.mockRejectedValueOnce(new Error('boom'));
+
+        const res = mockRes();
+        await handler(mockReq('admin:update_public_page_config', { featuredTestimonialIds: ['SR-OLD'] }), asResponse(res));
+
+        expect(res.statusCode).toBe(403);
+        expect(h.spies.updatePublicPageConfig).not.toHaveBeenCalled();
+    });
+
+    it('the primary gate stays on the branding perm (map pin)', () => {
+        expect(fullPermissionMap['admin:update_public_page_config']).toBe('admin:config:branding');
     });
 });

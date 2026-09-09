@@ -4,14 +4,20 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import compression from 'compression';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash, randomUUID } from 'node:crypto';
 import { getClientIp } from './lib/clientIp.js';
+import { getBuildId } from './lib/buildId.js';
+import { SESSION_COOKIE_IS_SECURE, credentialFromRequest, clearSessionCookie } from './lib/sessionCookie.js';
+import { checkRequestOrigin, allowedOriginsFor } from './lib/csrfOrigin.js';
+import { pruneUserRateLimitBuckets } from './lib/userRateLimit.js';
 import { buildConnectSrc } from './lib/cspConnectSrc.js';
 import { pruneAuthRateLimitBuckets } from './lib/authRateLimit.js';
 import orgUploadHandler, { pruneOrgUploadBuckets } from './api/orgUpload.js';
 import { MAX_UPLOAD_BYTES } from './lib/storage.js';
 import { runOrgMediaGc } from './lib/orgMediaGc.js';
 import { pruneAiRateLimitBuckets } from './lib/aiRateLimit.js';
+import { pruneSubmissionRateLimitBuckets } from './lib/submissionRateLimit.js';
+import { pruneRadioRateLimitBuckets } from './lib/radio.js';
 import { log as baseLog } from './lib/log.js';
 
 const log = baseLog.child({ module: 'server' });
@@ -56,6 +62,12 @@ setInterval(() => {
     pruneAuthRateLimitBuckets(now);
     pruneOrgUploadBuckets(now);
     pruneAiRateLimitBuckets(now);
+    // These two were exported and tested but NEVER called in production, so their maps only
+    // grew; once full, their shed-on-full branch permits every untracked key and the throttle
+    // quietly stops working until a restart. Wired here with the new per-user one.
+    pruneSubmissionRateLimitBuckets(now);
+    pruneRadioRateLimitBuckets(now);
+    pruneUserRateLimitBuckets(now);
 }, 60_000).unref?.();
 
 function bumpAbuseCounter(ip: string): void {
@@ -106,14 +118,16 @@ function isBlocked(ip: string): boolean {
 // relative imports resolve against the compiled output (Node16 resolution).
 import handlerFn from './api/index.js';
 import servicesFn, { validatePermissionMap } from './api/services.js';
-import queryFn from './api/query.js';
+import queryFn, { handleManifest } from './api/query.js';
 import swFn from './api/sw.js';
 import publicFn from './api/public.js';
 import { respondToPair as allianceRespondToPair, getAllianceSelfProfile as allianceGetSelfProfile, getAlliancePeerByInboundKey as allianceGetPeerByInboundKey, getAllianceShareableData as allianceGetShareableData,
     getOperationSnapshotForPeer, getOperationManifestForPeer, acceptInviteForPeer, declineInviteForPeer, upsertAlliedParticipant, removeAlliedParticipant,
     receiveMirrorInvite, receiveMirrorPush, receiveMirrorRevoke,
-    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, ImportRefusedError, getPlatformSettings, resolveOrgAppUrl } from './lib/db.js';
+    getAllyRosterProjection, getAllyFleetProjection, getUserById, importOrgData, ImportRefusedError, getPlatformSettings, resolveOrgAppUrl,
+    findActiveBan } from './lib/db.js';
 import { runFirstBootCheck } from './lib/firstBoot.js';
+import { findMissingApiKeyColumns } from './lib/db/system.js';
 import { verifyToken, signToken, isSessionForceLoggedOut, isSessionRevokedByWatermark } from './lib/auth.js';
 import { counts404TowardAbuse, isLoopbackIp } from './lib/abuseFilter.js';
 
@@ -192,9 +206,139 @@ app.use((req, res, next) => {
     next();
 });
 
+/** Did this request arrive over HTTPS? Per-request, and used ONLY for deriving the set of
+ *  origins that count as ours — never for choosing a cookie name. */
+function isRequestSecure(req: express.Request): boolean {
+    return req.secure || req.headers['x-forwarded-proto'] === 'https';
+}
+
+/**
+ * The session cookie's mode, resolved ONCE at boot.
+ *
+ * Deliberately a process constant rather than a per-request decision: a mode derived from
+ * X-Forwarded-Proto could flap on a spoofed header, and a flapping mode would accept an
+ * attacker-settable plain-name cookie on an HTTPS origin. One deployment has one scheme.
+ */
+
+if (!SESSION_COOKIE_IS_SECURE) {
+    // Loud, because the trade-off is real and invisible otherwise: without Secure the session
+    // cookie can be sent over plain HTTP, so anyone on the network path can read it. The
+    // alternative — setting Secure anyway — means the browser silently never stores it and
+    // NOBODY CAN LOG IN, with no error message anywhere. Working-and-warned beats
+    // strict-and-silently-broken.
+    log.warn('session cookie will NOT be marked Secure', {
+        reason: 'APP_URL is not https:// (or SESSION_COOKIE_SECURE=0)',
+        effect: 'The session cookie can travel over plain HTTP. Fine on a trusted LAN; not fine on the internet.',
+        fix: 'Serve over HTTPS and set APP_URL=https://your.domain, or set SESSION_COOKIE_SECURE=1 if TLS terminates upstream.',
+    });
+}
+
+// ---------------------------------------------------------------------------
+// CSRF ORIGIN GATE — must run BEFORE body parsing.
+//
+// The session credential can now ride an HttpOnly cookie, and the browser attaches a cookie to
+// every request to this origin whoever caused it. SameSite=Lax is a partial control only (it
+// still permits top-level GET navigation, and this app's reads are GETs on /api/query), so the
+// cookie-authenticated surfaces additionally demand positive evidence that the request came
+// from our own page.
+//
+// Mounted on the FOUR BROWSER paths by name, never on `/api` as a whole. /api/alliance/* is
+// deliberately excluded: those are SERVER-TO-SERVER calls authenticated by x-api-key, a peer has
+// no Origin header to send, and seven of them are POSTs — mounting this on /api would hard-403
+// pairing and mirror-push while leaving the GET routes working, which is a partial break and
+// therefore a harder one to diagnose.
+//
+// Placed before the parsers so a rejected cross-site request never has its body read.
+const CSRF_GUARDED_PATHS = ['/api/services', '/api/query', '/api/admin/import-stream', '/api/org/upload'];
+
+const csrfOriginGate: express.RequestHandler = (req, res, next) => {
+    // Unauthenticated public reads have no cookie to abuse and must stay reachable from a
+    // link, a crawler, or the PWA manifest fetch. GET-only, so it cannot relax a mutation, and
+    // none of the three can reach session-authenticated data.
+    const target = typeof req.query?.target === 'string' ? req.query.target : '';
+    if (req.method === 'GET' && (target === 'config' || target === 'manifest' || target === 'feed')) return next();
+
+    const secure = isRequestSecure(req);
+    const host = (req.headers['x-forwarded-host'] || req.headers['host'] || '') as string;
+    const verdict = checkRequestOrigin({
+        method: req.method,
+        origin: req.headers['origin'] as string | undefined,
+        secFetchSite: req.headers['sec-fetch-site'] as string | undefined,
+        allowedOrigins: allowedOriginsFor(host, secure, process.env.APP_URL),
+    });
+    if (verdict === 'deny') {
+        // NOT audited to the durable trail. This runs before ANY rate limiter, on a path
+        // reachable without a credential, so an emit here is one durable IP-bearing row per
+        // request — trivially amplified with a bogus Origin from many addresses, and retained
+        // for a year. api/orgUpload.ts refuses its own pre-auth cross-site emit for exactly
+        // this reason; the two surfaces stay at parity. A deduped log line is the right sink.
+        log.warn('cross-site request blocked', {
+            path: req.originalUrl,
+            method: req.method,
+            secFetchSite: req.headers['sec-fetch-site'] ?? null,
+        });
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(403).json({ message: 'Forbidden: cross-site request blocked' });
+    }
+    return next();
+};
+
+// MOUNTED PER PATH, not matched with `req.path === …`. Express routes with `strict routing` and
+// `case sensitive routing` BOTH DISABLED by default, so `/api/services/` and `/API/services`
+// reach the same handler — while an exact-string `includes(req.path)` misses them. That is a
+// complete bypass of this gate, and SameSite=Lax does not cover it: a page on a sibling origin
+// can POST to `https://org.example/api/services/`, the browser attaches the session cookie, and
+// the mutation executes as the victim. `app.use(path, …)` applies Express's own normalisation,
+// so the mount matches every form the router does.
+for (const guardedPath of CSRF_GUARDED_PATHS) app.use(guardedPath, csrfOriginGate);
+
+// ---------------------------------------------------------------------------
+// SPLIT BODY CAP.
+//
+// A flat 10 MB was granted to every caller including unauthenticated ones, so anyone could make
+// the server buffer 10 MB per request before a single auth check ran. The cap is now chosen by
+// whether the caller presents a credential — and the choice has to happen HERE, inside the
+// parser middleware, because body parsing runs before the dispatcher's auth.
+//
+// `verifyToken` is pure crypto with no I/O (and rejects any token carrying a `purpose` field, so
+// a scoped grant cannot be replayed as a session), which is what makes it safe to call this
+// early. It answers "is this a real token" only — revocation, force-logout and the user load all
+// still happen later, in the dispatcher, unchanged. The worst a valid-but-revoked token buys is
+// the larger body cap on a request that is about to be refused anyway.
+const ANON_BODY_LIMIT = '128kb';
+const AUTHED_BODY_LIMIT = '10mb';
+
+function callerIsAuthenticated(req: express.Request): boolean {
+    // The PROCESS constant, not the per-request scheme — see SESSION_COOKIE_IS_SECURE.
+    const credential = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
+    return !!credential && !!verifyToken(credential);
+}
+
+/** Pick a parser per request. Both parsers share the chooser so the two caps cannot drift. */
+function bodyLimitChooser(parserFor: (limit: string) => express.RequestHandler): express.RequestHandler {
+    const anon = parserFor(ANON_BODY_LIMIT);
+    const authed = parserFor(AUTHED_BODY_LIMIT);
+    return (req, res, next) => {
+        // No body to parse. Short-circuits before any credential work so express.static asset
+        // hits do not pay for a token verify and a Cookie-header parse.
+        if (req.method === 'GET' || req.method === 'HEAD') return next();
+        // import-stream has its OWN express.text parser on the route, so it must reach the route
+        // unparsed. This is the only path that may skip a parser entirely.
+        if (req.path === '/api/admin/import-stream') return next();
+        // Alliance federation is x-api-key server-to-server, so `callerIsAuthenticated` (which
+        // looks for a SESSION credential) is always false for it. It must still be PARSED —
+        // these two mounts are the only JSON parser in the app, so falling through to next()
+        // here leaves req.body undefined and silently breaks five of the seven federation POST
+        // routes: /pair 403s as "forbidden", op-mirror/push 500s, rsvp writes undefined fields.
+        // Given the generous cap, not the anonymous one: peers push operation snapshots.
+        if (req.path.startsWith('/api/alliance/')) return authed(req, res, next);
+        return (callerIsAuthenticated(req) ? authed : anon)(req, res, next);
+    };
+}
+
 // Middleware to parse JSON bodies (Vercel functions expect parsed body)
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(bodyLimitChooser((limit) => express.json({ limit })));
+app.use(bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })));
 app.use(compression());
 
 // Explicit connect-src list for the CSP, replacing a bare `https:` (which let the
@@ -248,6 +392,29 @@ app.use((req, res, next) => {
         res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
     next();
+});
+
+// Liveness probe. A self-hosted Node app behind Coolify, Docker or nginx needs one, and
+// there wasn't one — so an operator's health check hit the SPA catch-all instead, which reads
+// the settings table on every probe and, because that read returns {data,error} rather than
+// throwing, answers 200 with default branding even while the database is unreachable. A probe
+// that cannot fail is not a probe.
+//
+// LIVENESS ONLY — deliberately no database touch. A DB-gated probe takes every instance out of
+// rotation on a Supabase blip, converting a degraded read path into a total outage.
+//
+// Registered HERE, before the request logger and the static/API middleware, so a probe is not
+// logged on every tick and never consumes a rate-limit bucket. `noStore` is a hoisted function
+// declaration, so calling it above its definition is fine — do not "fix" that by moving this
+// route below the logger.
+//
+// Body is a fixed literal: no version, no schema state, no database detail. Anything richer is
+// an unauthenticated information leak, and the operator has Database Tools for the real answer.
+app.get('/healthz', (req, res) => {
+    noStore(res);
+    const buildId = getBuildId();
+    if (buildId) res.setHeader('X-Build-Id', buildId);
+    res.status(200).json({ status: 'ok' });
 });
 
 // Request Logging
@@ -375,9 +542,22 @@ app.use('/api/services', (req, res, next) => {
     next();
 });
 
+/** Stamp the deployment's build id on a browser-bound API response, so an open tab can notice
+ *  it is running a bundle the server no longer serves and offer a reload.
+ *
+ *  Only the two routes the BROWSER calls. Deliberately not inside noStore(): that would also
+ *  stamp the /api/alliance/* federation responses and import-stream, where nothing consumes it.
+ *  The id is a hash of the public index.html — not a secret, but there is no reason to hand a
+ *  federation peer a deployment fingerprint it has no use for. */
+function stampBuildId(res: express.Response): void {
+    const buildId = getBuildId();
+    if (buildId) res.setHeader('X-Build-Id', buildId);
+}
+
 // API Routes
 app.post('/api/services', async (req, res) => {
     noStore(res);
+    stampBuildId(res);
     try {
         // Adapt Express req/res to Vercel-like handler expectation
         await servicesFn(req, res);
@@ -387,8 +567,31 @@ app.post('/api/services', async (req, res) => {
     }
 });
 
+// The federation feed is server-to-server and API-key authenticated, which makes the
+// global per-IP cap the wrong instrument for it in BOTH directions: several peers can
+// sit behind one NAT and share a bucket they should not, while one stolen key replayed
+// from many addresses gets a fresh bucket per address and evades the bucket it should
+// hit. Key on the KEY. Hashed, so a live credential never becomes a rate-limiter
+// bucket name held in memory. Falls back to the IP when no key is presented, so an
+// unauthenticated prober is still capped.
+const feedLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    standardHeaders: true,
+    keyGenerator: (req) => {
+        const raw = req.headers['x-api-key'];
+        const key = typeof raw === 'string' ? raw : '';
+        return key
+            ? `feedkey:${createHash('sha256').update(key).digest('hex').slice(0, 32)}`
+            : ipKeyGenerator(getClientIp(req as express.Request));
+    },
+});
+// Engages ONLY for target=feed so the interactive app keeps the ordinary /api cap.
+app.get('/api/query', (req, res, next) => (req.query?.target === 'feed' ? feedLimiter(req, res, next) : next()));
+
 app.get('/api/query', async (req, res) => {
     noStore(res);
+    stampBuildId(res);
     try {
         await queryFn(req, res);
     } catch (e) {
@@ -397,16 +600,41 @@ app.get('/api/query', async (req, res) => {
     }
 });
 
-// First-run / admin STREAMED data import. Same gate as the admin:import_org RPC
-// (admin:access), but streams per-table progress as NDJSON so the onboarding
-// wizard + admin console render a real progress bar + live log. The body is the
-// raw NDJSON export (text/*, up to 64 MB); each event is flushed through the
-// compression middleware so the client sees progress incrementally.
-app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64mb' }), async (req, res) => {
+// First-run / admin STREAMED data import. Streams per-table progress as NDJSON so
+// the onboarding wizard + admin console render a real progress bar + live log. The
+// body is the raw NDJSON export (text/*, up to 64 MB); each event is flushed through
+// the compression middleware so the client sees progress incrementally.
+// Gated on the genuine system Admin (role identity) — a HIGHER bar than the
+// admin:import_org RPC's admin:access map entry, because this route replaces every
+// seeded table and can re-anchor the acting admin onto a new users.id.
+/**
+ * Cheap pre-parse credential check for the import stream.
+ *
+ * `express.text` is route middleware, so it reads the ENTIRE 64 MB body into memory before the
+ * handler's first auth line runs. The whole point of splitting the body cap was that an
+ * unauthenticated caller could make the server buffer megabytes before any check — and this
+ * surface is six times larger than the one that motivated it, so leaving it would be fixing the
+ * smaller half of the problem and calling it done.
+ *
+ * Signature-only, using the same pure, no-I/O verify the body-cap chooser already calls. The
+ * real ladder — force-logout, revocation watermark, the isSystemAdmin gate — stays exactly where
+ * it is in the handler and is unchanged; this just refuses an anonymous caller before they can
+ * cost us 64 MB.
+ */
+const importStreamPreAuth: express.RequestHandler = (req, res, next) => {
+    if (!callerIsAuthenticated(req)) {
+        noStore(res);
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+    }
+    next();
+};
+
+app.post('/api/admin/import-stream', importStreamPreAuth, express.text({ type: () => true, limit: '64mb' }), async (req, res) => {
     noStore(res);
     try {
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
+        // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+        const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
         const decoded = token ? verifyToken(token) : null;
         if (!decoded) { res.status(401).json({ error: 'Unauthorized' }); return; }
         // Mirror the dispatcher's force-logout enforcement (api/services.ts): a
@@ -425,8 +653,36 @@ app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64
             res.status(401).json({ error: 'Session expired. Please log in again.' });
             return;
         }
-        const isAdmin = !!user && (user.role === 'Admin' || (Array.isArray(user.permissions) && user.permissions.includes('admin:access')));
-        if (!isAdmin) { res.status(403).json({ error: 'Forbidden' }); return; }
+        // ───────────────────────── ORG BAN GATE ─────────────────────────
+        // Unreachable in practice — the system Admin role is always a ban-permission
+        // holder (getBanPermissionHolderIds arm 2) and the peer rule in ban:place
+        // refuses to ban a peer — but this route re-anchors admin identity and
+        // replaces every seeded table, and the rule for this build is that EVERY
+        // authenticated surface carries the gate. A gate that is only present on the
+        // paths someone remembered is the one that gets missed on the next route.
+        //
+        // Above the admin gate so the refusal does not depend on role state that an
+        // import is about to rewrite. Fails closed, never into a ban screen.
+        try {
+            const activeBan = await findActiveBan({ userId: user?.id, discordId: user?.discordId });
+            if (activeBan) { res.status(403).json({ error: 'Forbidden' }); return; }
+        } catch (e) {
+            if ((e as Error)?.name !== 'BanCheckUnavailable') {
+                log.error('ban gate failed unexpectedly on import-stream', { userId: user?.id, err: e });
+            }
+            res.status(503).json({ error: 'Unable to verify account status. Please try again.' });
+            return;
+        }
+
+        // TIGHTENED: the genuine system Admin only, by role IDENTITY
+        // (lib/db/adminIdentity.ts). This used to admit `admin:access`, which the
+        // seeded Dispatcher holds — so a Dispatcher could stream a 64 MB org import,
+        // wipe every seeded table and trigger an admin re-anchor, while every other
+        // apex surface (danger zone, maintenance toggle, force-logout-all, apex
+        // government seats) explicitly refuses that permission. It also used to
+        // admit the name-derived `role === 'Admin'` tier, i.e. any custom role
+        // called "Commander". Unstamped ⇒ 403 (fail closed).
+        if (!user || user.isSystemAdmin !== true) { res.status(403).json({ error: 'Forbidden' }); return; }
 
         const ndjson = typeof req.body === 'string' ? req.body : '';
         if (!ndjson.trim()) { res.status(400).json({ error: 'No import data provided.' }); return; }
@@ -444,6 +700,23 @@ app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64
 
         res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
         res.setHeader('X-Accel-Buffering', 'no');
+        // A MERGE can re-anchor this admin onto a different users.id, and the whole `users`
+        // table is replaced along the way. Any session cookie still on this browser then names
+        // a PRE-import id — which after the import either does not exist (every call 401s
+        // mid-wizard) or belongs to a DIFFERENT imported member, whose identity the browser
+        // would then silently assume, because the cookie is preferred over the header.
+        //
+        // It has to be cleared HERE, before the first write. importOrgData emits a `phase` event
+        // as its first statement, so by the time the re-anchor is known the headers are long
+        // flushed and no Set-Cookie can be added. The `reauth` event below carries the fresh
+        // token to the client, which sends it as an Authorization header from then on; the next
+        // login re-mints the cookie.
+        //
+        // Cost accepted: a merge that does NOT re-anchor also clears the cookie, so that admin
+        // may have to sign in again after the import. On a flow that has just replaced the
+        // database wholesale that is a fair price for never handing someone another member's
+        // session.
+        if (merge) res.setHeader('Set-Cookie', clearSessionCookie(SESSION_COOKIE_IS_SECURE));
         const write = (evt: unknown) => {
             res.write(JSON.stringify(evt) + '\n');
             (res as unknown as { flush?: () => void }).flush?.();
@@ -454,6 +727,9 @@ app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64
             // session token so the client stays authenticated as the merged identity.
             if (result.reanchoredAdminUserId != null && result.reanchoredAdminUserId !== decoded.userId) {
                 const token = signToken({ userId: result.reanchoredAdminUserId });
+                // No Set-Cookie here — headers were flushed by the first streamed event. The
+                // stale cookie was already cleared before streaming began (see above), so this
+                // token is the client's only credential and rides the Authorization header.
                 write({ type: 'reauth', token, userId: result.reanchoredAdminUserId });
             }
         } catch (err) {
@@ -462,6 +738,11 @@ app.post('/api/admin/import-stream', express.text({ type: () => true, limit: '64
             // instead of the mid-import "you may hold partial data, reset the database"
             // guidance, which would be actively wrong (and, for the empty-ship-catalog
             // refusal, would be the ordinary first-run outcome).
+            //
+            // Deliberately NOT run through isOpaqueServerError (lib/errors.ts) the way
+            // the dispatcher's 500 catch-alls are: this route is Admin-gated and the raw
+            // message is the operator's import diagnostic. If this surface ever widens
+            // past the system Admin role, classify here too.
             write({
                 type: 'error',
                 message: err instanceof Error ? err.message : 'Import failed.',
@@ -567,7 +848,11 @@ app.get('/api/alliance/data', allianceLimiter, async (req, res) => {
             countReports: data.reports.length,
             countWarrants: data.warrants.length,
             countBulletins: data.bulletins.length,
-            fetchedAt: new Date().toISOString(),
+            // MIRROR _meta, never the wall clock: a peer falls back to this top-level
+            // field when _meta is absent (lib/db/intel.ts) and writes it into
+            // alliance_peers.intel_synced_at. A fresh timestamp here would defeat the
+            // saturation clamp and skip the rows a truncated page withheld, for good.
+            fetchedAt: data._meta.fetchedAt,
             reports: data.reports,
             warrants: data.warrants,
             bulletins: data.bulletins,
@@ -801,21 +1086,30 @@ app.get('/sw.js', swLimiter, async (req, res) => {
     }
 });
 
-// PWA Manifest — CORS enabled for cross-origin tenant subdomain → TLD fetches
-app.options('/api/manifest', (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.status(204).end();
-});
+// PWA Manifest — public branding only (name / icon / theme colour). Deliberately
+// edge-cacheable; handleManifest sets its own Content-Type + Cache-Control.
+//
+// Single-org: no Access-Control-Allow-Origin and no OPTIONS preflight. There is
+// exactly one origin, the manifest is linked same-origin (index.html /
+// api/index.ts) and CSP manifest-src 'self' already forbids a cross-origin one, so
+// the CORS grant had no consumer.
 app.get('/api/manifest', async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
     try {
-        // Express 5: req.query is an immutable getter, so inject target via URL rewrite
-        const sep = req.url.includes('?') ? '&' : '?';
-        req.url = req.url + sep + 'target=manifest';
-        await queryFn(req, res);
+        // Call the manifest sub-handler DIRECTLY. This used to pin the target by
+        // rewriting the URL (`req.url += '&target=manifest'`) and then calling the
+        // generic query handler — which is forgeable: a trailing '#' makes parseurl
+        // treat the appended text as a fragment and DISCARD it, so
+        // '/api/manifest?target=state&subset=hr#' reached handleState, and config /
+        // initial-state / feed the same way, while riding THIS route — which never
+        // calls noStore() (verified against express 5.2.1; the %23 a browser sends
+        // is not the raw byte parseurl looks for, so that form fell closed to a 404
+        // and only curl-class clients could reach it). Do not reintroduce the
+        // rewrite — the target must be structurally unforgeable, not dependent on
+        // two URL parsers agreeing.
+        await handleManifest(req, res);
     } catch (e) {
+        // Belt-and-braces: handleManifest is double-try/catch and returns a default
+        // manifest rather than throwing, so this is not expected to fire.
         log.error('manifest error', { err: e });
         if (!res.headersSent) res.status(500).json({ error: 'Manifest Error' });
     }
@@ -854,10 +1148,50 @@ app.all(/(.*)/, (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
         return res.status(404).json({ message: 'Not found' });
     }
-    bumpAbuseCounter(getClientIp(req));
+    // Health paths are exempt. This counter is UNCONDITIONAL for anything reaching here —
+    // BENIGN_404_RE is never consulted on this path — so an uptime monitor configured to POST
+    // or HEAD /healthz (several do) would blackhole its own IP after 20 probes, and take its
+    // NAT neighbours with it, since a blocked IP gets a 404 on everything.
+    if (req.path !== '/healthz' && req.path !== '/readyz') bumpAbuseCounter(getClientIp(req));
     if (req.method === 'OPTIONS') return res.status(204).end();
     // Hardcoded literal '/' — NEVER derive the Location from req.path/host (open-redirect).
     return res.redirect(303, '/');
+});
+
+/**
+ * Terminal error handler. There was none, so a body-parser fault escaped to Express's
+ * finalhandler and answered a JSON API with an HTML error page — including, outside production,
+ * a stack trace and absolute filesystem paths. Splitting the body cap makes 413 a routine
+ * outcome rather than a curiosity, so the shape of that response now matters.
+ *
+ * Four arguments, and `_next` must stay: Express identifies an error handler by ARITY, so
+ * dropping the unused parameter silently turns this back into ordinary middleware that never
+ * runs. Registered last, after every route.
+ */
+app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const type = (err as { type?: string } | null)?.type;
+    const status = (err as { status?: number; statusCode?: number } | null)?.status
+        ?? (err as { statusCode?: number } | null)?.statusCode
+        ?? 500;
+
+    if (type === 'entity.too.large') {
+        log.warn('request body over cap', { path: req.originalUrl, method: req.method, ip: getClientIp(req) });
+        res.setHeader('Cache-Control', 'no-store');
+        res.status(413).json({ message: 'That upload is too large.' });
+        return;
+    }
+    if (type === 'entity.parse.failed') {
+        res.setHeader('Cache-Control', 'no-store');
+        res.status(400).json({ message: 'Malformed request body.' });
+        return;
+    }
+
+    // Anything else: log it server-side with an id, return an opaque message. The raw error
+    // text never crosses the wire — it can carry file paths and query fragments.
+    const requestId = randomUUID();
+    log.error('unhandled request error', { requestId, path: req.originalUrl, method: req.method, err });
+    res.setHeader('Cache-Control', 'no-store');
+    if (!res.headersSent) res.status(status >= 400 && status < 600 ? status : 500).json({ message: 'An internal server error occurred.', requestId });
 });
 
 // Cron jobs run in-process, each wrapped in withCronLease (a table-based lease,
@@ -867,7 +1201,10 @@ import cron from 'node-cron';
 import { cleanupInactiveDutyUsers } from './lib/db/users.js';
 import { cleanupExpiredBulletins } from './lib/db/intel.js';
 import { allianceSyncTick } from './lib/db/allianceSync.js';
+import { sendDueOperationReminders } from './lib/db/opReminders.js';
+import { sendDueOperationStartNotices } from './lib/db/opStartNotices.js';
 import { pruneOldNotifications } from './lib/db/notifications.js';
+import { pruneSecurityEvents } from './lib/db/securityEvents.js';
 import { withCronLease } from './lib/cronLock.js';
 
 // Only bind the port / register cron + signal handlers when this module is the
@@ -902,6 +1239,22 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
     if (permCheck.missing.length === 0 && permCheck.stale.length === 0) {
         log.info('permission map ok');
     }
+
+    // SCHEMA PREFLIGHT for the api_keys lifecycle columns. The code refuses API-key
+    // authentication when they are absent (fail closed), and the only symptom a peer sees is
+    // that we look down — so the operator has to be told here, at boot, in the deploy log,
+    // rather than finding out from an ally. Also surfaced in Database Tools and, for admins,
+    // as a banner in the app.
+    findMissingApiKeyColumns()
+        .then((missing) => {
+            if (missing.length > 0) {
+                log.error('DATABASE UPDATE REQUIRED — api_keys is missing columns; API key authentication is REFUSED until schema.sql is re-run', {
+                    missing,
+                    fix: 'Paste the current schema.sql into the Supabase SQL editor and run it.',
+                });
+            }
+        })
+        .catch((err) => log.warn('could not preflight api_keys columns', { err }));
 
     // Report the public origin this deployment will actually put in Discord deep links
     // and advertise to alliance peers, plus which source it came from. Deliberately
@@ -955,6 +1308,34 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
       });
     });
 
+    // Operation push reminders (every minute). The consumer for the
+    // operation_reminders rows lib/db/ops.ts has written since day one and that
+    // nothing ever read — until this job existed, no reminder had ever been
+    // delivered on any deployment. Fail-OPEN lease on purpose: the job claims each
+    // row with a conditional UPDATE (lib/db/opReminders.ts), so two instances
+    // running through a lease outage claim disjoint sets — alliance_sync's
+    // fail-closed rationale (peer rate limits) does not apply here.
+    cron.schedule('* * * * *', async () => {
+      await withCronLease('op_reminders', 50, async () => {
+        const t0 = Date.now();
+        try {
+            const sent = await sendDueOperationReminders();
+            if (sent > 0) log.info('cron op-reminders', { sent, durationMs: Date.now() - t0 });
+        } catch (e) {
+            log.error('cron op reminders failed', { err: e });
+        }
+        // Rides the SAME lease and the same tick — no second cron, no second lease
+        // key. Its OWN try/catch, so a Discord outage cannot stop the web-push
+        // reminders above it.
+        try {
+            const notices = await sendDueOperationStartNotices();
+            if (notices > 0) log.info('cron op-start-notices', { notices, durationMs: Date.now() - t0 });
+        } catch (e) {
+            log.error('cron op start notices failed', { err: e });
+        }
+      });
+    });
+
     // Alliance live-sync engine (every minute): per-peer due-time scheduling
     // (ops manifest reconcile / intel delta pull / directory refresh), peer
     // health + backoff, and rate budgeting all live inside the tick — see
@@ -986,6 +1367,22 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
             log.info('cron notification-prune done', { deleted, durationMs: Date.now() - t0 });
         } catch (e) {
             log.error('cron notification prune failed', { err: e });
+        }
+      });
+    });
+
+    // Security audit retention. The trail is PII-bearing (actor IPs), so it is pruned
+    // rather than kept forever - an audit log that grows without bound is a liability
+    // as well as an asset. 365 days by default; SECURITY_EVENT_RETENTION_DAYS overrides.
+    cron.schedule('45 3 * * *', async () => {
+      await withCronLease('prune_security_events', 600, async () => {
+        const t0 = Date.now();
+        try {
+            const days = Number(process.env.SECURITY_EVENT_RETENTION_DAYS) || 365;
+            const deleted = await pruneSecurityEvents(days);
+            log.info('cron security-event-prune done', { deleted, days, durationMs: Date.now() - t0 });
+        } catch (e) {
+            log.error('cron security event prune failed', { err: e });
         }
       });
     });

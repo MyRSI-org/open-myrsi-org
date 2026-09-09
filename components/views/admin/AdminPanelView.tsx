@@ -38,6 +38,8 @@ const AppearanceTab = React.lazy(() => import('./AppearanceTab'));
 const OrgPublicPageTab = React.lazy(() => import('./OrgPublicPageTab'));
 const LegalDocumentsTab = React.lazy(() => import('./LegalDocumentsTab'));
 const DatabaseToolsTab = React.lazy(() => import('./DatabaseToolsTab'));
+const SecurityAuditTab = React.lazy(() => import('./SecurityAuditTab'));
+const BanManagementTab = React.lazy(() => import('./BanManagementTab'));
 const WikiToolsTab = React.lazy(() => import('./WikiToolsTab'));
 const OrgImportTab = React.lazy(() => import('./OrgImportTab'));
 const GovernmentSettingsTab = React.lazy(() => import('./GovernmentSettingsTab'));
@@ -64,6 +66,7 @@ const tabGroups = {
     "User Management": [
         { id: 'roster', label: 'Members', icon: 'fa-solid fa-users', permission: 'admin:view:roster' },
         { id: 'clients', label: 'Clients', icon: 'fa-solid fa-address-book', permission: 'admin:view:clients' },
+        { id: 'bans', label: 'Bans & Appeals', icon: 'fa-solid fa-user-slash', permission: 'admin:user:ban' },
     ],
     "Organization": [
         { id: 'units', label: 'Units', icon: 'fa-solid fa-sitemap', permission: 'admin:config:units' },
@@ -93,7 +96,12 @@ const tabGroups = {
         { id: 'discord', label: 'Discord', icon: 'fa-brands fa-discord', permission: 'admin:config:discord' },
         { id: 'radio', label: 'Radio', icon: 'fa-solid fa-walkie-talkie', permission: 'admin:config:branding' },
         { id: 'ai', label: 'AI', icon: 'fa-solid fa-microchip', permission: 'admin:config:ai' },
-        { id: 'intel_mgmt', label: 'Intel Feeds', icon: 'fa-solid fa-filter', permission: 'intel:manage' },
+        // anyOf, because this ONE tab fronts two different capabilities: intel feed sources
+        // (intel:manage) and API-key management (admin:config:api). Gated on intel:manage alone,
+        // the permission literally named "Manage API Keys" had NO route to the only screen that
+        // manages API keys, while an intel:manage holder saw the key UI and 403'd on every
+        // click. The server gate is unchanged and remains the boundary.
+        { id: 'intel_mgmt', label: 'Intel Feeds', icon: 'fa-solid fa-filter', permission: 'intel:manage', anyOf: ['intel:manage', 'admin:config:api'] },
     ],
     "Appearance": [
         { id: 'appearance', label: 'Appearance', icon: 'fa-solid fa-palette', permission: 'admin:config:branding', anyOf: ['admin:config:branding', 'admin:config:theme', 'admin:config:settings', 'admin:config:metadata'] },
@@ -113,7 +121,16 @@ const tabGroups = {
         { id: 'catalog_locations', label: 'Location Catalog', icon: 'fa-solid fa-globe', permission: 'admin:config:catalog' },
     ],
     "Maintenance": [
+        // Deliberately the BROAD visibility gate (admin:access), not the high-bar
+        // admin:db:destroy the server enforces on every button inside. This tab is the
+        // org's break-glass: repairDatabase re-syncs the Admin role's permissions and
+        // lifts an unliftable ban on an Admin (liftBansOnSystemAdmins), and gating the
+        // route to it on a permission that only Repair itself can grant is the
+        // circularity that manufactures the lockout. The server gate is the boundary —
+        // assertAdminRoleFresh + admin:db:destroy — so a broad tab costs a 403, while a
+        // narrow one can cost the org its recovery path.
         { id: 'db_tools', label: 'Database Tools', icon: 'fa-solid fa-server', permission: 'admin:access' },
+        { id: 'security_audit', label: 'Security Audit', icon: 'fa-solid fa-shield-halved', permission: 'admin:security:view_audit' },
         { id: 'wiki_tools', label: 'Wiki Export/Import', icon: 'fa-solid fa-book', permission: 'admin:access' },
         { id: 'org_import', label: 'Import Organization', icon: 'fa-solid fa-database', permission: 'admin:access' },
     ],
@@ -198,6 +215,7 @@ const AdminPanelView: React.FC = () => {
             case 'overview': return <AnalyticsDashboard />;
             case 'roster': return hasPermission('admin:view:roster') ? <AdminMemberManagement onManageUser={setManagingUser} scrollId="admin-roster-list" /> : null;
             case 'clients': return hasPermission('admin:view:clients') ? <ClientManagementTab onManageUser={setManagingUser} /> : null;
+            case 'bans': return hasPermission('admin:user:ban') ? <BanManagementTab /> : null;
             case 'units': return hasPermission('admin:config:units') ? <UnitManagementTab /> : null;
             case 'ranks': return hasPermission('admin:config:ranks') ? <RankManagementTab /> : null;
             case 'member_roles': return hasPermission('hr:manage:positions') ? <div className="p-8"><ManagePositionsTab /></div> : null;
@@ -213,12 +231,13 @@ const AdminPanelView: React.FC = () => {
             case 'legal': return hasPermission('admin:config:branding') ? <LegalDocumentsTab /> : null;
             case 'radio': return hasPermission('admin:config:branding') ? <RadioSettingsTab /> : null;
             case 'ai': return hasPermission('admin:config:ai') ? <AIConfigTab /> : null;
-            case 'intel_mgmt': return hasPermission('intel:manage') ? <IntelligenceManagementTab /> : null;
+            case 'intel_mgmt': return (hasPermission('intel:manage') || hasPermission('admin:config:api')) ? <IntelligenceManagementTab /> : null;
             case 'alliances': return hasPermission('alliance:manage') ? <AllianceManagementTab /> : null;
             case 'marketplace_admin': return hasPermission('marketplace:admin') ? <MarketplaceAdminTab /> : null;
             case 'government': return hasPermission('gov:admin') ? <GovernmentSettingsTab /> : null;
             case 'features': return hasPermission('admin:config:features') ? <FeaturesSettingsTab /> : null;
             case 'db_tools': return hasPermission('admin:access') ? <DatabaseToolsTab /> : null;
+            case 'security_audit': return hasPermission('admin:security:view_audit') ? <SecurityAuditTab /> : null;
             case 'wiki_tools': return hasPermission('admin:access') ? <WikiToolsTab /> : null;
             case 'org_import': return hasPermission('admin:access') ? <OrgImportTab /> : null;
             case 'service_types': return hasPermission('admin:config:servicetypes') ? <ServiceTypesManagementTab /> : null;

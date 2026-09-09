@@ -10,6 +10,7 @@ import { useConfig } from '../../contexts/ConfigContext';
 import LocationInput from '../ui/LocationInput';
 import WindowFrame from '../layout/WindowFrame';
 import { useNavigation } from '../../contexts/NavigationContext';
+import { mayRaiseRequest } from '../../lib/requestLifecycle';
 
 interface CreateRequestModalProps {
     isOpen: boolean;
@@ -20,7 +21,7 @@ const CreateRequestModal: React.FC<CreateRequestModalProps> = ({ isOpen, onClose
     const { currentUser } = useAuth();
     const { createRequest } = useRequests();
     const { refreshRequests, refreshMainState, hydratedServiceRequests } = useData();
-    const { members } = useMembers();
+    const { anyStaffOnDuty } = useMembers();
     const { brandingConfig, heroCardConfig, serviceTypes } = useConfig();
     const { viewRequestDetails } = useNavigation();
 
@@ -46,7 +47,6 @@ const CreateRequestModal: React.FC<CreateRequestModalProps> = ({ isOpen, onClose
     const [isLoading, setIsLoading] = useState(false);
     const [submissionError, setSubmissionError] = useState<string | null>(null);
 
-    const areAnyMembersOnDuty = useMemo(() => members.some(m => m.isDuty), [members]);
     const isClient = currentUser?.role === 'Client';
 
     const clientHasActiveRequest = useMemo(() => {
@@ -105,7 +105,12 @@ const CreateRequestModal: React.FC<CreateRequestModalProps> = ({ isOpen, onClose
             } catch (err: any) {
                 console.error("Failed to create request:", err);
                 const msg = err?.message || err?.toString() || '';
-                if (msg.toLowerCase().includes('already have an active') || msg.toLowerCase().includes('action blocked')) {
+                // Order matters: the standing refusal also contains "Action Blocked", so it
+                // has to be matched FIRST or it renders as the active-request copy — telling a
+                // permanently-blocked account to wait for a request it does not have.
+                if (msg.toLowerCase().includes('standing')) {
+                    setSubmissionError('Your standing is too low to raise a service request. Contact command to have it reviewed — retrying will not help.');
+                } else if (msg.toLowerCase().includes('already have an active') || msg.toLowerCase().includes('action blocked')) {
                     setSubmissionError('You already have an active service request. Please use "Log Ad-Hoc" for additional requests, or wait for your current request to complete.');
                 } else {
                     setSubmissionError('Failed to create request. Please try again or contact support if the issue persists.');
@@ -117,7 +122,10 @@ const CreateRequestModal: React.FC<CreateRequestModalProps> = ({ isOpen, onClose
     }, [createRequest, serviceType, location, description, urgency, threatLevel, partyInfo, partyHandles, onClose, viewRequestDetails, currentUser, refreshRequests]);
 
     // Check for Low Reputation Standing
-    if (currentUser && currentUser.reputation <= 10) {
+    // Shared with the server (lib/requestLifecycle.ts). Behaviour-identical to the old
+    // inline `reputation <= 10`, because types.ts declares reputation as a required number
+    // and the mapper coerces a missing column to 0.
+    if (currentUser && !mayRaiseRequest(currentUser.reputation)) {
         return (
             <WindowFrame
                 isOpen={isOpen}
@@ -187,8 +195,39 @@ const CreateRequestModal: React.FC<CreateRequestModalProps> = ({ isOpen, onClose
         );
     }
 
+    // Availability unknown: the server's probe faulted. Deny the form — unknown must
+    // not widen — but do NOT tell the customer there is nobody on duty, which would
+    // assert a fact we do not have. Retry re-runs the {force:true} refreshMainState()
+    // the mount effect above uses.
+    if (isClient && anyStaffOnDuty === null) {
+        return (
+            <WindowFrame
+                isOpen={isOpen}
+                onClose={onClose}
+                title="Availability Unknown"
+                subtitle="Could not confirm unit availability"
+                icon="fa-solid fa-triangle-exclamation"
+                color="slate"
+                width="max-w-md"
+            >
+                <div className="p-6 text-center space-y-4">
+                    <p className="text-slate-400 text-sm leading-relaxed">
+                        We could not confirm whether any {brandingConfig.name || 'organization'} units are on duty.
+                    </p>
+                    <button
+                        type="button"
+                        onClick={() => { void refreshMainState(); }}
+                        className="text-xs font-bold text-sky-400 hover:text-white uppercase tracking-widest"
+                    >
+                        Retry
+                    </button>
+                </div>
+            </WindowFrame>
+        );
+    }
+
     // Check for No Service Availability for Clients
-    if (isClient && !areAnyMembersOnDuty) {
+    if (isClient && !anyStaffOnDuty) {
         return (
             <WindowFrame
                 isOpen={isOpen}

@@ -53,8 +53,17 @@
 --     DROP VIEW ... CASCADE + recreate + re-GRANT; plain CREATE OR REPLACE
 --     cannot change a view's columns).
 --   * New trigger/policy → DROP ... IF EXISTS first, then CREATE.
---   * New realtime table → add it to the §6a `CREATE PUBLICATION ... FOR TABLE`
---     list (the DROP+CREATE re-establishes current membership on re-run).
+--   * New realtime table → add it to private.rt_client_tables() (§4.9). That
+--     ONE array drives the §5 authenticated SELECT grant, the §6
+--     authenticated_select policy, the §6 deny-all exclusion and the §6a
+--     publication — tests/sec-schema-rls.test.ts pins all four to it.
+--     A new table is STAFF-ONLY by default; add it to
+--     private.rt_customer_visible_tables() (§4.9) only if an external customer's
+--     own screens consume it.
+--   * NEVER add a blanket `GRANT ... ON ALL TABLES/SEQUENCES` to `anon` or
+--     `authenticated`. §5 is REVOKE-then-allowlist by design: the browser's
+--     supabase-js client makes no PostgREST call at all, so table privilege
+--     beyond the realtime set is pure attack surface.
 --   * New permission   → add to §7 (ON CONFLICT DO NOTHING) AND to
 --     GLOBAL_PERMISSIONS (lib/db/system.ts) — tests/permissionSeedParity enforces it.
 --   * New seed reference data → add to lib/db/seeder.ts with an upsert so Repair
@@ -287,6 +296,16 @@ CREATE TABLE IF NOT EXISTS public.roles (
     is_system   boolean DEFAULT false,
     CONSTRAINT roles_name_key UNIQUE (name)
 );
+
+-- is_system has been in the CREATE TABLE body since the first open-build commit, but
+-- CREATE TABLE IF NOT EXISTS does not backfill a column on a table that already
+-- exists. private.rt_is_staff() (§4.9) is the first thing in this file to READ it, and
+-- a function body is validated at CREATE time, so on a database whose roles table came
+-- from somewhere else the whole apply would abort ~3000 lines below with a bare
+-- "column r.is_system does not exist". lib/db/common.ts and lib/db/roleDefaults.ts
+-- both carry pre-is_system fallbacks, i.e. this codebase already believes such
+-- databases exist. One guarded ALTER removes the question.
+ALTER TABLE public.roles ADD COLUMN IF NOT EXISTS is_system boolean DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS public.role_permissions (
     role_id       integer NOT NULL REFERENCES public.roles(id) ON DELETE CASCADE,
@@ -551,6 +570,152 @@ CREATE TABLE IF NOT EXISTS public.api_keys (
     key_hash     text NOT NULL,
     last_used_at timestamptz
 );
+
+-- API-key lifecycle. Keys used to have no expiry, no scopes, and no revocation RECORD:
+-- revoking meant DELETING the row, which destroyed the very audit trail an operator needs
+-- after a leak ("when was it issued, when was it last used, who killed it and why").
+--
+--   scopes        Which key-authenticated surface a key may reach: 'feed' (the read-only
+--                 intel feed) and/or 'alliance' (server-to-server federation). NULL means
+--                 "issued before scopes existed" and is grandfathered to both — see
+--                 lib/apiKeyScopes.ts. Repair Database converts those NULLs to explicit
+--                 arrays; it is NOT backfilled here, because this file is RE-RUNNABLE and a
+--                 backfill would re-widen scopes an operator has since narrowed on every
+--                 upgrade.
+--   expires_at    NULL = never. A federation pairing that silently expires at 3am is an
+--                 outage with no error message anywhere, so nothing sets this by default;
+--                 the health check warns before a key that HAS one dies.
+--   revoked_at /  Soft revocation. The row survives as the record. verifyApiKey refuses a
+--   revoked_by /  revoked key, so the credential is dead the moment this is stamped.
+--   revoked_reason
+--   key_prefix    First few characters of the key, stored so the admin list can tell one
+--                 key from another. Not a secret: 7 of 22 base64url characters of a 96-bit
+--                 random value. Without it every row rendered an identical placeholder and
+--                 an operator could not tell WHICH key they were about to revoke.
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS scopes        text[];
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS expires_at    timestamptz;
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS revoked_at    timestamptz;
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS revoked_by    integer;
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS revoked_reason text;
+ALTER TABLE public.api_keys ADD COLUMN IF NOT EXISTS key_prefix    text;
+
+-- Verification looks a key up by hash on every federation request and every feed pull.
+CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON public.api_keys (key_hash);
+
+-- Durable security audit trail. The dispatcher already log.warn'd every SecurityDenial
+-- (lib/errors.ts carries auditEvent + fields for exactly this purpose), but a log line
+-- is not queryable after the fact: answering "who tried what, when" meant grepping
+-- container logs that a redeploy discards. This is that sink.
+--
+-- PII-BEARING. actor_ip is personal data and actor_user_id identifies a member, so:
+--   * it is NOT in private.rt_client_tables(), so the SECTION 6 deny-all loop gives it
+--     a USING (false) policy and no realtime publication membership. It must never be
+--     added there.
+--   * there is NO /api/query subset for it. The admin screen reads it through a
+--     permission-gated RPC only, so it cannot ride a state bundle even by accident —
+--     the boot bundle and every *_slice path are structurally incapable of carrying it.
+--   * rows are pruned on a retention timer (the prune_security_events cron), because
+--     an audit trail that grows forever is a liability rather than an asset.
+-- tests/securityEventsEgress.test.ts pins all three.
+--
+-- outcome is free text rather than a CHECK so a new denial shape needs no migration;
+-- 'denied' is the overwhelming case, 'allowed' is reserved for the handful of
+-- high-consequence ALLOWED actions an operator wants a positive record of.
+-- details is jsonb and is written through a redacting serializer (lib/db/securityEvents
+-- recordSecurityEvent), so a field whose key looks like a secret never lands here.
+CREATE TABLE IF NOT EXISTS public.security_events (
+    id            bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    -- SET NULL, not CASCADE: removing a member must not erase the record of what that
+    -- account did. actor_label keeps a human-readable trace once the id is gone.
+    actor_user_id integer REFERENCES public.users(id) ON DELETE SET NULL,
+    actor_label   text,
+    actor_ip      text,
+    -- The audit slug, e.g. 'authz.denied', 'authz.db_reset.denied'. Matches
+    -- SecurityDenial.auditEvent so the two cannot drift.
+    event         text NOT NULL,
+    -- The dispatcher action or route the actor was attempting.
+    action        text,
+    outcome       text NOT NULL DEFAULT 'denied',
+    details       jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- The admin screen's default view: newest first.
+CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON public.security_events(created_at DESC);
+-- "What did this account do?" — the question asked during an incident.
+CREATE INDEX IF NOT EXISTS idx_security_events_actor ON public.security_events(actor_user_id, created_at DESC);
+-- "Show me every denial of this kind."
+CREATE INDEX IF NOT EXISTS idx_security_events_event ON public.security_events(event, created_at DESC);
+
+
+-- ---------------------------------------------------------------------------
+-- ORG BANS + APPEALS
+-- ---------------------------------------------------------------------------
+-- Admin-initiated member exclusion. Deliberately placed beside security_events,
+-- because it shares that table's properties exactly: PII-bearing, service-role
+-- only, absent from private.rt_client_tables() so realtime never carries it, and
+-- with NO /api/query subset — the ban console reads it through an RPC action.
+--
+-- SINGLE-ORG: hosted carries organization_id on both tables and a portal-owner
+-- break-glass that needs a platform tier above the org. Neither exists here.
+--
+-- discord_id is stored ALONGSIDE user_id, not instead of it. A ban has to survive
+-- the account: deleteUser is a soft delete that deliberately RETAINS discord_id
+-- "for abuse prevention (ban-evasion detection)", and a banned member who deletes
+-- themselves and signs in again arrives as a fresh users row with the same Discord
+-- identity. The partial unique indexes below are per-subject, so one member can
+-- hold at most one active ban on each axis.
+CREATE TABLE IF NOT EXISTS public.organization_bans (
+    id          bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    discord_id  text,
+    user_id     integer REFERENCES public.users(id) ON DELETE SET NULL,
+    reason      text NOT NULL,
+    expires_at  timestamptz,
+    banned_by   integer REFERENCES public.users(id) ON DELETE SET NULL,
+    banned_at   timestamptz NOT NULL DEFAULT now(),
+    lifted_at   timestamptz,
+    lifted_by   integer REFERENCES public.users(id) ON DELETE SET NULL,
+    lift_reason text,
+    -- A ban with neither subject can never match anyone: it would be an
+    -- unenforceable row that still occupies the console and the appeal queue.
+    CONSTRAINT organization_bans_subject_present CHECK (discord_id IS NOT NULL OR user_id IS NOT NULL)
+);
+
+-- At most ONE active ban per subject. Partial on lifted_at so a lifted ban stays
+-- in the history (the accountable trail) without blocking a future re-ban.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_bans_active_discord
+    ON public.organization_bans(discord_id) WHERE lifted_at IS NULL AND discord_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_bans_active_user
+    ON public.organization_bans(user_id) WHERE lifted_at IS NULL AND user_id IS NOT NULL;
+-- The console's default view: newest first.
+CREATE INDEX IF NOT EXISTS idx_org_bans_banned_at ON public.organization_bans(banned_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.organization_ban_appeals (
+    id          bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    ban_id      bigint NOT NULL REFERENCES public.organization_bans(id) ON DELETE CASCADE,
+    statement   text NOT NULL,
+    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected')),
+    reviewed_by integer REFERENCES public.users(id) ON DELETE SET NULL,
+    reviewed_at timestamptz,
+    review_note text,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- One appeal per ban: the appeal form is the banned member's ONLY reachable write,
+-- so without this it is an unmetered insert primitive for a hostile ex-member.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_ban_appeals_one_per_ban
+    ON public.organization_ban_appeals(ban_id);
+CREATE INDEX IF NOT EXISTS idx_org_ban_appeals_status
+    ON public.organization_ban_appeals(status, created_at DESC);
+
+-- §6's loop enables RLS on every public table and §5 grants service_role, so on a
+-- FULL re-run these two lines are redundant. They are here anyway: schema.sql is
+-- applied BY HAND and a pasted fragment is the documented failure mode, and these
+-- are the only tables outside `users` that carry discord_id. Two idempotent lines
+-- is the wrong thing to economise on.
+ALTER TABLE public.organization_bans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.organization_ban_appeals ENABLE ROW LEVEL SECURITY;
+
 
 CREATE TABLE IF NOT EXISTS public.external_tools (
     id          integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -1088,6 +1253,14 @@ CREATE TABLE IF NOT EXISTS public.operations (
     payout_mode           text NOT NULL DEFAULT 'equal'::text CHECK (payout_mode IN ('equal', 'weighted', 'custom')),
     discord_announcement_channel_id text,
     discord_announcement_message_id text,
+    -- "Post a Discord notice 15 minutes before this operation starts."
+    -- DEFAULT false is the ORG'S CONSENT: an operation publishes nothing to Discord
+    -- unless someone deliberately ticked the box. The _sent_at stamp is what makes a
+    -- per-minute cron exactly-once — the job CLAIMS the row by stamping it before it
+    -- posts, so a second instance (or a retried tick) finds nothing to do. Clearing
+    -- the stamp re-arms it, which is what a reschedule does.
+    discord_start_notice         boolean NOT NULL DEFAULT false,
+    discord_start_notice_sent_at timestamptz,
     -- Discord Guild Scheduled Event id (set when an op is created with a Discord event);
     -- read on op delete/update for event cleanup + mirroring. Server-authored, nullable.
     discord_event_id      text,
@@ -1194,6 +1367,57 @@ CREATE TABLE IF NOT EXISTS public.operation_command_nodes (
     fleet_group_id   integer REFERENCES public.fleet_groups(id) ON DELETE SET NULL,
     live_status      text
 );
+
+-- ORBAT ship seats. A TOP-LEVEL row is a ship or a generic capacity slot ("Solo
+-- Fighters" x10); a row with parent_slot_id set is a named SEAT on that ship. Max
+-- depth 2, enforced in lib/db/ops.ts (a parent must itself be top-level), which is
+-- also what prevents a re-parenting cycle.
+CREATE TABLE IF NOT EXISTS public.operation_ship_slots (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    operation_id   uuid NOT NULL REFERENCES public.operations(id) ON DELETE CASCADE,
+    parent_slot_id bigint REFERENCES public.operation_ship_slots(id) ON DELETE CASCADE,
+    -- The GLOBAL platform_ships catalog, so this is an existence check only.
+    ship_id        integer REFERENCES public.platform_ships(id) ON DELETE SET NULL,
+    label          text NOT NULL,
+    seat_role      text,
+    capacity       integer NOT NULL DEFAULT 1,
+    sort_order     integer NOT NULL DEFAULT 0,
+    notes          text,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operation_ship_slots_capacity_positive CHECK (capacity >= 1)
+);
+
+-- Who is applied-for or seated in a slot. The UNIQUE (slot_id, user_id) is what makes
+-- one-row-per-person-per-slot a database guarantee rather than an application check —
+-- every write is an upsert on that conflict target.
+CREATE TABLE IF NOT EXISTS public.operation_slot_assignments (
+    id           bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    operation_id uuid NOT NULL REFERENCES public.operations(id) ON DELETE CASCADE,
+    slot_id      bigint NOT NULL REFERENCES public.operation_ship_slots(id) ON DELETE CASCADE,
+    user_id      integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    status       text NOT NULL DEFAULT 'assigned',
+    user_ship_id integer REFERENCES public.user_ships(id) ON DELETE SET NULL,
+    assigned_by  integer REFERENCES public.users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operation_slot_assignments_status_chk CHECK (status IN ('applied','assigned')),
+    CONSTRAINT operation_slot_assignments_slot_user_uq UNIQUE (slot_id, user_id)
+);
+
+-- RLS, stated INLINE even though SECTION 6's loops would install exactly this on a
+-- full re-run. This file is applied BY HAND, and pasting only the new CREATE TABLE
+-- block is the documented failure mode — which would otherwise leave two tables
+-- carrying the seating chart of every operation with RLS not even enabled. Both
+-- statements are idempotent and cost nothing on a full apply.
+ALTER TABLE public.operation_ship_slots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.operation_slot_assignments ENABLE ROW LEVEL SECURITY;
+-- DROP-then-CREATE, byte-for-byte the form SECTION 6's loop emits, so a full
+-- re-run rewrites these to exactly what they already are.
+DROP POLICY IF EXISTS "Service role only" ON public.operation_ship_slots;
+CREATE POLICY "Service role only" ON public.operation_ship_slots FOR ALL TO public USING (false) WITH CHECK (false);
+DROP POLICY IF EXISTS "Service role only" ON public.operation_slot_assignments;
+CREATE POLICY "Service role only" ON public.operation_slot_assignments FOR ALL TO public USING (false) WITH CHECK (false);
 
 CREATE TABLE IF NOT EXISTS public.operation_limiting_markers (
     operation_id uuid NOT NULL REFERENCES public.operations(id) ON DELETE CASCADE,
@@ -1335,6 +1559,13 @@ CREATE TABLE IF NOT EXISTS public.operation_templates (
     classification_level integer NOT NULL DEFAULT 0,
     limiting_marker_ids  bigint[] NOT NULL DEFAULT '{}'
 );
+-- Re-runnable: the start-notice columns, for instances created before they existed.
+-- The server tolerates their absence (a 42703 on the operations update degrades to
+-- "no start notices" rather than "operations cannot be edited"), so an operator who
+-- has not re-run this file yet keeps a working build — they just get no notices.
+ALTER TABLE public.operations ADD COLUMN IF NOT EXISTS discord_start_notice boolean NOT NULL DEFAULT false;
+ALTER TABLE public.operations ADD COLUMN IF NOT EXISTS discord_start_notice_sent_at timestamptz;
+
 -- Re-runnable: add the clearance columns to instances created before they existed.
 ALTER TABLE public.operation_templates ADD COLUMN IF NOT EXISTS classification_level integer NOT NULL DEFAULT 0;
 ALTER TABLE public.operation_templates ADD COLUMN IF NOT EXISTS limiting_marker_ids bigint[] NOT NULL DEFAULT '{}';
@@ -1747,6 +1978,75 @@ CREATE INDEX IF NOT EXISTS idx_qm_issuances_due ON public.quartermaster_issuance
     WHERE status = 'active' AND due_back_at IS NOT NULL;
 
 
+-- ----- 3.11b Blueprints (registry + two-sided crafting requests) -------------
+-- Optional feature, default OFF (orgFeatures.blueprints.enabled).
+--
+-- NO GRANTS, NO RLS, NO POLICIES BELOW — that is deliberate, not an omission.
+-- §5 already carries `ALTER DEFAULT PRIVILEGES … GRANT ALL ON TABLES TO service_role` plus a
+-- blanket REVOKE for PUBLIC/anon/authenticated, and §6 enables RLS on every
+-- pg_tables row in a loop. A table with RLS on and NO policy is deny-all, which is
+-- strictly stronger than a `CREATE POLICY … USING (false)`: a permissive policy is one
+-- careless OR away from granting something, and an absent one cannot be.
+-- (This does mean a PARTIAL paste of just this section leaves the tables ungoverned
+-- until §5/§6 are re-run. Apply the whole file, as the header says.)
+CREATE TABLE IF NOT EXISTS public.blueprints (
+    id              bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    owner_id        integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    -- Optional pin to a catalog row. SET NULL, not CASCADE: the Quartermaster
+    -- bulk-deletes catalog rows, and a blueprint outliving its pin is history,
+    -- not garbage. category travels WITH this pin (see lib/db/blueprints.ts).
+    qm_catalog_id   bigint REFERENCES public.quartermaster_catalog(id) ON DELETE SET NULL,
+    item_name       text NOT NULL,
+    category        text,
+    notes           text,
+    -- A LIVE CONSENT FLAG, not history. It is the only thing that admits a new
+    -- crafting request against this member, which is why deleteUser clears it.
+    offers_crafting boolean NOT NULL DEFAULT false,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+-- One entry per member per item name. Case-insensitive, so "Ballista" and
+-- "ballista" are the same blueprint rather than two rows the dedupe would count.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_blueprints_owner_item
+    ON public.blueprints(owner_id, lower(item_name));
+CREATE INDEX IF NOT EXISTS idx_blueprints_craftable
+    ON public.blueprints(offers_crafting) WHERE offers_crafting;
+CREATE INDEX IF NOT EXISTS idx_blueprints_qm_catalog
+    ON public.blueprints(qm_catalog_id) WHERE qm_catalog_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.blueprint_requests (
+    id              bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    requester_id    integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    -- NULL until a crafter claims it. Pinning one at creation would tell the
+    -- requester which member matched their item before anyone volunteered.
+    crafter_id      integer REFERENCES public.users(id) ON DELETE SET NULL,
+    blueprint_id    bigint REFERENCES public.blueprints(id) ON DELETE SET NULL,
+    qm_catalog_id   bigint REFERENCES public.quartermaster_catalog(id) ON DELETE SET NULL,
+    -- Frozen at creation from the MATCHED registry row, never the client's string.
+    item_name       text NOT NULL,
+    quantity        integer NOT NULL DEFAULT 1 CHECK (quantity > 0 AND quantity <= 10000),
+    materials_note  text,
+    offer_price_uec bigint CHECK (offer_price_uec IS NULL OR (offer_price_uec >= 0 AND offer_price_uec <= 1000000000000)),
+    status          text NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'claimed', 'ready', 'delivered', 'completed', 'cancelled')),
+    claimed_at      timestamptz,
+    ready_at        timestamptz,
+    delivered_at    timestamptz,
+    completed_at    timestamptz,
+    cancelled_at    timestamptz,
+    cancel_reason   text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_blueprint_requests_status ON public.blueprint_requests(status);
+CREATE INDEX IF NOT EXISTS idx_blueprint_requests_requester ON public.blueprint_requests(requester_id);
+CREATE INDEX IF NOT EXISTS idx_blueprint_requests_crafter ON public.blueprint_requests(crafter_id);
+CREATE INDEX IF NOT EXISTS idx_blueprint_requests_blueprint
+    ON public.blueprint_requests(blueprint_id) WHERE blueprint_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_blueprint_requests_qm_catalog
+    ON public.blueprint_requests(qm_catalog_id) WHERE qm_catalog_id IS NOT NULL;
+
+
 -- ----- 3.12 Warehouse (bulk commodities) -------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.warehouse_catalog (
@@ -1970,6 +2270,77 @@ CREATE TABLE IF NOT EXISTS public.marketplace_contract_milestones (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_marketplace_milestones_contract ON public.marketplace_contract_milestones(contract_id);
+
+-- ---------------------------------------------------------------------------
+-- BARTER CONSIDERATION — mixed aUEC + goods terms.
+-- ---------------------------------------------------------------------------
+-- A leg is a LABEL AND A QUANTITY: a documented term of the deal, in exactly the
+-- same trust class as price_uec. It is an honour-system record of what was agreed,
+-- and it is NOT inventory.
+--
+-- THESE TABLES NEVER TOUCH warehouse_stock OR warehouse_stock_movements. Goods
+-- named in a barter leg are handed over in-game, by the members, between
+-- themselves. The one-sided warehouse flow for the PRIMARY item being sold
+-- (marketplace_listings.warehouse_stock_id) is unchanged and unaffected. Three
+-- reasons this is not an oversight: a leg has no location or condition so there is
+-- no row to move; the counterparty's goods are not in this org's warehouse at all;
+-- and making it settle would turn every listing edit into a stock mutation by a
+-- CUSTOMER-GRANTABLE permission.
+--
+-- NO CATALOG FK, deliberately. Hosted carries optional quartermaster_catalog /
+-- commodity pins guarded by an "is this a platform row" assert whose purpose was
+-- stopping a leg naming another TENANT's private row — a threat that does not
+-- exist in a single-org build. The faithful translation here would be worse than
+-- useless: quartermaster_catalog reads are gated qm:view and commodity reads
+-- warehouse:view, while marketplace:view is CUSTOMER-GRANTABLE
+-- (lib/clientRolePermissions.ts), so embedding a catalog name on the public board
+-- routes staff-gated reference data around its own gate. Hosted's own UI never
+-- sets the pins. Free-text labels are the whole feature.
+--
+-- NEITHER TABLE IS IN private.rt_client_tables(), and neither belongs there.
+-- postgres_changes ships the FULL row, and these rows are the agreed terms of a
+-- private trade between two members. The emit() in lib/db/marketplace.ts carries
+-- ids only and the client refetches through the party-gated read — keep it that way.
+CREATE TABLE IF NOT EXISTS public.marketplace_listing_considerations (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    listing_id     uuid NOT NULL REFERENCES public.marketplace_listings(id) ON DELETE CASCADE,
+    -- Which side of the advertised trade this leg sits on. 'want' = what the
+    -- lister is asking for, 'offer' = what they are putting up.
+    component_type text NOT NULL DEFAULT 'want',
+    label          text NOT NULL,
+    quantity       integer NOT NULL DEFAULT 1,
+    notes          text,
+    sort_order     integer NOT NULL DEFAULT 0,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT marketplace_listing_considerations_type_chk CHECK (component_type IN ('want', 'offer')),
+    CONSTRAINT marketplace_listing_considerations_qty_chk CHECK (quantity >= 1)
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_listing_considerations_listing
+    ON public.marketplace_listing_considerations(listing_id);
+
+-- The legs FROZEN onto a contract at propose time — the record both parties point
+-- at afterwards, which is why they are copied rather than referenced (the listing
+-- can be edited or deleted; a signed deal cannot be).
+--
+-- KNOWN ASYMMETRY, ported from hosted deliberately rather than redesigned here:
+-- only the PROPOSER's legs are snapshotted. On a sell listing advertising "want 500
+-- Titanium", a proposal offering "200 Laranite" records the 200 Laranite and not
+-- the seller's half. Fixing it means a 'side' discriminator and a two-column
+-- display — a data-model change that deserves its own review, not a rider on a port.
+CREATE TABLE IF NOT EXISTS public.marketplace_contract_considerations (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    contract_id    uuid NOT NULL REFERENCES public.marketplace_contracts(id) ON DELETE CASCADE,
+    component_type text NOT NULL DEFAULT 'offer',
+    label          text NOT NULL,
+    quantity       integer NOT NULL DEFAULT 1,
+    notes          text,
+    sort_order     integer NOT NULL DEFAULT 0,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT marketplace_contract_considerations_type_chk CHECK (component_type IN ('want', 'offer')),
+    CONSTRAINT marketplace_contract_considerations_qty_chk CHECK (quantity >= 1)
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_contract_considerations_contract
+    ON public.marketplace_contract_considerations(contract_id);
 
 CREATE TABLE IF NOT EXISTS public.marketplace_ratings (
     id          bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -2242,6 +2613,58 @@ CREATE INDEX IF NOT EXISTS idx_academy_enrollments_status  ON public.academy_enr
 CREATE INDEX IF NOT EXISTS idx_academy_enrollments_session ON public.academy_enrollments(session_id);
 CREATE INDEX IF NOT EXISTS idx_academy_enrollments_student ON public.academy_enrollments(student_id);
 
+-- 8a. academy_enrollment_requests — a member asking for a seat on a GATED course.
+-- Self-enrolment covers open courses; this is the ask-first path for everything else,
+-- so a member can put their hand up without an instructor having to notice them.
+--
+-- notified_at IS NOT DECORATION. request_enrollment is a user:manage:self action whose
+-- caller picks the session_id, and that choice selects a RECIPIENT SET of up to 50
+-- staff — each a durable notification row plus a web push. The partial unique index
+-- bounds only concurrent PENDING duplicates: withdraw-then-re-ask and deny-then-re-ask
+-- both clear it, and deny-then-re-ask is required behaviour. Without a record of
+-- whether this pairing has EVER been announced, one ordinary member sustains thousands
+-- of notifications a minute against the org's whole instructor population. The column
+-- is what makes the fan-out once-ever per (session, student).
+CREATE TABLE IF NOT EXISTS public.academy_enrollment_requests (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      uuid NOT NULL REFERENCES public.academy_sessions(id) ON DELETE CASCADE,
+    student_id      integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    status          text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'approved', 'denied', 'withdrawn')),
+    message         text,
+    decided_by      integer REFERENCES public.users(id) ON DELETE SET NULL,
+    decision_reason text,
+    decided_at      timestamptz,
+    -- When the approvers were told about this pairing. Set once, never cleared.
+    notified_at     timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+-- PARTIAL unique: one PENDING ask per pairing, while leaving a denied or withdrawn
+-- request re-askable — a member whose circumstances changed should be able to ask again.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_academy_enrollment_requests_pending
+    ON public.academy_enrollment_requests(session_id, student_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_academy_enrollment_requests_session
+    ON public.academy_enrollment_requests(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_academy_enrollment_requests_student
+    ON public.academy_enrollment_requests(student_id);
+
+-- 8b. academy_course_reviews — the approve/reject decision trail.
+-- The reject NOTE is the point: without it a course bounces back to draft with no
+-- statement of what was wrong, and the author is left guessing. Retained per decision
+-- rather than overwritten, so a course that went round twice shows both rounds.
+CREATE TABLE IF NOT EXISTS public.academy_course_reviews (
+    id          bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    course_id   uuid NOT NULL REFERENCES public.academy_courses(id) ON DELETE CASCADE,
+    decision    text NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note        text,
+    reviewed_by integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+-- Newest-first per course is the only access pattern: the banner reads the latest,
+-- the disclosure reads the rest.
+CREATE INDEX IF NOT EXISTS idx_academy_course_reviews_course
+    ON public.academy_course_reviews(course_id, created_at DESC);
+
 -- 9. academy_lesson_progress — self-paced curriculum completion (per enrolment).
 CREATE TABLE IF NOT EXISTS public.academy_lesson_progress (
     id                  bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -2269,6 +2692,126 @@ CREATE INDEX IF NOT EXISTS idx_academy_outcome_results_enrollment ON public.acad
 -- NOTE: the cert-award idempotency guard the hosted enhancement migration added as
 -- UNIQUE(user_id, certification_id) on user_certifications ALREADY EXISTS in this
 -- schema as that table's composite PRIMARY KEY — no separate constraint needed.
+
+
+-- ----- 3.x Foreign-key and hot-read indexes ----------------------------------
+--
+-- Postgres does NOT index a foreign key automatically. Every FK below is either read
+-- directly by a named query or walked by a CASCADE/RESTRICT delete, and without an index
+-- each of those is a sequential scan of the child table.
+--
+-- SINGLE-ORG TRANSLATION. Most of these correspond to indexes the hosted (multi-tenant)
+-- build carries as `(organization_id, x)` composites. An index LED by organization_id is
+-- worthless here — there is exactly one distinct value — so each was translated to its
+-- remaining columns, not copied. Anything whose translation was already covered as the
+-- prefix of an existing index was dropped from the list rather than added.
+--
+-- Every statement is CREATE INDEX IF NOT EXISTS, per the re-runnable-file rule in the
+-- header. Deliberately NOT CONCURRENTLY: this file is pasted into the Supabase SQL editor
+-- as one script, CONCURRENTLY cannot run inside a transaction block, and a failed
+-- concurrent build leaves an INVALID index that IF NOT EXISTS then silently skips forever.
+-- On a self-hosted org these tables are small enough that the brief lock is not a concern.
+
+-- The start-notice cron scans this table EVERY MINUTE. Partial on both predicates, so
+-- the index stays proportional to the handful of armed-and-unsent operations rather
+-- than to the whole history — the same shape as idx_op_reminders_due.
+CREATE INDEX IF NOT EXISTS idx_operations_pending_start_notice
+    ON public.operations (scheduled_start)
+    WHERE discord_start_notice AND discord_start_notice_sent_at IS NULL;
+
+-- Operations children. All are CASCADE children of `operations` AND are read together in
+-- one parallel fan-out when an operation detail view opens (lib/db/ops.ts).
+CREATE INDEX IF NOT EXISTS idx_op_phases_op ON public.operation_phases(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_schedule_op ON public.operation_schedule_entries(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_tasks_op ON public.operation_tasks(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_cmd_nodes_op ON public.operation_command_nodes(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_board_elements_op ON public.operation_board_elements(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_logistics_op ON public.operation_logistics(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_aar_entries_op ON public.operation_aar_entries(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_reminders_op ON public.operation_reminders(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_ship_slots_op ON public.operation_ship_slots(operation_id);
+CREATE INDEX IF NOT EXISTS idx_op_slot_assignments_op ON public.operation_slot_assignments(operation_id);
+
+-- Deleting a PHASE nulls these out (ON DELETE SET NULL), which needs a phase_id lookup on
+-- both children. The task read itself is already served by idx_op_tasks_op as a prefix —
+-- the FK walk is the justification here, not the query.
+CREATE INDEX IF NOT EXISTS idx_op_schedule_phase ON public.operation_schedule_entries(phase_id);
+CREATE INDEX IF NOT EXISTS idx_op_tasks_phase ON public.operation_tasks(phase_id);
+-- Self-referencing FK: deleting a command node cascades to its children.
+CREATE INDEX IF NOT EXISTS idx_op_cmd_nodes_parent ON public.operation_command_nodes(parent_id);
+-- Same shape, same reason: deleting a ship cascades to its seats. Unconditional, matching
+-- its twin above rather than hosted's partial form — the column is null for every
+-- top-level ship, and a partial index here would diverge from the local pattern for a
+-- saving proportional to a table bounded at 200 rows per operation.
+CREATE INDEX IF NOT EXISTS idx_op_ship_slots_parent ON public.operation_ship_slots(parent_slot_id);
+
+-- NOT ADDED, deliberately: operation_participants(operation_id), operation_locations and
+-- operation_allied_participants each already lead their PRIMARY KEY with operation_id, so
+-- the FK read is covered. Hosted ships separate indexes for them; porting those verbatim
+-- would add three indexes that serve nothing and slow every write to those tables.
+--
+-- Same call for operation_slot_assignments(slot_id): the UNIQUE (slot_id, user_id)
+-- constraint above already builds a btree LED by slot_id, which serves the assigned-count
+-- read, the has-assignments probe, the (slot_id, user_id) point lookups and the CASCADE
+-- walk from operation_ship_slots. Hosted ships that index too; it is prefix-redundant.
+
+-- The alert banner reads the newest ALERT for one operation on every board load.
+CREATE INDEX IF NOT EXISTS idx_op_log_entries_op_type ON public.operation_log_entries(operation_id, entry_type, created_at DESC);
+
+-- The reminder cron runs EVERY MINUTE and this table had no index at all. Partial, because
+-- almost every row ends up sent = true and so never needs to be visited again — the index
+-- stays proportional to the pending backlog rather than to history.
+CREATE INDEX IF NOT EXISTS idx_op_reminders_due ON public.operation_reminders(remind_at) WHERE sent = false;
+
+-- The participants PK is (operation_id, user_id), so a user_id-LED read is unserved. Both
+-- the intel read path and a hard user delete do exactly that. Hosted lacks this too.
+CREATE INDEX IF NOT EXISTS idx_op_participants_user ON public.operation_participants(user_id);
+-- Seat assignments carry THREE user-referencing FKs and none is served by the UNIQUE
+-- above. user_id CASCADEs on a hard user delete; assigned_by and user_ship_id are
+-- ON DELETE SET NULL, and a hangar-ship delete is a routine member action whose RI walk
+-- would otherwise scan every seat row in the org — not one operation's slice.
+CREATE INDEX IF NOT EXISTS idx_op_slot_assignments_user ON public.operation_slot_assignments(user_id);
+CREATE INDEX IF NOT EXISTS idx_op_slot_assignments_assigned_by ON public.operation_slot_assignments(assigned_by);
+CREATE INDEX IF NOT EXISTS idx_op_slot_assignments_user_ship ON public.operation_slot_assignments(user_ship_id);
+
+-- HR: interview panels are read by interview (hydrating a case file) and by user (the
+-- "my interviews" tab), and cascade from hr_interviews.
+CREATE INDEX IF NOT EXISTS idx_interview_panel_interview ON public.hr_interview_panel(interview_id);
+CREATE INDEX IF NOT EXISTS idx_interview_panel_user ON public.hr_interview_panel(user_id);
+-- Position history: the service-record timeline reads newest-first per user; the partial
+-- serves the "what post do they hold NOW" lookup that runs on every position change.
+CREATE INDEX IF NOT EXISTS idx_user_hr_pos_history_user ON public.user_hr_position_history(user_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_hr_pos_history_open ON public.user_hr_position_history(user_id) WHERE ended_at IS NULL;
+
+-- Government. The existing UNIQUE constraints on these tables are PARTIAL
+-- (WHERE withdrawn_at IS NULL / per-voter), so they do NOT cover a general read of every
+-- row for an election or a motion.
+CREATE INDEX IF NOT EXISTS idx_gov_holders_user ON public.government_position_holders(user_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_gov_leg_comments_legislation ON public.government_legislation_comments(legislation_id);
+CREATE INDEX IF NOT EXISTS idx_gov_candidates_election ON public.government_election_candidates(election_id);
+CREATE INDEX IF NOT EXISTS idx_gov_motion_votes_motion ON public.government_motion_votes(motion_id);
+
+-- Quartermaster. The issuance lookup also backs the RESTRICT foreign key from
+-- quartermaster_inventory, so an un-indexed version blocks deletes with a full scan.
+CREATE INDEX IF NOT EXISTS idx_qm_issuances_inventory ON public.quartermaster_issuances(inventory_id, status);
+-- PARTIAL on source: the catalog is dominated by synced 'platform' rows, and the org's own
+-- browse/filter path only ever reads its 'custom' ones. A full (category, name) index would
+-- be several times larger and would be rewritten by every platform catalog sync.
+CREATE INDEX IF NOT EXISTS idx_qm_catalog_custom_category_name ON public.quartermaster_catalog(category, name) WHERE source = 'custom';
+
+-- Warehouse. The stock lookup backs a RESTRICT foreign key as well as the request list.
+CREATE INDEX IF NOT EXISTS idx_warehouse_requests_stock ON public.warehouse_requests(stock_id, status);
+CREATE INDEX IF NOT EXISTS idx_warehouse_catalog_category_name ON public.warehouse_catalog(category, name);
+-- The one warehouse table that grows without bound; the ledger reads newest-first.
+CREATE INDEX IF NOT EXISTS idx_warehouse_movements_created ON public.warehouse_movements(created_at DESC);
+
+-- Fleet: a group's ships are always read in display order.
+CREATE INDEX IF NOT EXISTS idx_fleet_group_ships_group_sort ON public.fleet_group_ships(fleet_group_id, sort_order);
+
+-- Platform locations: a self-referencing parent FK, plus the system/kind filter behind the
+-- location pickers.
+CREATE INDEX IF NOT EXISTS idx_platform_locations_parent ON public.platform_locations(parent_id);
+CREATE INDEX IF NOT EXISTS idx_platform_locations_system_kind ON public.platform_locations(star_system_id, kind);
 
 
 -- =============================================================================
@@ -2557,6 +3100,50 @@ AS $$
     HAVING a.balance_cached <> COALESCE(SUM(e.amount) FILTER (WHERE e.status = 'confirmed'), 0);
 $$;
 
+-- Finance overview aggregate. The sibling of qm_overview_stats / warehouse_overview_stats,
+-- and it exists for CORRECTNESS, not speed.
+--
+-- getFinancesOverview used to pull every pending row and every confirmed row of the last 30
+-- days into Node and add them up there. PostgREST enforces db-max-rows SERVER-SIDE and returns
+-- a SHORT page with NO error, so a busy org's totals were silently wrong with nothing to
+-- notice — and the 30-day read discarded its error entirely, rendering the net as 0 on any
+-- fault. Summing in SQL removes both failure modes: there is no page to truncate and no
+-- partial result to mistake for an answer.
+--
+-- Behaviour-preserving details that are load-bearing, not incidental:
+--   * every SUM is COALESCEd — SUM over an empty set is NULL, not 0;
+--   * ABS() mirrors the old Math.abs(Number(r.amount)) on the pending buckets;
+--   * the pending buckets filter entry_type to deposit/withdrawal ONLY, because the TS loop
+--     silently ignored pending transfer/payout/adjustment rows. Widening it here would change
+--     every operator's numbers with no release note;
+--   * thirty_day_net sums the SIGNED amount (withdrawals are negative by
+--     treasury_ledger_sign_matches_type), so it is a NET, not a gross.
+CREATE OR REPLACE FUNCTION public.finance_overview_stats()
+RETURNS TABLE (
+    total_balance bigint,
+    pending_deposits_count bigint, pending_deposits_amount bigint,
+    pending_withdrawals_count bigint, pending_withdrawals_amount bigint,
+    thirty_day_net bigint
+) LANGUAGE plpgsql STABLE SET search_path = ''
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        COALESCE((SELECT SUM(a.balance_cached)::bigint FROM public.treasury_accounts a
+                   WHERE a.is_active), 0) AS total_balance,
+        (SELECT COUNT(*)::bigint FROM public.treasury_ledger_entries e
+          WHERE e.status = 'pending' AND e.entry_type = 'deposit') AS pending_deposits_count,
+        COALESCE((SELECT SUM(ABS(e.amount))::bigint FROM public.treasury_ledger_entries e
+                   WHERE e.status = 'pending' AND e.entry_type = 'deposit'), 0) AS pending_deposits_amount,
+        (SELECT COUNT(*)::bigint FROM public.treasury_ledger_entries e
+          WHERE e.status = 'pending' AND e.entry_type = 'withdrawal') AS pending_withdrawals_count,
+        COALESCE((SELECT SUM(ABS(e.amount))::bigint FROM public.treasury_ledger_entries e
+                   WHERE e.status = 'pending' AND e.entry_type = 'withdrawal'), 0) AS pending_withdrawals_amount,
+        COALESCE((SELECT SUM(e.amount)::bigint FROM public.treasury_ledger_entries e
+                   WHERE e.status = 'confirmed' AND e.created_at >= now() - interval '30 days'), 0) AS thirty_day_net;
+END;
+$$;
+
 
 -- ----- 4.5 Quartermaster functions (DE-ORG'd: no organization_id reads/writes) -
 
@@ -2721,8 +3308,9 @@ CREATE OR REPLACE FUNCTION public.qm_adjust_inventory(
 ) RETURNS uuid LANGUAGE plpgsql SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_exists bigint;
-    v_new_id uuid;
+    v_exists  bigint;
+    v_current integer;
+    v_new_id  uuid;
 BEGIN
     IF p_delta = 0 THEN RAISE EXCEPTION 'Delta cannot be zero'; END IF;
     IF p_reason NOT IN ('initial', 'adjust', 'loss', 'destruction') THEN
@@ -2732,9 +3320,86 @@ BEGIN
     SELECT id INTO v_exists FROM public.quartermaster_inventory WHERE id = p_inventory_id FOR UPDATE;
     IF v_exists IS NULL THEN RAISE EXCEPTION 'Inventory % not found', p_inventory_id; END IF;
 
+    -- Negative-stock backstop. Mirrors warehouse_adjust_stock in 4.6: an adjustment must
+    -- never drive computed on-hand (the SUM of movement deltas) below zero. Evaluated
+    -- under the FOR UPDATE row lock taken above, so concurrent adjustments serialise
+    -- against it. This was the ONE stock-decreasing qm_* function without the guard, and
+    -- until it existed the only thing standing in the way of a negative ledger was the
+    -- projectedTotal check in AdjustStockDialog.tsx: client-side, and computed from a
+    -- snapshot frozen when the dialog opened. Open the dialog at 10, let someone else
+    -- issue all 10, then set the total to 0 -- the browser sent -10 against a real
+    -- on-hand of 0 and the row landed at -10.
+    SELECT COALESCE(SUM(delta), 0) INTO v_current
+      FROM public.quartermaster_inventory_movements WHERE inventory_id = p_inventory_id;
+    IF v_current + p_delta < 0 THEN
+        RAISE EXCEPTION 'QM_INSUFFICIENT_STOCK: current %, delta %', v_current, p_delta;
+    END IF;
+
     INSERT INTO public.quartermaster_inventory_movements
         (inventory_id, delta, reason, actor_user_id, notes)
     VALUES (p_inventory_id, p_delta, p_reason, p_actor_id, p_notes)
+    RETURNING id INTO v_new_id;
+    RETURN v_new_id;
+END;
+$$;
+
+-- Atomic "set total". The delta is computed HERE, inside the transaction, under the
+-- same FOR UPDATE row lock every other qm_* writer takes -- never in the browser.
+-- AdjustStockDialog's "Set total" mode used to send (target - onHand) where onHand came
+-- from a useState snapshot frozen when the dialog opened and re-synced by nothing. Two
+-- managers each correcting 10 -> 8 both computed -2, and the row landed on 6: the row
+-- lock serialised the WRITES perfectly, but the ARITHMETIC had already been done against
+-- a stale read, so no amount of locking could save it.
+--
+-- Delta mode is race-free by construction (an absolute +/-n posted atomically) and is
+-- deliberately untouched -- qm_adjust_inventory still serves it.
+--
+-- 'initial' is NOT in the reason allow-list: a set-total is a correction to a row that
+-- already exists, never the seeding movement, and accepting it here would let a
+-- correction masquerade as one in the ledger.
+--
+-- Returns NULL when the row is ALREADY at the target: movements.delta carries
+-- CHECK (delta <> 0), so a no-op must post nothing. Callers must read NULL as success,
+-- not as a missing id.
+CREATE OR REPLACE FUNCTION public.qm_set_inventory_total(
+    p_inventory_id bigint, p_target_total integer, p_reason text, p_actor_id integer, p_notes text
+) RETURNS uuid LANGUAGE plpgsql SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_exists  bigint;
+    v_current integer;
+    v_delta   integer;
+    v_new_id  uuid;
+BEGIN
+    IF p_target_total IS NULL OR p_target_total < 0 THEN
+        RAISE EXCEPTION 'Target total must be a non-negative integer';
+    END IF;
+    -- Ceiling. movements.delta is an `integer` column and on-hand is SUM(delta) read into an
+    -- integer variable, so an absurd absolute total is how you overflow the ledger and
+    -- brick every later write to the row with "integer out of range". Because a
+    -- set-total lands the SUM exactly on p_target_total, this bounds on-hand outright.
+    IF p_target_total > 100000000 THEN
+        RAISE EXCEPTION 'Target total % exceeds the maximum of 100000000', p_target_total;
+    END IF;
+    IF p_reason NOT IN ('adjust', 'loss', 'destruction') THEN
+        RAISE EXCEPTION 'Invalid adjustment reason: %', p_reason;
+    END IF;
+
+    SELECT id INTO v_exists FROM public.quartermaster_inventory WHERE id = p_inventory_id FOR UPDATE;
+    IF v_exists IS NULL THEN RAISE EXCEPTION 'Inventory % not found', p_inventory_id; END IF;
+
+    SELECT COALESCE(SUM(delta), 0) INTO v_current
+      FROM public.quartermaster_inventory_movements WHERE inventory_id = p_inventory_id;
+
+    v_delta := p_target_total - v_current;
+    IF v_delta = 0 THEN RETURN NULL; END IF;
+    IF v_delta > 0 AND p_reason <> 'adjust' THEN
+        RAISE EXCEPTION 'Reason % cannot increase stock (current %, target %)', p_reason, v_current, p_target_total;
+    END IF;
+
+    INSERT INTO public.quartermaster_inventory_movements
+        (inventory_id, delta, reason, actor_user_id, notes)
+    VALUES (p_inventory_id, v_delta, p_reason, p_actor_id, p_notes)
     RETURNING id INTO v_new_id;
     RETURN v_new_id;
 END;
@@ -2823,6 +3488,227 @@ END;
 $$;
 
 
+
+-- Armoury facet options. Computed in SQL for the same reason qm_overview_stats is:
+-- the alternative is fetching every in-stock row into Node and folding it there,
+-- which is a full-table read whose cost grows with the armoury and which produces
+-- an answer capped by whatever page size someone chose. This is exact, uncapped,
+-- and one round-trip.
+--
+-- attributes is filtered to the FACETABLE_ATTR_KEYS allowlist INSIDE the function.
+-- Doing it in TS would make the function walk every key of every catalog row's
+-- JSONB and ship the whole distinct key/value cross-product just to discard it.
+-- Keep this list in step with FACETABLE_ATTR_KEYS in lib/db/quartermaster.ts;
+-- tests/qmArmouryFacets.test.ts pins that they agree.
+CREATE OR REPLACE FUNCTION public.qm_armoury_facets(p_include_archived boolean DEFAULT false)
+RETURNS jsonb LANGUAGE plpgsql STABLE SET search_path = ''
+AS $$
+DECLARE
+    v_keys text[] := ARRAY['Grade', 'Class', 'Armor Class', 'Weapon Class', 'Weapon Type'];
+    v_result jsonb;
+BEGIN
+    WITH stocked AS (
+        SELECT c.category, c.subcategory, c.size_label, c.company_name,
+               c.is_vehicle_item, c.attributes
+        FROM public.quartermaster_inventory i
+        JOIN public.quartermaster_catalog c ON c.id = i.catalog_id
+        WHERE p_include_archived OR i.is_archived = false
+    )
+    SELECT jsonb_build_object(
+        'types', COALESCE((
+            SELECT jsonb_agg(t ORDER BY t)
+            FROM (SELECT DISTINCT subcategory AS t FROM stocked WHERE subcategory IS NOT NULL AND subcategory <> '') s
+        ), '[]'::jsonb),
+        'sizes', COALESCE((
+            SELECT jsonb_agg(t ORDER BY t)
+            FROM (SELECT DISTINCT size_label AS t FROM stocked WHERE size_label IS NOT NULL AND size_label <> '') s
+        ), '[]'::jsonb),
+        'manufacturers', COALESCE((
+            SELECT jsonb_agg(t ORDER BY t)
+            FROM (SELECT DISTINCT company_name AS t FROM stocked WHERE company_name IS NOT NULL AND company_name <> '') s
+        ), '[]'::jsonb),
+        'categories', COALESCE((
+            SELECT jsonb_agg(t ORDER BY t)
+            FROM (SELECT DISTINCT category AS t FROM stocked WHERE category IS NOT NULL) s
+        ), '[]'::jsonb),
+        'hasVehicle', EXISTS (SELECT 1 FROM stocked WHERE is_vehicle_item = true),
+        'hasPersonal', EXISTS (SELECT 1 FROM stocked WHERE is_vehicle_item = false),
+        -- { key: [values…] } for the allowlisted keys only, each value list
+        -- deterministically ordered so the dropdowns do not reshuffle per request.
+        'attributes', COALESCE((
+            SELECT jsonb_object_agg(k, vals)
+            FROM (
+                SELECT kv.key AS k, jsonb_agg(DISTINCT kv.value ORDER BY kv.value) AS vals
+                FROM stocked s2, LATERAL jsonb_each_text(COALESCE(s2.attributes, '{}'::jsonb)) AS kv(key, value)
+                WHERE kv.key = ANY(v_keys) AND kv.value IS NOT NULL AND kv.value <> ''
+                GROUP BY kv.key
+            ) a
+        ), '{}'::jsonb)
+    ) INTO v_result;
+    RETURN COALESCE(v_result, '{}'::jsonb);
+END;
+$$;
+
+
+-- ----- 4.8 Academy functions -------------------------------------------------
+
+-- ATOMIC SEAT CLAIM.
+--
+-- selfEnroll used to COUNT the enrolments and then INSERT, with nothing between the
+-- two statements. The UNIQUE (session_id, student_id) stops the same student twice;
+-- it does nothing about two DIFFERENT students racing for the last seat, so a capped
+-- session could be overfilled by exactly the number of concurrent claimants. This
+-- takes the session row FOR UPDATE, so the count and the insert happen under one
+-- lock and the cap is a real cap.
+--
+-- RE-ACTIVATION, and why it clears more than hosted's does. A withdrawn student
+-- re-claiming a seat reuses the SAME enrolment row (the UNIQUE constraint leaves no
+-- choice), so everything keyed on enrollment_id survives the round trip. Hosted
+-- nulls the four sign-off columns and its migration comment says the verdicts are
+-- "a statement about a completed cohort" — but its SQL never deletes them. It is
+-- wrong: academy_outcome_results rows key on enrollment_id, so a member could
+-- self-enrol on an open course, be assessed competent, withdraw, re-enrol with no
+-- staff involvement, and pass allRequiredOutcomesCompetent instantly — straight to
+-- recommendForCertification and a real org certification with zero re-assessment.
+-- The verdicts go with the sign-off columns.
+--
+-- Lesson PROGRESS is deliberately kept: that is the member's own study record, it
+-- gates nothing, and re-reading the same lessons is not a control.
+CREATE OR REPLACE FUNCTION public.academy_claim_seat(
+    p_session_id uuid, p_student_id integer, p_source text
+) RETURNS uuid LANGUAGE plpgsql SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_capacity   integer;
+    v_open       boolean;
+    v_status     text;
+    v_taken      integer;
+    v_enrollment uuid;
+    v_existing   text;
+BEGIN
+    -- FOR UPDATE is the whole point: every concurrent claimant on this session
+    -- serialises here, so the count below cannot be stale by the time we insert.
+    SELECT capacity, enrollment_open, status INTO v_capacity, v_open, v_status
+    FROM public.academy_sessions WHERE id = p_session_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Session not found.'; END IF;
+    IF v_status IN ('completed', 'cancelled') OR v_open IS NOT TRUE THEN
+        RAISE EXCEPTION 'This session is not accepting enrolments.';
+    END IF;
+
+    SELECT id, status INTO v_enrollment, v_existing
+    FROM public.academy_enrollments
+    WHERE session_id = p_session_id AND student_id = p_student_id;
+
+    -- An ACTIVE enrolment is idempotent, not an error: the caller already has a seat.
+    IF v_enrollment IS NOT NULL AND v_existing <> 'withdrawn' THEN
+        RETURN v_enrollment;
+    END IF;
+
+    IF v_capacity IS NOT NULL THEN
+        SELECT count(*) INTO v_taken FROM public.academy_enrollments
+        WHERE session_id = p_session_id AND status <> 'withdrawn';
+        IF v_taken >= v_capacity THEN RAISE EXCEPTION 'This session is full.'; END IF;
+    END IF;
+
+    IF v_enrollment IS NOT NULL THEN
+        -- Re-activating. Clear every trace of the abandoned run's sign-off.
+        DELETE FROM public.academy_outcome_results WHERE enrollment_id = v_enrollment;
+        UPDATE public.academy_enrollments SET
+            status = 'enrolled', source = p_source, enrolled_at = now(),
+            recommended_by = NULL, recommended_at = NULL,
+            certified_by = NULL, completed_at = NULL
+        WHERE id = v_enrollment;
+        RETURN v_enrollment;
+    END IF;
+
+    INSERT INTO public.academy_enrollments (session_id, student_id, source, status)
+    VALUES (p_session_id, p_student_id, p_source, 'enrolled')
+    RETURNING id INTO v_enrollment;
+    RETURN v_enrollment;
+END;
+$$;
+
+-- academy_apply_order — re-space one parent's ENTIRE child list in a single
+-- statement.
+--
+-- WHY THIS IS A FUNCTION AND NOT N UPDATES. Hosted issues one UPDATE per id from
+-- Node, in a Promise.all, and only checks the errors afterwards. There is no
+-- transaction: a failure on the seventh of twelve leaves the first six moved, the
+-- rest where they were, and reports failure to a caller who now has a curriculum in
+-- an order nobody chose. Ordering is exactly the operation where a partial write is
+-- worse than no write, because the half-applied state looks deliberate.
+--
+-- WHY IT DEMANDS THE COMPLETE SIBLING SET. Hosted proves submitted-ids ARE-IN parent
+-- but never that they are ALL of parent. Send 2 of a course's 20 module ids and they
+-- are written to positions 10 and 20 — colliding with the two modules already there,
+-- which are not touched and not renumbered. The result is duplicate sort_orders and a
+-- silently arbitrary order, from a call that returned 200. Requiring the full set
+-- makes the submitted array the whole truth: every sibling gets a fresh position.
+--
+-- Both checks live HERE rather than in the caller so there is no window between
+-- proving and writing. The count check and the UPDATE are one transaction; a
+-- concurrent insert that lands between them fails the ROW_COUNT check and rolls the
+-- whole thing back.
+--
+-- Positions are (ordinal * 10). The 10 mirrors SORT_STEP in lib/db/academy.ts and is
+-- pinned by tests/academyCurriculum.test.ts — the gap is what lets a later
+-- insert-between pick a position without rewriting the list.
+CREATE OR REPLACE FUNCTION public.academy_apply_order(
+    p_entity text, p_parent text, p_ids bigint[]
+) RETURNS void LANGUAGE plpgsql SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_count   integer := COALESCE(array_length(p_ids, 1), 0);
+    v_total   integer;
+    v_written integer;
+BEGIN
+    IF v_count = 0 THEN
+        RAISE EXCEPTION 'ACADEMY_ORDER_EMPTY: an ordered list of ids is required';
+    END IF;
+
+    IF p_entity = 'modules' THEN
+        SELECT count(*) INTO v_total FROM public.academy_modules WHERE course_id = p_parent::uuid;
+        IF v_total <> v_count THEN
+            RAISE EXCEPTION 'ACADEMY_ORDER_INCOMPLETE: % ids submitted for % siblings', v_count, v_total;
+        END IF;
+        UPDATE public.academy_modules m SET sort_order = (o.pos * 10)::integer
+          FROM unnest(p_ids) WITH ORDINALITY AS o(child_id, pos)
+         WHERE m.id = o.child_id AND m.course_id = p_parent::uuid;
+        GET DIAGNOSTICS v_written = ROW_COUNT;
+
+    ELSIF p_entity = 'lessons' THEN
+        SELECT count(*) INTO v_total FROM public.academy_lessons WHERE module_id = p_parent::bigint;
+        IF v_total <> v_count THEN
+            RAISE EXCEPTION 'ACADEMY_ORDER_INCOMPLETE: % ids submitted for % siblings', v_count, v_total;
+        END IF;
+        UPDATE public.academy_lessons l SET sort_order = (o.pos * 10)::integer
+          FROM unnest(p_ids) WITH ORDINALITY AS o(child_id, pos)
+         WHERE l.id = o.child_id AND l.module_id = p_parent::bigint;
+        GET DIAGNOSTICS v_written = ROW_COUNT;
+
+    ELSIF p_entity = 'outcomes' THEN
+        SELECT count(*) INTO v_total FROM public.academy_outcomes WHERE course_id = p_parent::uuid;
+        IF v_total <> v_count THEN
+            RAISE EXCEPTION 'ACADEMY_ORDER_INCOMPLETE: % ids submitted for % siblings', v_count, v_total;
+        END IF;
+        UPDATE public.academy_outcomes x SET sort_order = (o.pos * 10)::integer
+          FROM unnest(p_ids) WITH ORDINALITY AS o(child_id, pos)
+         WHERE x.id = o.child_id AND x.course_id = p_parent::uuid;
+        GET DIAGNOSTICS v_written = ROW_COUNT;
+
+    ELSE
+        RAISE EXCEPTION 'ACADEMY_ORDER_ENTITY: unknown entity %', p_entity;
+    END IF;
+
+    -- Catches BOTH a foreign id (right count, wrong parent) and a duplicated id (the
+    -- join touches one row twice, so fewer rows move than ids were sent). Raising
+    -- rolls the UPDATE back — this is why the check can safely come after the write.
+    IF v_written <> v_count THEN
+        RAISE EXCEPTION 'ACADEMY_ORDER_FOREIGN: % of % ids belong to this parent', v_written, v_count;
+    END IF;
+END;
+$$;
+
 -- ----- 4.6 Warehouse functions (DE-ORG'd: no organization_id reads/writes) ----
 
 CREATE OR REPLACE FUNCTION public.warehouse_adjust_stock(
@@ -2850,6 +3736,61 @@ BEGIN
 
     INSERT INTO public.warehouse_movements (stock_id, delta, reason, actor_user_id, notes)
     VALUES (p_stock_id, p_delta, p_reason, p_actor_id, p_notes)
+    RETURNING id INTO v_new_id;
+
+    UPDATE public.warehouse_stock SET updated_at = now() WHERE id = p_stock_id;
+    RETURN v_new_id;
+END;
+$$;
+
+-- The warehouse twin of qm_set_inventory_total -- same defect, same fix, same shape.
+-- WhAdjustStockDialog.tsx froze its own snapshot exactly the way AdjustStockDialog did
+-- (WarehouseView.tsx sets adjustTarget and nothing re-syncs it), so shipping only the QM
+-- half would have been half a fix. Reason allow-list differs from QM's because the
+-- warehouse ledger has a distinct 'restock' reason, which the dialog maps to directly;
+-- 'initial' is excluded here for the same reason it is there.
+--
+-- NOTE, deliberately not fixed here: the guard is on on-hand ONLY and never consults
+-- quantity_reserved, exactly like warehouse_adjust_stock. A manager CAN set a total
+-- below what open withdrawal requests and accepted marketplace contracts have reserved.
+-- That is not a hole this function opens -- it is one keystroke rather than a large
+-- deliberate delta -- and nothing over-issues, because warehouse_fulfil_request and
+-- warehouse_marketplace_deliver each re-check real stock under their own FOR UPDATE.
+-- Refusing the write would be worse: you cannot decline to record a physical count.
+CREATE OR REPLACE FUNCTION public.warehouse_set_stock_total(
+    p_stock_id bigint, p_target_total integer, p_reason text, p_actor_id integer, p_notes text
+) RETURNS uuid LANGUAGE plpgsql SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_exists  bigint;
+    v_current integer;
+    v_delta   integer;
+    v_new_id  uuid;
+BEGIN
+    IF p_target_total IS NULL OR p_target_total < 0 THEN
+        RAISE EXCEPTION 'Target total must be a non-negative integer';
+    END IF;
+    IF p_target_total > 100000000 THEN
+        RAISE EXCEPTION 'Target total % exceeds the maximum of 100000000', p_target_total;
+    END IF;
+    IF p_reason NOT IN ('adjust', 'restock', 'loss', 'destruction') THEN
+        RAISE EXCEPTION 'Invalid adjustment reason: %', p_reason;
+    END IF;
+
+    SELECT id INTO v_exists FROM public.warehouse_stock WHERE id = p_stock_id FOR UPDATE;
+    IF v_exists IS NULL THEN RAISE EXCEPTION 'Warehouse stock % not found', p_stock_id; END IF;
+
+    SELECT COALESCE(SUM(delta), 0) INTO v_current
+      FROM public.warehouse_movements WHERE stock_id = p_stock_id;
+
+    v_delta := p_target_total - v_current;
+    IF v_delta = 0 THEN RETURN NULL; END IF;
+    IF v_delta > 0 AND p_reason NOT IN ('adjust', 'restock') THEN
+        RAISE EXCEPTION 'Reason % cannot increase stock (current %, target %)', p_reason, v_current, p_target_total;
+    END IF;
+
+    INSERT INTO public.warehouse_movements (stock_id, delta, reason, actor_user_id, notes)
+    VALUES (p_stock_id, v_delta, p_reason, p_actor_id, p_notes)
     RETURNING id INTO v_new_id;
 
     UPDATE public.warehouse_stock SET updated_at = now() WHERE id = p_stock_id;
@@ -3053,6 +3994,14 @@ $$;
 -- Marketplace release: atomically return p_qty to a listing on contract cancel,
 -- re-opening it if it had auto-closed and is not expired. GREATEST(0, …) floors
 -- the claim so a double-cancel can't drive it negative.
+--
+-- moderation_closed_at IS NULL is load-bearing in the reopen arm. Without it, a
+-- listing a moderator had taken down came back to 'active' the moment any contract
+-- against it was cancelled — with moderation_closed_at still stamped — putting a
+-- moderator-actioned listing back on the public board with no moderator involved.
+-- The seller does not even have to act: cancelling is the BUYER's control too.
+-- (The seller-driven route is closed in updateMarketplaceListing; this is the route
+-- that bypasses that check entirely by never going through it.)
 CREATE OR REPLACE FUNCTION public.marketplace_release_listing(p_listing_id uuid, p_qty integer)
 RETURNS void LANGUAGE plpgsql SET search_path = public, pg_temp
 AS $$
@@ -3061,6 +4010,7 @@ BEGIN
        SET quantity_claimed = GREATEST(0, quantity_claimed - p_qty),
            status = CASE
                WHEN status = 'closed'
+                    AND moderation_closed_at IS NULL
                     AND (quantity IS NULL OR GREATEST(0, quantity_claimed - p_qty) < quantity)
                     AND (expires_at IS NULL OR expires_at > now())
                THEN 'active' ELSE status END,
@@ -3196,6 +4146,342 @@ END;
 $$;
 
 
+-- ----- 4.9 Realtime authorization helpers (private schema) -------------------
+-- These exist so the realtime RLS policies in §6/§6b do not have to read
+-- public.users / public.operations / public.role_permissions as role
+-- `authenticated`. A policy expression is evaluated with the CALLER's table
+-- privileges AND the referenced table's own RLS, so an inline EXISTS forces one
+-- of two bad outcomes: either a blanket `GRANT SELECT ON ALL TABLES TO
+-- authenticated` (what §5 now revokes — it exposed settings.value, which holds
+-- the AES-GCM-encrypted Discord/LiveKit/Gemini secrets, api_keys.key_hash and
+-- alliance_peers.*_enc to any holder of a server-minted realtime JWT via
+-- /rest/v1), or a policy that silently evaluates false because the referenced
+-- table is deny-all. SECURITY DEFINER runs the body as the owning role and
+-- sidesteps both.
+--
+-- They live in `private`, not `public`, deliberately: PostgREST exposes only the
+-- public schema, so these are unreachable at /rest/v1/rpc/ and §5's "no function
+-- is granted to authenticated" invariant for the public schema stands unchanged.
+-- `authenticated` needs USAGE on this schema (granted in §5, in the same block as
+-- the EXECUTE grants) — without it every policy raises "permission denied for
+-- schema private" and ALL realtime dies.
+
+-- Single source of truth for the realtime client table set: the §5 SELECT grant,
+-- the §6 authenticated_select policy, the §6 deny-all exclusion and the §6a
+-- publication all derive from this ONE array, so they cannot drift apart.
+-- The §6 policy loop additionally consults private.rt_customer_visible_tables() to
+-- pick ONE OF TWO predicates per table. That is a predicate SELECTOR, not a second
+-- table set — the four derivations above still come from this array alone.
+CREATE OR REPLACE FUNCTION private.rt_client_tables()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT ARRAY[
+        'ranks', 'units', 'roles', 'locations', 'radio_channels',
+        'personnel_positions',
+        'security_clearances', 'security_limiting_markers',
+        'specialization_tags', 'certifications', 'commendations',
+        'service_types'
+    ]::text[];
+$$;
+
+-- The SUBSET of rt_client_tables() whose rows a NON-STAFF caller — one of the org's
+-- external CUSTOMERS — may still read. A PREDICATE SELECTOR consulted inside the ONE
+-- §6 policy loop, NOT a second table set: rt_client_tables() above remains the single
+-- source of truth for the §5 SELECT grant, the §6 deny-all exclusion and the §6a
+-- publication, all three of which still derive from that array alone.
+--
+-- EMPTY, deliberately — all twelve reference tables are staff-only. service_types was
+-- the one candidate, because a customer's service picker
+-- (components/modals/CreateRequestModal.tsx) renders from it. It is staff-only anyway:
+-- the picker's DATA still arrives in the `main` bundle, so the only thing a customer
+-- loses is LIVE updates to that picker while their tab is open, recovered on tab
+-- refocus (contexts/DataCoreContext.tsx). Leaving it customer-visible would in
+-- exchange keep service_types.discord_channel_id readable over PostgREST by EVERY
+-- authenticated bearer — including the Members and Dispatchers whose `main` projection
+-- strips that column behind admin:config:servicetypes. The residual was all-tiers, not
+-- customer-only, which is what decided it.
+--
+-- POLARITY IS LOAD-BEARING, AND IT IS AN ALLOWLIST. A new realtime table added to
+-- rt_client_tables() and forgotten here falls to the STAFF-ONLY branch, so the failure
+-- mode of forgetting is a customer-facing table losing liveness — visible, cosmetic,
+-- recovered on refocus — rather than org structure published to every customer,
+-- silently. That is the same idiom as the §6 deny-all loop below, where an unlisted
+-- table falls to USING (false). A deny-list here would default the other way.
+--
+-- CONTRACT: every entry MUST also be in rt_client_tables() — a name here that is not
+-- there gets no policy at all and is silently inert. tests/rtIsStaffParity.test.ts
+-- pins the subset relation AND the emptiness, so making any table customer-visible is
+-- a deliberate, reviewed edit rather than a silent one.
+CREATE OR REPLACE FUNCTION private.rt_customer_visible_tables()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT ARRAY[]::text[];
+$$;
+
+-- "Is the caller a live member?" — the predicate §6 authenticated_select and §6b
+-- rt_recv_org_channels used to inline. deleted_at cuts a removed account off at
+-- once rather than at token expiry; iat vs tokens_valid_from does the same for a
+-- session an admin revoked (revokeUserSessions) without deleting the user.
+-- Argument-free and self-scoped: it reports only on the caller's own token.
+-- THE SINGLE LIVENESS GATE for realtime. Three revocation terms, in one place:
+-- soft delete, the tokens_valid_from watermark, and an ACTIVE ORG BAN.
+--
+-- The ban term is here rather than in the token because ban:place deliberately does
+-- NOT stamp tokens_valid_from (api/actions/bans.ts explains why: the watermark check
+-- in the dispatcher 401s unconditionally, so stamping it would 401 a banned member
+-- before they could reach ban:my_notice / ban:submit_appeal and the appeal flow would
+-- be dead). The ban ROW is the boundary, and every HTTP surface consults it on every
+-- request with no caching. Realtime was the one surface that did not: a member's
+-- private channels and their PostgREST read of every rt_client_tables() table were
+-- authorized by a JWT minted before the ban and valid for hours afterwards, so a
+-- banned member kept receiving live broadcast content and could keep reading. The
+-- bans module already drops push subscriptions and evicts LiveKit rooms for exactly
+-- this reason; this is the third such channel and the one with the widest reach.
+--
+-- Matched on EITHER identity, like findActiveBan (lib/db/bans.ts), because a ban
+-- survives a soft delete and re-signup: deleteUser retains discord_id and the evasion
+-- route mints a NEW users row carrying it. Expiry is evaluated here against the
+-- SERVER clock, the same rule the TypeScript path applies.
+--
+-- Both arms are index-backed: idx_org_bans_active_user and idx_org_bans_active_discord
+-- are partial unique indexes on exactly this predicate (lifted_at IS NULL).
+--
+-- Do NOT copy these terms into another policy — see the note on rt_is_staff(). Compose
+-- with this function instead, which is why rt_can_read_op_board() calls it.
+CREATE OR REPLACE FUNCTION private.rt_is_live_member()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.users u
+        WHERE u.id = NULLIF(auth.jwt()->>'user_id', '')::int
+          AND u.deleted_at IS NULL
+          AND (u.tokens_valid_from IS NULL
+               OR to_timestamp(NULLIF(auth.jwt()->>'iat', '')::bigint) >= u.tokens_valid_from)
+          AND NOT EXISTS (
+              SELECT 1 FROM public.organization_bans b
+              WHERE b.lifted_at IS NULL
+                AND (b.expires_at IS NULL OR b.expires_at > now())
+                AND (b.user_id = u.id
+                     OR (b.discord_id IS NOT NULL AND b.discord_id = u.discord_id))
+          )
+    );
+$$;
+
+-- The org's EXTERNAL CUSTOMER entitlement set — the mirror of CUSTOMER_GRANTABLE_PERMS
+-- (lib/clientRolePermissions.ts): CLIENT_DEFAULT_PERMS, what the seeded Client role
+-- holds, PLUS the three permissions lib/staffPerms.ts documents as grantable to
+-- customers and deliberately excludes from STAFF_VIEW_PERMS for that reason. A customer
+-- on a CUSTOM role may hold any of these NINE and nothing else. marketplace:list and
+-- marketplace:contract are here because client TRADING is an opt-in org feature: an
+-- admin running a marketplace may permit non-members to buy and sell, so a customer
+-- can hold them legitimately. (marketplace:admin is NOT here - moderation is staff.) The seventh is
+-- user:manage:self, which api/services.ts treats as a PSEUDO-permission meaning
+-- "any authenticated user" — so holding it must never imply staff. It is a real,
+-- tickable catalog row ("Manage Own Profile") and a Member/Dispatcher default, so an
+-- operator ticking it on a bespoke customer role looks harmless and, without this
+-- entry, would flip that account to STAFF here while TypeScript still called it a
+-- customer.
+--
+-- IT IS NOT A MIRROR OF CLIENT_DEFAULT_PERMS, and the distinction is the whole point:
+-- a customer holding units:view_all, academy:view or marketplace:view would otherwise
+-- fall OUTSIDE the customer set, satisfy rt_is_staff() below, and keep the entire
+-- PostgREST read this helper exists to close — the role table, the unit tree and the
+-- classification taxonomy, security_limiting_markers.sync_restricted included.
+--
+-- Kept as a function, not inlined, so ONE literal exists and
+-- tests/rtIsStaffParity.test.ts can scrape it and assert exact equality against the
+-- TypeScript list — and, via the lib/staffPerms.ts docstring scrape, fail CI when a
+-- FOURTH customer-grantable permission is documented without being added here. NOT
+-- granted to `authenticated`: it is only ever called from inside rt_is_staff(), whose
+-- SECURITY DEFINER body runs as the owner — the same reason rt_client_tables() carries
+-- no grant.
+CREATE OR REPLACE FUNCTION private.rt_customer_perms()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT ARRAY[
+        'request:create', 'request:cancel', 'request:rate',
+        'units:view_all', 'academy:view', 'marketplace:view',
+        'user:manage:self',
+        'marketplace:list', 'marketplace:contract'
+    ]::text[];
+$$;
+
+-- "Is the caller ORG PERSONNEL rather than one of the org's external customers?"
+-- The SECOND conjunct of §6's authenticated_select on the staff-only reference tables.
+-- It exists because rt_is_live_member() above is role-blind: a Client-role account IS a
+-- live member, so it satisfied the old policy on its own and could read the whole
+-- classification taxonomy (INCLUDING security_limiting_markers.sync_restricted, the
+-- flag marking which compartments must never leave the org), the role table and the
+-- unit tree straight out of PostgREST — using the realtime JWT the server hands every
+-- authenticated user (api/query.ts -> lib/auth.ts signRealtimeToken, role
+-- 'authenticated') plus the anon key that GET /api/query?target=config serves
+-- unauthenticated.
+--
+-- DEFINED AS THE COMPLEMENT OF THE CUSTOMER SET, NOT AS AN ALLOWLIST MIRROR of the
+-- TypeScript staff lists. Deliberate, and measured rather than assumed: of the 110
+-- seeded permissions, 72 are in neither the customer set nor the union of
+-- STAFF_VIEW_PERMS + its implication closure + CLEARANCE_VISIBLE_PERMS +
+-- HR_METADATA_PERMS + APEX_ADMIN_PERMS + HR_ROSTER_VIEW_PERMS. An allowlist mirror
+-- would therefore classify a custom "Fleet Officer" holding only fleet:manage, a
+-- "Treasurer" holding only finance:manage and a "Wiki Editor" holding only
+-- wiki:edit_page as CUSTOMERS and cut real staff off from their own org's live
+-- rank/unit/role/clearance updates. It would also have to track five TypeScript lists
+-- plus the implication ladder, and pinning a server-side boundary to a client-side
+-- attachment decision is the coupling CLAUDE.md rule 2 forbids.
+--
+-- FAIL DIRECTION, stated plainly rather than assumed. A permission in NEITHER list
+-- reads as STAFF here, so this predicate is deliberately WIDER than the TypeScript
+-- staff gate. A wrong PASS is a REAL LEAK, not a duplicate of an already-gated read:
+-- the `main` projection gates on mayReceiveRoster (lib/rosterGate.ts), which is
+-- NARROWER than this
+-- complement, so anything wrongly admitted here reads rows the application layer
+-- refuses. The complement is chosen anyway because the allowlist alternative is
+-- fail-BROKEN at the scale computed above, and this build's rule is that failing
+-- closed must not mean failing broken. Its safety therefore rests ENTIRELY on
+-- rt_customer_perms() being the COMPLETE customer-grantable set, which
+-- tests/rtIsStaffParity.test.ts pins in both directions.
+--
+-- TWO ARMS, mirroring the shape of the TypeScript roster gate:
+--   (A) the seeded system Admin role BY IDENTITY — is_system AND a case-folded,
+--       trimmed name of 'admin' — the same RULE as lib/db/adminIdentity.ts
+--       isSystemAdminRole, though not byte-for-byte: JS .trim() strips all Unicode
+--       whitespace and single-argument btrim() strips spaces only, so a name like
+--       "	Admin" would differ. Unreachable (updateRole refuses to rename an
+--       is_system role, roles_name_key blocks a second 'Admin') and it fails toward
+--       DENIAL, which is the safe direction. Without this arm an operator who prunes the Admin role's
+--       permission rows would be classified a customer. roles_name_key makes a second
+--       literal 'Admin' impossible and updateRole refuses to rename an is_system role,
+--       so this cannot be forged with a role name. It DOES depend on is_system being
+--       stamped: lib/db/seeder.ts stamps it on a fresh install and repairDatabase
+--       otherwise, but a database whose roles arrive through lib/db/importer.ts can
+--       land unstamped — hence "re-run schema.sql AND run Repair Database" in the
+--       release note.
+--   (B) holds at least one permission OUTSIDE the customer set — a strict SUPERSET of
+--       hasAnyStaffViewPerm by construction, so it cannot deny anyone the TypeScript
+--       gate admits, however that gate is later re-shaped. mayReceiveRoster's other
+--       two disjuncts (the system-Admin identity and ROSTER_AUTHORITY_PERMS) are
+--       SUBSUMED by this arm: every entry is outside the customer set. That, and
+--       CLEARANCE_VISIBLE_PERMS, are pinned by tests/rtIsStaffParity.test.ts.
+--       (HR_METADATA_PERMS / APEX_ADMIN_PERMS / HR_ROSTER_VIEW_PERMS are
+--       module-local consts in files this item does not own, so they are checked
+--       by review rather than scraped by name — a scraper would break on a rename
+--       the renamer could not see.)
+-- During an org import role_permissions is transiently empty, so arm (B) reads FALSE
+-- for everyone until the import completes; arm (A) covers the Admin through it.
+-- A custom role with ZERO permission rows — the "Recruit"/"Probationary" induction
+-- role lib/db/clientRoleLock.ts names as legitimate — also fails both arms and is
+-- classed customer. That is the ACCEPTED fail direction, and it is cosmetic: the
+-- reference data still arrives in the `main` bundle and refreshes on tab refocus.
+--
+-- NOT A LIVENESS GATE. It deliberately does NOT re-check deleted_at /
+-- tokens_valid_from: it is only ever composed as
+-- `rt_is_live_member() AND rt_is_staff()`, and duplicating the revocation terms would
+-- create a second place to keep them right. The composition is pinned by
+-- tests/sec-schema-rls.test.ts and tests/rtIsStaffParity.test.ts. Do not use this
+-- helper alone in a new policy.
+--
+-- SECURITY DEFINER is load-bearing for the same reason it is on the two helpers above:
+-- §5 revokes `authenticated`'s SELECT on public.users, roles, role_permissions and
+-- permissions, so an inline EXISTS would be evaluated with the CALLER's privileges and
+-- read FALSE for everyone — fail-BROKEN, silently.
+CREATE OR REPLACE FUNCTION private.rt_is_staff()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.users u
+        LEFT JOIN public.roles r ON r.id = u.role_id
+        WHERE u.id = NULLIF(auth.jwt()->>'user_id', '')::int
+          AND (
+                (r.is_system IS TRUE AND lower(btrim(r.name)) = 'admin')
+                OR EXISTS (
+                    SELECT 1
+                    FROM public.role_permissions rp
+                    JOIN public.permissions p ON p.id = rp.permission_id
+                    WHERE rp.role_id = u.role_id
+                      AND p.name <> ALL (private.rt_customer_perms())
+                )
+          )
+    );
+$$;
+
+-- Tactical-board visibility, gating §6b rt_recv_op_board. Board deltas carry full
+-- element content (broadcastBoardAdd emits the `element` object and
+-- broadcastBoardUpdate the `changes` object — lib/db/ops.ts), so receipt is gated
+-- on the SAME operation-visibility predicate the app enforces on its read paths
+-- (lib/db/ops.ts canUserSeeOpInList / assertOpVisibleToUser):
+--   owner, OR operations:manage holder, OR
+--   (clearance level met AND every limiting marker held
+--    AND — for SPECIAL operations — caller is an ACTIVE participant).
+-- Special operations are invite-only: a clearance-0 (or otherwise clearance-met,
+-- unmarked) special op must NOT be readable by every member — only the owner,
+-- operations:manage holders, and ACTIVE participants (operation_participants rows
+-- with time_left IS NULL) may receive its live board. Without this branch a
+-- non-participant could subscribe to op-board-<id> directly via supabase-js and
+-- read the special op's tactical board content. This mirrors the special-op gate
+-- the TS read/list/detail/action paths enforce so the realtime channel cannot
+-- drift from them. NULL user clearance is treated as level 0, identical to the
+-- app's passesClearance (lib/clearance.ts).
+-- The parameter stays `text` and the comparison stays `o.id::text = p_operation_id`
+-- so a malformed topic tail can never raise a cast error — Postgres does not
+-- guarantee AND short-circuiting, and the caller's regex guard runs in the same
+-- expression.
+CREATE OR REPLACE FUNCTION private.rt_can_read_op_board(p_operation_id text)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.operations o
+        -- Liveness is DELEGATED, not restated. This join used to carry its own copy of
+        -- deleted_at + tokens_valid_from — the "second place to keep them right" the
+        -- rt_is_staff() note warns against — and it duly missed the org-ban term when
+        -- that was added, leaving a banned member reading live tactical-board content
+        -- through this one predicate after every other surface had shut them out. `u`
+        -- is still joined because the clearance, ownership, participation and marker
+        -- terms below are all about that row; only the revocation terms moved.
+        JOIN public.users u
+          ON u.id = NULLIF(auth.jwt()->>'user_id', '')::int
+         AND private.rt_is_live_member()
+        LEFT JOIN public.security_clearances sc ON sc.id = u.clearance_level_id
+        WHERE o.id::text = p_operation_id
+          AND (
+                o.owner_id = u.id
+                OR EXISTS (
+                    SELECT 1 FROM public.role_permissions rp
+                    JOIN public.permissions p ON p.id = rp.permission_id
+                    WHERE rp.role_id = u.role_id AND p.name = 'operations:manage'
+                )
+                OR (
+                    (
+                        NOT COALESCE(o.is_special, false)
+                        OR EXISTS (
+                            SELECT 1 FROM public.operation_participants opp
+                            WHERE opp.operation_id = o.id
+                              AND opp.user_id = u.id
+                              AND opp.time_left IS NULL
+                        )
+                    )
+                    AND COALESCE(o.clearance_level, 0) <= COALESCE(sc.level, 0)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM public.operation_limiting_markers olm
+                        WHERE olm.operation_id = o.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM public.user_limiting_markers ulm
+                              WHERE ulm.user_id = u.id AND ulm.marker_id = olm.marker_id
+                          )
+                    )
+                )
+          )
+    );
+$$;
+
+
 -- =============================================================================
 -- SECTION 5 — Grants
 -- =============================================================================
@@ -3209,28 +4495,69 @@ GRANT ALL ON ALL TABLES    IN SCHEMA public TO service_role;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
 GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO service_role;
 
--- authenticated needs table-level SELECT privilege in addition to a permissive
--- RLS policy. INSERT/UPDATE/DELETE stay with service_role (the app server).
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO authenticated;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
-
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT ALL ON TABLES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT ALL ON SEQUENCES TO service_role;
+
+-- authenticated (the realtime client) is ALLOWLISTED, never blanket-granted.
+-- Deleting a GRANT from a re-runnable script revokes NOTHING from an existing
+-- install, and Supabase's own bootstrap records ALTER DEFAULT PRIVILEGES ...
+-- GRANT ALL ON TABLES TO anon, authenticated for the role that runs this file —
+-- so the sweep below is what actually narrows the surface. Same REVOKE-then-
+-- allowlist shape the function grants further down already use.
+--
+-- NOTE: ALTER DEFAULT PRIVILEGES only revokes defaults recorded for the role
+-- RUNNING the statement, so this must be applied in the Supabase SQL editor as
+-- `postgres` — the same role that created the tables.
+REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT ON TABLES TO authenticated;
+    REVOKE ALL ON TABLES FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    REVOKE ALL ON SEQUENCES FROM anon, authenticated;
+
+-- Re-grant SELECT on exactly the realtime client tables. Nothing else: the
+-- browser's supabase-js client makes NO PostgREST call anywhere in the app
+-- (every hit in components/ contexts/ hooks/ services/ is supabase.channel /
+-- realtime.setAuth / removeChannel), so table privilege beyond this set has no
+-- consumer and is pure attack surface. Sequences are needed by nobody — the
+-- browser never INSERTs — so they are not re-granted at all.
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY private.rt_client_tables()
+    LOOP
+        IF to_regclass('public.' || quote_ident(t)) IS NOT NULL THEN
+            EXECUTE format('GRANT SELECT ON public.%I TO authenticated;', t);
+        END IF;
+    END LOOP;
+END $$;
 
 -- Function execute grants: service_role ONLY. Every supabase.rpc() caller runs
 -- server-side under the service-role key (lib/db/**); the client never invokes
 -- these via PostgREST (it POSTs to /api/services, gated by fullPermissionMap).
--- These functions are SECURITY DEFINER and trust their caller, so granting
--- `authenticated` would let any logged-in member call finance_*/qm_*/warehouse_*
--- directly via /rest/v1/rpc and bypass the server's permission checks — a latent
--- BOLA surface with no consumer. Keep them service_role-only (deny-by-default).
+-- EIGHT of the functions below are SECURITY DEFINER — try_acquire_cron_lock,
+-- release_cron_lock, admin_truncate_all_data, add_uec_to_operation,
+-- add_cost_to_operation, admin_adjust_reputation, public_stats_for_org and
+-- import_reset_sequence. Those are the ones that would run with the DEFINER's rights.
+-- The rest (every finance_*/qm_*/warehouse_*/marketplace_* writer) are invoker-rights
+-- with `SET search_path = public, pg_temp`. The distinction matters when you are
+-- deciding which of these is dangerous — but it does not change the grant, because ALL
+-- of them trust their caller. Granting `authenticated` would let any logged-in member
+-- call them directly via /rest/v1/rpc and bypass the server's permission checks — a
+-- latent BOLA surface with no consumer. Keep them service_role-only (deny-by-default).
+--
+-- A new function here needs its GRANT line even though `GRANT ALL ON ALL FUNCTIONS IN
+-- SCHEMA public TO service_role` (below) covers a FULL re-run: there is no
+-- `ALTER DEFAULT PRIVILEGES ... GRANT EXECUTE ON FUNCTIONS TO service_role` anywhere in
+-- this file (only TABLES and SEQUENCES), while the REVOKE default at §5's tail IS
+-- recorded — so an operator who pastes just the new §4 function gets 42501, not a
+-- working RPC. This list is the allowlist; keep it complete.
 GRANT EXECUTE ON FUNCTION public.try_acquire_cron_lock(text, text, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.release_cron_lock(text, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.finance_reconcile_balances() TO service_role;
+GRANT EXECUTE ON FUNCTION public.finance_overview_stats() TO service_role;
 GRANT EXECUTE ON FUNCTION public.add_uec_to_operation(uuid, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.add_cost_to_operation(uuid, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.op_join_participant(uuid, integer, text, text, integer, integer) TO service_role;
@@ -3247,10 +4574,18 @@ GRANT EXECUTE ON FUNCTION public.qm_issue_direct(bigint, integer, integer, times
 GRANT EXECUTE ON FUNCTION public.qm_return_issuance(bigint, integer, text, integer, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.qm_write_off_issuance(bigint, text, integer, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.qm_adjust_inventory(bigint, integer, text, integer, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.qm_set_inventory_total(bigint, integer, text, integer, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.qm_issue_bulk(integer, timestamptz, integer, text, bigint, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.qm_return_bulk(integer, text, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.qm_overview_stats() TO service_role;
+-- LOAD-BEARING on a partial paste: this file records the REVOKE default but has no
+-- ALTER DEFAULT PRIVILEGES grant for functions, so a new function without its own
+-- grant is a 42501 at runtime, not a missing feature at deploy time.
+GRANT EXECUTE ON FUNCTION public.qm_armoury_facets(boolean) TO service_role;
+GRANT EXECUTE ON FUNCTION public.academy_claim_seat(uuid, integer, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.academy_apply_order(text, text, bigint[]) TO service_role;
 GRANT EXECUTE ON FUNCTION public.warehouse_adjust_stock(bigint, integer, text, integer, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.warehouse_set_stock_total(bigint, integer, text, integer, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.warehouse_fulfil_request(uuid, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.warehouse_transfer_stock(bigint, bigint, integer, integer, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.warehouse_overview_stats() TO service_role;
@@ -3262,11 +4597,14 @@ GRANT EXECUTE ON FUNCTION public.admin_truncate_all_data() TO service_role;
 
 -- PostgreSQL grants EXECUTE on every function to PUBLIC by default, which via
 -- PostgREST (/rest/v1/rpc/<fn>) would let an unauthenticated caller invoke the
--- SECURITY DEFINER functions above and bypass app-level authorization (these
--- functions trust their caller — the server calls them under the service-role
--- key after its own permission checks). Revoke the implicit PUBLIC + anon grant;
--- the explicit service_role grants are the allowlist (no function is granted to
--- `authenticated` — every caller runs server-side under service_role).
+-- functions above and bypass app-level authorization — the eight SECURITY DEFINER
+-- ones with the definer's rights, and the invoker-rights majority because they trust
+-- their caller just the same (the server calls them under the service-role key after
+-- its own permission checks). Revoke the implicit PUBLIC + anon grant;
+-- the explicit service_role grants are the allowlist. No function in `public` is
+-- granted to `authenticated` — every caller runs server-side under service_role.
+-- (The three realtime policy helpers ARE granted to authenticated, but they live in
+-- `private`, which PostgREST does not expose — see the block at §5's tail.)
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM anon;
 -- On Supabase, its bootstrap runs ALTER DEFAULT PRIVILEGES granting EXECUTE on
@@ -3276,6 +4614,21 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM anon;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM authenticated;
 -- And for any function added to the schema later in this apply.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, anon, authenticated;
+
+-- The ONLY grants `authenticated` holds besides SELECT on the realtime tables:
+-- USAGE on `private` plus EXECUTE on the three §4.9 policy helpers. The realtime
+-- RLS policies call them, and a policy is evaluated with the CALLER's privileges,
+-- so dropping either line raises "permission denied for schema private" and kills
+-- ALL private-channel realtime. They are argument-free or self-scoped (the caller's
+-- own token; whether the caller may already subscribe to that board), so they leak
+-- nothing a subscriber does not already know — and `private` is outside PostgREST's
+-- exposed schemas, so they are not callable at /rest/v1/rpc/ at all.
+-- Keep these five lines together; they are one unit.
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA private FROM PUBLIC, anon;
+GRANT USAGE ON SCHEMA private TO authenticated;
+GRANT EXECUTE ON FUNCTION private.rt_is_live_member()        TO authenticated;
+GRANT EXECUTE ON FUNCTION private.rt_can_read_op_board(text) TO authenticated;
+GRANT EXECUTE ON FUNCTION private.rt_is_staff()              TO authenticated;
 
 
 -- =============================================================================
@@ -3324,13 +4677,7 @@ BEGIN
     -- Since clients now authenticate to Realtime as role=authenticated (private
     -- channel JWT), these policies actually deliver — the exclusions above are
     -- load-bearing, not cosmetic.
-    FOREACH t IN ARRAY ARRAY[
-        'ranks', 'units', 'roles', 'locations', 'radio_channels',
-        'personnel_positions',
-        'security_clearances', 'security_limiting_markers',
-        'specialization_tags', 'certifications', 'commendations',
-        'service_types'
-    ]
+    FOREACH t IN ARRAY private.rt_client_tables()
     LOOP
         EXECUTE format('DROP POLICY IF EXISTS authenticated_select ON public.%I;', t);
         -- Require the realtime token's user_id to be a live (non-deleted) member,
@@ -3339,9 +4686,33 @@ BEGIN
         -- looser `auth.uid() IS NOT NULL`, which any token satisfies. The iat vs
         -- tokens_valid_from check also cuts off a revoked-but-not-deleted session
         -- (admin "revoke sessions") before the realtime token's own expiry.
-        EXECUTE format(
-            'CREATE POLICY authenticated_select ON public.%I FOR SELECT TO authenticated USING (EXISTS (SELECT 1 FROM public.users u WHERE u.id = NULLIF(auth.jwt()->>''user_id'', '''')::int AND u.deleted_at IS NULL AND (u.tokens_valid_from IS NULL OR to_timestamp(NULLIF(auth.jwt()->>''iat'', '''')::bigint) >= u.tokens_valid_from)));',
-            t);
+        -- The predicate lives in private.rt_is_live_member() (§4.9) because an
+        -- inline EXISTS on public.users would be evaluated with the CALLER's
+        -- privileges, and §5 no longer grants authenticated SELECT on that table.
+        --
+        -- SECOND CONJUNCT, for the staff-only tables: rt_is_live_member() is role-blind,
+        -- and the org's external customers — the Client system role, and any custom role
+        -- holding only customer-grantable permissions — ARE live members. On its own it
+        -- therefore published the full classification taxonomy (INCLUDING
+        -- security_limiting_markers.sync_restricted, the flag marking which compartments
+        -- must never leave the org), the role table and the unit tree to any customer
+        -- holding the realtime JWT the server hands every authenticated user.
+        -- private.rt_is_staff() (§4.9) closes that.
+        --
+        -- The arms are an ALLOWLIST on private.rt_customer_visible_tables(), which is
+        -- deliberately EMPTY: every one of the twelve takes the ELSE branch today. The IF
+        -- arm is kept as the reviewed extension point — a table becomes customer-visible
+        -- only by being named there, and tests/rtIsStaffParity.test.ts goes red when one
+        -- is, so it can never happen silently.
+        IF t = ANY (private.rt_customer_visible_tables()) THEN
+            EXECUTE format(
+                'CREATE POLICY authenticated_select ON public.%I FOR SELECT TO authenticated USING (private.rt_is_live_member());',
+                t);
+        ELSE
+            EXECUTE format(
+                'CREATE POLICY authenticated_select ON public.%I FOR SELECT TO authenticated USING (private.rt_is_live_member() AND private.rt_is_staff());',
+                t);
+        END IF;
     END LOOP;
 END $$;
 
@@ -3355,13 +4726,7 @@ END $$;
 DO $$
 DECLARE
     t text;
-    allowlist text[] := ARRAY[
-        'ranks', 'units', 'roles', 'locations', 'radio_channels',
-        'personnel_positions',
-        'security_clearances', 'security_limiting_markers',
-        'specialization_tags', 'certifications', 'commendations',
-        'service_types'
-    ];
+    allowlist text[] := private.rt_client_tables();
 BEGIN
     FOR t IN
         SELECT tablename FROM pg_tables
@@ -3389,12 +4754,14 @@ END $$;
 -- guard: a non-allowlisted table has no authenticated SELECT policy and so would
 -- deliver nothing even if mistakenly added here.
 DROP PUBLICATION IF EXISTS supabase_realtime;
-CREATE PUBLICATION supabase_realtime FOR TABLE
-    public.ranks, public.units, public.roles, public.locations,
-    public.radio_channels, public.personnel_positions,
-    public.security_clearances, public.security_limiting_markers,
-    public.specialization_tags, public.certifications, public.commendations,
-    public.service_types;
+DO $$
+DECLARE tables text;
+BEGIN
+    SELECT string_agg('public.' || quote_ident(t), ', ' ORDER BY t)
+      INTO tables
+      FROM unnest(private.rt_client_tables()) AS t;
+    EXECUTE format('CREATE PUBLICATION supabase_realtime FOR TABLE %s;', tables);
+END $$;
 
 -- -----------------------------------------------------------------------------
 -- SECTION 6b — Realtime Authorization (private broadcast channels)
@@ -3425,87 +4792,29 @@ CREATE POLICY rt_recv_org_channels ON realtime.messages
     USING (
         realtime.messages.extension = 'broadcast'
         AND realtime.topic() IN ('db-changes', 'auth-alerts')
-        AND EXISTS (
-            SELECT 1 FROM public.users u
-            WHERE u.id = NULLIF(auth.jwt()->>'user_id', '')::int
-              AND u.deleted_at IS NULL
-              AND (u.tokens_valid_from IS NULL
-                   OR to_timestamp(NULLIF(auth.jwt()->>'iat', '')::bigint) >= u.tokens_valid_from)
-        )
+        AND private.rt_is_live_member()
     );
 
--- Tactical board channels: deltas carry full element content (broadcastBoardAdd
--- emits the `element` object and broadcastBoardUpdate the `changes` object —
--- lib/db/ops.ts), so receipt is gated on the SAME operation-visibility predicate
--- the app enforces on its read paths (lib/db/ops.ts canUserSeeOpInList /
--- assertOpVisibleToUser):
---   owner, OR operations:manage holder, OR
---   (clearance level met AND every limiting marker held
---    AND — for SPECIAL operations — caller is an ACTIVE participant).
--- Special operations are invite-only: a clearance-0 (or otherwise clearance-met,
--- unmarked) special op must NOT be readable by every member — only the owner,
--- operations:manage holders, and ACTIVE participants (operation_participants rows
--- with time_left IS NULL) may receive its live board. Without this branch a
--- non-participant could subscribe to op-board-<id> directly via supabase-js and
--- read the special op's tactical board content. This mirrors the special-op gate
--- the TS read/list/detail/action paths enforce so the realtime channel cannot
--- drift from them. Topic format: 'op-board-<operation uuid>'; the regex guard
--- rejects malformed topics up front (a non-UUID tail never matches o.id — the
--- EXISTS fails closed — but the guard makes the contract explicit and avoids a
--- needless scan). NULL user clearance is treated as level 0, identical to the
--- app's passesClearance (lib/clearance.ts).
+-- Tactical board channels. The visibility predicate itself lives in
+-- private.rt_can_read_op_board() (§4.9) — read the contract there; it is the same
+-- owner / operations:manage / clearance+markers+special-participation disjunction
+-- the TS read paths enforce (lib/db/ops.ts canUserSeeOpInList /
+-- assertOpVisibleToUser), moved into a SECURITY DEFINER function so the policy
+-- does not have to read public.operations / users / role_permissions as role
+-- `authenticated` (§5 no longer grants that). Topic format:
+-- 'op-board-<operation uuid>'; the regex guard rejects malformed topics up front.
 --
 -- MANUAL APPLY: schema.sql is applied by hand via the Supabase SQL editor, not via
--- migrations. After editing this policy you MUST re-run this DROP/CREATE POLICY
--- block against the live database for the change to take effect.
+-- migrations. After editing this policy — or private.rt_can_read_op_board(), which
+-- now holds the predicate — you MUST re-run BOTH the function and this DROP/CREATE
+-- POLICY block against the live database for the change to take effect.
 DROP POLICY IF EXISTS rt_recv_op_board ON realtime.messages;
 CREATE POLICY rt_recv_op_board ON realtime.messages
     FOR SELECT TO authenticated
     USING (
         realtime.messages.extension = 'broadcast'
         AND realtime.topic() ~ '^op-board-[0-9a-fA-F-]{36}$'
-        AND EXISTS (
-            SELECT 1
-            FROM public.operations o
-            JOIN public.users u
-              ON u.id = NULLIF(auth.jwt()->>'user_id', '')::int
-             AND u.deleted_at IS NULL
-             AND (u.tokens_valid_from IS NULL
-                  OR to_timestamp(NULLIF(auth.jwt()->>'iat', '')::bigint) >= u.tokens_valid_from)
-            LEFT JOIN public.security_clearances sc ON sc.id = u.clearance_level_id
-            WHERE o.id::text = substring(realtime.topic() FROM 10)
-              AND (
-                    o.owner_id = u.id
-                    OR EXISTS (
-                        SELECT 1 FROM public.role_permissions rp
-                        JOIN public.permissions p ON p.id = rp.permission_id
-                        WHERE rp.role_id = u.role_id AND p.name = 'operations:manage'
-                    )
-                    OR (
-                        -- Special-op participation gate: a special op is visible
-                        -- through clearance ONLY to ACTIVE participants (time_left
-                        -- IS NULL). Non-special ops keep clearance-only behavior.
-                        (
-                            NOT COALESCE(o.is_special, false)
-                            OR EXISTS (
-                                SELECT 1 FROM public.operation_participants opp
-                                WHERE opp.operation_id = o.id
-                                  AND opp.user_id = u.id
-                                  AND opp.time_left IS NULL
-                            )
-                        )
-                        AND COALESCE(o.clearance_level, 0) <= COALESCE(sc.level, 0)
-                        AND NOT EXISTS (
-                            SELECT 1 FROM public.operation_limiting_markers olm
-                            WHERE olm.operation_id = o.id
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM public.user_limiting_markers ulm
-                                  WHERE ulm.user_id = u.id AND ulm.marker_id = olm.marker_id
-                              )
-                        )
-                    )
-              )
-        )
+        AND private.rt_can_read_op_board(substring(realtime.topic() FROM 10))
     );
 
 
@@ -3549,6 +4858,7 @@ INSERT INTO public.permissions (name, description, category) VALUES
     ('admin:user:manage_clearance', 'Change User Clearance', 'User Management'),
     ('admin:user:adjust_reputation', 'Adjust User Reputation', 'User Management'),
     ('admin:user:view_history', 'View User History', 'User Management'),
+    ('admin:user:ban', 'Ban & Unban Members', 'User Management'),
     ('user:manage:conduct_record', 'Add/Remove Conduct Entries', 'User Management'),
     ('user:manage:personnel_notes', 'Add/View Personnel Notes', 'User Management'),
     ('user:toggle_duty', 'Toggle Duty Status', 'User Management'),
@@ -3593,6 +4903,7 @@ INSERT INTO public.permissions (name, description, category) VALUES
     ('unit:manage:own', 'Manage Own Unit', 'Organization'),
     ('units:view_all', 'View All Restricted Units', 'Organization'),
     ('admin:config:settings', 'Manage Client UI Settings', 'System'),
+    ('admin:security:view_audit', 'View Security Audit Trail', 'System'),
     ('user:receive:eam', 'Receive EAM Alerts', 'Communications'),
     ('fleet:view', 'View Fleet Manager', 'Fleet'),
     ('fleet:manage_own', 'Manage Own Ship Hangar', 'Fleet'),
@@ -3631,7 +4942,12 @@ INSERT INTO public.permissions (name, description, category) VALUES
     ('marketplace:admin', 'Moderate Marketplace & Reports', 'Marketplace'),
     ('academy:view',     'View Academy (staff surfaces)',            'Academy'),
     ('academy:instruct', 'Instruct Courses & Run Sessions',          'Academy'),
-    ('academy:manage',   'Manage Academy (approve, certify, award)', 'Academy')
+    ('academy:manage',   'Manage Academy (approve, certify, award)', 'Academy'),
+    ('blueprint:view',     'Browse Blueprint Registry',        'Blueprints'),
+    ('blueprint:register', 'Register & Manage Own Blueprints', 'Blueprints'),
+    ('blueprint:request',  'Raise Crafting Requests',          'Blueprints'),
+    ('blueprint:craft',    'Claim & Fulfil Crafting Requests', 'Blueprints'),
+    ('blueprint:manage',   'Moderate Org Blueprints',          'Blueprints')
 ON CONFLICT (name) DO NOTHING;
 
 
@@ -3656,7 +4972,7 @@ ON CONFLICT (name) DO NOTHING;
 -- JSON string. BUMP this whenever you change the schema (see AMENDMENT RULES at top);
 -- keep it aligned with the app version where practical.
 INSERT INTO public.settings (key, value)
-VALUES ('schema_version', '"15.2.0-open"'::jsonb)
+VALUES ('schema_version', '"15.7.0-open"'::jsonb)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- =============================================================================

@@ -17,9 +17,33 @@ interface MaybeStructuredError {
 }
 
 /**
- * Return true when `e` looks like a Supabase PostgrestError/AuthError or a
- * Node system error — anything whose `message` may include schema/SQL/infra
- * detail we don't want to forward to clients. Heuristic, not exhaustive:
+ * Native engine error constructors. Their `message` is machine-generated V8 text
+ * built out of OUR identifiers — "Cannot read properties of undefined (reading
+ * 'tokensValidFrom')", "x.map is not a function", "Unexpected token < in JSON at
+ * position 0". That is a crash report, never deliberate user-facing copy: nothing
+ * in this repo throws one on purpose, so forwarding the message only ever hands a
+ * caller a description of an internal failure.
+ *
+ * Matched by NAME first so it still holds for an error that crossed a realm/vm
+ * boundary (undici's `TypeError: fetch failed`, a worker thread) where instanceof
+ * is false; instanceof is then checked as a fallback so an engine or transpiler
+ * that reports a different `name` still fails CLOSED.
+ *
+ * Deliberately NOT listed: plain `Error`. `throw new Error('user-facing copy')` is
+ * this codebase's business-error idiom ('Only an Admin may perform this action.',
+ * 'Role not found', 'Import file too large (max 64 MB).') and must keep reaching
+ * the client — that, and SecurityDenial (whose `name` is its own), are why this is
+ * a name allowlist rather than "anything that isn't Error.prototype".
+ */
+const NATIVE_ENGINE_ERROR_NAMES: ReadonlySet<string> = new Set([
+    'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'EvalError', 'URIError', 'AggregateError',
+]);
+
+/**
+ * Return true when `e` looks like a Supabase PostgrestError/AuthError, a Node
+ * system error, or a native engine error (TypeError & friends) — anything whose
+ * `message` may include schema/SQL/infra detail, or our own identifiers, that we
+ * don't want to forward to clients. Heuristic, not exhaustive:
  * matches against the structural shape of the error rather than instanceof,
  * because Supabase errors are plain objects (not Error subclasses) when they
  * bubble through `throw error;`.
@@ -35,6 +59,16 @@ export function isOpaqueServerError(e: unknown): boolean {
     if (typeof err.errno === 'number' || typeof err.syscall === 'string') return true;
     if (typeof err.name === 'string' && err.name.startsWith('Auth')) return true;
     if (typeof err.details === 'string' || typeof err.hint === 'string') return true;
+
+    // Native engine errors — a bug in OUR code, not a message for the caller. A
+    // bare TypeError carries no code/errno/details, so without this every
+    // "Cannot read properties of undefined (reading 'x')" was forwarded verbatim.
+    if (typeof err.name === 'string' && NATIVE_ENGINE_ERROR_NAMES.has(err.name)) return true;
+    if (
+        e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError ||
+        e instanceof SyntaxError || e instanceof EvalError || e instanceof URIError ||
+        e instanceof AggregateError
+    ) return true;
 
     return false;
 }

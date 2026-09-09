@@ -27,8 +27,16 @@ vi.mock('../lib/auth', () => ({ verifyToken: () => h.decoded, tokenIssuedAt: () 
 vi.mock('../lib/db', () => ({
     getPlatformSettings: async () => ({}),
     getUserById: async () => h.user,
+    // The read path now runs the ORG BAN GATE above every other gate.
+    // Not banned by default; the ban tests drive the real module.
+    findActiveBan: async () => null,
+    getBanNotice: async () => null,
     getAllSettings: async () => ({}),
     getUsersByIdsLite: async (ids: number[]) => { h.calls.usersSlice.push(ids); return h.sliceUsers; },
+    // users_slice now issues the availability probe alongside the roster rows
+    // (Phase 3 item 2 — the scalar rides every user_update-triggered response).
+    // This factory hand-lists its exports, so an unmocked db.* call throws.
+    isAnyStaffOnDuty: async () => true,
     getOperationByIdLite: async (id: string, user: { id?: unknown } | null) => { h.calls.opSlice.push({ id, userId: user?.id }); return h.sliceOp; },
     listOperationTemplates: async () => { h.calls.templates++; return [{ id: 1, name: 'tpl' }]; },
 }));
@@ -48,6 +56,13 @@ function mockReq(query: Record<string, unknown>) {
 
 const clientUser = { id: 5, role: 'Client', permissions: [], auth_user_id: 'u5' };
 const memberUser = { id: 6, role: 'Member', permissions: ['operations:view'], auth_user_id: 'u6' };
+// users_slice is STAFF-gated as of Phase 3 item 3 (getMainState no longer ships the
+// roster to a non-staff caller, so the old "they already have it all in main"
+// justification is gone). The ids-validation and field-strip suites below are about
+// PARSING and REDACTION, not entitlement, so they run under a staff fixture and keep
+// pinning exactly what they were written to pin. The entitlement gate itself is
+// asserted in both directions in tests/rosterEgressGates.test.ts.
+const staffUser = { id: 6, role: 'Member', permissions: ['user:view:roster'], auth_user_id: 'u6' };
 
 beforeEach(() => {
     h.decoded = { userId: 5 };
@@ -83,6 +98,9 @@ describe('subset=users_slice — strict ids validation', () => {
     });
 
     it('dedupes ids and accepts both CSV and repeated-param forms', async () => {
+        // 200-path: needs the staff entitlement now, or the parse assertions below
+        // never run.
+        h.decoded = { userId: 6 }; h.user = staffUser;
         let res = mockRes();
         await handler(mockReq({ target: 'state', subset: 'users_slice', ids: '1,2,2,3' }), res);
         expect(res.statusCode).toBe(200);
@@ -114,6 +132,11 @@ describe('subset=users_slice — per-requester field strip (real userFilters)', 
     });
 
     it('a non-privileged requester gets the row with every sensitive field stripped', async () => {
+        // "Non-privileged" here means "holds no HR/roster-admin capability", NOT "not
+        // staff": this test is about the per-field STRIP, and a caller who cannot reach
+        // the subset at all would assert nothing about it. user:view:roster is the
+        // seeded Member default and buys none of the fields checked below.
+        h.decoded = { userId: 6 }; h.user = staffUser;
         h.sliceUsers = [targetUser()];
         const res = mockRes();
         await handler(mockReq({ target: 'state', subset: 'users_slice', ids: '7' }), res);
@@ -130,12 +153,33 @@ describe('subset=users_slice — per-requester field strip (real userFilters)', 
         expect(JSON.stringify(res.body)).not.toContain(SECRET_PNOTE);
     });
 
-    it('self keeps personnelNotes/conductRecord but never adminNotes (same as main)', async () => {
+    it('a NON-STAFF caller gets 403 even for their own id — user_detail is the self path', async () => {
+        // Phase 3 item 3: there is no self carve-out on users_slice. A non-staff
+        // viewer's own record reaches them through subset=user_detail (the identity
+        // path SessionContext.refreshSelfIdentity uses), which allows self
+        // unconditionally. Adding a self branch HERE would couple the roster gate to
+        // the availability discriminator for no gain, and would give the wire shape a
+        // third meaning: lib/db/users.ts getUsersByIdsLite and lib/sliceMerge.ts both
+        // document `{users: []}` as unambiguously "deleted".
         h.decoded = { userId: 7 };
         h.user = { id: 7, role: 'Client', permissions: [], auth_user_id: 'u7' };
         h.sliceUsers = [targetUser()];
         const res = mockRes();
         await handler(mockReq({ target: 'state', subset: 'users_slice', ids: '7' }), res);
+        expect(res.statusCode).toBe(403);
+        expect(res.body.users).toBeUndefined();
+        expect(h.calls.usersSlice).toHaveLength(0);
+    });
+
+    it('a STAFF caller viewing their own row keeps personnelNotes/conductRecord but never adminNotes', async () => {
+        // Keeps stripSensitiveUserFields' isSelf branch covered on this route — the
+        // 403 test above removes the only other self case from this file.
+        h.decoded = { userId: 7 };
+        h.user = { id: 7, role: 'Member', permissions: ['user:view:roster'], auth_user_id: 'u7' };
+        h.sliceUsers = [targetUser()];
+        const res = mockRes();
+        await handler(mockReq({ target: 'state', subset: 'users_slice', ids: '7' }), res);
+        expect(res.statusCode).toBe(200);
         const row = res.body.users[0];
         expect(row.personnelNotes).toBe(SECRET_PNOTE);
         expect(row.conductRecord).toHaveLength(1);

@@ -74,8 +74,12 @@ interface ReorderPositionsPayload {
     orderedIds: number[];
 }
 
-/** Actor the dispatcher injects; the gov authority ceiling reads role + permissions. */
-interface GovActor { id?: number; role?: string; permissions?: string[] }
+/**
+ * Actor the dispatcher injects. The gov authority ceiling reads role IDENTITY
+ * (isSystemAdmin) + permissions — never the name-derived `role` tier. Mirrors
+ * GovActor in lib/db/government/structure.ts; keep the two in lock-step.
+ */
+interface GovActor { id?: number; isSystemAdmin?: boolean; permissions?: string[] }
 
 interface AppointHolderPayload {
     positionId: number;

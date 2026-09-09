@@ -6,6 +6,7 @@ import { supabase, handleSupabaseError } from './db/common.js';
 import { cache } from './cache.js';
 
 import { getOrgSecret } from './secrets.js';
+import { DISCORD_SNOWFLAKE_RE } from './discordConfigKeys.js';
 import { stripHtmlSingleLine } from './textSanitize.js';
 import { log as baseLog } from './log.js';
 
@@ -392,6 +393,96 @@ export async function pushDiscordRolesForUser(
     }
 }
 
+// SUPPRESS MENTIONS UNLESS THE CALLER ASKED FOR THEM. Discord's default, with
+// `allowed_mentions` absent, is to parse @everyone / @here / <@&role> out of
+// `content` — so any path that ever puts member-authored text in `content` is a
+// mass-ping primitive. Default to parsing NOTHING; a caller that wants to ping
+// passes `allowed_mentions` explicitly (see buildMentionContent and the EAM
+// broadcast in lib/db/system.ts) and keeps it.
+//
+// The presence CHECK rather than a spread default is deliberate: a spread would
+// let a caller passing `allowed_mentions: undefined` overwrite the default with
+// undefined, JSON.stringify would drop the key, and Discord would go back to
+// parsing every mention. Non-object payloads pass through untouched, and the
+// caller's object is never mutated — postOperationAnnouncementEmbed reuses its
+// embed object across the enqueue tick.
+function withMentionSuppression(content: unknown): unknown {
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return content;
+    const c = content as Record<string, unknown>;
+    const explicit = c.allowed_mentions != null && typeof c.allowed_mentions === 'object';
+    return explicit ? { ...c } : { ...c, allowed_mentions: { parse: [] as string[] } };
+}
+
+/**
+ * Build the `content` + `allowed_mentions` that actually make Discord notify people.
+ *
+ * Three Discord behaviours this encodes, each of which fails silently:
+ *  - A mention inside an EMBED never notifies anyone. Only `content` pings, which
+ *    is why every pinging path sends a short content line alongside its embed.
+ *  - Without `allowed_mentions`, Discord parses mentions out of content by default.
+ *    sendDiscordChannelMessage now suppresses ALL of them, so a ping is something a
+ *    caller opts into rather than something arbitrary text can trigger.
+ *  - `parse` and an explicit id array must not name the same TYPE or the API 400s.
+ *    `parse: ['everyone']` (which covers @here) alongside `roles: [id]` is legal;
+ *    `parse: ['roles']` alongside `roles: [id]` is not.
+ *
+ * Returns {} when nothing should be pinged, so callers can spread it unconditionally.
+ */
+export function buildMentionContent(opts: { roleId?: string | null; here?: boolean; everyone?: boolean }): {
+    content?: string;
+    allowed_mentions?: { parse: string[]; roles?: string[] };
+} {
+    const roleId = opts.roleId && DISCORD_SNOWFLAKE_RE.test(opts.roleId) ? opts.roleId : null;
+    // @everyone implies the same permission as @here ('everyone' covers both), so it
+    // SUPERSEDES rather than combines — '@here @everyone' would notify the same
+    // people twice in one message. The else-if is what enforces that.
+    const everyone = !!opts.everyone;
+    const here = !!opts.here;
+    if (!roleId && !here && !everyone) return {};
+
+    const parts: string[] = [];
+    if (everyone) parts.push('@everyone');
+    else if (here) parts.push('@here');
+    if (roleId) parts.push(`<@&${roleId}>`);
+
+    return {
+        content: parts.join(' '),
+        allowed_mentions: {
+            parse: (here || everyone) ? ['everyone'] : [],
+            ...(roleId ? { roles: [roleId] } : {}),
+        },
+    };
+}
+
+/**
+ * THE ROUTE-ID GUARD. Every function below interpolates its ids straight into a
+ * Discord REST path that carries `Authorization: Bot <token>`, so an id is not a
+ * parameter — it chooses the ENDPOINT.
+ *
+ * `fetch` normalises the URL before sending, so a value containing `../` walks out
+ * of the route, and a `?` truncates whatever the template appends after it:
+ *
+ *     channelId = '../guilds/<id>/prune?x='
+ *     `${API_ENDPOINT}/channels/${channelId}/messages`
+ *       -> https://discord.com/api/v10/guilds/<id>/prune?x=/messages
+ *
+ * which is an arbitrary bot-authenticated POST — Begin-Guild-Prune, role creation,
+ * a post to any channel the bot can see. Callers validate at their own edges
+ * (normaliseDiscordSnowflake on the admin config write path and on
+ * operation:repost_announcement), but "every caller remembers" is not a boundary:
+ * operation:create did not, the value it stored is re-fired later by the start-notice
+ * cron, and an imported org brings its own persisted ids.
+ *
+ * So the check lives HERE, at the one place every Discord path is built, and it
+ * covers messageId too — that also comes from a persisted column.
+ *
+ * Refuses rather than sanitises: there is no safe repair of a junk snowflake, and a
+ * silent trim would post to the WRONG channel rather than to none.
+ */
+function isDiscordRouteId(value: unknown): value is string {
+    return typeof value === 'string' && DISCORD_SNOWFLAKE_RE.test(value);
+}
+
 // Posts a message to a Discord channel. Returns the new message ID on success
 // so callers can chain reactions / edits / deletes; returns `error` on failure
 // (callers that ignore the return — intel & service requests today — see no
@@ -400,6 +491,10 @@ export async function sendDiscordChannelMessage(
     channelId: string,
     content: any,
 ): Promise<{ messageId?: string; error?: string }> {
+    if (!isDiscordRouteId(channelId)) {
+        log.warn('refusing to send: channel id is not a snowflake', { channelId });
+        return { error: 'Invalid Discord channel ID.' };
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     if (!botToken) {
         log.warn('cannot send message: no bot token found');
@@ -413,7 +508,7 @@ export async function sendDiscordChannelMessage(
                 Authorization: `Bot ${botToken}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify(content),
+            body: JSON.stringify(withMentionSuppression(content)),
         });
 
         if (!response.ok) {
@@ -437,6 +532,10 @@ export async function editDiscordChannelMessage(
     messageId: string,
     content: any,
 ): Promise<{ ok: boolean; error?: string; gone?: boolean }> {
+    if (!isDiscordRouteId(channelId) || !isDiscordRouteId(messageId)) {
+        log.warn('refusing to edit: channel or message id is not a snowflake', { channelId, messageId });
+        return { ok: false, error: 'Invalid Discord channel or message ID.' };
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     if (!botToken) return { ok: false, error: 'Discord bot token is not configured.' };
 
@@ -447,7 +546,9 @@ export async function editDiscordChannelMessage(
                 Authorization: `Bot ${botToken}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify(content),
+            // Applied on edit too, even though Discord never re-notifies on a PATCH:
+            // leaving the two paths asymmetric is how the default gets forgotten.
+            body: JSON.stringify(withMentionSuppression(content)),
         });
         if (!response.ok) {
             const error = await response.json().catch(() => ({}));
@@ -469,6 +570,10 @@ export async function deleteDiscordChannelMessage(
     channelId: string,
     messageId: string,
 ): Promise<void> {
+    if (!isDiscordRouteId(channelId) || !isDiscordRouteId(messageId)) {
+        log.warn('refusing to delete: channel or message id is not a snowflake', { channelId, messageId });
+        return;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     if (!botToken) return;
     try {
@@ -493,6 +598,10 @@ export async function addMessageReactions(
     messageId: string,
     emojis: string[],
 ): Promise<void> {
+    if (!isDiscordRouteId(channelId) || !isDiscordRouteId(messageId)) {
+        log.warn('refusing to react: channel or message id is not a snowflake', { channelId, messageId });
+        return;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     if (!botToken) return;
     for (const emoji of emojis) {
@@ -527,17 +636,68 @@ export interface OperationAnnouncementEmbedInput {
     locationLabel?: string | null;
     operationDeepLink?: string | null;
     branding?: { name?: string; iconUrl?: string };
+    /** EGRESS GATE: true when the op is clearance>0, carries any limiting marker,
+     *  or is a Special Operation — the same three dimensions operationIsRestricted
+     *  and the realtime authorization policy (schema.sql §6b) gate the in-app read
+     *  on. The announcement channel is a GENERAL channel with no per-recipient
+     *  clearance/marker filter, so a restricted op must post a bare notice only. */
+    restricted?: boolean;
+    /** Which moment this embed describes. 'announce' (default) = posted to the
+     *  board; 'starting' = a T-minus notice. Deliberately a branch INSIDE this
+     *  builder, not a second builder, so the restricted leg cannot be
+     *  reimplemented wrong. */
+    variant?: 'announce' | 'starting';
 }
 
 const OPERATION_ANNOUNCEMENT_REACTIONS = ['✅', '❌', '❓'];
 
-function buildOperationAnnouncementEmbed(input: OperationAnnouncementEmbedInput) {
+// Exported for the egress-gate test (tests/operationAnnouncementEgress.test.ts),
+// which renders the real bytes a restricted op would ship. Not a posting API —
+// callers use postOperationAnnouncementEmbed / editOperationAnnouncementEmbed.
+export function buildOperationAnnouncementEmbed(input: OperationAnnouncementEmbedInput) {
     const safe = (val: any, fallback = 'N/A', maxLength = 1024) => {
         if (val === null || val === undefined) return fallback;
         const str = String(val).trim();
         if (str.length === 0) return fallback;
         return str.length > maxLength ? str.substring(0, maxLength - 3) + '...' : str;
     };
+
+    const branding = input.branding || {};
+
+    // RESTRICTED -> bare notice. NO briefing, no clearance label, no location, no
+    // unit, no type, no schedule. Cleared members open the dashboard, where
+    // assertOpVisibleToUser gates the detail.
+    //
+    // Two things deliberately survive the collapse, and both are WEAKER than the
+    // in-app gate (which hides a restricted op's existence entirely, lib/db/ops.ts
+    // canUserSeeOpInList) and weaker than notifyDiscordIntelBulletin (which drops
+    // the bulletin title outright): the op NAME, and the deep link. The name is
+    // kept because an operator who asked for an announcement needs the notice to
+    // identify which op it is, and the guild-scheduled-event path cannot drop a
+    // name at all (Discord requires one) — so dropping it here would only make the
+    // two egress surfaces disagree. Operators who encode the objective in the op
+    // name should title restricted ops accordingly. The deep link is this
+    // deployment's own URL: non-sensitive navigation, and the only way a cleared
+    // member reaches the gated detail.
+    if (input.restricted) {
+        const fields: any[] = [];
+        if (input.operationDeepLink) {
+            fields.push({ name: 'Details', value: `[Open in myRSI](${input.operationDeepLink})`, inline: false });
+        }
+        return {
+            title: input.variant === 'starting'
+                ? `⏱️ RESTRICTED OPERATION STARTING SOON: ${safe(input.name, 'Untitled Operation', 256)}`
+                : `🛰️ RESTRICTED OPERATION: ${safe(input.name, 'Untitled Operation', 256)}`,
+            description: 'A restricted operation was posted. Open the dashboard to view.',
+            color: 0x64748b, // slate — matches the classified intel-bulletin notice
+            fields,
+            timestamp: new Date().toISOString(),
+            footer: {
+                text: `${branding.name || 'Organization'} Operations`,
+                ...(branding.iconUrl && branding.iconUrl.startsWith('http') ? { icon_url: branding.iconUrl } : {}),
+            },
+        };
+    }
 
     const fields: any[] = [];
     if (input.type) fields.push({ name: 'Type', value: safe(input.type, 'N/A', 256), inline: true });
@@ -558,9 +718,10 @@ function buildOperationAnnouncementEmbed(input: OperationAnnouncementEmbedInput)
         fields.push({ name: 'Details', value: `[Open in myRSI](${input.operationDeepLink})`, inline: false });
     }
 
-    const branding = input.branding || {};
     return {
-        title: `🛰️ OPERATION: ${safe(input.name, 'Untitled Operation', 256)}`,
+        title: input.variant === 'starting'
+            ? `⏱️ STARTING SOON: ${safe(input.name, 'Untitled Operation', 256)}`
+            : `🛰️ OPERATION: ${safe(input.name, 'Untitled Operation', 256)}`,
         description: safe(input.description, 'No briefing provided.', 4000),
         color: 0x6366f1, // indigo-500 — matches the Operations Center accent
         fields,
@@ -579,10 +740,19 @@ function buildOperationAnnouncementEmbed(input: OperationAnnouncementEmbedInput)
 export async function postOperationAnnouncementEmbed(
     channelId: string,
     input: OperationAnnouncementEmbedInput,
+    // The role to @-mention alongside the embed, or nothing.
+    //
+    // Resolved SERVER-SIDE from discordConfig by the caller and never taken from a
+    // request payload — that separation is the control. Configuring who gets pinged
+    // is an admin:config:discord decision; triggering an announcement is
+    // operations:create. A pingRoleId travelling in a payload would collapse the two
+    // and hand every op creator an arbitrary @-mention primitive.
+    opts: { pingRoleId?: string | null } = {},
 ): Promise<{ messageId?: string; error?: string }> {
     const embed = buildOperationAnnouncementEmbed(input);
+    const mention = buildMentionContent({ roleId: opts.pingRoleId });
     return enqueueChannelPost(channelId, async () => {
-        const sendResult = await sendDiscordChannelMessage(channelId, { embeds: [embed] });
+        const sendResult = await sendDiscordChannelMessage(channelId, { ...mention, embeds: [embed] });
         if (!sendResult.messageId) return sendResult;
         // Reactions are appended sequentially under the same enqueue tick — no
         // extra spacing needed since `addMessageReactions` awaits each one and
@@ -592,8 +762,32 @@ export async function postOperationAnnouncementEmbed(
     });
 }
 
+/**
+ * The "starting in 15 minutes" notice.
+ *
+ * THREE deliberate differences from the announcement post above, all of them about
+ * not being annoying:
+ *  - NO reactions. The announcement is the RSVP surface; a reaction chain on a
+ *    reminder is noise on a message nobody is meant to act on.
+ *  - NO ping, ever, and not even an opt. This fires on a timer with no human in the
+ *    loop, so a role mention here is an unattended @-mention on a schedule. Sending
+ *    `{ embeds: [embed] }` alone lets withMentionSuppression stamp `parse: []`.
+ *  - It still goes through enqueueChannelPost, because the per-channel queue is what
+ *    keeps a batch of simultaneously-starting operations from tripping Discord's
+ *    rate limiter.
+ */
+export async function postOperationStartingEmbed(
+    channelId: string,
+    input: OperationAnnouncementEmbedInput,
+): Promise<{ messageId?: string; error?: string }> {
+    const embed = buildOperationAnnouncementEmbed({ ...input, variant: 'starting' });
+    return enqueueChannelPost(channelId, () => sendDiscordChannelMessage(channelId, { embeds: [embed] }));
+}
+
 // Edits the embed of an existing operation announcement message in place.
 // Preserves Discord-side reactions, which a delete+repost would lose.
+// Deliberately PINGLESS: an edit is not a new event, and re-pinging on every
+// scheduled-time tweak is how an integration gets muted.
 export async function editOperationAnnouncementEmbed(
     channelId: string,
     messageId: string,
@@ -628,9 +822,28 @@ export interface ListGuildChannelsResult {
 
 const GUILD_CHANNELS_TTL_MS = 60_000;
 
+/**
+ * Floor on how often a CALLER-DRIVEN cache bypass may actually reach Discord.
+ *
+ * forceRefresh is reachable by every operations:create holder through
+ * 'discord:list_guild_channels', so without a floor it is a rate-limit amplifier
+ * against the bot token: a loop can drive uncached GET /guilds/{id}/channels calls
+ * at the per-user request ceiling. A 429'd or flagged bot silently breaks EVERY
+ * Discord path in the product — announcements, EAM, intel, requests, start notices —
+ * so the blast radius is far wider than the feature the bypass serves.
+ *
+ * The floor is deliberately INSIDE this function rather than at a call site: there
+ * are two callers today and adding a third must not reopen the door.
+ */
+const GUILD_CHANNELS_FORCE_FLOOR_MS = 10_000;
+let lastForcedChannelFetch = 0;
+
 export async function listGuildChannels(opts: { forceRefresh?: boolean } = {}): Promise<ListGuildChannelsResult> {
     const cacheKey = 'discord_guild_channels';
-    if (!opts.forceRefresh) {
+    const now = Date.now();
+    const forceAllowed = !!opts.forceRefresh && (now - lastForcedChannelFetch) >= GUILD_CHANNELS_FORCE_FLOOR_MS;
+    if (forceAllowed) lastForcedChannelFetch = now;
+    if (!forceAllowed) {
         const cached = cache.get<ListGuildChannelsResult>(cacheKey);
         if (cached) return cached;
     }

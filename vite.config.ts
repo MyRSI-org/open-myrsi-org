@@ -34,14 +34,18 @@ export default defineConfig(({ mode }) => {
         exclude: ['**/*.d.ts'],
         reporter: ['text-summary'],
         thresholds: {
-          // Ratcheted 23 Aug 26 (importer contract suites) to sit ~1pt under the
-          // measured baseline (lines 42.12 / statements 40.05 / functions 32.80 /
-          // branches 36.21). Previously 40/38/31/34 against a 41.19/39.05/32.17/35.38
-          // baseline. This is a regression FLOOR — ratchet it up, never down.
-          lines: 41,
-          statements: 39,
-          functions: 32,
-          branches: 35,
+          // Ratcheted 6 Sep 26 (catch-up phase 6: org bans, ship seats, armoury
+          // facets, Discord feature layer, marketplace barter, Academy v1.2,
+          // Blueprint Manager) to sit ~1pt under the measured baseline
+          // (lines 56.02 / statements 53.58 / functions 44.92 / branches 47.37).
+          // Previously 54/51/42/45 against a 54.66/52.38/43.60/46.27 baseline,
+          // 50/48/39/42 before that, 41/39/32/35 before that, and 40/38/31/34
+          // before that.
+          // This is a regression FLOOR — ratchet it up, never down.
+          lines: 55,
+          statements: 52,
+          functions: 43,
+          branches: 46,
         },
       },
     },

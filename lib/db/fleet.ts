@@ -412,7 +412,7 @@ export async function getUserShips(): Promise<UserShip[]> {
     const query = supabase.from('user_ships')
         .select('id, user_id, ship_id, custom_name, loadout_notes, status, is_primary, created_at, ship:platform_ships(id, name, manufacturer, role, size, crew_min, crew_max, cargo_capacity, image_url), user:users!user_ships_user_id_fkey(id, name, avatar_url, rsi_handle, role_id)')
 
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(USER_SHIPS_READ_LIMIT);
     const data = await safeFetch<UserShipRow[]>(
         query as unknown as PromiseLike<{ data: UserShipRow[] | null; error: { code?: string; message?: string; hint?: string; details?: string } | null }>,

@@ -4,6 +4,7 @@ import { useAuth } from '../../../../contexts/AuthContext';
 import { useData } from '../../../../contexts/DataContext';
 
 import OpOrbatNodeGraph from './OpOrbatNodeGraph';
+import OpShipSeatsPanel from './OpShipSeatsPanel';
 import { useNotification } from '../../../../contexts/NotificationContext';
 
 interface OpOrbatTabProps {
@@ -21,7 +22,7 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
     const { confirm } = useNotification();
     const nodes = operation.commandNodes || [];
 
-    const [subView, setSubView] = useState<'roster' | 'structure'>('roster');
+    const [subView, setSubView] = useState<'roster' | 'structure' | 'seats'>('roster');
 
     const [rosterSearch, setRosterSearch] = useState('');
     const [rosterSort, setRosterSort] = useState<'name' | 'role' | 'ready' | 'joined'>('ready');
@@ -139,6 +140,10 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
                             className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all ${
                                 subView === 'structure' ? 'bg-purple-500/20 text-purple-300' : 'text-slate-500 hover:text-slate-300'
                             }`}>Structure</button>
+                        <button onClick={() => setSubView('seats')}
+                            className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all ${
+                                subView === 'seats' ? 'bg-purple-500/20 text-purple-300' : 'text-slate-500 hover:text-slate-300'
+                            }`}>Ships &amp; Seats</button>
                     </div>
                 </div>
                 <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700/50 rounded-lg px-3 py-2">
@@ -351,6 +356,14 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
                         fillParent
                     />
                 </div>
+            )}
+
+            {/* SHIPS & SEATS — organiser-designed ships with named seats, or flat
+                capacity groups. A separate sub-view rather than folded into the
+                command graph: the two are different ORBAT structures that happen to
+                share a tab, and merging them is not this port's job. */}
+            {subView === 'seats' && (
+                <OpShipSeatsPanel operation={operation} canManage={canManage} onRefresh={onRefresh} />
             )}
         </div>
     );

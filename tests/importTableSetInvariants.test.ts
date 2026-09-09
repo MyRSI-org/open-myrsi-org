@@ -3,11 +3,12 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
     IMPORTABLE_TABLES, SEQUENCE_BACKED, STRIP_ALWAYS, CATALOG_REMAPS, DROPPED_PARENT_FKS,
+    SECRET_DROP_COLUMNS, SELF_REF_FKS, NULL_FKS, DEFERRED_FKS, SYNTHESIZED_NOT_NULL,
 } from '../lib/db/importer';
 
 // MECHANICAL invariants over the importer's table policy, checked against schema.sql
-// rather than against a hand-maintained list. Both of these were previously enforced
-// by nothing at all, and both fail LATE and QUIETLY when they drift:
+// rather than against a hand-maintained list. All of these were previously enforced
+// by nothing at all, and all of them fail LATE and QUIETLY when they drift:
 //
 //   * A table imported with explicit identity ids but missing from SEQUENCE_BACKED
 //     leaves its sequence at 0. The import looks perfect; the first row created
@@ -15,8 +16,13 @@ import {
 //     (This is exactly how the ten Academy tables would have shipped.)
 //   * A catalog remap whose embed alias is missing from STRIP_ALWAYS inserts the
 //     joined object as if it were a column.
+//   * A column this schema requires NOT NULL that the importer STRIPS or NULLS is a
+//     23502 on every row of that table — the whole table is discarded row-by-row as a
+//     generic constraintViolation. (This is exactly how every secret election ballot
+//     was lost: the exporter drops voter_hash, and government_election_votes.voter_hash
+//     is NOT NULL here.)
 //
-// Both are decidable from the source, so they are asserted, not remembered.
+// All are decidable from the source, so they are asserted, not remembered.
 
 const schemaSql = readFileSync(resolve(__dirname, '../schema.sql'), 'utf8');
 
@@ -38,6 +44,28 @@ function schemaTables(): Set<string> {
     return new Set([...schemaSql.matchAll(/^CREATE TABLE IF NOT EXISTS public\.([a-z0-9_]+)/gm)].map((m) => m[1]));
 }
 
+/** Every column of `table` that this schema declares NOT NULL with no DEFAULT and no
+ *  GENERATED clause — i.e. every column an insert MUST supply or eat a 23502.
+ *  Terminates the body on `);` so the CREATE INDEX / COMMENT statements between two
+ *  tables cannot leak into the next table's column list. */
+function notNullNoDefault(table: string): string[] {
+    const out: string[] = [];
+    let inBody = false;
+    for (const line of schemaSql.split(/\r?\n/)) {
+        const m = /^CREATE TABLE IF NOT EXISTS public\.([a-z0-9_]+)/.exec(line);
+        if (m) { inBody = m[1] === table; continue; }
+        if (!inBody) continue;
+        if (/^\);/.test(line)) { inBody = false; continue; }
+        // Column lines are indented and start with a lowercase identifier; table
+        // constraints start with an uppercase keyword and are skipped by that alone.
+        const col = /^\s+([a-z_][a-z0-9_]*)\s+/.exec(line);
+        if (!col) continue;
+        if (!/NOT NULL/.test(line) || /DEFAULT/.test(line) || /GENERATED/.test(line)) continue;
+        out.push(col[1]);
+    }
+    return out;
+}
+
 describe('importer table-set invariants', () => {
     it('sanity: schema.sql parses into a plausible table inventory', () => {
         expect(schemaTables().size).toBeGreaterThan(80);
@@ -47,6 +75,64 @@ describe('importer table-set invariants', () => {
         // uuid PKs must NOT be picked up by the parser.
         expect(identityPkTables().has('academy_courses')).toBe(false);
         expect(identityPkTables().has('marketplace_listings')).toBe(false);
+    });
+
+    it('sanity: the NOT-NULL parser sees real columns (a dead regex would make the next test vacuous)', () => {
+        // Indented column lines, terminated at `);` — both were easy to get wrong, and
+        // getting either wrong makes notNullNoDefault() return [] for every table and
+        // the invariant below pass on any tree at all.
+        expect(notNullNoDefault('government_election_votes')).toContain('voter_hash');
+        expect(notNullNoDefault('government_election_votes')).toContain('election_id');
+        // …has a DEFAULT → not required of an insert.
+        expect(notNullNoDefault('government_election_votes')).not.toContain('cast_at');
+        // …nullable here, which is why secret MOTION ballots always imported fine.
+        expect(notNullNoDefault('government_motion_votes')).not.toContain('voter_hash');
+        // The CREATE UNIQUE INDEX between the two tables must not leak across.
+        expect(notNullNoDefault('government_motion_votes')).not.toContain('election_id');
+    });
+
+    it('no importable table has a NOT-NULL-without-default column the importer strips or nulls without supplying one', () => {
+        // THE class-of-defect invariant. government_election_votes.voter_hash was
+        // NOT NULL here and dropped by the exporter's GLOBAL_DROP, so every secret
+        // election ballot 23502'd row-by-row and was discarded as a generic
+        // constraintViolation. Nothing enforced this; now the schema does.
+        const orphaned: string[] = [];
+        for (const t of IMPORTABLE_TABLES) {
+            const removed = new Set<string>([
+                ...SECRET_DROP_COLUMNS,
+                ...(NULL_FKS[t] || []),
+                ...(SELF_REF_FKS[t] || []),
+                ...(DEFERRED_FKS[t] || []),
+                'organization_id',
+            ]);
+            for (const c of notNullNoDefault(t)) {
+                if (removed.has(c) && !SYNTHESIZED_NOT_NULL[t]?.columns[c]) orphaned.push(`${t}.${c}`);
+            }
+        }
+        expect(orphaned.sort(), 'required columns the importer removes and never supplies').toEqual([]);
+    });
+
+    it('SECRET_DROP_COLUMNS covers voter_hash — exact parity with the exporter GLOBAL_DROP', () => {
+        // The importer's denylist is the exporter's GLOBAL_DROP; voter_hash was the one
+        // member missing from the mirror. Beyond the ballot loss, dropping it also stops
+        // a crafted NDJSON pre-seeding a member's uq_gov_motion_vote_hash slot.
+        expect(SECRET_DROP_COLUMNS.has('voter_hash')).toBe(true);
+    });
+
+    it('SYNTHESIZED_NOT_NULL declares only real required columns, and every one is also stripped', () => {
+        for (const [table, spec] of Object.entries(SYNTHESIZED_NOT_NULL)) {
+            expect(IMPORTABLE_TABLES.has(table), `${table} is not importable`).toBe(true);
+            const required = notNullNoDefault(table);
+            for (const col of Object.keys(spec.columns)) {
+                // No dead entries: the map cannot rot into a lie about the schema.
+                expect(required, `${table}.${col} is not NOT-NULL-without-default`).toContain(col);
+                // prepareRow writes the synthesised value UNCONDITIONALLY, which is only
+                // non-destructive because the inbound value was already deleted. An entry
+                // for a column the export legitimately carries would silently shred it.
+                expect(SECRET_DROP_COLUMNS.has(col), `${table}.${col} must also be in SECRET_DROP_COLUMNS`).toBe(true);
+            }
+            expect(spec.warning(3)).toContain(table);
+        }
     });
 
     it('every importable table actually exists in this instance schema', () => {
@@ -86,13 +172,17 @@ describe('importer table-set invariants', () => {
     });
 
     it('every ship remap emits all three key forms in precision order, and selects the columns they need', () => {
-        // The two platform_ships consumers must key the catalog IDENTICALLY — the index
+        // EVERY platform_ships consumer must key the catalog IDENTICALLY — the index
         // is cached per catalog table, so a divergence would silently mis-resolve one of
         // them. Asserting the emitted forms (rather than object identity) also pins the
         // precision order the lookup depends on: an exact external id must always be
         // tried before the name fallback.
+        //
+        // The census is spelled out so a NEW consumer has to be added here deliberately;
+        // that is the moment to check it spreads PLATFORM_SHIP_REMAP rather than
+        // hand-rolling its own keys.
         const shipRemaps = Object.entries(CATALOG_REMAPS).filter(([, r]) => r.catalogTable === 'platform_ships');
-        expect(shipRemaps.map(([t]) => t).sort()).toEqual(['operation_participants', 'user_ships']);
+        expect(shipRemaps.map(([t]) => t).sort()).toEqual(['operation_participants', 'operation_ship_slots', 'user_ships']);
         for (const [table, remap] of shipRemaps) {
             expect(remap.keysOf({ external_uuid: 'U', external_api_id: 42, name: 'Cutlass Black', manufacturer: 'Drake Interplanetary' }),
                 `${table} key order`).toEqual(['a:42', 'u:U', 'n:cutlass black|drake interplanetary']);

@@ -49,6 +49,7 @@ export default function AdminItemCatalogTab() {
     const [categories, setCategories] = useState<QmPlatformCategory[]>([]);
     const [showCategories, setShowCategories] = useState(false);
     const [syncLoading, setSyncLoading] = useState(false);
+    const [attrSyncLoading, setAttrSyncLoading] = useState(false);
     const [syncErrors, setSyncErrors] = useState<Array<{ categoryId: number; categoryName: string; message: string }>>([]);
 
     const requestSeqRef = useRef(0);
@@ -137,6 +138,29 @@ export default function AdminItemCatalogTab() {
         }
     }, [rpcAction, toast, loadCategories, loadCount, load]);
 
+    // Populates the armoury's facet dropdowns. A second pass rather than part of
+    // "Sync from UEX" because it walks a different endpoint per category and takes
+    // noticeably longer; running it is also optional — the armoury works without it,
+    // it just has fewer filters.
+    const handleAttrSync = useCallback(async () => {
+        setAttrSyncLoading(true);
+        setSyncErrors([]);
+        try {
+            const res = await rpcAction('catalog:sync_item_attributes', {});
+            const errCount = (res.itemErrors || 0) + (res.fetchErrors?.length || 0);
+            toast(
+                `Attributes synced: ${res.itemsUpdated} items updated from ${res.categoriesScanned} categories, ${errCount} errors`,
+                errCount > 0 ? 'warning' : 'success'
+            );
+            if (res.fetchErrors?.length) setSyncErrors(res.fetchErrors);
+            await load();
+        } catch (e: any) {
+            toast(`Attribute sync failed: ${e?.message || 'unknown'}`, 'error');
+        } finally {
+            setAttrSyncLoading(false);
+        }
+    }, [rpcAction, toast, load]);
+
     const openEdit = (item: QmPlatformItemWithUsage) => {
         setEditing(item);
         setEditForm({ ...item });
@@ -209,6 +233,15 @@ export default function AdminItemCatalogTab() {
                     >
                         {syncLoading ? <i className="fa-solid fa-spinner animate-spin"></i> : <i className="fa-solid fa-arrows-rotate"></i>}
                         {syncLoading ? 'Syncing...' : 'Sync from UEX'}
+                    </button>
+                    <button
+                        onClick={handleAttrSync}
+                        disabled={attrSyncLoading || syncLoading}
+                        title="Fetches item attributes (Grade, Class, Weapon Type…) used by the Armoury filters. Slower than the item sync; safe to run at any time."
+                        className="flex items-center gap-2 bg-slate-800 text-slate-300 border border-white/10 hover:bg-slate-700 px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50"
+                    >
+                        {attrSyncLoading ? <i className="fa-solid fa-spinner animate-spin"></i> : <i className="fa-solid fa-sliders"></i>}
+                        {attrSyncLoading ? 'Syncing...' : 'Sync Attributes'}
                     </button>
                 </div>
             </div>
@@ -435,7 +468,7 @@ export default function AdminItemCatalogTab() {
                                 <div className="space-y-3">
                                     <ImageInput
                                         label="Thumbnail URL"
-                                        feature="quartermaster"
+                                        feature="catalog"
                                         preview="square"
                                         value={editForm.thumbnailUrl || null}
                                         onChange={(v) => setEditForm({ ...editForm, thumbnailUrl: v })}

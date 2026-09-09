@@ -1,6 +1,9 @@
 
 import * as db from '../../lib/db.js';
 import { toOperationBoardElement } from '../../lib/db/mappers.js';
+// Imported DIRECTLY, not through the barrel: lib/db/opAnnouncement.ts reads
+// getOrgTenantUrl OFF the barrel, so re-exporting it back out would close a cycle.
+import { buildAnnouncementEmbedInput } from '../../lib/db/opAnnouncement.js';
 import {
     createGuildScheduledEvent,
     deleteGuildScheduledEvent,
@@ -9,9 +12,9 @@ import {
     postOperationAnnouncementEmbed,
     editOperationAnnouncementEmbed,
     deleteDiscordChannelMessage,
-    type OperationAnnouncementEmbedInput,
 } from '../../lib/discord.js';
 import { log as baseLog } from '../../lib/log.js';
+import { normaliseDiscordSnowflake } from '../../lib/discordConfigKeys.js';
 import { passesClearance, canViewAllClassifications } from '../../lib/clearance.js';
 import { assertAiRateLimit } from '../../lib/aiRateLimit.js';
 import type {
@@ -29,32 +32,8 @@ const log = baseLog.child({ module: 'actions.operations' });
 // types handlers as `(payload: any) => Promise<unknown>`.
 
 // Subset of the local Supabase error shape this file inspects.
-interface SupabaseLikeError {
-    code?: string;
-    message?: string;
-    hint?: string;
-    details?: string;
-}
 
-// Row shape pulled by buildAnnouncementEmbedInput's `operations` select.
-interface OperationEmbedRow {
-    id: string;
-    name: string;
-    description: string | null;
-    type: string;
-    scheduled_start: string | null;
-    scheduled_end: string | null;
-    clearance_level: number | null;
-    unit_id: number | null;
-    location_id: number | null;
-    location_text?: string | null;
-}
 
-// Branding settings blob the embed pulls name + iconUrl off.
-interface BrandingConfig {
-    name?: string;
-    iconUrl?: string;
-}
 
 // Free-form sub-resource payload (phases/schedule/tasks/nodes/board/logistics).
 // The lib/db layer accepts `any` for these; we only ever read `status` directly
@@ -100,16 +79,17 @@ interface OperationUpdates {
     [key: string]: unknown;
 }
 
-interface GetDetailsPayload { operationId: string; user?: { id?: number; role?: string; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] } }
+// `role` is deliberately absent — see the ActorUser note in api/actions/intel.ts.
+// This actor flows into the op clearance/marker predicates, which read isSystemAdmin.
+interface GetDetailsPayload { operationId: string; user?: { id?: number; isSystemAdmin?: boolean; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] } }
 interface DeletePayload { operationId: string; userId: number }
 interface UpdatePayload { operationId: string; updates: OperationUpdates; userId: number; user?: Parameters<typeof db.updateOperationDetails>[3] }
 interface RepostAnnouncementPayload { operationId: string; channelId?: string }
 interface UpdateStatusPayload { operationId: string; status: string; userId: number }
 interface JoinPayload { operationId: string; userId: number; joinCode?: string }
-// `user` is the server-injected actor (a full User); typed structurally here to
-// the two fields this handler inspects so the `role === 'Admin'` literal compare
-// stays valid (a string-enum field would reject the raw-string comparison).
-interface LeavePayload { operationId: string; targetUserId?: number; userId: number; user?: { role?: string; permissions?: string[] } }
+// `user` is the server-injected actor (a full User); typed structurally here to the
+// one field this handler inspects.
+interface LeavePayload { operationId: string; targetUserId?: number; userId: number; user?: { permissions?: string[] } }
 interface AddParticipantPayload { operationId: string; targetUserId: number; userId: number }
 interface AddUecPayload { operationId: string; amount: number; reason: string; userId: number }
 interface AddCostPayload { operationId: string; amount: number; category: string; description: string; userId: number }
@@ -131,12 +111,22 @@ interface DeletePhasePayload { phaseId: number; operationId: string }
 interface AddScheduleEntryPayload { operationId: string; data: SubResourceData }
 interface UpdateScheduleEntryPayload { entryId: number; data: SubResourceData; operationId: string }
 interface DeleteScheduleEntryPayload { entryId: number; operationId: string }
-interface AddTaskPayload { operationId: string; data: SubResourceData }
+interface AddTaskPayload { operationId: string; data: SubResourceData; userId: number }
 interface UpdateTaskPayload { taskId: number; data: SubResourceData; operationId: string }
 interface DeleteTaskPayload { taskId: number; operationId: string }
-interface AddCommandNodePayload { operationId: string; data: SubResourceData }
+interface AddCommandNodePayload { operationId: string; data: SubResourceData; userId: number }
 interface UpdateCommandNodePayload { nodeId: number; data: SubResourceData; operationId: string }
 interface DeleteCommandNodePayload { nodeId: number; operationId: string }
+interface AddShipSlotPayload { operationId: string; data: SubResourceData }
+interface UpdateShipSlotPayload { slotId: number; data: SubResourceData; operationId: string }
+interface DeleteShipSlotPayload { slotId: number; operationId: string }
+interface AssignSlotPayload { operationId: string; slotId: number; targetUserId: number; userId: number; userShipId?: number }
+interface ApplyForSlotPayload { operationId: string; slotId: number; userId: number; userShipId?: number }
+interface DecideSlotApplicationPayload { operationId: string; slotId: number; targetUserId: number; decision: 'approve' | 'deny'; userId: number }
+interface RemoveSlotAssignmentPayload { operationId: string; slotId: number; targetUserId: number }
+// NOTE the absence of targetUserId: a member withdraws their OWN seat and nothing
+// else. See the handler.
+interface WithdrawSlotPayload { operationId: string; slotId: number; userId: number }
 interface AddBoardElementPayload { operationId: string; data: SubResourceData; clientNonce?: string }
 interface UpdateBoardElementPayload { elementId: number; data: SubResourceData; operationId: string }
 interface DeleteBoardElementPayload { elementId: number; operationId: string }
@@ -159,97 +149,28 @@ interface TemplateDeletePayload { id: number }
 interface TemplateFromOperationPayload { operationId: string }
 interface ListGuildChannelsPayload { forceRefresh?: boolean }
 
-// Builds the embed payload for an operation announcement. Pulls branding +
-// clearance label + unit name + location text from the DB so the Discord embed
-// is self-contained (Discord viewers don't have to click through for context).
-async function buildAnnouncementEmbedInput(operationId: string): Promise<OperationAnnouncementEmbedInput | null> {
-    // Base columns are guaranteed to exist on every deployed schema. `location_text`
-    // is from migrations/add-operations-location-text.sql; embedded joins on
-    // `units` and `locations` rely on PostgREST's FK inference and its schema
-    // cache. Pull each optional bit separately so a missing column / stale cache
-    // / FK ambiguity degrades the embed instead of blanking it.
-    const baseSelect = 'id, name, description, type, scheduled_start, scheduled_end, clearance_level, unit_id, location_id';
-    const initial = await db.supabase
-        .from('operations')
-        .select(`${baseSelect}, location_text`)
-        .eq('id', operationId)
-        
-        .single();
-    let op = initial.data as OperationEmbedRow | null;
-    let opErr = initial.error as SupabaseLikeError | null;
+// buildAnnouncementEmbedInput moved to lib/db/opAnnouncement.ts so the start-notice
+// cron job can reuse it — a lib/ module must not import from api/actions/**.
 
-    // Fallback: location_text column not yet present (migration not applied or
-    // PostgREST cache stale). Same error codes the createOperation fallback uses.
-    const code = opErr?.code;
-    if (opErr && (code === '42703' || code === 'PGRST204')) {
-        log.warn('operations.location_text unavailable — retrying without', { code, hint: 'run migrations/add-operations-location-text.sql' });
-        const retry = await db.supabase
-            .from('operations')
-            .select(baseSelect)
-            .eq('id', operationId)
-            
-            .single();
-        op = retry.data as OperationEmbedRow | null;
-        opErr = retry.error as SupabaseLikeError | null;
-    }
-
-    if (opErr || !op) {
-        if (opErr) log.error('operation lookup failed', { operationId, code: opErr.code, message: opErr.message, hint: opErr.hint || '', details: opErr.details || '' });
+/**
+ * The role to @-mention on an operation announcement, read SERVER-SIDE.
+ *
+ * Never from a payload, and that is the entire control. Configuring who gets pinged
+ * is an admin:config:discord decision; posting an announcement is operations:create.
+ * A pingRoleId travelling in a request body would collapse the two and hand every op
+ * creator an arbitrary @-mention primitive aimed at any role in the guild.
+ *
+ * Soft-fails to null: a settings read fault costs the ping, never the announcement.
+ */
+async function getOperationAnnouncePingRoleId(): Promise<string | null> {
+    try {
+        const { data } = await db.supabase.from('settings')
+            .select('value').eq('key', 'discordConfig').maybeSingle();
+        const cfg = (data?.value ?? null) as { operationAnnouncePingRoleId?: unknown } | null;
+        return normaliseDiscordSnowflake(cfg?.operationAnnouncePingRoleId, 'operationAnnouncePingRoleId');
+    } catch {
         return null;
     }
-
-    // Empty-branch placeholder when the op has no unit/location FK to resolve.
-    // Typed to the subset of the single-row response these reads use
-    // ({ data: { name } | null }) so the ternary unifies with the query builder
-    // (also PromiseLike) without `any`.
-    const emptyNamedRow: Promise<{ data: { name: string } | null; error: null }> =
-        Promise.resolve({ data: null, error: null });
-    const [unitRes, locationRes, settingsRes] = await Promise.all([
-        op.unit_id
-            ? db.supabase.from('units').select('name').eq('id', op.unit_id).maybeSingle()
-            : emptyNamedRow,
-        op.location_id
-            ? db.supabase.from('locations').select('name').eq('id', op.location_id).maybeSingle()
-            : emptyNamedRow,
-        db.supabase.from('settings')
-            .select('key, value')
-            
-            .in('key', ['brandingConfig']),
-    ]);
-    const settingsRows = (settingsRes.data || []) as Array<{ key: string; value: unknown }>;
-    const branding = (settingsRows.find((r) => r.key === 'brandingConfig')?.value as BrandingConfig | undefined) || {};
-
-    let clearanceLabel: string | null = null;
-    if (typeof op.clearance_level === 'number' && op.clearance_level > 0) {
-        const { data: clearance } = await db.supabase
-            .from('security_clearances')
-            .select('name, level')
-            
-            .eq('level', op.clearance_level)
-            .maybeSingle();
-        clearanceLabel = clearance?.name ? `L${clearance.level} — ${clearance.name}` : `Level ${op.clearance_level}`;
-    }
-
-    const unitName = unitRes.data?.name || null;
-    const locationLabel = (op.location_text && String(op.location_text).trim())
-        || locationRes.data?.name
-        || null;
-
-    const tenantUrl = await db.getOrgTenantUrl();
-    const operationDeepLink = tenantUrl ? `${tenantUrl.replace(/\/$/, '')}/operations/${operationId}` : null;
-
-    return {
-        name: op.name,
-        description: op.description,
-        type: op.type,
-        scheduledStart: op.scheduled_start,
-        scheduledEnd: op.scheduled_end,
-        clearanceLabel,
-        unitName,
-        locationLabel,
-        operationDeepLink,
-        branding: { name: branding?.name, iconUrl: branding?.iconUrl },
-    };
 }
 
 export const operationActions = {
@@ -275,9 +196,17 @@ export const operationActions = {
             // If end ended up ≤ clamped start (e.g. very short event whose start
             // got clamped forward), push end out 15 minutes past the new start.
             const clampedEndMs = Number.isFinite(endMs) && endMs > clampedStartMs ? endMs : clampedStartMs + 15 * 60_000;
+            // EGRESS GATE: a Guild Scheduled Event is privacy_level GUILD_ONLY —
+            // visible to EVERY member of the Discord server, a strictly wider
+            // audience than the operator-picked announcement channel. So a
+            // restricted op's briefing must not ride it. The event NAME is
+            // unavoidable (Discord requires one) and matches what the collapsed
+            // announcement embed keeps; the description is dropped entirely.
+            // Same predicate as the embed so the two surfaces cannot drift.
+            const restricted = await db.operationIsRestricted(result.id);
             const discordResult = await createGuildScheduledEvent({
                 name: opData.name,
-                description: opData.description,
+                description: restricted ? undefined : opData.description,
                 scheduledStart: new Date(clampedStartMs).toISOString(),
                 scheduledEnd: new Date(clampedEndMs).toISOString(),
                 locationUrl: tenantUrl,
@@ -298,9 +227,19 @@ export const operationActions = {
                 if (!input) {
                     result.discordAnnouncementFailed = 'Could not load operation details for announcement.';
                 } else {
+                    // VALIDATE THE CALLER-SUPPLIED CHANNEL, exactly as
+                    // operation:repost_announcement does below. Its comment says "both
+                    // halves are needed; either alone leaves a door open" — that was
+                    // true of repost and false HERE, and this action names the same
+                    // destination under the weaker operations:create gate. lib/discord.ts
+                    // now refuses a non-snowflake at the sink as well, but the value is
+                    // also PERSISTED (lib/db/ops.ts) and re-fired later by the
+                    // start-notice cron, so a junk id caught only at the sink becomes a
+                    // silent, permanent "the bot doesn't post".
                     const post = await postOperationAnnouncementEmbed(
-                        String(opData.discordAnnouncementChannelId).trim(),
+                        normaliseDiscordSnowflake(opData.discordAnnouncementChannelId, 'discordAnnouncementChannelId') || '',
                         input,
+                        { pingRoleId: await getOperationAnnouncePingRoleId() },
                     );
                     if (post.messageId) {
                         await db.supabase.from('operations')
@@ -342,6 +281,26 @@ export const operationActions = {
         }
         // Strip the join PIN for anyone but the owner / managers.
         if (!isOwner && !canManage) op.joinCode = undefined;
+
+        // SEAT APPLICATIONS are organiser-facing. A pending application is a member
+        // saying "I want that seat", which they said to the organiser — not to the
+        // whole operation. Everyone else sees the assigned seats plus their OWN
+        // application, and nobody else's.
+        //
+        // Done HERE, not in getFullOperationDetails, because that function takes no
+        // viewer and has three other callers: the dispatcher's owner probe, the
+        // federation snapshot builder, and get_participant_ships. A viewer-dependent
+        // filter inside it would either break the probe or leak into federation input.
+        // The panel's own canManage check is cosmetic — rule 2.
+        if (!isOwner && !canManage && op.shipSlots?.length) {
+            for (const slot of op.shipSlots) {
+                // `|| []` because the slots and assignments reads soft-fail
+                // independently: a TypeError here would 500 the WHOLE detail view for
+                // every non-manager, not just hide the seats.
+                slot.assignments = (slot.assignments || [])
+                    .filter(a => a.status !== 'applied' || a.userId === user?.id);
+            }
+        }
         return op;
     },
     'operation:delete': async ({ operationId, userId }: DeletePayload) => {
@@ -368,20 +327,32 @@ export const operationActions = {
         // Mirror amendments onto the linked Discord scheduled event + announcement
         // embed, if either are linked. Soft dependency: failures surface as a
         // warning — the DB update still stands.
-        const touched = ['name', 'description', 'scheduledStart', 'scheduledEnd', 'type', 'clearanceLevel', 'unitId', 'locationId', 'locationText'].some(k => updates?.[k] !== undefined);
+        // markerIds and isSpecial are in the list because either one RESTRICTS an
+        // already-published op (lib/db/ops.ts handles both as ordinary edits) —
+        // without them the full briefing stays on Discord, which is the whole
+        // egress gate bypassed by a one-field edit.
+        const touched = ['name', 'description', 'scheduledStart', 'scheduledEnd', 'type', 'clearanceLevel', 'unitId', 'locationId', 'locationText', 'markerIds', 'isSpecial'].some(k => updates?.[k] !== undefined);
         if (touched) {
             const { data: op } = await db.supabase.from('operations')
                 .select('discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, name, description, scheduled_start, scheduled_end')
                 .eq('id', operationId)
                 .single();
             if (op?.discord_event_id) {
+                // EGRESS GATE, same predicate as the announcement embed: the event
+                // is GUILD_ONLY, i.e. every guild member. Sent UNCONDITIONALLY when
+                // restricted rather than only when `description` was edited —
+                // otherwise attaching a marker (or flipping isSpecial) would restrict
+                // the op while leaving the previously-published briefing on the event.
+                const restricted = await db.operationIsRestricted(operationId);
                 const discordResult = await updateGuildScheduledEvent(
                     op.discord_event_id,
                     {
                         // Send the current DB state for the touched fields — picks up
                         // whatever we just wrote, so we never drift from the source of truth.
                         ...(updates.name !== undefined ? { name: op.name } : {}),
-                        ...(updates.description !== undefined ? { description: op.description } : {}),
+                        ...(restricted
+                            ? { description: '' }
+                            : updates.description !== undefined ? { description: op.description } : {}),
                         ...(updates.scheduledStart !== undefined && op.scheduled_start ? { scheduledStart: op.scheduled_start } : {}),
                         ...(updates.scheduledEnd !== undefined && op.scheduled_end ? { scheduledEnd: op.scheduled_end } : {}),
                     },
@@ -436,12 +407,22 @@ export const operationActions = {
             .single();
         if (!op) throw new Error('Operation not found or access denied.');
 
-        const targetChannel = (channelId && String(channelId).trim()) || op.discord_announcement_channel_id;
+        // VALIDATE THE CALLER-SUPPLIED CHANNEL. `channelId` comes straight off the
+        // payload and is the DESTINATION of a bot post — without a shape check this
+        // action posts to any string a caller sends. It is also why this action is now
+        // in OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS: an op owner holding only
+        // operations:create could otherwise aim the org's announcements at any channel
+        // the bot can see. Both halves are needed; either alone leaves a door open.
+        const requestedChannel = channelId != null && String(channelId).trim()
+            ? normaliseDiscordSnowflake(channelId, 'channelId')
+            : null;
+        const targetChannel = requestedChannel || op.discord_announcement_channel_id;
         if (!targetChannel) throw new Error('No Discord channel selected for this announcement.');
 
         const channelChanged = !!op.discord_announcement_channel_id
             && !!op.discord_announcement_message_id
             && targetChannel !== op.discord_announcement_channel_id;
+
 
         const input = await buildAnnouncementEmbedInput(operationId);
         if (!input) throw new Error('Could not load operation details for announcement.');
@@ -463,6 +444,10 @@ export const operationActions = {
             await deleteDiscordChannelMessage(op.discord_announcement_channel_id, op.discord_announcement_message_id);
         }
 
+        // NO PING on a repost, deliberately, and for the same reason
+        // editOperationAnnouncementEmbed has none: the announcement is one event.
+        // Pinging here would make this action a repeatable @-mention of the org's
+        // configured role, which is a different thing from announcing an operation.
         const post = await postOperationAnnouncementEmbed(targetChannel, input);
         if (!post.messageId) return { ok: false, error: post.error || 'Post failed.' };
 
@@ -492,7 +477,8 @@ export const operationActions = {
             // itself is gated only by operations:view (every member has that)
             // because the self-leave path is universal — but the targetUserId
             // form is admin-only and must be checked here, not on the client.
-            const canManage = user?.role === 'Admin' || (Array.isArray(user?.permissions) && user.permissions.includes('operations:manage'));
+            // Permission only — no role-name bypass (see lib/radio.ts:generateOpRadioToken).
+            const canManage = Array.isArray(user?.permissions) && user.permissions.includes('operations:manage');
             if (!canManage) {
                 throw new Error('Forbidden: removing other participants requires operations:manage.');
             }
@@ -505,7 +491,14 @@ export const operationActions = {
             // which is the read-side bypass — no extra visibility check needed.)
             await db.assertOpVisibleToUser(operationId, user);
         }
-        return db.leaveOperation(operationId, tid);
+        const removed = await db.leaveOperation(operationId, tid);
+        // Only a REAL removal, and only when someone removed somebody else. `removed` is
+        // deliberately NOT returned to the caller: a boolean answer to "was targetUserId a
+        // participant of this operation" is a small membership oracle, and rule 3 says
+        // hydrate only what is displayed.
+        if (removed && tid !== userId) {
+            await db.notifyOperationRemoval(operationId, tid, userId);
+        }
     },
     'operation:add_participant': ({ operationId, targetUserId, userId }: AddParticipantPayload) => db.addOperationParticipant(operationId, targetUserId, userId),
     'operation:add_uec': ({ operationId, amount, reason, userId }: AddUecPayload) => db.addOperationUec(operationId, amount, reason, userId),
@@ -606,9 +599,10 @@ export const operationActions = {
     },
 
     // Tasks
-    'operation:add_task': async ({ operationId, data }: AddTaskPayload) => {
+    'operation:add_task': async ({ operationId, data, userId }: AddTaskPayload) => {
         await db.verifyOperationAccess(operationId);
         const r = await db.addOperationTask(operationId, data);
+        await db.notifyOperationAssignee(operationId, (r as { assigned_user_id?: number } | null)?.assigned_user_id, userId, 'task');
         await db.broadcastOpChange(operationId);
         return r;
     },
@@ -624,9 +618,10 @@ export const operationActions = {
     },
 
     // Command Nodes (C2)
-    'operation:add_command_node': async ({ operationId, data }: AddCommandNodePayload) => {
+    'operation:add_command_node': async ({ operationId, data, userId }: AddCommandNodePayload) => {
         await db.verifyOperationAccess(operationId);
         const r = await db.addCommandNode(operationId, data);
+        await db.notifyOperationAssignee(operationId, (r as { assigned_user_id?: number } | null)?.assigned_user_id, userId, 'command');
         await db.broadcastOpChange(operationId);
         return r;
     },
@@ -639,6 +634,64 @@ export const operationActions = {
         await db.verifyOperationAccess(operationId);
         await db.deleteCommandNode(nodeId, operationId);
         await db.broadcastOpChange(operationId);
+    },
+
+    // Ship Slots + Seats (ORBAT multi-crew seats / event ship slots).
+    //
+    // TWO GATE TIERS, and the split is the point. Slot CRUD is organiser design
+    // work (operations:manage) and follows the command-node shape above. The four
+    // seat actions touch MEMBER IDENTITY, so they use assertOpVisibleToUser — the
+    // clearance/marker/special-op gate — rather than verifyOperationAccess, which
+    // in this build is existence-only. Hosted uses its own verifyOperationAccess
+    // for all of them; here that would be a clearance bypass, letting a member who
+    // cannot see a restricted operation learn (and change) who is crewing it.
+    'operation:add_ship_slot': async ({ operationId, data }: AddShipSlotPayload) => {
+        await db.verifyOperationAccess(operationId);
+        const r = await db.addShipSlot(operationId, data);
+        await db.broadcastOpChange(operationId);
+        return r;
+    },
+    'operation:update_ship_slot': async ({ slotId, data, operationId }: UpdateShipSlotPayload) => {
+        await db.verifyOperationAccess(operationId);
+        await db.updateShipSlot(slotId, data, operationId);
+        await db.broadcastOpChange(operationId);
+    },
+    'operation:delete_ship_slot': async ({ slotId, operationId }: DeleteShipSlotPayload) => {
+        await db.verifyOperationAccess(operationId);
+        await db.deleteShipSlot(slotId, operationId);
+        await db.broadcastOpChange(operationId);
+    },
+    'operation:assign_slot': async ({ operationId, slotId, targetUserId, userId, userShipId, user }: AssignSlotPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
+        await db.assertOpVisibleToUser(operationId, user);
+        const target = Number(targetUserId);
+        const r = await db.assignSlot(operationId, slotId, target, userId, userShipId != null ? Number(userShipId) : undefined);
+        // Through the local helper, never a raw createNotification: it carries the
+        // fail-closed participant precondition, the self-skip, and the generic body
+        // that keeps operation content out of an unfiltered notification row.
+        await db.notifyOperationAssignee(operationId, target, userId, 'seat');
+        return r;
+    },
+    'operation:decide_slot_application': async ({ operationId, slotId, targetUserId, decision, userId, user }: DecideSlotApplicationPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
+        await db.assertOpVisibleToUser(operationId, user);
+        const target = Number(targetUserId);
+        const dec: 'approve' | 'deny' = decision === 'approve' ? 'approve' : 'deny';
+        await db.decideSlotApplication(operationId, slotId, target, dec, userId);
+        if (dec === 'approve') await db.notifyOperationAssignee(operationId, target, userId, 'seat');
+    },
+    'operation:remove_slot_assignment': async ({ operationId, slotId, targetUserId, user }: RemoveSlotAssignmentPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
+        await db.assertOpVisibleToUser(operationId, user);
+        await db.removeSlotAssignment(operationId, slotId, Number(targetUserId));
+    },
+    'operation:apply_for_slot': async ({ operationId, slotId, userId, userShipId, user }: ApplyForSlotPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
+        await db.assertOpVisibleToUser(operationId, user);
+        return db.applyForSlot(operationId, slotId, userId, userShipId != null ? Number(userShipId) : undefined);
+    },
+    'operation:withdraw_slot': async ({ operationId, slotId, userId, user }: WithdrawSlotPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
+        await db.assertOpVisibleToUser(operationId, user);
+        // `userId` is DISPATCHER-FORCED (ACTOR_ID_FIELDS); `targetUserId` is not, and
+        // is deliberately absent from this payload. Reading a target here would let
+        // any member withdraw anyone else's seat through an operations:view action.
+        await db.removeSlotAssignment(operationId, slotId, userId);
     },
 
     // Board Elements (Tactical Board)
@@ -803,6 +856,18 @@ export const operationActions = {
     // Discord channel directory — read-only list of voice/text channels in the
     // org's guild, used by the Comms Plan editor's provider dropdown. Cached
     // server-side for 60s; pass `forceRefresh: true` to bypass.
+    /**
+     * The SAME read as 'discord:list_guild_channels', under a different permission.
+     *
+     * An alias rather than a re-gate, because fullPermissionMap holds exactly one
+     * permission per action: re-gating the existing action on admin:config:discord
+     * would take the channel picker away from every op creator who is not a Discord
+     * admin. Two actions, two audiences, one implementation.
+     *
+     * No forceRefresh here — the admin tab loads the directory once per visit and has
+     * no reason to hand a caller a cache bypass.
+     */
+    'discord:list_channels_admin': async () => listGuildChannels({}),
     'discord:list_guild_channels': async ({ forceRefresh }: ListGuildChannelsPayload) => {
         return listGuildChannels({ forceRefresh: !!forceRefresh });
     },

@@ -391,7 +391,6 @@ export default function QuartermasterView() {
                         canManage={canManage}
                         canRequest={canRequest}
                         onIssue={canManage ? (item) => setIssueTarget({ seedItem: item }) : undefined}
-                        onCreate={canManage ? () => setCreateInventoryOpen(true) : undefined}
                         refreshKey={armoryRefreshKey}
                     />
                 )}

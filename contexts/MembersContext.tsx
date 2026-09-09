@@ -39,6 +39,20 @@ export interface MembersContextValue {
 
     members: User[];
 
+    /**
+     * "Is anyone available to take a service request?" — the ONE duty question asked on
+     * a surface the org's external customers can reach. TRI-STATE on purpose:
+     *   true  -> someone is on duty; open the request form.
+     *   false -> nobody is; show "Services Unavailable".
+     *   null  -> the server's availability probe could not answer (or has not answered
+     *            yet and this caller has no roster to derive one from). Consumers must
+     *            render an honest "could not confirm availability" frame: NEITHER the
+     *            form (unknown must not widen) NOR "there are no units on duty" (that
+     *            would assert a fact we do not have). A read error must never read as
+     *            zero — CLAUDE.md, at the layer the user actually sees.
+     */
+    anyStaffOnDuty: boolean | null;
+
     // Exposed for DataContext's optimisticUpdate ('ranks', 'organizational_units')
     // branches.
     setAllUsers: React.Dispatch<React.SetStateAction<User[]>>;
@@ -130,6 +144,45 @@ export const MembersProvider: React.FC<{ children: React.ReactNode }> = ({ child
         [allUsers],
     );
 
+    /**
+     * "Is anyone available to take a service request?" — the shared predicate behind
+     * DashboardView's QuickRequestForm and CreateRequestModal. Both render a yes/no,
+     * never a number, so this is a boolean and the server ships a boolean.
+     *
+     * SERVER-PRIMARY, roster as the fallback, null = genuinely unknown. The server
+     * value wins whenever it is a boolean. Three reasons, all load-bearing:
+     *
+     *  1. A roster-first heuristic would make this file's correctness a hostage of the
+     *     bundle projection. mergeUsersSlice APPENDS rows not already present
+     *     (lib/sliceMerge.ts) off a user_update handler attached UNCONDITIONALLY, so if
+     *     the users_slice gate is ever missed or weakened a rosterless customer's
+     *     allUsers refills row by row and the instant it crosses the threshold the
+     *     discriminator would flip to deriving `false` from two arbitrary rows —
+     *     permanent denial of the customer flow, looking like somebody else's bug.
+     *  2. The heuristic is unnecessary. Both consumers are Client-only: QuickRequestForm
+     *     renders only inside DashboardView's isClient branch, and CreateRequestModal's
+     *     gate is `isClient && !anyStaffOnDuty`.
+     *  3. The roster derivation is the KNOWN-WRONG half. `members` above filters on the
+     *     NAME-inferred tier, and inferUserRoleTier (lib/db/mappers.ts) falls THROUGH to
+     *     UserRole.Client for any custom role holding no tier-marking permission — so an
+     *     org whose responders sit on a permissionless custom role would show "units
+     *     available" to customers (server: role_id != Client) and "0 on duty" to its own
+     *     dispatchers (DashboardMetrics), from the same duty state. That divergence is
+     *     an ACCEPTED outcome, not a bug: the staff surfaces keep their own roster
+     *     derivation unchanged and must not be repointed at this boolean.
+     *
+     * null propagates. The server sends null for "the probe faulted" and the setter
+     * below refuses to write it, so the last known answer stands; on a cold boot there
+     * is none and the UI renders its honest third frame.
+     */
+    const [serverAnyStaffOnDuty, setServerAnyStaffOnDuty] = useState<boolean | null>(null);
+    const anyStaffOnDuty = useMemo<boolean | null>(
+        () => (typeof serverAnyStaffOnDuty === 'boolean'
+            ? serverAnyStaffOnDuty
+            : (allUsers.length > 0 ? members.some(u => u.isDuty) : null)),
+        [serverAnyStaffOnDuty, allUsers.length, members],
+    );
+
     // DataContext registers refreshMainState/refreshDiscord here on mount; held
     // in refs so CRUD method identities stay stable across refresh-fn changes.
     const refreshMainStateRef = useRef<(() => Promise<void> | void) | null>(null);
@@ -162,6 +215,14 @@ export const MembersProvider: React.FC<{ children: React.ReactNode }> = ({ child
     useEffect(() => {
         const cleanups = [
             registerSliceSetter('users', (data: any) => { if (data.users) setAllUsers(data.users); }),
+            // typeof-boolean, NOT truthiness and NOT `!== undefined`. `false` is the
+            // value that actually gates the customer request form, so a truthiness guard
+            // would drop exactly the case that matters; and the server sends `null` for
+            // "the availability probe faulted", which must leave the last known answer
+            // standing rather than write a fabricated "nobody on duty".
+            registerSliceSetter('anyStaffOnDuty', (data: any) => {
+                if (typeof data.anyStaffOnDuty === 'boolean') setServerAnyStaffOnDuty(data.anyStaffOnDuty);
+            }),
             registerSliceSetter('ranks', (data: any) => { if (data.ranks) setRanks(data.ranks); }),
             registerSliceSetter('units', (data: any) => { if (data.units) setUnits(data.units); }),
             registerSliceSetter('roles', (data: any) => { if (data.roles) setRoles(data.roles); }),
@@ -339,7 +400,7 @@ export const MembersProvider: React.FC<{ children: React.ReactNode }> = ({ child
         allUsers, ranks, units, roles,
         securityClearances, limitingMarkers, specializationTags, certifications, commendations,
         syncedDiscordRoles, rankMappings, roleMappings,
-        members,
+        members, anyStaffOnDuty,
         setAllUsers, setRanks, setUnits, setRoles,
         setSecurityClearances, setLimitingMarkers, setSpecializationTags, setCertifications, setCommendations,
         setSyncedDiscordRoles, setRankMappings, setRoleMappings,
@@ -359,7 +420,7 @@ export const MembersProvider: React.FC<{ children: React.ReactNode }> = ({ child
         allUsers, ranks, units, roles,
         securityClearances, limitingMarkers, specializationTags, certifications, commendations,
         syncedDiscordRoles, rankMappings, roleMappings,
-        members,
+        members, anyStaffOnDuty,
         addUnit, updateUnit, deleteUnit,
         addRank, updateRank, deleteRank,
         addRole, updateRole, deleteRole, getRoleDetails, updateRolePermissions,

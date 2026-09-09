@@ -64,7 +64,15 @@ const UnitFeed: React.FC<{ unitId: number }> = ({ unitId }) => {
         const supabase = getSupabase();
         if (!supabase) return;
 
-        const channel = supabase.channel(`unit_posts:${unitId}`)
+        // PRIVATE, like every other channel in the tree. `unit_posts` is not in
+        // private.rt_client_tables() — which is what builds the realtime publication — so this
+        // subscription currently delivers nothing and the feed refreshes only on mount and on
+        // the user's own post. That makes the attribute look cosmetic today; it is not. This
+        // was the one channel in the codebase constructed WITHOUT `{ private: true }`, so the
+        // day anyone adds unit_posts to that publication, a private feed would start streaming
+        // full rows over a public topic. Unit posts are membership-scoped content, and rule 4
+        // says every channel is private.
+        const channel = supabase.channel(`unit_posts:${unitId}`, { config: { private: true } })
             .on('postgres_changes',
                 { event: '*', schema: 'public', table: 'unit_posts', filter: `unit_id=eq.${unitId}` },
                 () => fetchFeed()

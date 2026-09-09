@@ -24,6 +24,47 @@ const GRACE_MS = 48 * 60 * 60 * 1000;
 interface ReferencedKeys { public: Set<string>; private: Set<string> }
 
 /**
+ * EVERY read below must be EXHAUSTIVE, and that is the difference between this job
+ * reclaiming disk and this job deleting live images.
+ *
+ * PostgREST caps an unbounded select at its server-side maximum and returns the short
+ * page with a 200 and no error. These reads build the "still referenced" set, so a
+ * truncated read does not fail — it silently produces a SMALLER reference set, and
+ * every row past the cap becomes an unreferenced object this job then deletes. The
+ * grace window is no protection: those objects are all older than 48h.
+ *
+ * It is not hypothetical either. `quartermaster_catalog` is UEX-sourced and its own
+ * comment in lib/db/quartermaster.ts puts it at 5,600+ rows, and `wiki_pages` grows
+ * without bound — both were read unpaged.
+ *
+ * So: page every read to exhaustion, and REFUSE rather than sweep if a table is larger
+ * than the ceiling. The builder is passed as a factory so each call site keeps its
+ * `.select('…')` as a string literal — a dynamic select argument would also opt the
+ * call out of tests/wildcardSelectRatchet.test.ts, which is the rule that keeps these
+ * column lists honest.
+ */
+const GC_PAGE = 1000;
+const GC_MAX_PAGES = 200;
+
+async function readAllPaged<T>(
+    table: string,
+    build: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+): Promise<T[]> {
+    const out: T[] = [];
+    for (let page = 0; page < GC_MAX_PAGES; page++) {
+        const from = page * GC_PAGE;
+        const { data, error } = await build(from, from + GC_PAGE - 1);
+        if (error) throw error;
+        const rows = (data || []) as T[];
+        out.push(...rows);
+        if (rows.length < GC_PAGE) return out;
+    }
+    // Deliberately a throw, not a truncation: the caller skips the whole sweep on a
+    // throw, and skipping costs disk while continuing costs somebody's images.
+    throw new Error(`media gc: ${table} exceeded ${GC_MAX_PAGES * GC_PAGE} rows; refusing to sweep on a partial reference set`);
+}
+
+/**
  * Build the complete set of referenced object keys (split by bucket). THROWS on any query
  * error — the caller must skip the sweep on throw (no deletes on an incomplete set).
  */
@@ -55,40 +96,44 @@ async function gatherReferencedKeys(): Promise<ReferencedKeys> {
     };
 
     // 1) All settings rows (branding, metadata, public page, hero card, wiki home, alliance
-    //    self-profile, ...). Read the rows directly so an error throws rather than defaulting.
-    const settingsQ = await supabase.from('settings').select('value');
-    if (settingsQ.error) throw settingsQ.error;
-    for (const row of (settingsQ.data || [])) walkSettingValue((row as { value: unknown }).value);
+    //    self-profile, ...). Ordered by `key`, its primary key — `settings` is the one table
+    //    here with no `id` column.
+    const settingsRows = await readAllPaged<{ value: unknown }>('settings', (f, t) =>
+        supabase.from('settings').select('value, key').order('key', { ascending: true }).range(f, t));
+    for (const row of settingsRows) walkSettingValue(row.value);
 
-    // 2) Row image columns. Errors throw (fail-safe).
-    const rowQueries = await Promise.all([
-        supabase.from('ranks').select('icon_url'),
-        supabase.from('units').select('logo_url, banner_url'),
-        supabase.from('specialization_tags').select('image_url'),
-        supabase.from('certifications').select('image_url'),
-        supabase.from('commendations').select('image_url'),
-        supabase.from('quartermaster_catalog').select('thumbnail_url, screenshot_url'),
-        supabase.from('academy_courses').select('image_url'),
-    ]);
-    for (const q of rowQueries) { if (q.error) throw q.error; }
-    for (const r of (rowQueries[0].data || [])) addRef((r as { icon_url?: string }).icon_url);
-    for (const r of (rowQueries[1].data || [])) { addRef((r as { logo_url?: string }).logo_url); addRef((r as { banner_url?: string }).banner_url); }
-    for (const r of (rowQueries[2].data || [])) addRef((r as { image_url?: string }).image_url);
-    for (const r of (rowQueries[3].data || [])) addRef((r as { image_url?: string }).image_url);
-    for (const r of (rowQueries[4].data || [])) addRef((r as { image_url?: string }).image_url);
-    for (const r of (rowQueries[5].data || [])) { addRef((r as { thumbnail_url?: string }).thumbnail_url); addRef((r as { screenshot_url?: string }).screenshot_url); }
-    for (const r of (rowQueries[6].data || [])) addRef((r as { image_url?: string }).image_url);
+    // 2) Row image columns.
+    const ranks = await readAllPaged<{ icon_url?: string }>('ranks', (f, t) =>
+        supabase.from('ranks').select('icon_url, id').order('id', { ascending: true }).range(f, t));
+    const units = await readAllPaged<{ logo_url?: string; banner_url?: string }>('units', (f, t) =>
+        supabase.from('units').select('logo_url, banner_url, id').order('id', { ascending: true }).range(f, t));
+    const tags = await readAllPaged<{ image_url?: string }>('specialization_tags', (f, t) =>
+        supabase.from('specialization_tags').select('image_url, id').order('id', { ascending: true }).range(f, t));
+    const certs = await readAllPaged<{ image_url?: string }>('certifications', (f, t) =>
+        supabase.from('certifications').select('image_url, id').order('id', { ascending: true }).range(f, t));
+    const commends = await readAllPaged<{ image_url?: string }>('commendations', (f, t) =>
+        supabase.from('commendations').select('image_url, id').order('id', { ascending: true }).range(f, t));
+    const catalog = await readAllPaged<{ thumbnail_url?: string; screenshot_url?: string }>('quartermaster_catalog', (f, t) =>
+        supabase.from('quartermaster_catalog').select('thumbnail_url, screenshot_url, id').order('id', { ascending: true }).range(f, t));
+    const courses = await readAllPaged<{ image_url?: string }>('academy_courses', (f, t) =>
+        supabase.from('academy_courses').select('image_url, id').order('id', { ascending: true }).range(f, t));
 
-    // 3) Rich-text document columns (private keys embedded in bodies). Errors throw.
-    const docQueries = await Promise.all([
-        supabase.from('wiki_pages').select('content'),
-        supabase.from('government_configs').select('constitution_content'),
-        supabase.from('government_legislation').select('body'),
-    ]);
-    for (const q of docQueries) { if (q.error) throw q.error; }
-    for (const r of (docQueries[0].data || [])) addDoc((r as { content?: unknown }).content);
-    for (const r of (docQueries[1].data || [])) addDoc((r as { constitution_content?: unknown }).constitution_content);
-    for (const r of (docQueries[2].data || [])) addDoc((r as { body?: unknown }).body);
+    for (const r of ranks) addRef(r.icon_url);
+    for (const r of units) { addRef(r.logo_url); addRef(r.banner_url); }
+    for (const r of [...tags, ...certs, ...commends, ...courses]) addRef(r.image_url);
+    for (const r of catalog) { addRef(r.thumbnail_url); addRef(r.screenshot_url); }
+
+    // 3) Rich-text document columns (private keys embedded in bodies).
+    const wikiPages = await readAllPaged<{ content?: unknown }>('wiki_pages', (f, t) =>
+        supabase.from('wiki_pages').select('content, id').order('id', { ascending: true }).range(f, t));
+    const govConfigs = await readAllPaged<{ constitution_content?: unknown }>('government_configs', (f, t) =>
+        supabase.from('government_configs').select('constitution_content, id').order('id', { ascending: true }).range(f, t));
+    const legislation = await readAllPaged<{ body?: unknown }>('government_legislation', (f, t) =>
+        supabase.from('government_legislation').select('body, id').order('id', { ascending: true }).range(f, t));
+
+    for (const r of wikiPages) addDoc(r.content);
+    for (const r of govConfigs) addDoc(r.constitution_content);
+    for (const r of legislation) addDoc(r.body);
 
     return { public: pub, private: priv };
 }
@@ -107,6 +152,19 @@ async function sweep(now: number, dryRun: boolean): Promise<{ deleted: number; k
     ];
     for (const [bucket, refSet] of buckets) {
         const objects = await listOrgMediaObjects(bucket);
+        // FAIL-SAFE: "nothing is referenced" is far more likely to be a broken reference set
+        // than a genuinely empty org. gatherReferencedKeys throws on a query ERROR, but a
+        // query that SUCCEEDS and returns rows whose refs no longer parse yields a
+        // legitimately-empty set — and this loop would read that as "delete everything".
+        // The 48h grace window does not bound it: every object already in the bucket is older
+        // than that. The realistic trigger is a stored-URL origin change (custom domain,
+        // proxy swap, project restore, staging→prod dump), which is precisely why the read-
+        // side parser is deliberately NOT origin-checked. Belt and braces: skip the bucket.
+        if (refSet.size === 0 && objects.length > 0) {
+            log.warn('media gc skipped: empty reference set with objects present', { bucket, objects: objects.length });
+            kept += objects.length;
+            continue;
+        }
         const toDelete: string[] = [];
         for (const obj of objects) {
             if (refSet.has(obj.key)) { kept++; continue; }

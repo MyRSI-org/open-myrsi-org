@@ -3,7 +3,7 @@ import * as db from '../../lib/db.js';
 import * as discord from '../../lib/discord.js';
 import * as radio from '../../lib/radio.js';
 import { signToken, signAdminSetupGrant, verifyAdminSetupGrant, signIdentityGrant, verifyIdentityGrant } from '../../lib/auth.js';
-import { verifyRsiHandle, generateRsiVerificationCode } from '../../lib/rsi.js';
+import { verifyRsiHandle, generateRsiVerificationCode, isValidRsiHandle } from '../../lib/rsi.js';
 import { stripSensitiveUserFields } from '../../lib/db/userFilters.js';
 import { adminExists } from '../../lib/firstBoot.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
@@ -12,13 +12,82 @@ import type { User } from '../../types.js';
 
 const log = baseLog.child({ module: 'actions.auth' });
 
+// ---------------------------------------------------------------------------
+// ORG BANS on the LOGIN path
+// ---------------------------------------------------------------------------
+// The dispatcher's ban gate cannot help here: auth:discord_callback and
+// auth:finalize_setup are PUBLIC_ACTIONS, so they run above every gate, with no
+// authenticated user to check. Without these two the ban is a lockout that a
+// single Discord click walks straight past — and worse, the login path
+// REACTIVATES a soft-deleted row, so a banned-and-removed member would be
+// un-deleted on the way in.
+//
+// One generic message for every refusal on this surface. These actions are
+// reachable unauthenticated by anyone who can start an OAuth flow, so a message
+// that varied by cause would answer "is this Discord id banned from your org?"
+// for an id the caller chose.
+const BAN_LOGIN_REFUSED = 'You cannot sign in to this organization.';
+
+/**
+ * Ban lookup for the login path.
+ *
+ * findActiveBan already fails closed by THROWING BanCheckUnavailable; this
+ * wrapper exists to say out loud that the throw must propagate. Degrading to
+ * "not banned" here would make a DB blip the ban-evasion route, and the login
+ * path is the one surface where that is a single retry away.
+ */
+async function loadOrgBanForLogin(discordId: string) {
+    return db.findActiveBan({ discordId });
+}
+
+/**
+ * The banned member's way IN to their own notice and the appeal form.
+ *
+ * Mints an ORDINARY session token and returns NO user object. That is the whole
+ * design: the ban gate (api/services.ts) refuses everything this token can reach
+ * except user:logout, ban:my_notice and ban:submit_appeal, and the boot gate
+ * (api/query.ts) hands back the notice instead of org state. A banned member
+ * therefore holds a session that can do exactly three things.
+ *
+ * includeDeleted is FALSE on purpose. A ban SURVIVES a soft delete — findActiveBan
+ * matches on the Discord id — but a deleted member has no account to appeal as, and
+ * reactivating one here would undo the deletion for someone the org has locked out.
+ * They are refused with the generic message instead.
+ */
+async function issueBanAppealSession(discordId: string, banId: number) {
+    const user = await db.findUserByDiscordId(discordId, false);
+    if (!user) throw new Error(BAN_LOGIN_REFUSED);
+
+    const notice = await db.getBanNotice(user.id, discordId);
+    // A ban that resolved a moment ago and cannot resolve now is a race with a
+    // lift; refuse rather than mint a session on a notice we could not read.
+    if (!notice) throw new Error(BAN_LOGIN_REFUSED);
+
+    try {
+        void db.recordSecurityEvent({
+            event: 'authz.org_ban.login_denied',
+            action: 'auth:discord_callback',
+            actorUserId: user.id,
+            actorLabel: user.rsiHandle ?? null,
+            outcome: 'denied',
+            details: { banId, appealSession: true },
+        }).catch(() => { /* best-effort */ });
+    } catch { /* never let the audit emitter break the refusal it records */ }
+
+    return { isNewUser: false, banned: true, banNotice: notice, token: signToken({ userId: user.id }) };
+}
+
 // --- Payload shapes (request bodies; actor-id fields injected server-side) ---
 
 // participantName / userId in the body are IGNORED — the dispatcher injects the
 // authenticated `user`, and radio token identity/name + authorization derive
 // from it. The fields remain for backward-compat with old clients.
-// limitingMarkers ride along so op-voice auth can enforce compartments.
-type RadioActor = { id: number; name?: string; role?: string; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] };
+// limitingMarkers ride along so op-voice auth can enforce compartments, and `unit`
+// so the squad-net gate (radio-unit-<id>) can compare against the caller's OWN unit.
+// Mirrors RadioUser (lib/radio.ts). `role` is deliberately absent: radio authz is
+// permission-only, and op-voice authz runs through the clearance module, which reads
+// the stamped role IDENTITY.
+type RadioActor = { id: number; name?: string; isSystemAdmin?: boolean; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[]; unit?: { id?: number | null; hasRadioChannel?: boolean } | null };
 
 interface RadioAuthPayload {
     roomName: string;
@@ -143,10 +212,17 @@ export const authActions = {
         radio.assertRadioRateLimit(user.id);
         return radio.generateOpRadioToken(user, operationId);
     },
-    // Participant identities only for radio managers; others get presence counts.
+    // Participant identities only for radio managers; others get presence counts —
+    // and only for the rooms `viewer` is authorized to know exist, so the room list
+    // can't be used to enumerate live missions or restricted squad nets.
     'radio:status': ({ user }: { user?: RadioActor }) => {
         radio.assertRadioRateLimit(user?.id);
-        return radio.getRadioStatus({ includeParticipants: user?.role === 'Admin' || (user?.permissions || []).includes('radio:manage') });
+        return radio.getRadioStatus({
+            // Permission only — no role-name bypass. Matches lib/radio.ts's own
+            // isManager (radio:manage / admin:access), which the Dispatcher holds.
+            includeParticipants: (user?.permissions || []).includes('radio:manage'),
+            viewer: user,
+        });
     },
     'radio:reboot': ({ user }: { user?: RadioActor }) => {
         // Throttle per user like the other radio actions: radio:manage controls who
@@ -190,6 +266,23 @@ export const authActions = {
             throw new Error('Discord returned an unexpected account id.');
         }
         const avatarUrl = discord.buildGlobalAvatarUrl(discordUser);
+
+        // ───────────────────────── ORG BAN GATE (login) ─────────────────────────
+        // ABOVE the admin-claim block below (so a banned member cannot burn the
+        // one-time setup code) and above findUserByDiscordId(…, true) further down
+        // (so a banned member who was soft-deleted is not reactivated on the way in).
+        //
+        // Anchored on the DISCORD ID, not a user row, which is the only anchor that
+        // survives delete-then-sign-in-again — the documented evasion route, and why
+        // deleteUser retains discord_id "for ban-evasion detection".
+        //
+        // A hit does not simply refuse: it mints an APPEAL SESSION. A silent wall is
+        // what makes a ban unaccountable, and this is the only path by which a banned
+        // member can ever read their own notice or contest it.
+        const loginBan = await loadOrgBanForLogin(discordUser.id);
+        if (loginBan) {
+            return await issueBanAppealSession(discordUser.id, loginBan.id);
+        }
 
         let isAdminClaim = false;
 
@@ -253,7 +346,11 @@ export const authActions = {
             // user as their own requester: personal data (personnel notes /
             // conduct / markers) is preserved for self; adminNotes is blanked
             // unless they actually hold admin:user:update.
-            const safeUser = stripSensitiveUserFields(user, { id: user.id, role: user.role, permissions: user.permissions || [] });
+            // isSystemAdmin is forwarded (findUserByDiscordId stamps it) so the self
+            // record keeps the full-record path on role IDENTITY rather than on the
+            // name-derived tier — otherwise an Admin whose role had admin:user:update
+            // revoked would silently stop seeing their own adminNotes at login.
+            const safeUser = stripSensitiveUserFields(user, { id: user.id, role: user.role, isSystemAdmin: user.isSystemAdmin === true, permissions: user.permissions || [] });
             return { user: safeUser, token, isNewUser: false };
         }
 
@@ -283,6 +380,15 @@ export const authActions = {
         if (!payload.rsiHandle) {
             throw new Error("An RSI handle is required.");
         }
+        // This is a PUBLIC_ACTION and the handle is unauthenticated input that drives
+        // an OUTBOUND request (verifyRsiHandle) before it ever reaches the db layer.
+        // Gate the shape here so the network call is never made for a non-handle;
+        // createUser re-checks it as the db-layer chokepoint. Deliberately NOT inside
+        // verifyRsiHandle — that helper is also the encoding contract pinned by
+        // tests/sec-rsi.test.ts, and the guard belongs at the trust boundary.
+        if (!isValidRsiHandle(payload.rsiHandle)) {
+            throw new Error("That is not a valid RSI handle. Handles are letters, numbers, underscores and hyphens.");
+        }
 
         // Bind the new account to the Discord identity that completed OAuth. The
         // grant was minted in auth:discord_callback for the verified discordId, so
@@ -290,6 +396,22 @@ export const authActions = {
         const identity = verifyIdentityGrant(payload.identityToken);
         if (!identity || identity.discordId !== payload.discordId) {
             throw new Error("Your sign-in session has expired. Please sign in with Discord again.");
+        }
+
+        // ──────────────── ORG BAN GATE (account creation) ────────────────
+        // A HARD refusal, with no appeal session: this is where the users row is
+        // written, so there is no member to appeal as and nothing to attach an appeal
+        // to. Reaching this action at all means the ban is anchored on a Discord id
+        // with no live user row — exactly the ban-then-delete case.
+        //
+        // BELOW the identity-grant check on purpose, and that ordering is the whole
+        // security property. payload.discordId is client-supplied and unverified until
+        // the line above; checking a ban FIRST would turn this PUBLIC action into an
+        // oracle answering "is this Discord id banned from your org?" for any id the
+        // caller cares to type. After the grant check, the caller has already proved
+        // they own the id, so the only thing the answer reveals is their own status.
+        if (await loadOrgBanForLogin(identity.discordId)) {
+            throw new Error(BAN_LOGIN_REFUSED);
         }
 
         // The Admin role is granted ONLY when the caller presents a valid,

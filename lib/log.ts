@@ -121,6 +121,24 @@ function emit(level: Exclude<Level, 'silent'>, context: Record<string, unknown>,
     else process.stdout.write(line);
 }
 
+/**
+ * The redaction walk above, exposed for the ONE other sink that persists
+ * caller-supplied diagnostic fields: the security_events audit trail
+ * (lib/db/securityEvents.ts). That table is written from the same SecurityDenial
+ * `fields` bag that reaches emit(), and it is DURABLE, QUERYABLE and read back by an
+ * admin screen — so it must not be a second, weaker redactor. A { botToken } that
+ * log.warn() scrubs must not survive into a database row that outlives the log.
+ * Keep this and emit() on the same SECRET_KEY_RE + serializeField; pinned by
+ * tests/securityEventsEgress.test.ts.
+ */
+export function redactFields(fields: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(fields)) {
+        out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : serializeField(fields[k]);
+    }
+    return out;
+}
+
 function createLogger(context: Record<string, unknown>): Logger {
     return {
         debug: (msg, fields) => emit('debug', context, msg, fields),

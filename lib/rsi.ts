@@ -4,6 +4,18 @@ import { ssrfSafeFetch } from './ssrf.js';
 
 const log = baseLog.child({ module: 'lib.rsi' });
 
+/** RSI citizen handles are alphanumeric plus underscore/hyphen, and short. */
+const RSI_HANDLE_RE = /^[A-Za-z0-9_-]{1,60}$/;
+
+/**
+ * Reject anything not shaped like a citizen handle BEFORE it reaches the network
+ * or the database. Handles flow into `.ilike()` identity lookups, so a value
+ * carrying LIKE metacharacters is a wildcard, not a name.
+ */
+export function isValidRsiHandle(raw: unknown): raw is string {
+    return typeof raw === 'string' && RSI_HANDLE_RE.test(raw.trim());
+}
+
 // Generate a high-entropy, server-issued verification code for RSI handle linking.
 // It must be hard to guess and very unlikely to already appear on someone's public
 // profile, so that "the code is present on the page" really does prove the user

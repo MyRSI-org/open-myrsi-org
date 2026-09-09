@@ -389,3 +389,35 @@ export function isValidTimezone(value: unknown): value is string {
         return false;
     }
 }
+
+/**
+ * Countdown to an instant, at seconds granularity: "2d 04:13:57", "04:13:57",
+ * "13:57". Returns null once the target has passed, and for a null target.
+ *
+ * formatRelativeTime is unusable for this — it collapses everything under 45
+ * seconds to "just now", which is precisely the stretch a countdown exists to
+ * show. Deliberately clock-agnostic: it takes `now` as an argument so the caller
+ * decides the tick rate (useNow), and so this stays a pure function.
+ *
+ * COSMETIC ONLY. Every ban check re-evaluates expiry against the SERVER clock
+ * (lib/db/bans.ts); a client whose clock says its own ban has run out gets no
+ * further than the gate.
+ */
+export function formatCountdown(target: string | number | Date | null | undefined, now: number = Date.now()): string | null {
+    if (target == null) return null;
+    const end = target instanceof Date ? target.getTime() : new Date(target).getTime();
+    if (Number.isNaN(end)) return null;
+    const remaining = end - now;
+    if (remaining <= 0) return null;
+
+    const totalSeconds = Math.floor(remaining / 1000);
+    const days = Math.floor(totalSeconds / 86_400);
+    const hours = Math.floor((totalSeconds % 86_400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const pad = (n: number) => String(n).padStart(2, '0');
+
+    if (days > 0) return `${days}d ${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+    if (hours > 0) return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+    return `${pad(minutes)}:${pad(seconds)}`;
+}

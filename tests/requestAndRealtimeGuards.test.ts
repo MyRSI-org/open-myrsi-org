@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
     resolveQuery: ((_q: { table: string; calls: Array<{ method: string; args: unknown[] }> }) => ({ data: null as unknown, error: null as unknown })) as (q: { table: string; calls: Array<{ method: string; args: unknown[] }> }) => { data?: unknown; error?: unknown },
     queries: [] as Array<{ table: string; calls: Array<{ method: string; args: unknown[] }> }>,
     broadcasts: [] as Array<{ channel: string; event: string; payload: Record<string, unknown> }>,
+    pushes: [] as Array<{ userIds: number[]; payload: Record<string, unknown> }>,
 }));
 
 vi.mock('../lib/db/common', () => {
@@ -56,7 +57,7 @@ vi.mock('../lib/db/common', () => {
 // Push must not fire real web-push during the EAM test.
 vi.mock('../lib/push', () => ({
     sendPushToAll: async () => {},
-    sendPushToUsers: async () => {},
+    sendPushToUsers: async (userIds: number[], payload: Record<string, unknown>) => { h.pushes.push({ userIds, payload }); },
     sendPushToRoles: async () => {},
     sendPushToStaff: async () => {},
     sendPushToPermission: async () => {},
@@ -73,6 +74,7 @@ beforeEach(() => {
     h.resolveQuery = () => ({ data: [], error: null });
     h.queries = [];
     h.broadcasts = [];
+    h.pushes = [];
 });
 
 describe('request visibility is server-enforced per caller (BOLA fix)', () => {
@@ -106,23 +108,57 @@ describe('request visibility is server-enforced per caller (BOLA fix)', () => {
 describe('request WRITE ownership gate (cancel/rate BOLA fix)', () => {
     it('a non-owner Client is rejected', async () => {
         h.resolveQuery = () => ({ data: { client_id: 99 }, error: null });
-        await expect(assertRequestOwnerOrDuty('r1', { id: 5, role: 'Client', permissions: ['request:cancel'] }))
+        await expect(assertRequestOwnerOrDuty('r1', { id: 5, permissions: ['request:cancel'] }, 'rate'))
             .rejects.toThrow(/your own requests/i);
     });
     it('the owner passes', async () => {
         h.resolveQuery = () => ({ data: { client_id: 5 }, error: null });
-        await expect(assertRequestOwnerOrDuty('r1', { id: 5, role: 'Client', permissions: ['request:rate'] }))
+        await expect(assertRequestOwnerOrDuty('r1', { id: 5, permissions: ['request:rate'] }, 'rate'))
             .resolves.toBeUndefined();
     });
     it('a dispatch-duty holder bypasses without an ownership lookup', async () => {
         h.queries = [];
-        await assertRequestOwnerOrDuty('r1', { id: 6, role: 'Member', permissions: ['request:dispatch'] });
+        await assertRequestOwnerOrDuty('r1', { id: 6, permissions: ['request:dispatch'] }, 'rate');
         expect(h.queries.find(q => q.table === 'service_requests')).toBeUndefined();
     });
     it('request:accept alone is NOT dispatch duty — a non-owner cannot cancel/rate', async () => {
         h.resolveQuery = () => ({ data: { client_id: 99 }, error: null });
-        await expect(assertRequestOwnerOrDuty('r1', { id: 6, role: 'Member', permissions: ['request:accept'] }))
+        await expect(assertRequestOwnerOrDuty('r1', { id: 6, permissions: ['request:accept'] }, 'rate'))
             .rejects.toThrow(/your own requests/i);
+    });
+    it('a role NAME alone is not duty — the bypass is permission-only', async () => {
+        h.resolveQuery = () => ({ data: { client_id: 99 }, error: null });
+        await expect(assertRequestOwnerOrDuty(
+            'r1',
+            { id: 6, role: 'Admin', permissions: [] } as unknown as Parameters<typeof assertRequestOwnerOrDuty>[1],
+            'rate',
+        )).rejects.toThrow(/your own requests/i);
+    });
+
+    // The status half of the same predicate. Both client copies gate Cancel on
+    // status === Submitted; the server checked ownership and nothing else, so a Client could
+    // flip their OWN completed job to Cancelled and delete it from the public scoreboard.
+    it('the owner may cancel a Submitted request', async () => {
+        h.resolveQuery = () => ({ data: { client_id: 5, status: 'Submitted' }, error: null });
+        await expect(assertRequestOwnerOrDuty('r1', { id: 5, permissions: ['request:cancel'] }, 'cancel'))
+            .resolves.toBeUndefined();
+    });
+    it('the owner may NOT cancel a request that has been picked up', async () => {
+        for (const status of ['Accepted', 'In-Progress', 'Success', 'Cancelled']) {
+            h.resolveQuery = () => ({ data: { client_id: 5, status }, error: null });
+            await expect(assertRequestOwnerOrDuty('r1', { id: 5, permissions: ['request:cancel'] }, 'cancel'))
+                .rejects.toThrow(/no longer be cancelled/i);
+        }
+    });
+    it('a duty holder may still cancel from any status', async () => {
+        h.resolveQuery = () => ({ data: { client_id: 99, status: 'Success' }, error: null });
+        await expect(assertRequestOwnerOrDuty('r1', { id: 6, permissions: ['request:dispatch'] }, 'cancel'))
+            .resolves.toBeUndefined();
+    });
+    it('the RATE kind does not apply the cancel status precondition', async () => {
+        h.resolveQuery = () => ({ data: { client_id: 5, status: 'Success' }, error: null });
+        await expect(assertRequestOwnerOrDuty('r1', { id: 5, permissions: ['request:rate'] }, 'rate'))
+            .resolves.toBeUndefined();
     });
 });
 
@@ -215,5 +251,74 @@ describe('signRealtimeToken', () => {
             if (prev !== undefined) process.env.SUPABASE_JWT_SECRET = prev;
             else delete process.env.SUPABASE_JWT_SECRET;
         }
+    });
+});
+
+describe('the operation-alert PUSH is clearance-aware, not just the broadcast', () => {
+    // The broadcast was carefully reduced to {operationId, timestamp} and the read is
+    // gated behind operations:view + assertOpVisibleToUser — and then the push carried
+    // the raw alert text to every active participant with no filter at all. A push lands
+    // on a lock screen, outside the app, so it is the LEAST gated surface of the three.
+    //
+    // Being a participant is not being cleared to read the op: addOperationParticipant
+    // does not check the target's clearance, updateOperation can add limiting markers
+    // after people have joined, and clearance can be revoked afterwards. That is exactly
+    // why the reminder job (lib/db/opReminders.ts) already withholds the op NAME on a
+    // restricted op; the alert path now mirrors it.
+    const ALERT = 'Abort the approach — hostiles on site';
+
+    /** Drive operationIsRestricted's three dimensions plus the participant read. */
+    const withOp = (op: { clearance_level?: number; is_special?: boolean }, markerCount = 0) => {
+        h.resolveQuery = (q) => {
+            if (q.table === 'operations') return { data: { clearance_level: op.clearance_level ?? 0, is_special: !!op.is_special }, error: null };
+            if (q.table === 'operation_limiting_markers') return { data: [], error: null, count: markerCount } as never;
+            if (q.table === 'operation_participants') return { data: [{ user_id: 7 }, { user_id: 8 }], error: null };
+            return { data: [], error: null };
+        };
+    };
+
+    it('an UNRESTRICTED op still pushes the alert text — the fix must not mute everything', async () => {
+        withOp({ clearance_level: 0, is_special: false }, 0);
+        await broadcastOperationAlert('op-1', ALERT);
+        expect(h.pushes).toHaveLength(1);
+        expect(h.pushes[0].payload.body).toBe(ALERT);
+    });
+
+    it('a CLEARANCE-GATED op pushes a content-free notice instead', async () => {
+        withOp({ clearance_level: 3, is_special: false }, 0);
+        await broadcastOperationAlert('op-1', ALERT);
+        expect(h.pushes).toHaveLength(1);
+        expect(h.pushes[0].payload.body).not.toContain('hostiles');
+        expect(JSON.stringify(h.pushes), 'the alert text reached a push on a restricted op').not.toContain('hostiles');
+    });
+
+    it('a SPECIAL op does too', async () => {
+        withOp({ clearance_level: 0, is_special: true }, 0);
+        await broadcastOperationAlert('op-1', ALERT);
+        expect(JSON.stringify(h.pushes)).not.toContain('hostiles');
+    });
+
+    it('and so does an op carrying a LIMITING MARKER', async () => {
+        withOp({ clearance_level: 0, is_special: false }, 1);
+        await broadcastOperationAlert('op-1', ALERT);
+        expect(JSON.stringify(h.pushes)).not.toContain('hostiles');
+    });
+
+    it('routing is unchanged, so a cleared member still taps through to the gated read', async () => {
+        withOp({ clearance_level: 3 }, 0);
+        await broadcastOperationAlert('op-9', ALERT);
+        expect(h.pushes[0].payload.data).toMatchObject({ type: 'operation_alert', operationId: 'op-9' });
+        expect(h.pushes[0].userIds).toEqual([7, 8]);
+    });
+
+    it('fails CLOSED — an unreadable operation row withholds the text', async () => {
+        // operationIsRestricted returns true on any read fault; the alert must follow it.
+        h.resolveQuery = (q) => {
+            if (q.table === 'operations') return { data: null, error: { message: 'boom' } };
+            if (q.table === 'operation_participants') return { data: [{ user_id: 7 }], error: null };
+            return { data: [], error: null };
+        };
+        await broadcastOperationAlert('op-1', ALERT);
+        expect(JSON.stringify(h.pushes)).not.toContain('hostiles');
     });
 });

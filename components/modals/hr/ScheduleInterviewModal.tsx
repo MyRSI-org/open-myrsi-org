@@ -1,5 +1,5 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useHR } from '../../../contexts/HRContext';
@@ -16,12 +16,29 @@ interface ScheduleInterviewModalProps {
     editingInterview?: HydratedHRInterview;
 }
 
+/**
+ * Return shape of the `hr:get_eligible_interviewers` RPC (lib/db/hr.ts
+ * EligibleHRMember). Declared locally — client code may not import lib/db.
+ */
+interface EligibleMember {
+    id: number;
+    name: string;
+    avatarUrl: string;
+}
+
 const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen, onClose, applicant, editingInterview }) => {
     const { rpcAction, refreshHR } = useData();
     const { members } = useMembers();
     const { hrTemplates, hrApplicants } = useHR();
-    const { currentUser } = useAuth();
+    const { currentUser, hasPermission } = useAuth();
     const { addToast } = useNotification();
+
+    // The interviewer picker is fed by hr:get_eligible_interviewers, which is gated on
+    // hr:recruiter (the same permission hr:create_interview / hr:update_interview need
+    // to SAVE). Anyone without it could previously open this modal from HRHubView's
+    // hr:admin branch, get an enabled `required` select and a 403 on submit. Gate the
+    // fetch AND the control on the same string the server enforces.
+    const canRecruit = hasPermission('hr:recruiter');
 
     const isEditMode = !!editingInterview;
 
@@ -85,9 +102,29 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
         }
     }
 
-    const availableInterviewers = useMemo(() => {
-        return members.filter(m => m.permissions.includes('hr:recruiter') || m.permissions.includes('hr:admin'));
-    }, [members]);
+    // Eligible lead interviewers / panel members. Was `members.filter(m =>
+    // m.permissions.includes(...))` off the bulk roster; another member's permission
+    // array is no longer shipped to any viewer (lib/db/userFilters.ts), so the list is
+    // now resolved server-side at the ROLE level and returns id/name/avatarUrl only.
+    //
+    // rpcAction re-throws (contexts/DataCoreContext.tsx) and apiService.rpc throws on
+    // !ok, so the .catch is required: without it a non-entitled open is an unhandled
+    // rejection. Failing to an EMPTY list is the fail-closed direction.
+    const [availableInterviewers, setAvailableInterviewers] = useState<EligibleMember[]>([]);
+    useEffect(() => {
+        // Guard with a bare return, never a synchronous setState (cascading renders,
+        // and react-hooks/set-state-in-effect). The list starts empty and the picker
+        // it feeds only renders under the same canRecruit condition, so there is no
+        // stale-list window to clear.
+        if (!isOpen || !canRecruit) return;
+        let cancelled = false;
+        rpcAction('hr:get_eligible_interviewers', {})
+            .then((rows: EligibleMember[] | null | undefined) => {
+                if (!cancelled) setAvailableInterviewers(Array.isArray(rows) ? rows : []);
+            })
+            .catch(() => { if (!cancelled) setAvailableInterviewers([]); });
+        return () => { cancelled = true; };
+    }, [isOpen, canRecruit, rpcAction]);
 
     // Panel member options: eligible interviewers excluding the selected lead
     const availablePanelMembers = useMemo(() => {
@@ -309,16 +346,26 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
 
                     <div>
                         <label className={labelClass}>Lead Interviewer</label>
-                        <select
-                            value={interviewerId}
-                            onChange={(e) => handleInterviewerChange(e.target.value)}
-                            className={inputClass}
-                            required
-                            disabled={isLoading}
-                        >
-                            <option value="">- Select Lead -</option>
-                            {availableInterviewers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-                        </select>
+                        {canRecruit ? (
+                            <select
+                                value={interviewerId}
+                                onChange={(e) => handleInterviewerChange(e.target.value)}
+                                className={inputClass}
+                                required
+                                disabled={isLoading}
+                            >
+                                <option value="">- Select Lead -</option>
+                                {availableInterviewers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                            </select>
+                        ) : (
+                            // No hr:recruiter ⇒ the eligibility list is not fetched and the
+                            // save would 403 anyway. Show the interview's real lead read-only
+                            // rather than an empty `required` select that reads as "unassigned".
+                            <p className="w-full bg-slate-950/50 border border-slate-800 rounded-lg p-2.5 text-slate-300 text-sm">
+                                {editingInterview?.interviewer?.name || 'Unassigned'}
+                                <span className="block text-[10px] text-slate-500 mt-1">Requires the HR Recruiter permission to change.</span>
+                            </p>
+                        )}
                     </div>
 
                     {/* Panel Members */}
@@ -392,7 +439,10 @@ const ScheduleInterviewModal: React.FC<ScheduleInterviewModalProps> = ({ isOpen,
                     <button
                         type="submit"
                         className="flex items-center gap-2 px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/40 rounded-lg shadow-lg shadow-emerald-900/30 transition disabled:opacity-50"
-                        disabled={isLoading}
+                        /* hr:create_interview / hr:update_interview are both hr:recruiter
+                           (api/services.ts). Without it the submit has always 403'd; stop
+                           offering it rather than letting the error surface as a toast. */
+                        disabled={isLoading || !canRecruit}
                     >
                         {isLoading ? <i className="fa-solid fa-spinner animate-spin"></i> : isEditMode ? 'Save Changes' : 'Confirm Schedule'}
                     </button>

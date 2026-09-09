@@ -66,7 +66,7 @@ export async function getElectionsState(currentUserId?: number): Promise<Governm
                 )
             `)
             
-            .order('created_at', { ascending: false })
+            .order('created_at', { ascending: false }).order('id', { ascending: false })
             .limit(50),
         [], 'government_elections'
     );
@@ -145,7 +145,44 @@ export async function createElection(data: ElectionInput): Promise<GovernmentEle
     return result ? toGovernmentElection(result) : null;
 }
 
+/**
+ * The fields below that DECIDE THE OUTCOME may only change while the election is a
+ * Draft — before anybody can have voted.
+ *
+ * Without this guard the counting rules were editable at any point in an election's
+ * life, including after ballots were cast: drop min_voter_turnout_pct once turnout
+ * looks short, raise max_winners once the standings are visible, switch
+ * election_type, or flip allow_runoff / runoff_top_n to manufacture a second round.
+ * concludeElection reads these values at conclusion time, so an edit made mid-vote is
+ * applied retroactively to ballots cast under different rules, and the result is
+ * presented as authoritative with nothing in the UI marking that the rules moved.
+ *
+ * This build is deliberately AHEAD of hosted on election integrity (HMAC voter
+ * hashing, enforced turnout quorum, ballot dedup) — that work is worth nothing if the
+ * rules it enforces can be rewritten mid-count. Mirrors the guard updateLegislation
+ * already carries for its Voting state.
+ *
+ * Cosmetic fields (title, description) and the SCHEDULE stay editable throughout:
+ * moving a candidacy or voting window is ordinary administration and changes no
+ * ballot's meaning.
+ */
+const OUTCOME_FIELDS = [
+    'electionType', 'maxWinners', 'minCandidates', 'minVoterTurnoutPct',
+    'minVoteThresholdPct', 'allowRunoff', 'runoffTopN',
+] as const;
+
 export async function updateElection(electionId: number, updates: Partial<GovernmentElection>) {
+    const touchesOutcome = OUTCOME_FIELDS.some((f) => updates[f] !== undefined);
+    if (touchesOutcome) {
+        // Fails CLOSED: an unreadable status refuses the edit rather than assuming Draft.
+        const { data: existing, error: statusErr } = await supabase.from('government_elections')
+            .select('status').eq('id', electionId).single();
+        handleSupabaseError({ error: statusErr, message: 'Failed to load election' });
+        if (existing?.status !== 'Draft') {
+            throw new Error('The rules of an election can only be changed while it is a draft.');
+        }
+    }
+
     const dbUpdates: Record<string, unknown> = {};
     if (updates.title !== undefined) dbUpdates.title = updates.title;
     if (updates.description !== undefined) dbUpdates.description = updates.description;
@@ -522,6 +559,18 @@ export async function concludeElection(electionId: number) {
                 result.isConclusive = false;
             }
         }
+    }
+
+    // A tally that could not be COMPUTED must never be persisted as a normal
+    // conclusion. Producers: the imported-ballot refusal in tallyPreferentialFull,
+    // plus the pre-existing 'No votes cast' / 'IRV inconclusive' exits, which until
+    // now were all recorded as "Election concluded normally". Fail closed — cancel,
+    // state why, appoint nobody. Placed AFTER the threshold/tie blocks (both of which
+    // are gated on result.isConclusive and so are unreachable here) so the tally's own
+    // reason wins over the turnout text rather than being masked by it.
+    if (!result.isConclusive && result.reason) {
+        status = 'Cancelled';
+        conclusionReason = result.reason;
     }
 
     const now = new Date().toISOString();

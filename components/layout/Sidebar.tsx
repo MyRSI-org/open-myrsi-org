@@ -68,6 +68,7 @@ const Sidebar: React.FC<SidebarProps> = ({
     // Academy: default OFF. Shown to ANY member when enabled (My Academy is
     // self-service, permission-less) — the staff surfaces inside are perm-gated.
     const academyEnabled = (orgMeta?.features?.academy?.enabled) === true;
+    const blueprintsEnabled = (orgMeta?.features?.blueprints?.enabled) === true;
     // Leaderboard and External Tools default ON — absent means enabled.
     const leaderboardEnabled = (orgMeta?.features?.leaderboard?.enabled) !== false;
     const externalToolsEnabled = (orgMeta?.features?.externalTools?.enabled) !== false;
@@ -82,7 +83,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         const v = activeView;
         if (['dashboard', 'requests', 'request-detail', 'dispatch', 'operations', 'operation-detail', 'warrants', 'intel'].includes(v)) return 'command';
         if (['roster', 'member-record', 'leaderboard', 'hr', 'applicant-detail', 'security-vetting', 'case-file-detail', 'internal-transfer-detail', 'internal-job-detail', 'fleet', 'government', 'academy'].includes(v)) return 'org';
-        if (['finances', 'quartermaster', 'warehouse', 'marketplace'].includes(v)) return 'economy';
+        if (['finances', 'quartermaster', 'warehouse', 'marketplace', 'blueprints'].includes(v)) return 'economy';
         if (['wiki', 'external-tools', 'radio-control'].includes(v)) return 'resources';
         if (['profile', 'help', 'admin'].includes(v)) return 'system';
         return null;
@@ -299,6 +300,16 @@ const Sidebar: React.FC<SidebarProps> = ({
                 isMobile={isMobileOpen}
             />
         ) : null;
+        const blueprints = (hasPermission('blueprint:view') && blueprintsEnabled) ? (
+            <NavItem
+                icon={<i className="fa-solid fa-scroll fa-fw"></i>}
+                label="Blueprints"
+                isActive={activeView === 'blueprints'}
+                onClick={() => handleNavClick('blueprints')}
+                isCollapsed={isSidebarCollapsed}
+                isMobile={isMobileOpen}
+            />
+        ) : null;
         const academy = academyEnabled ? (
             <NavItem
                 icon={<i className="fa-solid fa-graduation-cap fa-fw"></i>}
@@ -373,7 +384,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         // Group membership
         const commandItems = [dashboard, serviceRequests, dispatchConsole, operations, warrants, intel].filter(Boolean);
         const orgItems = [dutyRoster, orgChart, leaderboard, hr, academy, fleet, government, alliances].filter(Boolean);
-        const economyItems = [finances, quartermaster, warehouse, marketplace].filter(Boolean);
+        const economyItems = [finances, quartermaster, warehouse, marketplace, blueprints].filter(Boolean);
         const resourcesItems = [wiki, externalTools, radio].filter(Boolean);
         const systemItems = [profile, help, admin].filter(Boolean);
 
@@ -575,7 +586,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                         {(!isSidebarCollapsed || isMobileOpen) && (
                             <div className="text-center">
                                 <button onClick={() => handleNavClick('changelog')} className="text-[10px] text-slate-600 hover:text-sky-500 transition-colors font-mono">
-                                    v15.4.1-open (STABLE)
+                                    v15.7.0-open (STABLE)
                                 </button>
                             </div>
                         )}

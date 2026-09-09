@@ -3,6 +3,7 @@ import { useData } from '../../../../contexts/DataContext';
 import WindowFrame from '../../../layout/WindowFrame';
 import type { WarehouseStock, WarehouseMovementReason } from '../../../../types';
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { MAX_STOCK_TOTAL } from '../../../../lib/stockLimits';
 
 type AdjustReasonKey = 'restock' | 'adjust' | 'loss' | 'destruction';
 
@@ -70,32 +71,53 @@ export default function WhAdjustStockDialog({ isOpen, stock, onClose, onSubmitte
     const unit = stock.catalog?.unit || 'units';
     const locationName = stock.location?.name || '—';
 
+    const targetTotal: number | null = (() => {
+        if (mode !== 'set') return null;
+        const n = parseInt(setTotalInput, 10);
+        return Number.isFinite(n) ? n : null;
+    })();
+
+    // See AdjustStockDialog (quartermaster) — identical defect, identical fix. In SET mode
+    // this delta is an ESTIMATE for the preview only and is never submitted; `stock` is a
+    // snapshot frozen when the dialog opened and WarehouseView re-syncs nothing.
     const computedDelta: number | null = (() => {
         if (mode === 'delta') {
             const n = parseInt(deltaInput, 10);
             return Number.isFinite(n) ? n : null;
         }
-        const n = parseInt(setTotalInput, 10);
-        if (!Number.isFinite(n)) return null;
-        return n - currentQty;
+        return targetTotal == null ? null : targetTotal - currentQty;
     })();
 
-    const projectedTotal = computedDelta == null ? null : currentQty + computedDelta;
+    const projectedTotal = mode === 'set'
+        ? targetTotal
+        : (computedDelta == null ? null : currentQty + computedDelta);
 
     let validationError: string | null = null;
-    if (computedDelta == null) validationError = 'Enter a number.';
-    else if (computedDelta === 0) validationError = 'Delta must be non-zero.';
-    else if (reason.deltaSign === 'positive' && computedDelta < 0) validationError = 'Restock delta must be positive.';
-    else if (reason.deltaSign === 'negative' && computedDelta > 0) validationError = `${reason.label} delta must be negative.`;
-    else if (projectedTotal != null && projectedTotal < 0) validationError = `Would take stock below zero (current ${currentQty}).`;
-    else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    if (mode === 'set') {
+        // No sign check and no zero check: both would judge a stale-derived delta and can
+        // refuse a legitimate correction. The server owns those rules.
+        if (targetTotal == null) validationError = 'Enter a number.';
+        else if (targetTotal < 0) validationError = 'New total cannot be negative.';
+        else if (targetTotal > MAX_STOCK_TOTAL) validationError = `New total cannot exceed ${MAX_STOCK_TOTAL.toLocaleString()}.`;
+        else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    } else {
+        if (computedDelta == null) validationError = 'Enter a number.';
+        else if (computedDelta === 0) validationError = 'Delta must be non-zero.';
+        else if (reason.deltaSign === 'positive' && computedDelta < 0) validationError = 'Restock delta must be positive.';
+        else if (reason.deltaSign === 'negative' && computedDelta > 0) validationError = `${reason.label} delta must be negative.`;
+        else if (projectedTotal != null && projectedTotal < 0) validationError = `Would take stock below zero (current ${currentQty}).`;
+        else if (reason.notesRequired && !notes.trim()) validationError = `Notes are required for ${reason.label.toLowerCase()}.`;
+    }
 
     const handleSubmit = async () => {
-        if (validationError || computedDelta == null) return;
+        if (validationError) return;
+        if (mode === 'set' ? targetTotal == null : computedDelta == null) return;
         if (reason.destructive) {
             const confirmed = await confirm({
                 title: `Confirm ${reason.label}`,
-                message: `Record ${Math.abs(computedDelta)} ${unit} of ${itemName}${quality} as ${reason.label.toLowerCase()}? This is logged to the movement ledger.`,
+                message: mode === 'set'
+                    ? `Set ${itemName}${quality} to ${targetTotal} ${unit} and record the difference as ${reason.label.toLowerCase()}? The exact quantity is computed server-side against the live total and logged to the movement ledger.`
+                    : `Record ${Math.abs(computedDelta!)} ${unit} of ${itemName}${quality} as ${reason.label.toLowerCase()}? This is logged to the movement ledger.`,
                 confirmText: reason.label,
                 variant: 'danger',
             });
@@ -103,16 +125,25 @@ export default function WhAdjustStockDialog({ isOpen, stock, onClose, onSubmitte
         }
         setSubmitting(true);
         try {
-            await rpcAction('warehouse:adjust_stock', {
-                stockId: stock.id,
-                delta: computedDelta,
-                reason: reason.serverReason,
-                notes: notes.trim() || undefined,
-            });
+            if (mode === 'set') {
+                await rpcAction('warehouse:set_stock_total', {
+                    stockId: stock.id,
+                    targetTotal,
+                    reason: reason.serverReason,
+                    notes: notes.trim() || undefined,
+                });
+            } else {
+                await rpcAction('warehouse:adjust_stock', {
+                    stockId: stock.id,
+                    delta: computedDelta,
+                    reason: reason.serverReason,
+                    notes: notes.trim() || undefined,
+                });
+            }
             addToast('Stock adjusted',
                 <i className="fa-solid fa-check" />,
                 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50',
-                { description: `${itemName}${quality}: ${currentQty} → ${projectedTotal}` });
+                { description: mode === 'set' ? `${itemName}${quality}: set to ${targetTotal}` : `${itemName}${quality}: ${currentQty} → ${projectedTotal}` });
             onSubmitted();
             onClose();
         } catch (err: any) {
@@ -201,6 +232,11 @@ export default function WhAdjustStockDialog({ isOpen, stock, onClose, onSubmitte
                             <i className="fa-solid fa-arrow-right-arrow-left mr-2" />
                             <strong>{currentQty}</strong> → <strong>{projectedTotal}</strong>
                             <span className="text-emerald-400/70 ml-2">({computedDelta != null && computedDelta > 0 ? `+${computedDelta}` : computedDelta})</span>
+                            {mode === 'set' && (
+                                <span className="block mt-1 text-[10px] text-emerald-400/60">
+                                    Change estimated from the figure loaded above; the server applies the difference against the live total.
+                                </span>
+                            )}
                         </div>
                     )}
                     {validationError && (

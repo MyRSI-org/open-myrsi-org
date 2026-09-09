@@ -5,11 +5,14 @@ import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, broadcastToCh
 import { passesClearance, canViewAllClassifications, assertCanClassify, type ClearanceUser } from '../clearance.js';
 import { sendPushToUsers } from '../push.js';
 import { toHydratedOperation, minifyUser } from './mappers.js';
-import { getUserById } from './users.js';
+import { getUserById, getActorLabel } from './users.js';
 import { bumpOperationVersion, pushOperationToAllies, scheduleAlliedPush } from './operations-federation.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import { cache, TTL } from '../cache.js';
 import { log as baseLog } from '../log.js';
+import { createNotification } from './notifications.js';
+import { SecurityDenial } from '../errors.js';
+import { DISCORD_SNOWFLAKE_RE } from '../discordConfigKeys.js';
 
 const log = baseLog.child({ module: 'db.ops' });
 
@@ -26,6 +29,41 @@ function broadcastOperationUpdate(operationId: string) {
     scheduleAlliedPush(operationId);
 }
 
+/**
+ * RESTRICTED := clearance_level > 0 OR the op carries any limiting marker OR it is
+ * a Special Operation — the SAME three dimensions the in-app gates hide an op on
+ * (canUserSeeOpInList / assertOpVisibleToUser / passesClearance) and the same three
+ * the realtime authorization policy uses (schema.sql §6b).
+ *
+ * The single definition behind every EGRESS gate that leaves this deployment for an
+ * audience the server cannot filter per-recipient: the operation announcement embed,
+ * the guild-wide Discord scheduled event (both in api/actions/operations.ts), and
+ * any future unfiltered fan-out. Three inline copies of a security predicate is how
+ * the gates drift, so callers use this rather than re-deriving it.
+ *
+ * FAIL-CLOSED: supabase-js RESOLVES `{ data: null, error }` / `{ count: null, error }`
+ * rather than throwing, so an unread `error` would collapse a high-clearance op to
+ * level 0 and a markered op to zero markers — falsely UNrestricting it and
+ * publishing its briefing exactly when the DB blips. Any probe fault returns true.
+ */
+export async function operationIsRestricted(operationId: string): Promise<boolean> {
+    const { data: op, error: opErr } = await supabase
+        .from('operations')
+        .select('clearance_level, is_special')
+        .eq('id', operationId)
+        .maybeSingle();
+    if (opErr) return true;
+    if ((op?.clearance_level || 0) > 0) return true;
+    if (op?.is_special) return true;
+    // Head-only probe: the count, no row data.
+    const { count: markerCount, error: markerErr } = await supabase
+        .from('operation_limiting_markers')
+        .select('operation_id', { count: 'exact', head: true })
+        .eq('operation_id', operationId);
+    if (markerErr) return true;
+    return (markerCount || 0) > 0;
+}
+
 /** Broadcast an operation alert with push notifications. The caller (the
  *  operation:broadcast_alert handler) persists the alert as an ALERT log
  *  entry BEFORE invoking this, so receivers can fetch the content. */
@@ -34,11 +72,32 @@ export async function broadcastOperationAlert(operationId: string, message: stri
 
     // The realtime emit is a TRIGGER ONLY ({operationId, timestamp}). Receivers
     // pull the alert body via the clearance-gated operation:get_latest_alert RPC.
-    // Push (encrypted, participant-targeted) still carries the body for
-    // notification UX.
     const broadcastPromise = broadcastToChannel('auth-alerts', 'operation_alert', { operationId, timestamp });
 
-    // Get all participant user IDs for push notifications
+    // PUSH IS AN EGRESS PATH, and on a restricted op it was the hole in an otherwise
+    // careful design. Everything else about an alert is clearance-gated: the broadcast
+    // carries ids only, and getLatestOperationAlert is fetched through
+    // operation:get_latest_alert behind operations:view + assertOpVisibleToUser. The
+    // push carried the raw alert TEXT to every active participant with no such filter.
+    //
+    // Being a participant is not the same as being cleared to read the op. The comment
+    // on lib/db/opReminders.ts spells out why: addOperationParticipant does not check
+    // the TARGET's clearance, updateOperation can add limiting markers after people
+    // have joined, and clearance can be revoked afterwards. So a participant list can
+    // legitimately contain members who must not see the op's name, let alone its alert
+    // body — and a push lands on a lock screen, outside the app entirely.
+    //
+    // Mirrors exactly what the reminder job already does for the same population, so
+    // the two cannot drift. operationIsRestricted fails CLOSED (every read fault
+    // returns true), which is the right direction: an unverifiable op is treated as
+    // restricted and the alert text simply is not pushed.
+    const restricted = await operationIsRestricted(operationId);
+
+    // Get all participant user IDs for push notifications. `time_left IS NULL`
+    // keeps departed participants out; REMOVED members are a different hole —
+    // deleteUser soft-deletes without stamping time_left or dropping their
+    // subscriptions, so they stay "active" here and are intersected out at the
+    // choke point inside sendPushToUsers (lib/push.ts).
     const { data: participants } = await supabase
         .from('operation_participants')
         .select('user_id')
@@ -51,7 +110,12 @@ export async function broadcastOperationAlert(operationId: string, message: stri
     const pushPromise = participantIds.length > 0
         ? sendPushToUsers(participantIds, {
             title: 'Operations Alert',
-            body: message,
+            // The routing stays identical either way — only the body is withheld — so a
+            // member who IS cleared taps through and reads the alert through the gated
+            // fetch, exactly as they would have from the notification text.
+            body: restricted
+                ? 'An alert was posted on an operation you are on. Open the dashboard to view.'
+                : message,
             tag: 'high-priority',
             data: { type: 'operation_alert', operationId, url: `/operations` },
             requireInteraction: true,
@@ -135,7 +199,7 @@ export async function broadcastOpChange(operationId: string) {
 // throws PGRST201 "Ambiguous Join" — silently empties the entire ops list.
 // The bang-prefixed FK constraint name forces the direct relationship.
 const OPS_SELECT = `
-    id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
+    id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, discord_start_notice, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
     owner:users!operations_owner_id_fkey(id, name, avatar_url),
     participants:operation_participants(user_id, joined_at, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
     log:operation_log_entries(id, operation_id, entry_type, log_entry, author_id, created_at, uec_amount, cost_category, cost_description, author:users!operation_log_entries_author_id_fkey(id, name, avatar_url)),
@@ -225,7 +289,7 @@ export async function getOperations(user?: User | null): Promise<HydratedOperati
 
     const query = supabase.from('operations').select(OPS_SELECT)
 
-        .order('created_at', { ascending: false }).limit(100);
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(100);
     // PostgREST infers to-one embeds (owner/unit/location) as arrays under explicit
     // column lists; cast through unknown to the relationship-aware row shape the
     // mapper consumes (the mapper still controls what reaches the wire).
@@ -439,9 +503,20 @@ export async function createOperation(opData: CreateOperationInput) {
         // path on `discord_event_id`). The channel ID is captured up-front so
         // we can post the embed once the row exists; the message ID is
         // back-filled by api/actions/operations.ts after the post succeeds.
-        discord_announcement_channel_id: opData.postDiscordAnnouncement && opData.discordAnnouncementChannelId
+        //
+        // SHAPE-CHECKED BEFORE IT IS PERSISTED. This column is caller-supplied and is
+        // later re-read and fired by the T-15 start-notice cron (lib/db/opStartNotices.ts),
+        // so a junk value stored here outlives the request that sent it. DROPPED to null
+        // rather than thrown on: the operation itself is valid and must still be created,
+        // and the handler's own normaliseDiscordSnowflake — which runs after this, on the
+        // announcement — is what tells the operator their channel id was rejected.
+        discord_announcement_channel_id: opData.postDiscordAnnouncement
+            && DISCORD_SNOWFLAKE_RE.test(String(opData.discordAnnouncementChannelId ?? '').trim())
             ? String(opData.discordAnnouncementChannelId).trim()
             : null,
+        // Opt-in to the T-15 "starting soon" Discord notice. Defaults FALSE — an
+        // operation publishes nothing unless somebody ticked the box.
+        discord_start_notice: !!opData.discordStartNotice,
     };
 
     let { data: op, error } = await supabase.from('operations').insert(dbPayload).select('id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, is_special, join_code, clearance_level, is_training, max_participants, unit_id, is_joint, roe, commander_notes, comms_plan, live_status').single();
@@ -493,6 +568,9 @@ export async function createOperation(opData: CreateOperationInput) {
     if (error && (errCode3 === '42703' || errCode3 === 'PGRST204') && dbPayload.discord_announcement_channel_id !== undefined) {
         log.warn('db migration: operations.discord_announcement_channel_id unavailable — retrying without. run migrations/add-operation-discord-announcement.sql', { errCode: errCode3 });
         delete dbPayload.discord_announcement_channel_id;
+        // Both Discord columns land in the same re-apply, so ONE retry covers both —
+        // a second missing-column round-trip for the sibling would be wasted.
+        delete dbPayload.discord_start_notice;
         const retry = await supabase.from('operations').insert(dbPayload).select('id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, is_special, join_code, clearance_level, is_training, max_participants, unit_id, is_joint, roe, commander_notes, comms_plan, live_status').single();
         op = retry.data;
         error = retry.error;
@@ -595,8 +673,13 @@ export async function createOperation(opData: CreateOperationInput) {
         await broadcastOperationUpdate(op.id);
     }
 
-    // Fetch user details for the return object
-    const owner = await getUserById(ownerId);
+    // Display-only hydration for the create RESPONSE: the operation row is already
+    // committed above, so a read fault must not surface as a failed create.
+    // minifyUser(null) falls through to the blank fallbackUser below and the
+    // client's next operation_slice fetch repairs the owner card.
+    let owner: User | null | undefined = null;
+    try { owner = await getUserById(ownerId); }
+    catch (err) { log.warn('owner hydrate failed after create; returning fallback owner card', { ownerId, err }); }
     const fallbackUser: User = {
         id: ownerId,
         name: 'Commander',
@@ -661,7 +744,7 @@ export async function createOperation(opData: CreateOperationInput) {
 
 export async function getFullOperationDetails(operationId: string) {
     const query = supabase.from('operations').select(`
-            id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
+            id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, discord_start_notice, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
             owner:users!operations_owner_id_fkey(id, name, avatar_url),
             participants:operation_participants(user_id, joined_at, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
             log:operation_log_entries(id, operation_id, entry_type, log_entry, author_id, created_at, uec_amount, cost_category, cost_description, author:users!operation_log_entries_author_id_fkey(id, name, avatar_url)),
@@ -689,6 +772,41 @@ export async function getFullOperationDetails(operationId: string) {
         safeFetch(supabase.from('operation_allied_participants').select('operation_id, peer_id, remote_user_handle, display_name, avatar_url, role, ship_text, rsvp_status, is_ready, updated_at').eq('operation_id', operationId), [], 'allied_participants'),
     ]);
 
+    // ORBAT ship seats, in their OWN statement rather than appended to the fan-out
+    // above — and that is a deliberate structural choice, not a style one.
+    //
+    // The order ratchet (tests/listReadOrderRatchet.test.ts) slices a query chain
+    // from `.select(` to the next top-level `;`. Every read in the array above
+    // therefore has a chain that runs to the array's closing `]);`, so a CAPPED
+    // read added to the END of that array appears inside all ten siblings' chains
+    // and makes every one of them read as capped. Those ten are genuinely uncapped
+    // and are carried explicitly in the ratchet's budget; masking them would remove
+    // ten real reads from the absolute rule while looking like an improvement.
+    //
+    // Both of these ARE capped and both end on `id`: the absolute rule needs a
+    // total order, and sort_order is not one.
+    const [shipSlots, slotAssignments] = await Promise.all([
+        safeFetch(supabase.from('operation_ship_slots').select('id, operation_id, parent_slot_id, ship_id, label, seat_role, capacity, sort_order, notes, created_at, updated_at, ship:platform_ships(id, name, image_url)').eq('operation_id', operationId).order('sort_order').order('id').limit(MAX_SLOTS_PER_OPERATION), [], 'ship_slots'),
+        // NO applicant embed and NO assigned_by. The panel resolves a seat holder's
+        // name from the op's own participant roster it is already rendering beside,
+        // so an embed here would be a second identity egress path for the same data;
+        // and "which manager seated whom" is not rendered anywhere, so under rule 1
+        // it does not belong on the wire.
+        safeFetch(supabase.from('operation_slot_assignments').select('id, operation_id, slot_id, user_id, status, user_ship_id, created_at, updated_at').eq('operation_id', operationId).order('id').limit(MAX_SEAT_ASSIGNMENTS_PER_OPERATION), [], 'slot_assignments'),
+    ]);
+
+    // Nest each assignment under its slot so the mapper sees one tree.
+    const assignmentsBySlot = new Map<number, unknown[]>();
+    for (const a of (slotAssignments || []) as Array<{ slot_id?: number }>) {
+        if (typeof a?.slot_id !== 'number') continue;
+        const list = assignmentsBySlot.get(a.slot_id);
+        if (list) list.push(a); else assignmentsBySlot.set(a.slot_id, [a]);
+    }
+    const shipSlotsHydrated = ((shipSlots || []) as Array<{ id?: number }>).map((slot) => ({
+        ...slot,
+        assignments: (typeof slot?.id === 'number' ? assignmentsBySlot.get(slot.id) : undefined) || [],
+    }));
+
     const enriched = {
         ...data,
         phases,
@@ -701,6 +819,7 @@ export async function getFullOperationDetails(operationId: string) {
         operation_locations: additionalLocations,
         allied_orgs: alliedOrgs,
         allied_participants: alliedParticipants,
+        ship_slots: shipSlotsHydrated,
     };
     return toHydratedOperation(enriched as unknown as Parameters<typeof toHydratedOperation>[0]);
 }
@@ -760,7 +879,35 @@ export async function updateOperationDetails(operationId: string, updates: Updat
     if (updates.joinCode !== undefined) dbUpdates.join_code = updates.joinCode;
     if (updates.unitId !== undefined) dbUpdates.unit_id = updates.unitId || null;
     if (updates.locationId !== undefined) dbUpdates.location_id = updates.locationId || null;
-    if (updates.scheduledStart !== undefined) dbUpdates.scheduled_start = updates.scheduledStart || null;
+    if (updates.scheduledStart !== undefined) {
+        dbUpdates.scheduled_start = updates.scheduledStart || null;
+
+        // RE-ARM ON RESCHEDULE. The notice is claimed by stamping
+        // discord_start_notice_sent_at, so moving the start time has to clear the
+        // stamp or the new time passes in silence.
+        //
+        // Compare PARSED INSTANTS, not strings: the client round-trips the value
+        // through a datetime-local input, so '2026-01-01T18:00:00+00:00' and
+        // '2026-01-01T18:00:00Z' are the same moment written two ways, and a string
+        // compare would re-arm on every save that touched nothing.
+        //
+        // AND READ THE ERROR. supabase-js RESOLVES { data: null, error } rather than
+        // throwing, so an unread fault would give before = null against a real
+        // `after` — always unequal — and clear the claim on a transient blip,
+        // re-firing a notice that already went out. Fail CLOSED: if the prior value
+        // cannot be read, leave it claimed. A missed notice is quieter than a
+        // duplicate ping.
+        const { data: currentRow, error: readErr } = await supabase.from('operations')
+            .select('scheduled_start').eq('id', operationId).maybeSingle();
+        if (!readErr) {
+            const before = currentRow?.scheduled_start ? new Date(currentRow.scheduled_start).getTime() : null;
+            const after = updates.scheduledStart ? new Date(String(updates.scheduledStart)).getTime() : null;
+            if (before !== after) dbUpdates.discord_start_notice_sent_at = null;
+        } else {
+            log.warn('start-notice re-arm skipped: could not read the prior scheduled_start', { operationId, code: readErr.code });
+        }
+    }
+    if (updates.discordStartNotice !== undefined) dbUpdates.discord_start_notice = !!updates.discordStartNotice;
     if (updates.scheduledEnd !== undefined) dbUpdates.scheduled_end = updates.scheduledEnd || null;
     if (updates.clearanceLevel !== undefined) dbUpdates.clearance_level = updates.clearanceLevel;
     if (updates.roe !== undefined) dbUpdates.roe = updates.roe;
@@ -786,12 +933,30 @@ export async function updateOperationDetails(operationId: string, updates: Updat
 
     if (Object.keys(dbUpdates).length === 0 && updates.markerIds === undefined) return;
 
-    const { error } = await supabase.from('operations').update(dbUpdates)
+    let { error } = await supabase.from('operations').update(dbUpdates)
         .eq('id', operationId)
         ;
+
+    // Pre-apply tolerance, and NOT optional: OpAdministerTab sends scheduledStart on
+    // EVERY save, so on a database where schema.sql has not been re-run the block
+    // above puts discord_start_notice_sent_at into every update and 42703s the lot.
+    // Degrade to "no start notices", never to "operations cannot be edited".
+    const startNoticeCode = (error as { code?: string } | null)?.code;
+    if (error && (startNoticeCode === '42703' || startNoticeCode === 'PGRST204')
+        && (dbUpdates.discord_start_notice_sent_at !== undefined || dbUpdates.discord_start_notice !== undefined)) {
+        log.warn('operations start-notice columns unavailable — retrying without. re-run schema.sql', { code: startNoticeCode });
+        delete dbUpdates.discord_start_notice_sent_at;
+        delete dbUpdates.discord_start_notice;
+        if (Object.keys(dbUpdates).length > 0) {
+            ({ error } = await supabase.from('operations').update(dbUpdates).eq('id', operationId));
+        } else {
+            error = null;
+        }
+    }
+
     if (!error) {
-        const actor = await getUserById(userId);
-        await logOperationEntry(operationId, 'UPDATE', `${actor?.name || 'Unknown'} updated operation details`, userId);
+        const actorName = await getActorLabel(userId);
+        await logOperationEntry(operationId, 'UPDATE', `${actorName} updated operation details`, userId);
     }
     handleSupabaseError({ error, message: 'Failed to update operation' });
     await broadcastOperationUpdate(operationId);
@@ -809,8 +974,8 @@ export async function updateOperationStatus(operationId: string, status: string,
         .eq('id', operationId)
         ;
     if (!error) {
-        const actor = await getUserById(userId);
-        await logOperationEntry(operationId, 'STATUS_CHANGE', `${actor?.name || 'Unknown'} changed status to ${status}`, userId);
+        const actorName = await getActorLabel(userId);
+        await logOperationEntry(operationId, 'STATUS_CHANGE', `${actorName} changed status to ${status}`, userId);
     }
     handleSupabaseError({ error, message: 'Failed to update operation status' });
 
@@ -824,6 +989,11 @@ export async function updateOperationStatus(operationId: string, status: string,
             live_status: null,
             time_left: now,
         }).eq('operation_id', operationId).is('time_left', null);
+
+        // …which empties the ACTIVE roster the seats panel resolves names against,
+        // so every surviving seat would render as "User #N". This is the COMMON
+        // departure path, not leaveOperation.
+        await clearSeatAssignmentsForOperation(operationId);
 
         // Disconnect participants from radio by clearing their voice channel
         const { data: participants } = await supabase
@@ -909,25 +1079,121 @@ export async function joinOperation(operationId: string, userId: number, joinCod
         }
     }
 
-    const joiner = await getUserById(userId);
-    await logOperationEntry(operationId, 'JOIN', `${joiner?.name || 'Unknown'} joined the operation`, userId);
+    const joinerName = await getActorLabel(userId);
+    await logOperationEntry(operationId, 'JOIN', `${joinerName} joined the operation`, userId);
     await broadcastOperationUpdate(operationId);
 }
 
-export async function leaveOperation(operationId: string, userId: number) {
+/**
+ * Notify a member about something that happened to them inside an operation.
+ *
+ * THE PARTICIPANT PRECONDITION IS THE WHOLE POINT. `assigned_user_id` on a task or a
+ * command node is the CLIENT'S OWN value, round-tripped through the insert — addOperationTask
+ * and addCommandNode write `data.assignedUserId || null` with no existence, participant or
+ * clearance check anywhere on that path. And the gate is weaker than it looks:
+ * `operation:add_task` and `operation:add_command_node` are NOT in
+ * OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS, so anyone holding `operations:create` can create
+ * an operation, own it, and thereby satisfy its `operations:manage` entry. Without this
+ * check they could loop add_task with arbitrary user ids and spray durable notification rows
+ * plus OS web-pushes at the entire org.
+ *
+ * Mirrors updateOperationParticipant's own refusal ("the target must already be a
+ * participant"), which sits a few lines below this.
+ *
+ * Fails CLOSED: a read fault or a non-participant means NO notification.
+ */
+async function notifyOperationAssignment(
+    operationId: string,
+    assigneeId: number | null | undefined,
+    actorId: number,
+    input: { type: string; title: string; body: string },
+): Promise<void> {
+    const uid = Number(assigneeId);
+    if (!Number.isInteger(uid) || uid <= 0 || uid === actorId) return;
+
+    const { data: participant, error } = await supabase.from('operation_participants')
+        .select('user_id').eq('operation_id', operationId).eq('user_id', uid).maybeSingle();
+    if (error || !participant) return;
+
+    await createNotification(uid, {
+        type: input.type,
+        title: input.title,
+        // Generic BY NECESSITY, not by style. Operations carry clearance levels and limiting
+        // markers (assertOpVisibleToUser), and NEITHER a durable notification row NOR an OS
+        // push tray is clearance-filtered at read time. The operation name and the task title
+        // are operation content; they must never ride either.
+        body: input.body,
+        link: 'operations',
+        metadata: { operationId },
+    }).catch(() => { /* best-effort: a notify fault must not fail the write it follows */ });
+}
+
+/** Wrapper for the action handlers that hold the assignee id (tasks, command nodes, seats). */
+export async function notifyOperationAssignee(
+    operationId: string,
+    assigneeId: number | null | undefined,
+    actorId: number,
+    kind: 'task' | 'command' | 'seat',
+): Promise<void> {
+    const input = kind === 'task'
+        ? { type: 'operation_assigned', title: 'New task assignment', body: 'You have been assigned a task in an operation.' }
+        : kind === 'command'
+            ? { type: 'operation_assigned', title: 'Command role assigned', body: 'You have been assigned a command position in an operation.' }
+            // Generic for the same reason as its siblings: neither a notification row
+            // nor an OS push tray is clearance-filtered at read time, so the ship name
+            // and the seat label — both operation content — must not ride either.
+            : { type: 'operation_assigned', title: 'Seat assigned', body: 'You have been assigned a seat in an operation.' };
+    await notifyOperationAssignment(operationId, assigneeId, actorId, input);
+}
+
+/**
+ * Returns TRUE only if a participant row was actually deleted.
+ *
+ * It used to return void, which made it impossible for the caller to tell a real removal
+ * from a no-op delete against a user who was never a participant — so notifying on its
+ * return would have handed any `operations:manage` holder an arbitrary-recipient push
+ * amplifier ("you were removed from an operation" to anyone, repeatedly).
+ */
+export async function leaveOperation(operationId: string, userId: number): Promise<boolean> {
     await verifyOperationAccess(operationId);
 
-    const { error = null } = await supabase.from('operation_participants').delete().eq('operation_id', operationId).eq('user_id', userId);
+    const { data, error = null } = await supabase.from('operation_participants')
+        .delete().eq('operation_id', operationId).eq('user_id', userId).select('user_id');
+    const removed = (((data as { user_id: number }[] | null) || []).length > 0);
+    // A seat that outlives its participant row renders as "User #N" forever — the
+    // panel resolves names from the ACTIVE roster. Best-effort: the departure is
+    // the thing that must succeed.
+    if (removed) await clearSeatAssignmentsForUser(operationId, userId);
     if (!error) {
-        const leaver = await getUserById(userId);
-        await logOperationEntry(operationId, 'LEAVE', `${leaver?.name || 'Unknown'} left the operation`, userId);
+        const leaverName = await getActorLabel(userId);
+        await logOperationEntry(operationId, 'LEAVE', `${leaverName} left the operation`, userId);
     }
     handleSupabaseError({ error, message: 'Failed to leave operation' });
     await broadcastOperationUpdate(operationId);
+    return removed;
+}
+
+/** Notify a member that they were REMOVED from an operation by someone else. */
+export async function notifyOperationRemoval(operationId: string, targetUserId: number, actorId: number): Promise<void> {
+    const uid = Number(targetUserId);
+    if (!Number.isInteger(uid) || uid <= 0 || uid === actorId) return;
+    await createNotification(uid, {
+        type: 'operation_removed',
+        title: 'Removed from an operation',
+        body: 'You were removed from an operation.',
+        link: 'operations',
+        metadata: { operationId },
+    }).catch(() => { /* best-effort */ });
 }
 
 export async function addOperationParticipant(operationId: string, targetUserId: number, adminId: number) {
     await verifyOperationAccess(operationId);
+
+    // Read BEFORE the upsert so a re-add is distinguishable. A faulted read resolves to
+    // "already a participant", i.e. the no-notify answer — fail closed on the amplifier.
+    const { data: priorRow, error: priorErr } = await supabase.from('operation_participants')
+        .select('user_id').eq('operation_id', operationId).eq('user_id', targetUserId).maybeSingle();
+    const wasAlreadyParticipant = !!priorRow || !!priorErr || targetUserId === adminId;
 
     const { error } = await supabase.from('operation_participants').upsert({
         operation_id: operationId,
@@ -935,8 +1201,22 @@ export async function addOperationParticipant(operationId: string, targetUserId:
         attendance_status: 'Registered',
     }, { onConflict: 'operation_id,user_id', ignoreDuplicates: false });
     if (!error) {
-        const [target, admin] = await Promise.all([getUserById(targetUserId), getUserById(adminId)]);
-        await logOperationEntry(operationId, 'ADD_MEMBER', `${target?.name || 'Unknown'} added by ${admin?.name || 'Unknown'}`, adminId);
+        const [targetName, adminName] = await Promise.all([getActorLabel(targetUserId), getActorLabel(adminId)]);
+        await logOperationEntry(operationId, 'ADD_MEMBER', `${targetName} added by ${adminName}`, adminId);
+        // ONLY a genuinely new participant. The upsert above uses ignoreDuplicates:false, so
+        // re-adding an existing participant succeeds every single time — an unconditional
+        // notify here would be a repeatable push amplifier aimed at a caller-supplied member
+        // id. addResponderToRequest guards exactly this and says so in its own comment; this
+        // path is its sibling and had no such guard in the proposal.
+        if (!wasAlreadyParticipant) {
+            await createNotification(targetUserId, {
+                type: 'operation_assigned',
+                title: 'Added to an operation',
+                body: 'A team member added you to an operation.',
+                link: 'operations',
+                metadata: { operationId },
+            }).catch(() => { /* best-effort */ });
+        }
     }
     handleSupabaseError({ error, message: 'Failed to add participant' });
     await broadcastOperationUpdate(operationId);
@@ -1036,9 +1316,9 @@ export async function addOperationCost(
         }
     }
 
-    const actor = await getUserById(userId);
+    const actorName = await getActorLabel(userId);
     const desc = description?.trim() || '';
-    const human = `${actor?.name || 'Unknown'} recorded ${amount} aUEC cost${category ? ` (${category})` : ''}${desc ? `. ${desc}` : ''}`;
+    const human = `${actorName} recorded ${amount} aUEC cost${category ? ` (${category})` : ''}${desc ? `. ${desc}` : ''}`;
     await logOperationEntry(operationId, 'UEC_COST', human, userId, amount, category, desc || undefined);
 
     await broadcastOperationUpdate(operationId);
@@ -1186,8 +1466,8 @@ export async function addOperationUec(operationId: string, amount: number, reaso
 
     const { error } = await supabase.rpc('add_uec_to_operation', { op_id: operationId, amount_to_add: amt });
     if (!error) {
-        const actor = await getUserById(userId);
-        await logOperationEntry(operationId, 'UEC_DEPOSIT', `${actor?.name || 'Unknown'} deposited ${amount} aUEC. Reason: ${reason}`, userId, amount);
+        const actorName = await getActorLabel(userId);
+        await logOperationEntry(operationId, 'UEC_DEPOSIT', `${actorName} deposited ${amount} aUEC. Reason: ${reason}`, userId, amount);
     }
     handleSupabaseError({ error, message: 'Failed to add UEC' });
     await broadcastOperationUpdate(operationId);
@@ -1216,8 +1496,8 @@ export async function updateParticipantLiveStatus(operationId: string, userId: n
         .eq('operation_id', operationId)
         .eq('user_id', userId);
     handleSupabaseError({ error, message: 'Failed to update participant live status' });
-    const actor = await getUserById(userId);
-    await logOperationEntry(operationId, 'STATUS_CHANGE', `${actor?.name || 'Unknown'} set personal status to ${safeStatus}`, userId);
+    const actorName = await getActorLabel(userId);
+    await logOperationEntry(operationId, 'STATUS_CHANGE', `${actorName} set personal status to ${safeStatus}`, userId);
     await broadcastOperationUpdate(operationId);
 }
 
@@ -1260,7 +1540,11 @@ export async function createOperationReminders(operationId: string, scheduledSta
         sent: false
     }));
 
-    await supabase.from('operation_reminders').insert(rows);
+    // Deliberately NOT handleSupabaseError: a reminder-insert failure must not fail
+    // operation:create. Logged, though — a swallowed insert is how "reminders never
+    // fire" stays invisible (see lib/db/opReminders.ts, which delivers these rows).
+    const { error } = await supabase.from('operation_reminders').insert(rows);
+    if (error) log.warn('failed to create operation reminders', { operationId, code: error.code, message: error.message });
 }
 
 export async function updateLiveStatus(operationId: string, liveStatus: string, userId: number) {
@@ -1269,8 +1553,8 @@ export async function updateLiveStatus(operationId: string, liveStatus: string, 
         .eq('id', operationId)
         ;
     handleSupabaseError({ error, message: 'Failed to update live status' });
-    const actor = await getUserById(userId);
-    await logOperationEntry(operationId, 'STATUS_CHANGE', `${actor?.name || 'Unknown'} set live status to ${liveStatus}`, userId);
+    const actorName = await getActorLabel(userId);
+    await logOperationEntry(operationId, 'STATUS_CHANGE', `${actorName} set live status to ${liveStatus}`, userId);
     await broadcastOperationUpdate(operationId);
 }
 
@@ -1499,6 +1783,405 @@ export async function deleteCommandNode(nodeId: number, operationId?: string) {
     handleSupabaseError({ error, message: 'Failed to delete command node' });
 }
 
+
+// =============================================================================
+// Ship slots + seat assignments (ORBAT multi-crew seats / event ship slots)
+// =============================================================================
+// operation_ship_slots = organiser-authored ships (top-level) with named seats
+// (children via parent_slot_id), or flat capacity slots ("Solo Fighters" x10).
+// operation_slot_assignments = who is applied-for / assigned to a slot. Both are
+// op-scoped children and every mutation rides the existing operation_update
+// realtime event — no new channel, no new subset, no new postgres_changes table.
+//
+// THE FAILURE-DIRECTION RULE FOR THIS WHOLE SECTION: every guard below reads the
+// database to decide whether a write is allowed, and every one of them THROWS on a
+// read fault rather than returning a permissive default. Hosted's originals
+// destructure only `count` — so a timeout, a 5xx or a not-yet-applied table makes
+// slotAssignedCount return 0 (capacity check passes for everyone), slotHasChildren
+// return false (seats get nested under a ship holding live assignments, orphaning
+// them) and slotHasAssignments return false (same, from the other side). A
+// precondition whose read fault reads as "satisfied" is not a precondition.
+
+const SHIP_SLOT_COLS = 'id, operation_id, parent_slot_id, ship_id, label, seat_role, capacity, sort_order, notes, created_at, updated_at';
+
+// Ceiling on organiser-authored slots per operation, mirroring MAX_HANGAR_SHIPS
+// (lib/db/fleet.ts). Also the read cap on the detail fan-out below, so the two
+// cannot drift into a state where a slot exists but never renders.
+const MAX_SLOTS_PER_OPERATION = 200;
+// Assignments are bounded by slots × capacity, so this is generous rather than
+// tight — it exists so the detail read is CAPPED at all (the absolute order rule),
+// not to constrain the feature.
+const MAX_SEAT_ASSIGNMENTS_PER_OPERATION = 1000;
+// A member may hold at most this many open APPLICATIONS on one operation. Applying
+// is an operations:view-tier write with one row per (slot, user) — without a
+// ceiling a member could apply to every slot on every op they can see, and each
+// apply/withdraw fires an org-wide operation_update that makes every viewer of
+// that op re-run operation:get_details.
+const MAX_OPEN_APPLICATIONS_PER_OPERATION = 10;
+
+function slotIntOrNull(v: unknown): number | null {
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() ? Number(v.trim()) : NaN);
+    return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function clampSlotCapacity(v: unknown): number {
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isInteger(n) && n >= 1 ? Math.min(n, 500) : 1;
+}
+
+/**
+ * ship_id references the GLOBAL platform_ships catalog, so this is existence-only.
+ * Falsy = no ship reference = allowed.
+ */
+async function assertPlatformShipExists(shipId: unknown, fnName: string): Promise<void> {
+    if (shipId == null || shipId === '' || shipId === 0 || shipId === false) return;
+    const id = slotIntOrNull(shipId);
+    if (!id) throw new SecurityDenial('That ship reference is not valid.', {
+        auditEvent: 'authz.invalid_target', fields: { fnName },
+    });
+    const { data, error } = await supabase.from('platform_ships').select('id').eq('id', id).maybeSingle();
+    handleSupabaseError({ error, message: `${fnName}: failed to verify ship reference` });
+    if (!data) throw new SecurityDenial('That ship reference is not valid.', {
+        auditEvent: 'authz.invalid_target', fields: { fnName, shipId: id },
+    });
+}
+
+/**
+ * Confirm a slot id belongs to THIS operation — the child-of-child BOLA guard.
+ *
+ * `slotId` is an enumerable bigint and every seat mutation is addressed by it, so
+ * without this a caller who can act on ANY operation could aim a seat write at a
+ * slot belonging to an operation they cannot see. Returns capacity so the caller
+ * can enforce it off the same read.
+ */
+async function loadSlotInOp(operationId: string, slotId: unknown, fnName: string): Promise<{ id: number; capacity: number }> {
+    const sid = slotIntOrNull(slotId);
+    if (!sid) throw new SecurityDenial('That slot is not available.', {
+        auditEvent: 'authz.invalid_target', fields: { fnName, operationId },
+    });
+    const { data, error } = await supabase.from('operation_ship_slots')
+        .select('id, capacity').eq('id', sid).eq('operation_id', operationId).maybeSingle();
+    handleSupabaseError({ error, message: `${fnName}: failed to resolve slot` });
+    if (!data) throw new SecurityDenial('That slot is not available.', {
+        auditEvent: 'authz.resource.denied', fields: { fnName, operationId, slotId: sid },
+    });
+    return { id: (data as { id: number }).id, capacity: Number((data as { capacity?: number }).capacity ?? 1) };
+}
+
+/**
+ * Members currently ASSIGNED (not merely applied) to a slot.
+ *
+ * Counts `user_id`, a real column — hosted's sibling participants check counted a
+ * column that does not exist on its table and silently disabled itself, and its
+ * comment says so. Throws on a read fault: a count that degrades to 0 turns the
+ * capacity check into a no-op for every caller.
+ */
+async function slotAssignedCount(slotId: number): Promise<number> {
+    const { count, error } = await supabase.from('operation_slot_assignments')
+        .select('user_id', { count: 'exact', head: true })
+        .eq('slot_id', slotId).eq('status', 'assigned');
+    handleSupabaseError({ error, message: 'Failed to count seat assignments' });
+    return count ?? 0;
+}
+
+/** Does this slot have child seats? Throws on a read fault — see the section note. */
+async function slotHasChildren(slotId: number): Promise<boolean> {
+    const { count, error } = await supabase.from('operation_ship_slots')
+        .select('id', { count: 'exact', head: true }).eq('parent_slot_id', slotId);
+    handleSupabaseError({ error, message: 'Failed to check for child seats' });
+    return (count ?? 0) > 0;
+}
+
+/** Does this slot hold assignments? Throws on a read fault — see the section note. */
+async function slotHasAssignments(slotId: number): Promise<boolean> {
+    const { count, error } = await supabase.from('operation_slot_assignments')
+        .select('id', { count: 'exact', head: true }).eq('slot_id', slotId);
+    handleSupabaseError({ error, message: 'Failed to check for seat assignments' });
+    return (count ?? 0) > 0;
+}
+
+/**
+ * Validate a parent_slot_id: in THIS op, not itself, and TOP-LEVEL.
+ *
+ * The top-level rule does two jobs at once — it caps nesting depth at 2
+ * (ship → seat) and it makes cycles impossible, because once A is a child of B, B
+ * is no longer top-level and so can never be re-parented under A.
+ */
+async function assertValidParentSlot(operationId: string, parentSlotId: unknown, selfSlotId: number | null, fnName: string): Promise<number> {
+    const pid = slotIntOrNull(parentSlotId);
+    if (!pid) throw new SecurityDenial('That ship is not available.', {
+        auditEvent: 'authz.invalid_target', fields: { fnName, operationId },
+    });
+    if (selfSlotId != null && pid === selfSlotId) throw new Error('A slot cannot be its own parent.');
+    const { data, error } = await supabase.from('operation_ship_slots')
+        .select('id, parent_slot_id').eq('id', pid).eq('operation_id', operationId).maybeSingle();
+    handleSupabaseError({ error, message: `${fnName}: failed to resolve parent slot` });
+    if (!data) throw new SecurityDenial('That ship is not available.', {
+        auditEvent: 'authz.resource.denied', fields: { fnName, operationId, parentSlotId: pid },
+    });
+    if ((data as { parent_slot_id?: number | null }).parent_slot_id != null) {
+        throw new Error('Seats can only be added to a ship, not to another seat.');
+    }
+    return pid;
+}
+
+/**
+ * The target must ALREADY be an active participant.
+ *
+ * Hosted instead calls an `ensureParticipant` helper that upserts the row. That is
+ * not portable here: 'operation:add_participant' and 'operation:update_participant'
+ * are deliberately excluded from the op-owner bypass (api/services.ts) precisely so
+ * an owner without operations:manage cannot enroll arbitrary members — and an
+ * assign_slot that writes the participant row is a rename of add_participant that
+ * walks straight around that exclusion. It would also hollow out
+ * notifyOperationAssignment's participant precondition, by creating the row moments
+ * before the notify reads it.
+ *
+ * `if (error || !row)` is written out rather than relying on maybeSingle's null:
+ * this is the port's only new authorization read, and a later refactor to
+ * `.select().limit(1)` would otherwise invert it silently.
+ *
+ * Deliberately STRICTER than updateOperationParticipant's own precondition, which
+ * does not filter time_left. This one does, matching assertOpVisibleToUser's
+ * special-op rule: seating someone who has already left the operation is not a
+ * thing an organiser means to do. The two preconditions now differ on purpose.
+ */
+async function assertIsActiveParticipant(operationId: string, userId: number, fnName: string): Promise<void> {
+    const { data: row, error } = await supabase.from('operation_participants')
+        .select('user_id')
+        .eq('operation_id', operationId).eq('user_id', userId).is('time_left', null)
+        .maybeSingle();
+    if (error || !row) {
+        throw new SecurityDenial('That member is not on this operation.', {
+            auditEvent: 'authz.invalid_target', fields: { fnName, operationId, targetUserId: userId },
+        });
+    }
+}
+
+// --- Slot CRUD (organiser designs ships + seats; operations:manage) ---
+
+export async function addShipSlot(operationId: string, data: Record<string, unknown>) {
+    // A seat's parent must be a top-level ship in THIS op, and a ship that already
+    // holds assigned members cannot gain seats: a slot is EITHER fillable OR a
+    // container of seats, never both, so parent-level assignments can never be
+    // orphaned by seats added later.
+    if (data.parentSlotId) {
+        const pid = await assertValidParentSlot(operationId, data.parentSlotId, null, 'addShipSlot');
+        if (await slotHasAssignments(pid)) throw new Error('Remove assigned members from this ship before adding seats.');
+    }
+    await assertPlatformShipExists(data.shipId, 'addShipSlot');
+
+    const { count, error: countErr } = await supabase.from('operation_ship_slots')
+        .select('id', { count: 'exact', head: true }).eq('operation_id', operationId);
+    handleSupabaseError({ error: countErr, message: 'Failed to count ship slots' });
+    if ((count ?? 0) >= MAX_SLOTS_PER_OPERATION) {
+        throw new Error(`Slot limit reached (max ${MAX_SLOTS_PER_OPERATION} per operation).`);
+    }
+
+    const { data: result, error } = await supabase.from('operation_ship_slots').insert({
+        operation_id: operationId,
+        parent_slot_id: slotIntOrNull(data.parentSlotId),
+        ship_id: slotIntOrNull(data.shipId),
+        // Sanitised, not just trimmed: these are operator free text that renders in
+        // the seats panel. Hosted writes String(...).trim() with no strip and no cap.
+        label: stripHtmlSingleLine(data.label, 80) || 'Slot',
+        seat_role: data.seatRole ? (stripHtmlSingleLine(data.seatRole, 40) || null) : null,
+        capacity: clampSlotCapacity(data.capacity),
+        sort_order: typeof data.sortOrder === 'number' ? data.sortOrder : 0,
+        notes: data.notes ? (stripHtml(data.notes, 500) || null) : null,
+    }).select(SHIP_SLOT_COLS).single();
+    handleSupabaseError({ error, message: 'Failed to add ship slot' });
+    return result;
+}
+
+export async function updateShipSlot(slotId: number, data: Record<string, unknown>, operationId?: string) {
+    if (!operationId) throw new Error('updateShipSlot: operationId is required');
+    if (data.parentSlotId) {
+        await assertValidParentSlot(operationId, data.parentSlotId, slotId, 'updateShipSlot');
+        // A ship that already has seats cannot itself be nested under another ship.
+        if (await slotHasChildren(slotId)) throw new Error('This ship has seats; remove them before nesting it under another ship.');
+    }
+    if (data.shipId !== undefined) await assertPlatformShipExists(data.shipId, 'updateShipSlot');
+    const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (data.parentSlotId !== undefined) updates.parent_slot_id = slotIntOrNull(data.parentSlotId);
+    if (data.shipId !== undefined) updates.ship_id = slotIntOrNull(data.shipId);
+    if (data.label !== undefined) updates.label = stripHtmlSingleLine(data.label, 80) || 'Slot';
+    if (data.seatRole !== undefined) updates.seat_role = data.seatRole ? (stripHtmlSingleLine(data.seatRole, 40) || null) : null;
+    if (data.capacity !== undefined) updates.capacity = clampSlotCapacity(data.capacity);
+    if (data.sortOrder !== undefined) updates.sort_order = typeof data.sortOrder === 'number' ? data.sortOrder : 0;
+    if (data.notes !== undefined) updates.notes = data.notes ? (stripHtml(data.notes, 500) || null) : null;
+    const { error } = await supabase.from('operation_ship_slots').update(updates)
+        .eq('id', slotId).eq('operation_id', operationId);
+    handleSupabaseError({ error, message: 'Failed to update ship slot' });
+}
+
+export async function deleteShipSlot(slotId: number, operationId?: string) {
+    if (!operationId) throw new Error('deleteShipSlot: operationId is required');
+    // Child seats + their assignments cascade via the FKs.
+    const { error } = await supabase.from('operation_ship_slots').delete()
+        .eq('id', slotId).eq('operation_id', operationId);
+    handleSupabaseError({ error, message: 'Failed to delete ship slot' });
+}
+
+// --- Assignment / application (organiser assigns = manage; member applies = view) ---
+
+/**
+ * Organiser seats a member.
+ *
+ * Capacity is checked, not serialised: two concurrent calls can overfill a slot by
+ * the number of concurrent writers. That is a KNOWING divergence from the local
+ * standard — `op_join_participant` (schema.sql) solves the identical problem for
+ * participants with a FOR UPDATE plpgsql function. It is not copied here because a
+ * new plpgsql function carries the explicit `GRANT EXECUTE … TO service_role`
+ * obligation (this file records the REVOKE default but no default grant, so a
+ * partial paste yields 42501), and the overfill is bounded, visible on the roster
+ * and non-security. Revisit if seats ever gate anything.
+ */
+export async function assignSlot(operationId: string, slotId: number, targetUserId: number, actorUserId: number, userShipId?: number) {
+    const slot = await loadSlotInOp(operationId, slotId, 'assignSlot');
+    if (await slotHasChildren(slot.id)) throw new Error('Assign members to a seat, not the ship itself.');
+    await assertIsActiveParticipant(operationId, targetUserId, 'assignSlot');
+    await assertUserShipOwnedBy(userShipId, targetUserId, 'assignSlot');
+
+    const { data: existing, error: existingErr } = await supabase.from('operation_slot_assignments')
+        .select('status').eq('slot_id', slot.id).eq('user_id', targetUserId).maybeSingle();
+    handleSupabaseError({ error: existingErr, message: 'Failed to read seat assignment' });
+    if ((existing as { status?: string } | null)?.status !== 'assigned') {
+        if (await slotAssignedCount(slot.id) >= slot.capacity) throw new Error('This slot is full.');
+    }
+
+    const { error } = await supabase.from('operation_slot_assignments').upsert({
+        operation_id: operationId,
+        slot_id: slot.id,
+        user_id: targetUserId,
+        status: 'assigned',
+        user_ship_id: userShipId || null,
+        assigned_by: actorUserId,
+        updated_at: new Date().toISOString(),
+    }, { onConflict: 'slot_id,user_id', ignoreDuplicates: false });
+    handleSupabaseError({ error, message: 'Failed to assign seat' });
+    await broadcastOpChange(operationId);
+    return { targetUserId };
+}
+
+/**
+ * Member self-applies. `userId` is dispatcher-forced, so this cannot be aimed at
+ * anyone else. Applying does NOT consume capacity — only an 'assigned' row does.
+ */
+export async function applyForSlot(operationId: string, slotId: number, userId: number, userShipId?: number) {
+    const slot = await loadSlotInOp(operationId, slotId, 'applyForSlot');
+    if (await slotHasChildren(slot.id)) throw new Error('Apply to a seat, not the ship itself.');
+    await assertUserShipOwnedBy(userShipId, userId, 'applyForSlot');
+
+    const { data: existing, error: existingErr } = await supabase.from('operation_slot_assignments')
+        .select('status').eq('slot_id', slot.id).eq('user_id', userId).maybeSingle();
+    handleSupabaseError({ error: existingErr, message: 'Failed to read seat assignment' });
+    if ((existing as { status?: string } | null)?.status === 'assigned') return { status: 'assigned' };
+
+    // Ceiling on OPEN applications, checked only when this is a new one. Every
+    // apply fires an org-wide operation_update, so an unbounded applicant is a
+    // fan-out amplifier as well as a row-count one.
+    if (!existing) {
+        const { count, error: countErr } = await supabase.from('operation_slot_assignments')
+            .select('id', { count: 'exact', head: true })
+            .eq('operation_id', operationId).eq('user_id', userId).eq('status', 'applied');
+        handleSupabaseError({ error: countErr, message: 'Failed to count open applications' });
+        if ((count ?? 0) >= MAX_OPEN_APPLICATIONS_PER_OPERATION) {
+            throw new Error(`You already have ${MAX_OPEN_APPLICATIONS_PER_OPERATION} open seat applications on this operation.`);
+        }
+    }
+
+    const { error } = await supabase.from('operation_slot_assignments').upsert({
+        operation_id: operationId,
+        slot_id: slot.id,
+        user_id: userId,
+        status: 'applied',
+        user_ship_id: userShipId || null,
+        updated_at: new Date().toISOString(),
+    }, { onConflict: 'slot_id,user_id', ignoreDuplicates: false });
+    handleSupabaseError({ error, message: 'Failed to apply for seat' });
+    await broadcastOpChange(operationId);
+    return { status: 'applied' };
+}
+
+/**
+ * Organiser approves or declines an APPLICATION.
+ *
+ * The `status === 'applied'` requirement is load-bearing and diverges from hosted,
+ * which only checks that a row exists. Without it `decision: 'deny'` against an
+ * ASSIGNED member deletes their seat — making this action a duplicate of
+ * remove_slot_assignment while carrying a different owner-bypass rule. Deciding an
+ * application and removing a seat holder are now two different things, which is
+ * what lets them be gated differently.
+ */
+export async function decideSlotApplication(operationId: string, slotId: number, targetUserId: number, decision: 'approve' | 'deny', actorUserId: number) {
+    const slot = await loadSlotInOp(operationId, slotId, 'decideSlotApplication');
+    const { data: appRow, error: appErr } = await supabase.from('operation_slot_assignments')
+        .select('status').eq('slot_id', slot.id).eq('user_id', targetUserId).maybeSingle();
+    handleSupabaseError({ error: appErr, message: 'Failed to read seat application' });
+    if (!appRow) throw new Error('No application found for this seat.');
+    if ((appRow as { status?: string }).status !== 'applied') {
+        throw new Error('That member is already seated — remove the assignment instead.');
+    }
+
+    if (decision === 'deny') {
+        const { error } = await supabase.from('operation_slot_assignments').delete()
+            .eq('operation_id', operationId).eq('slot_id', slot.id).eq('user_id', targetUserId);
+        handleSupabaseError({ error, message: 'Failed to decline application' });
+    } else {
+        await assertIsActiveParticipant(operationId, targetUserId, 'decideSlotApplication');
+        if (await slotAssignedCount(slot.id) >= slot.capacity) throw new Error('This slot is full.');
+        const { error } = await supabase.from('operation_slot_assignments')
+            .update({ status: 'assigned', assigned_by: actorUserId, updated_at: new Date().toISOString() })
+            .eq('operation_id', operationId).eq('slot_id', slot.id).eq('user_id', targetUserId);
+        handleSupabaseError({ error, message: 'Failed to approve application' });
+    }
+    await broadcastOpChange(operationId);
+}
+
+/**
+ * Remove a seat assignment or application. An organiser removes anyone
+ * (operations:manage); a member withdraws their own, and the handler passes the
+ * dispatcher-FORCED userId for that — never a client-supplied targetUserId, which
+ * is not in ACTOR_ID_FIELDS and would let one member withdraw another's seat
+ * through the view-tier action.
+ */
+export async function removeSlotAssignment(operationId: string, slotId: number, targetUserId: number) {
+    const slot = await loadSlotInOp(operationId, slotId, 'removeSlotAssignment');
+    const { error } = await supabase.from('operation_slot_assignments').delete()
+        .eq('operation_id', operationId).eq('slot_id', slot.id).eq('user_id', targetUserId);
+    handleSupabaseError({ error, message: 'Failed to remove seat assignment' });
+    await broadcastOpChange(operationId);
+}
+
+/**
+ * Drop a member's seats when they leave, or are removed from, an operation.
+ *
+ * Both exits need it and for the same reason: the panel resolves a seat holder's
+ * name against the op's ACTIVE participants, so a seat outliving its participant
+ * row renders as "User #N" forever. Best-effort by contract — the departure is the
+ * thing that must succeed.
+ */
+export async function clearSeatAssignmentsForUser(operationId: string, userId: number): Promise<void> {
+    const { error } = await supabase.from('operation_slot_assignments')
+        .delete().eq('operation_id', operationId).eq('user_id', userId);
+    if (error) log.warn('failed to clear seat assignments on departure', { operationId, userId, message: error.message });
+}
+
+/**
+ * Drop EVERY seat when an operation concludes.
+ *
+ * updateOperationStatus stamps time_left on every active participant, so after a
+ * conclusion the panel's active-participant lookup is empty and every remaining
+ * seat renders as "User #N". This is the more common path than an individual
+ * departure, and the one hosted's model leaves behind.
+ */
+export async function clearSeatAssignmentsForOperation(operationId: string): Promise<void> {
+    const { error } = await supabase.from('operation_slot_assignments')
+        .delete().eq('operation_id', operationId);
+    if (error) log.warn('failed to clear seat assignments on conclusion', { operationId, message: error.message });
+}
+
 // =============================================================================
 // Board Element CRUD (Tactical Board)
 // =============================================================================
@@ -1660,7 +2343,14 @@ export async function updateLogisticsItem(itemId: number, data: Record<string, u
     if (data.itemName !== undefined) updates.item_name = data.itemName;
     if (data.quantityNeeded !== undefined) updates.quantity_needed = data.quantityNeeded;
     if (data.quantityFulfilled !== undefined) updates.quantity_fulfilled = data.quantityFulfilled;
-    if (data.fulfilledByUserId !== undefined) updates.fulfilled_by_user_id = data.fulfilledByUserId || null;
+    // fulfilled_by_user_id is deliberately NOT writable here. It is an attribution FK
+    // that was taken verbatim from the client-supplied `data` bag: `fulfilledByUserId`
+    // is not in ACTOR_ID_FIELDS (api/services.ts) and the dispatcher's actor-field
+    // overwrite is top-level only — it does not recurse into payload.data — so an
+    // operations:manage holder, or the op's own owner via the api/services.ts owner
+    // bypass (operation:update_logistics is not in OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS),
+    // could attribute a fulfilment to any user. fulfillLogisticsItem() below is the ONLY
+    // writer and derives it from the dispatcher-authenticated actor.
     if (data.category !== undefined) updates.category = data.category;
     if (data.status !== undefined) updates.status = data.status;
     if (data.notes !== undefined) updates.notes = data.notes;

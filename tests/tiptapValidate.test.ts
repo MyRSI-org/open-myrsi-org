@@ -118,6 +118,82 @@ describe('sanitizeTiptapJson — wiki mode', () => {
         expect(srcs.some((s: string) => s.includes('evil'))).toBe(false);
     });
 
+    // @tiptap/extension-youtube stores the pasted URL VERBATIM and only rewrites it at
+    // render time, so `youtu.be/ID` (what the Share button emits), bare
+    // `youtube.com/watch?v=ID` and `m.`/`music.youtube.com` all arrived here off
+    // allow-list and the node was silently DELETED on save — the author's video
+    // vanished with no warning, on wiki pages, legislation and the wiki home blurb
+    // alike. The sanitizer now normalises a recognised share link to its canonical
+    // nocookie embed URL, but ONLY when the src would otherwise be dropped.
+    describe('YouTube share-link normalisation at the write boundary', () => {
+        const ID = 'dQw4w9WgXcQ';
+        const NOCOOKIE = `https://www.youtube-nocookie.com/embed/${ID}`;
+        const doc = (src: string, type = 'youtube') => ({ type: 'doc', content: [{ type, attrs: { src } }] });
+
+        it('a pasted youtu.be share link is normalised, not deleted', () => {
+            const out = sanitizeTiptapJson(doc(`https://youtu.be/${ID}?si=xyz`), 'wiki');
+            expect(out.content).toHaveLength(1);
+            expect(out.content[0].attrs.src).toBe(NOCOOKIE);
+        });
+
+        it('a bare youtube.com/watch link is normalised, not deleted', () => {
+            const out = sanitizeTiptapJson(doc(`https://youtube.com/watch?v=${ID}`), 'wiki');
+            expect(out.content).toHaveLength(1);
+            expect(out.content[0].attrs.src).toBe(NOCOOKIE);
+        });
+
+        it('the same rescue applies to an iframe node carrying a share link', () => {
+            const out = sanitizeTiptapJson(doc(`https://m.youtube.com/watch?v=${ID}`, 'iframe'), 'wiki');
+            expect(out.content).toHaveLength(1);
+            expect(out.content[0].type).toBe('iframe');
+            expect(out.content[0].attrs.src).toBe(NOCOOKIE);
+        });
+
+        // The fix must be MONOTONE: only previously-deleted nodes change. Anything
+        // already allow-listed is stored byte-for-byte as the author wrote it, so no
+        // embed parameter is ever silently dropped from content that works today.
+        it('NEVER rewrites an already-allow-listed src — stored content is byte-identical', () => {
+            for (const src of [
+                'https://www.youtube.com/embed/abc',
+                'https://player.vimeo.com/video/123',
+                `https://www.youtube.com/embed/${ID}?list=PLabc`,
+                `https://www.youtube.com/watch?v=${ID}&list=PLabc`,
+                `https://www.youtube.com/embed/${ID}`,
+                'https://docs.google.com/document/d/x/preview',
+            ]) {
+                const out = sanitizeTiptapJson(doc(src, 'iframe'), 'wiki');
+                expect(out.content).toHaveLength(1);
+                expect(out.content[0].attrs.src).toBe(src);
+            }
+        });
+
+        it('re-saving a stored doc does not drift (idempotent)', () => {
+            const once = sanitizeTiptapJson(doc(`https://youtu.be/${ID}`), 'wiki');
+            expect(sanitizeTiptapJson(once, 'wiki')).toEqual(once);
+        });
+
+        it('normalisation is not an allow-list bypass — a look-alike host is still dropped', () => {
+            for (const src of [
+                `https://www.youtube.com.evil.example/watch?v=${ID}`,
+                `https://www.youtube.com@evil.example/watch?v=${ID}`,
+                `https://evil.example/?u=https://youtu.be/${ID}`,
+                `https://youtu.be.evil.example/${ID}`,
+            ]) {
+                expect(sanitizeTiptapJson(doc(src, 'iframe'), 'wiki').content).toBeUndefined();
+            }
+        });
+
+        it('the safeUrl scheme guard still runs FIRST — a javascript: src never reaches the normaliser', () => {
+            expect(sanitizeTiptapJson(doc('javascript:alert(1)'), 'wiki').content).toBeUndefined();
+            expect(sanitizeTiptapJson(doc('data:text/html,<script>1</script>', 'iframe'), 'wiki').content).toBeUndefined();
+        });
+
+        it('does not smuggle embeds into minimal mode (the only dangerouslySetInnerHTML path)', () => {
+            expect(sanitizeTiptapJson(doc(`https://youtu.be/${ID}`), 'minimal').content).toBeUndefined();
+            expect(sanitizeTiptapJson(doc(`https://youtu.be/${ID}`, 'iframe'), 'minimal').content).toBeUndefined();
+        });
+    });
+
     it('drops a non-https iframe even on an allow-listed host (write-boundary parity with CSP)', () => {
         const input = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'keep' }] }, { type: 'iframe', attrs: { src: 'http://www.youtube.com/embed/abc' } }] };
         const out = sanitizeTiptapJson(input, 'wiki');

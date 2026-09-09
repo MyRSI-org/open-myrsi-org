@@ -1,4 +1,5 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
+import { hardReload } from '../../lib/hardReload';
 
 interface ErrorBoundaryProps {
   children?: ReactNode;
@@ -34,24 +35,9 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
     this.setState({ errorInfo });
   }
 
-  private handleReload = async () => {
-    try {
-      // Unregister all service workers so stale cached modules are cleared
-      if ('serviceWorker' in navigator) {
-        const registrations = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(registrations.map(reg => reg.unregister()));
-      }
-      // Clear all caches (SW cache + Cache API)
-      if ('caches' in window) {
-        const cacheNames = await caches.keys();
-        await Promise.all(cacheNames.map(name => caches.delete(name)));
-      }
-    } catch (e) {
-      console.error('Cache clear failed:', e);
-    }
-    // Force a fresh navigation (not a soft reload)
-    window.location.replace(window.location.href);
-  };
+  // Shared with the other ErrorBoundary and the update banner — a plain reload can be answered
+  // by the service worker from its own cache, landing the user back on the same broken build.
+  private handleReload = () => { void hardReload(); };
 
   render() {
     const { hasError, error, errorInfo } = this.state;

@@ -42,10 +42,12 @@ interface RemoveShipsPayload extends ActorFields {
     userShipIds: number[];
 }
 
-// Members with only fleet:manage_own may mutate ONLY their own ships. Those
-// with fleet:manage (or Admin) operate org-wide → pass undefined (no scoping).
-function fleetOwnScope(user?: { role?: string; permissions?: string[] }, userId?: number): number | undefined {
-    const canManageAll = user?.role === 'Admin' || (Array.isArray(user?.permissions) && user!.permissions!.includes('fleet:manage'));
+// Members with only fleet:manage_own may mutate ONLY their own ships. fleet:manage
+// holders operate org-wide → pass undefined (no scoping). NO ROLE-NAME BYPASS: a
+// permissionless custom role called "Commander" escaped own-ship scoping. Admin and
+// Dispatcher are both seeded with fleet:manage.
+function fleetOwnScope(user?: { permissions?: string[] }, userId?: number): number | undefined {
+    const canManageAll = Array.isArray(user?.permissions) && user!.permissions!.includes('fleet:manage');
     return canManageAll ? undefined : userId;
 }
 

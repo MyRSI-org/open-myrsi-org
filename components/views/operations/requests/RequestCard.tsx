@@ -19,6 +19,7 @@ import SlaBadge from './SlaBadge';
 import ResponderStack from './ResponderStack';
 import { statusAccent, timeAgoShort, reputationAccent } from './requestStyles';
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { isCancellableByClient, isRateableStatus } from '../../../../lib/requestLifecycle';
 
 interface Props {
     request: HydratedServiceRequest;
@@ -128,7 +129,18 @@ const RequestCard: React.FC<Props> = ({
         if (!confirmed) return;
         setLoadingAction('cancel');
         try { await cancelRequest(request.id); }
-        catch (err) { console.error('Failed to cancel', err); }
+        catch (err) {
+            // The server refuses a cancel once the request has been picked up, and a stale tab
+            // reaches that honestly. Swallowing the message into the console left the user
+            // watching a spinner stop with nothing changed and no reason given.
+            console.error('Failed to cancel', err);
+            addToast(
+                'Cancel failed',
+                <i className="fa-solid fa-triangle-exclamation" />,
+                'bg-red-500/10 text-red-400 border-red-500/50',
+                { description: err instanceof Error ? err.message : 'Could not cancel this request.' },
+            );
+        }
         finally { setLoadingAction(null); }
     };
 
@@ -259,7 +271,7 @@ const RequestCard: React.FC<Props> = ({
             </div>
 
             <div className="relative pl-4 pr-3 py-2.5 bg-slate-950/40 border-t border-white/5 flex flex-wrap justify-end gap-2 shrink-0">
-                {isClientOwner && request.status === ServiceRequestStatus.Submitted && (
+                {isClientOwner && isCancellableByClient(request.status) && (
                     <button
                         onClick={handleCancel}
                         disabled={!!loadingAction}
@@ -324,7 +336,7 @@ const RequestCard: React.FC<Props> = ({
                         Complete
                     </button>
                 )}
-                {isClientOwner && hasPermission('request:rate') && request.status === ServiceRequestStatus.Success && !request.rated && (
+                {isClientOwner && hasPermission('request:rate') && isRateableStatus(request.status) && !request.rated && (
                     <button
                         onClick={(e) => { e.stopPropagation(); if (!loadingAction) onRate(request); }}
                         disabled={!!loadingAction}

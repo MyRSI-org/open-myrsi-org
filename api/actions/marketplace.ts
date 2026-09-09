@@ -6,7 +6,7 @@
 // the dispatcher does NOT overwrite (unlike the actor's `userId`).
 
 import * as db from '../../lib/db.js';
-import type { MarketplaceListingType } from '../../types.js';
+import type { MarketplaceListingType, MarketplaceConsiderationInput } from '../../types.js';
 
 // `user` is the dispatcher-injected authenticated actor (full User). Used for
 // warehouse-stock authorization on the listing/delivery paths.
@@ -20,7 +20,7 @@ interface CreateListingPayload extends Actor {
     priceType?: string; location?: string; tags?: string[]; expiresAt?: string | null; warehouseStockId?: number | null;
 }
 interface UpdateListingPayload extends Actor { id: string; updates: Record<string, unknown> }
-interface ProposePayload extends Actor { listingId: string; quantity?: number | null; agreedPriceUec?: number | null; termsNote?: string; milestones?: { title: string; description?: string }[] }
+interface ProposePayload extends Actor { listingId: string; quantity?: number | null; agreedPriceUec?: number | null; termsNote?: string; milestones?: { title: string; description?: string }[]; considerations?: MarketplaceConsiderationInput[] | null }
 interface CancelPayload extends Actor { id: string; reason?: string }
 interface RatePayload extends Actor { id: string; stars: number; feedback?: string }
 interface MilestoneIdPayload extends Actor { milestoneId: number }
@@ -37,8 +37,9 @@ export const marketplaceActions = {
     'marketplace:get_categories': () => db.getMarketplaceCategories(),
     'marketplace:browse': (p: BrowsePayload) => db.browseMarketplaceListings({ kind: p?.kind, listingType: p?.listingType, categoryId: p?.categoryId, search: p?.search }),
     'marketplace:get_listing': ({ id, userId }: ListingIdPayload & Actor) => db.getMarketplaceListing(id, userId),
-    'marketplace:get_rep': ({ targetUserId }: TargetUserPayload) => db.getMarketplaceReputation(targetUserId),
-    'marketplace:get_profile': ({ targetUserId }: TargetUserPayload) => db.getMarketplaceTraderProfile(targetUserId),
+    // `userId` is the dispatcher-forced actor (ACTOR_ID_FIELDS), never payload input —
+    // it decides only whether the caller is looking at their OWN profile.
+    'marketplace:get_profile': ({ targetUserId, userId }: TargetUserPayload & Actor) => db.getMarketplaceTraderProfile(targetUserId, userId),
     'marketplace:get_contract_ratings': ({ id, userId }: ContractIdPayload & Actor) => db.getContractRatings(id, userId),
     'marketplace:report': ({ listingId, contractId, reasonCategory, details, userId }: ReportPayload) =>
         db.reportMarketplace({ listingId, contractId, reasonCategory, details }, userId),
@@ -49,7 +50,10 @@ export const marketplaceActions = {
     'marketplace:delete_listing': ({ id, userId }: UpdateListingPayload) => db.deleteMarketplaceListing(id, userId),
 
     // Contracts (marketplace:contract — party-scoped in the db layer)
-    'marketplace:propose': (p: ProposePayload) => db.proposeMarketplaceContract({ listingId: p.listingId, quantity: p.quantity, agreedPriceUec: p.agreedPriceUec, termsNote: p.termsNote, milestones: p.milestones }, p.userId),
+    // Field-by-field on purpose (it is the actor-forced boundary), which means a new
+    // input field has to be added HERE too or it is silently dropped — the create and
+    // update paths take the whole object, so this is the one that can drift.
+    'marketplace:propose': (p: ProposePayload) => db.proposeMarketplaceContract({ listingId: p.listingId, quantity: p.quantity, agreedPriceUec: p.agreedPriceUec, termsNote: p.termsNote, milestones: p.milestones, considerations: p.considerations }, p.userId),
     'marketplace:accept': ({ id, userId }: ContractIdPayload & Actor) => db.acceptMarketplaceContract(id, userId),
     'marketplace:mark_delivered': ({ id, userId, user }: ContractIdPayload & Actor) => db.markMarketplaceDelivered(id, userId, user),
     'marketplace:confirm_received': ({ id, userId }: ContractIdPayload & Actor) => db.confirmMarketplaceReceived(id, userId),
@@ -58,7 +62,6 @@ export const marketplaceActions = {
     'marketplace:cancel': ({ id, reason, userId, user }: CancelPayload) => db.cancelMarketplaceContract(id, userId, reason, user),
     'marketplace:rate': ({ id, stars, feedback, userId }: RatePayload) => db.rateMarketplaceContract(id, { stars, feedback }, userId),
     'marketplace:my_contracts': ({ userId }: Actor) => db.getMyMarketplaceContracts(userId),
-    'marketplace:get_contract': ({ id, userId }: ContractIdPayload & Actor) => db.getMarketplaceContract(id, userId),
     'marketplace:get_milestones': ({ id, userId }: ContractIdPayload & Actor) => db.getMarketplaceMilestones(id, userId),
     'marketplace:toggle_milestone': ({ milestoneId, userId }: MilestoneIdPayload) => db.toggleMarketplaceMilestone(milestoneId, userId),
     'marketplace:delete_milestone': ({ milestoneId, userId }: MilestoneIdPayload) => db.deleteMarketplaceMilestone(milestoneId, userId),

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useDebouncedValue } from '../../../hooks/useDebouncedValue';
-import type { QmInventoryItem, QmLocation, QmCatalogCategory } from '../../../types';
+import type { QmInventoryItem, QmLocation, QmCatalogCategory, QmArmouryFacets } from '../../../types';
 import { ACCENTS, AccentKey } from '../../shared/ui/accents';
 import { SkeletonCardGrid } from '../../shared/ui/Skeleton';
 import AdjustStockDialog from './AdjustStockDialog';
@@ -17,17 +17,27 @@ const CATEGORY_ACCENT: Record<QmCatalogCategory, AccentKey> = {
 
 const PAGE_SIZE = 60;
 
+// The shape the tab renders before (or instead of) a successful facets fetch.
+// getArmoryFacets soft-fails to this same empty shape server-side, so a missing
+// qm_armoury_facets function costs the DROPDOWNS and nothing else — the armoury
+// itself is a separate read.
+const EMPTY_FACETS: QmArmouryFacets = {
+    categories: [], types: [], sizes: [], manufacturers: [],
+    hasVehicle: false, hasPersonal: false, attributes: {},
+};
+
+const selectCls = 'bg-slate-900 border border-white/10 rounded-lg px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-300 max-w-[12rem]';
+
 interface Props {
     locations: QmLocation[];
     canManage: boolean;
     canRequest: boolean;
     onIssue?: (item: QmInventoryItem) => void;
-    onCreate?: () => void;
     /** Bumped by parent to force a re-fetch (e.g. after a sibling action edited inventory). */
     refreshKey?: number;
 }
 
-export default function QmArmoryTab({ locations, canManage, canRequest, onIssue, onCreate, refreshKey }: Props) {
+export default function QmArmoryTab({ locations, canManage, canRequest, onIssue, refreshKey }: Props) {
     const { rpcAction } = useData();
     const { addToast } = useNotification();
 
@@ -44,15 +54,45 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
 
     const [adjustTarget, setAdjustTarget] = useState<QmInventoryItem | null>(null);
 
+    // Catalog facets. All server-side — a facet filters the JOINED catalog row, which
+    // the browser cannot do over one page of results.
+    const [typeFilter, setTypeFilter] = useState('all');
+    const [sizeFilter, setSizeFilter] = useState('all');
+    const [mfrFilter, setMfrFilter] = useState('all');
+    const [kindFilter, setKindFilter] = useState<'all' | 'vehicle' | 'personal'>('all');
+    const [attrFilters, setAttrFilters] = useState<Record<string, string>>({});
+    const [facets, setFacets] = useState<QmArmouryFacets>(EMPTY_FACETS);
+
     const requestSeqRef = useRef(0);
 
-    // Server-side: location only (catalog category isn't a column on inventory;
-    // we still client-filter by category over the visible page).
+    // EVERY filter is server-side now, including category.
+    //
+    // It used to be client-side over the visible page while totalCount counted the
+    // UNFILTERED set, so picking "weapon" on page 1 of 200 items showed the weapons
+    // among 60 rows above a pager that still claimed 4 pages. The list and the count
+    // take the same payload, so they cannot disagree.
     const filterPayload = useMemo(() => ({
         locationId: locationFilter === 'all' ? null : locationFilter,
         search: debouncedSearch || undefined,
         includeArchived: false,
-    }), [locationFilter, debouncedSearch]);
+        category: categoryFilter === 'all' ? null : categoryFilter,
+        subcategory: typeFilter === 'all' ? null : typeFilter,
+        sizeLabel: sizeFilter === 'all' ? null : sizeFilter,
+        manufacturer: mfrFilter === 'all' ? null : mfrFilter,
+        itemKind: kindFilter === 'all' ? null : kindFilter,
+        attributes: Object.keys(attrFilters).length ? attrFilters : null,
+    }), [locationFilter, debouncedSearch, categoryFilter, typeFilter, sizeFilter, mfrFilter, kindFilter, attrFilters]);
+
+    // Facets describe what is IN STOCK, so they change when stock changes — not when
+    // a filter changes. Deliberately not in filterPayload's dependency list: refetching
+    // the option lists on every dropdown change would make the other dropdowns
+    // reshuffle underneath the operator as they narrow down.
+    const loadFacets = useCallback(async () => {
+        try {
+            const f = await rpcAction('qm:list_inventory_facets', { includeArchived: false });
+            if (f && typeof f === 'object') setFacets({ ...EMPTY_FACETS, ...f });
+        } catch { /* the dropdowns are an affordance, not the data */ }
+    }, [rpcAction]);
 
     const loadCount = useCallback(async () => {
         try {
@@ -100,6 +140,10 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
         void (async () => { await loadCount(); })();
     }, [loadCount, refreshKey]);
 
+    useEffect(() => {
+        void (async () => { await loadFacets(); })();
+    }, [loadFacets, refreshKey]);
+
     const requestItem = async (item: QmInventoryItem) => {
         const qtyStr = window.prompt(`Request how many of "${item.catalog?.name || item.customName}"?`, '1');
         if (qtyStr === null) return;
@@ -137,12 +181,25 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
         }
     };
 
-    // Client-side filter by category (catalog.category isn't on the inventory
-    // row; the join is in the response).
-    const visible = useMemo(() => {
-        if (categoryFilter === 'all') return items;
-        return items.filter((it) => (it.catalog?.category || 'misc') === categoryFilter);
-    }, [items, categoryFilter]);
+    // Branch the empty state on whether a FILTER IS ACTIVE, not on totalCount. The count query
+    // applies the same filters, so once search actually works a term that legitimately matches
+    // nothing drives totalCount to 0 — and the old branch then told the operator they had no
+    // inventory at all, which is the same misleading message the search defect used to produce.
+    const filtersActive = !!debouncedSearch || locationFilter !== 'all' || categoryFilter !== 'all'
+        || typeFilter !== 'all' || sizeFilter !== 'all' || mfrFilter !== 'all' || kindFilter !== 'all'
+        || Object.keys(attrFilters).length > 0;
+
+    const setAttrFilter = (key: string, value: string) => setAttrFilters((prev) => {
+        const next = { ...prev };
+        if (value === 'all') delete next[key]; else next[key] = value;
+        return next;
+    });
+
+    const clearFilters = () => {
+        setCategoryFilter('all'); setLocationFilter('all'); setTypeFilter('all');
+        setSizeFilter('all'); setMfrFilter('all'); setKindFilter('all');
+        setAttrFilters({}); setSearch(''); setPage(0);
+    };
 
     const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
@@ -162,6 +219,56 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
                         </button>
                     ))}
                 </div>
+
+                {/* Facet dropdowns. Each lists only values that stock ACTUALLY HAS, so an
+                    empty list means the org owns nothing with that attribute — the select
+                    is hidden rather than shown empty. */}
+                {facets.types.length > 0 && (
+                    <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} className={selectCls} title="Item type">
+                        <option value="all">All Types</option>
+                        {facets.types.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                )}
+                {facets.sizes.length > 0 && (
+                    <select value={sizeFilter} onChange={(e) => setSizeFilter(e.target.value)} className={selectCls} title="Size">
+                        <option value="all">All Sizes</option>
+                        {facets.sizes.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                )}
+                {facets.manufacturers.length > 0 && (
+                    <select value={mfrFilter} onChange={(e) => setMfrFilter(e.target.value)} className={selectCls} title="Manufacturer">
+                        <option value="all">All Manufacturers</option>
+                        {facets.manufacturers.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                )}
+                {facets.hasVehicle && facets.hasPersonal && (
+                    <select value={kindFilter} onChange={(e) => setKindFilter(e.target.value as 'all' | 'vehicle' | 'personal')} className={selectCls} title="Vehicle or personal">
+                        <option value="all">Vehicle &amp; Personal</option>
+                        <option value="vehicle">Vehicle</option>
+                        <option value="personal">Personal</option>
+                    </select>
+                )}
+                {Object.entries(facets.attributes).map(([key, values]) => (
+                    <select
+                        key={key}
+                        value={attrFilters[key] ?? 'all'}
+                        onChange={(e) => setAttrFilter(key, e.target.value)}
+                        className={selectCls}
+                        title={key}
+                    >
+                        <option value="all">All {key}</option>
+                        {values.map((v) => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                ))}
+
+                {filtersActive && (
+                    <button
+                        onClick={clearFilters}
+                        className="shrink-0 px-3 py-1.5 rounded-lg border border-white/10 bg-slate-900 text-[11px] font-bold uppercase tracking-widest text-slate-400 hover:text-slate-200 transition"
+                    >
+                        <i className="fa-solid fa-filter-circle-xmark mr-1.5" aria-hidden />Clear
+                    </button>
+                )}
 
                 <select
                     value={locationFilter}
@@ -188,25 +295,24 @@ export default function QmArmoryTab({ locations, canManage, canRequest, onIssue,
                 >
                     <i className="fa-solid fa-file-csv" /> Export CSV
                 </button>
-                {onCreate && (
-                    <button
-                        onClick={onCreate}
-                        className="inline-flex items-center gap-2 bg-orange-600 hover:bg-orange-500 text-white px-3 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-widest transition"
-                    >
-                        <i className="fa-solid fa-plus" /> Add Stock
-                    </button>
-                )}
             </div>
 
             {loading && !hasLoadedOnce ? (
                 <SkeletonCardGrid count={9} accent="orange" />
-            ) : visible.length === 0 ? (
+            ) : items.length === 0 ? (
                 <div className="rounded-xl border border-white/5 bg-slate-900/30 p-10 text-center text-slate-500 text-sm">
-                    {totalCount === 0 ? 'No inventory yet. Use "Add Stock" to record some.' : 'No items match the current filters.'}
+                    {filtersActive
+                        ? 'No items match the current filters.'
+                        : canManage
+                            ? 'No inventory yet. Use "Add Stock" to record some.'
+                            // Add Stock is canManage-gated everywhere it appears, so telling a
+                            // qm:view-only member to use it points them at a button that does
+                            // not exist for them.
+                            : 'No inventory recorded yet. A quartermaster can add stock.'}
                 </div>
             ) : (
                 <div className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
-                    {visible.map((it) => {
+                    {items.map((it) => {
                         const cat: QmCatalogCategory = (it.catalog?.category as QmCatalogCategory) || 'misc';
                         const a = ACCENTS[CATEGORY_ACCENT[cat]];
                         const name = it.catalog?.name || it.customName || 'Unnamed';

@@ -19,6 +19,7 @@ import { StatusPill, UrgencyPill, ThreatPill } from './requests/pills';
 import SlaBadge from './requests/SlaBadge';
 import MissionLogTimeline, { MissionLogEntry } from './requests/MissionLogTimeline';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { isCancellableByClient, isRateableStatus } from '../../../lib/requestLifecycle';
 import {
     statusAccent,
     reputationAccent,
@@ -340,9 +341,20 @@ const ServiceRequestDetailView: React.FC<ServiceRequestDetailViewProps> = ({
     const handleAction = useCallback(async (action: () => Promise<void>, actionName: string) => {
         setLoadingAction(actionName);
         try { await action(); }
-        catch (err) { console.error(`Failed to ${actionName}`, err); }
+        catch (err) {
+            // Every lifecycle transition now has a server-side status precondition, so this
+            // catch is the only thing standing between a refused action and a silently
+            // stopped spinner. Show what the server said.
+            console.error(`Failed to ${actionName}`, err);
+            addToast(
+                `Could not ${actionName}`,
+                <i className="fa-solid fa-triangle-exclamation" />,
+                'bg-red-500/10 text-red-400 border-red-500/50',
+                { description: err instanceof Error ? err.message : 'The server refused this action.' },
+            );
+        }
         finally { setLoadingAction(null); }
-    }, []);
+    }, [addToast]);
 
     const handleDelete = async () => {
         const confirmed = await confirm({
@@ -397,8 +409,11 @@ const ServiceRequestDetailView: React.FC<ServiceRequestDetailViewProps> = ({
     const canManageResponders = (hasPermission('request:manage_responders') || hasPermission('request:set_lead') || isLead) && isActiveMission;
     const canUpdate = hasPermission('request:update');
     const canComplete = (hasPermission('request:complete') || isLead) && isActiveMission;
-    const canCancel = isClientOwner && request.status === ServiceRequestStatus.Submitted;
-    const canRate = isClientOwner && hasPermission('request:rate') && request.status === ServiceRequestStatus.Success && !request.rated;
+    // Shared with the server (lib/requestLifecycle.ts) rather than re-derived here. These
+    // two predicates existed in TWO client files and nowhere on the server, which is exactly
+    // how they came to be enforceable only by a disabled attribute.
+    const canCancel = isClientOwner && isCancellableByClient(request.status);
+    const canRate = isClientOwner && hasPermission('request:rate') && isRateableStatus(request.status) && !request.rated;
     const canDelete = hasPermission('request:delete');
 
     /* Keyboard shortcuts */

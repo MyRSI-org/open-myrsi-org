@@ -21,7 +21,13 @@ vi.mock('../lib/auth', () => ({
     signIdentityGrant: () => 'IDENTITY',
     verifyIdentityGrant: () => null,
 }));
-vi.mock('../lib/rsi', () => ({ verifyRsiHandle: async () => true, generateRsiVerificationCode: () => 'MYRSI-test' }));
+// Spread the real module so validators the action layer uses (isValidRsiHandle) stay
+// live; only the outbound proof and the CSPRNG code are stubbed.
+vi.mock('../lib/rsi', async () => ({
+    ...(await vi.importActual<typeof import('../lib/rsi')>('../lib/rsi')),
+    verifyRsiHandle: async () => true,
+    generateRsiVerificationCode: () => 'MYRSI-test',
+}));
 vi.mock('../lib/db/userFilters', () => ({ stripSensitiveUserFields: (u: unknown) => u }));
 const DISCORD_ID = '123456789012345678'; // valid numeric snowflake
 vi.mock('../lib/discord', () => ({
@@ -31,6 +37,10 @@ vi.mock('../lib/discord', () => ({
 }));
 vi.mock('../lib/radio', () => ({}));
 vi.mock('../lib/db', () => ({
+    // auth:discord_callback now runs the ORG BAN GATE above the admin-claim block,
+    // so a banned member cannot burn the one-time setup code. Not banned by default.
+    findActiveBan: async () => null,
+    getBanNotice: async () => null,
     // settings table is only touched by validateClaimCode; validateNote fires when
     // its select reaches the settings lookup, proving the adminExists()
     // short-circuit ran before the code was validated.

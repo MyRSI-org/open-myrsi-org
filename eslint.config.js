@@ -30,6 +30,12 @@ export default [
             '.vite/**',
             // Vite serves /public/ as static assets; not part of the TS compile.
             'public/**',
+            // Agent tooling — saved workflow scripts and local settings. Git-ignored,
+            // never bundled, never imported by the app, so it is outside the boundary
+            // this config exists to enforce. Without the entry a bare `npm run lint`
+            // exits 1 on a saved script's top-level `return` that CI never sees, which
+            // trains everyone to ignore a red gate.
+            '.claude/**',
         ],
     },
 
@@ -293,7 +299,7 @@ export default [
                         '**/lib/secrets', '**/lib/crypto', '**/lib/auth', '**/lib/discord',
                         '**/lib/push', '**/lib/radio', '**/lib/ai', '**/lib/pgrest',
                         '**/lib/ssrf', '**/lib/firstBoot', '**/lib/cronLock', '**/lib/seeder',
-                        '**/lib/supabaseServer', '**/lib/abuseFilter',
+                        '**/lib/supabaseServer', '**/lib/abuseFilter', '**/lib/buildId',
                         '**/api/services', '**/api/query', '**/api/public', '**/api/index', '**/api/sw',
                         '**/api/actions/**',
                     ],

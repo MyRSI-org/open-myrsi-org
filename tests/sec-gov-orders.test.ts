@@ -42,6 +42,7 @@ vi.mock('../lib/db/common', () => {
 });
 
 import { listGovernmentOrders, getGovernmentOrder } from '../lib/db/government/orders';
+import { stripComments } from './stripComments';
 
 // Exactly the keys toGovernmentOrder enumerates — the wire contract.
 const EXPECTED_KEYS = [
@@ -173,5 +174,36 @@ describe('const-indirection wildcard ratchet', () => {
 
     it('lib/db/government/orders.ts contributes 0 wildcard selects (const included)', () => {
         expect(countWildcardSelectsResolvingConsts(ordersSrc)).toBe(0);
+    });
+});
+
+describe('a PUBLISHED executive order cannot be edited by echoing its status', () => {
+    // The guard read `ex.status !== 'draft' && patch.status !== 'active'`, and the
+    // caller controls the second half. Sending `status: 'active'` in the patch
+    // satisfied it for an order in ANY state — active, or even revoked — and every
+    // content field was then applied. So the author of an order that was already in
+    // force could silently rewrite its title, body, preamble, rationale, number and
+    // effective date while it stood, with no re-issuance and nothing in the record
+    // marking that the text had changed. For an instrument whose whole value is that
+    // it says what it said when it was issued, that is the defect that matters.
+    // Comment-stripped, and that is load-bearing here: the fix's own comment QUOTES the
+    // expression it replaced, so scanning the raw file makes the negative assertion
+    // below match the prose that explains it rather than the code.
+    const src = stripComments(readFileSync(resolve(__dirname, '..', 'lib', 'db', 'government', 'orders.ts'), 'utf8'));
+    const fn = src.slice(src.indexOf('export async function updateGovernmentOrder'), src.indexOf('export async function revokeGovernmentOrder'));
+
+    it('the editability gate depends only on the STORED status, never on the patch', () => {
+        expect(fn, 'the caller-controlled escape hatch is back').not.toMatch(/patch\.status !== 'active'/);
+        expect(fn).toMatch(/if \(ex\.status !== 'draft'\)/);
+    });
+
+    it('the draft -> active publish is still its own explicit transition', () => {
+        // Refusing edits must not also break publishing, which is the one thing
+        // patch.status is legitimately for — and only from draft.
+        expect(fn).toMatch(/patch\.status === 'active' && ex\.status === 'draft'/);
+    });
+
+    it('authorship is still checked before anything else', () => {
+        expect(fn.indexOf('Only the author can edit')).toBeLessThan(fn.indexOf("ex.status !== 'draft'"));
     });
 });

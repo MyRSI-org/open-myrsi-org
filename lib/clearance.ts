@@ -6,7 +6,8 @@
 // (client-side filters are cosmetic):
 //   - the item's classification must be at/below the viewer's clearance level, AND
 //   - the viewer must hold EVERY limiting marker attached to the item.
-// Admins (and any caller holding one of `bypassPermissions`) see everything.
+// The org's system Admin (by role IDENTITY — see ClearanceUser.isSystemAdmin) and
+// any caller holding one of `bypassPermissions` see everything.
 //
 // Marker values are compared as strings on both sides (the mappers project both
 // the user's and the item's limiting markers to the same `marker` scalar).
@@ -19,13 +20,25 @@ export interface ClearanceItem {
 export interface ClearanceUser {
     clearanceLevel?: { level?: number } | null;
     limitingMarkers?: unknown[];
-    role?: string;
+    /**
+     * Server-resolved role IDENTITY (lib/db/adminIdentity.ts), stamped on the
+     * session actor by getUserById. `role` is deliberately ABSENT from this
+     * interface: it is an inferred, NAME-derived display tier, so a permissionless
+     * custom role called "Commander" — or literally "admin" in lowercase — cleared
+     * this bypass. It must never re-enter a clearance decision.
+     */
+    isSystemAdmin?: boolean;
     permissions?: string[];
 }
 
+// The Admin half of this bypass is load-bearing and stays: ten wiki call sites pass
+// an EMPTY bypass list (there is no wiki:manage permission), and a freshly seeded
+// Admin is clearance level 0 because users.clearance_level_id is nullable with no
+// default. Only the SOURCE of the admin fact changes — from a forgeable name to an
+// unforgeable role identity. Unstamped ⇒ false ⇒ bypass withheld (fail closed).
 export function canViewAllClassifications(user?: ClearanceUser | null, bypassPermissions: string[] = []): boolean {
     if (!user) return false;
-    if (user.role === 'Admin') return true;
+    if (user.isSystemAdmin === true) return true;
     return Array.isArray(user.permissions) && bypassPermissions.some((p) => user.permissions!.includes(p));
 }
 
@@ -82,8 +95,9 @@ export function filterByClearance<T extends ClearanceItem>(
 // classification level + marker ids verbatim, or a low-clearance author could
 // mislabel content UP to a level they cannot read, or apply a compartment marker
 // they do not hold. Mirrored from the read side: the population that may VIEW all
-// classifications in a domain (Admin, or the domain's `*:manage` bypass) is
-// exactly the population that may CLASSIFY at any level / with any marker.
+// classifications in a domain (the system Admin by role identity, or the domain's
+// `*:manage` bypass) is exactly the population that may CLASSIFY at any level /
+// with any marker.
 // Everyone else is bounded by their own clearance level and held markers.
 //
 // This guards the NEW label. Preventing a *downgrade* of an existing classified
@@ -109,7 +123,8 @@ function heldMarkerIds(user?: ClearanceUser | null): Set<string> {
 
 /**
  * Throws if `user` may not author content at `classificationLevel` with
- * `markerIds`. Admins / `bypassPermissions` holders may classify anything.
+ * `markerIds`. The system Admin (role identity) / `bypassPermissions` holders may
+ * classify anything.
  * Everyone else: the level must be at/below their clearance, and they must
  * hold every applied marker. Fails closed (no user → clearance 0, no markers).
  */

@@ -7,6 +7,8 @@ import {
 import type { Tables } from './rows.js';
 import { supabase, handleSupabaseError, safeFetch, broadcastToOrg, getSystemRoles } from './common.js';
 import { escapeLikePattern } from '../pgrest.js';
+import { isValidRsiHandle } from '../rsi.js';
+import { SecurityDenial } from '../errors.js';
 import { toHydratedApplication, toHRInterviewTemplate, toJobPosting, toHydratedInterview, toMiniUser, toTransferRequest, toPersonnelPosition } from './mappers.js';
 import { logHrPositionChange } from './users.js';
 import { sendPushToUsers } from '../push.js';
@@ -36,6 +38,8 @@ interface CreateHRApplicationPayload {
     discordId?: string;
     userId?: number;
     assignedRecruiterId?: number | null;
+    /** Dispatcher-injected actor (api/services.ts overwrites payload.user unconditionally). */
+    user?: { id?: number; role?: string; permissions?: string[]; rsiHandle?: string };
 }
 interface CreateHRInterviewPayload {
     applicationId: string;
@@ -102,13 +106,92 @@ function broadcastHRUpdate(...slices: HrSlice[]) {
     broadcastToOrg('hr_update', slices.length > 0 ? { slices } : {});
 }
 
+// The permissions that make a ROLE "HR staff". ONE definition, shared by the push
+// fan-out (notifyHRStaff) and the case-officer eligibility lookup below, so the two
+// cannot drift into different notions of who runs HR.
+//
+// NOT derived from, and not the same question as, isHrRecruiter() further down: that
+// is a single-permission predicate on a *requester* ("is this caller a recruiter"),
+// while this is a role-eligibility set ("which roles are HR staff"). Folding them
+// together would conflate a caller check with a role query.
+const HR_STAFF_PERMS = ['hr:recruiter', 'hr:manager', 'hr:admin'] as const;
+
+// Interviewer eligibility is genuinely NARROWER than HR_STAFF_PERMS — an
+// hr:manager-only role assigns case officers but does not run interviews. Kept as
+// its own constant rather than a slice of the above: they answer different questions.
+const HR_INTERVIEWER_PERMS = ['hr:recruiter', 'hr:admin'] as const;
+
+// Same ceiling as the getMainState roster. A three-column projection already filtered
+// to permission-holding roles, so this is a pathological-org backstop, not paging.
+const HR_ELIGIBILITY_SCAN_LIMIT = 1000;
+
+/** The only shape either eligibility RPC returns: enough to render an <option>. */
+export interface EligibleHRMember {
+    id: number;
+    name: string;
+    avatarUrl: string;
+}
+
+/**
+ * Members whose ROLE grants any of `wanted`. Returns only { id, name, avatarUrl } —
+ * the permission arrays are read at the ROLE level and never leave the server. This
+ * exists so the two HR pickers stop filtering the bulk roster by another member's
+ * `permissions[]`, which stripSensitiveUserFields no longer ships to anyone.
+ *
+ * FAIL-CLOSED: both reads use safeFetch with an EMPTY fallback. An empty picker is a
+ * visible, recoverable failure; a widened one is a silent leak.
+ *
+ * Deliberately does NOT force-add the system Admin role the way notifyHRStaff does:
+ * eligibility must track the actual grant, so a hand-pruned Admin role that cannot run
+ * interviews is not offered — exactly what the client-side filter it replaces did.
+ */
+async function getEligibleHRMembers(wanted: readonly string[]): Promise<EligibleHRMember[]> {
+    const roleRows = await safeFetch(
+        supabase.from('role_permissions')
+            .select('role_id, permission:permissions!inner(name)')
+            .in('permission.name', [...wanted]),
+        [] as Array<{ role_id: number; permission: { name: string }[] }>,
+        'HR eligibility role lookup failed',
+    );
+    const roleIds = [...new Set(roleRows.map((r) => r.role_id))];
+    if (roleIds.length === 0) return [];
+
+    const rows = await safeFetch(
+        supabase.from('users')
+            .select('id, name, display_name, avatar_url')
+            .in('role_id', roleIds)
+            .is('deleted_at', null)
+            .order('name', { ascending: true }).order('id', { ascending: true })
+            .limit(HR_ELIGIBILITY_SCAN_LIMIT),
+        [] as Array<{ id: number; name: string | null; display_name: string | null; avatar_url: string | null }>,
+        'HR eligibility member lookup failed',
+    );
+    if (rows.length === HR_ELIGIBILITY_SCAN_LIMIT) {
+        log.warn('HR eligibility list hit the scan cap — some eligible members are not offered', { cap: HR_ELIGIBILITY_SCAN_LIMIT });
+    }
+    // Effective display name, matching toUser (lib/db/mappers.ts) so the picker shows
+    // what the roster used to show; the avatar falls back the same way.
+    return rows.map((u) => ({
+        id: u.id,
+        name: (u.display_name && u.display_name.trim()) ? u.display_name.trim() : (u.name || 'Unknown'),
+        avatarUrl: u.avatar_url || 'https://cdn.discordapp.com/embed/avatars/0.png',
+    }));
+}
+
+/** Lead-interviewer / panel picker source. Gated at hr:recruiter (the create/update
+ *  interview save gate) — never at hr:view, which every seeded Member holds. */
+export const getEligibleHRInterviewers = (): Promise<EligibleHRMember[]> => getEligibleHRMembers(HR_INTERVIEWER_PERMS);
+
+/** Case-officer picker source. Gated at hr:manager, matching hr:assign_recruiter. */
+export const getEligibleHROfficers = (): Promise<EligibleHRMember[]> => getEligibleHRMembers(HR_STAFF_PERMS);
+
 // Helper to notify HR staff
 async function notifyHRStaff(title: string, body: string, data: Record<string, unknown>) {
     // Find roles that have HR permissions
     const { data: roles } = await supabase
         .from('role_permissions')
         .select('role_id, permission:permissions!inner(name)')
-        .in('permission.name', ['hr:recruiter', 'hr:manager', 'hr:admin']);
+        .in('permission.name', [...HR_STAFF_PERMS]);
 
     const roleIds = new Set<number>();
     roles?.forEach((r: { role_id: number }) => roleIds.add(r.role_id));
@@ -147,7 +230,7 @@ export async function getHRApplications(): Promise<HydratedHRApplication[]> {
             assignedRecruiter:users!hr_applications_assigned_recruiter_id_fkey(id, name, avatar_url, role_id, rsi_handle)
         `);
 
-    query = query.order('created_at', { ascending: false }).limit(200);
+    query = query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(200);
     const data = await safeFetch<Parameters<typeof toHydratedApplication>[0][]>(
         query as unknown as PromiseLike<{ data: Parameters<typeof toHydratedApplication>[0][] | null; error: { code?: string; message?: string; hint?: string; details?: string } | null }>,
         [],
@@ -221,7 +304,7 @@ export async function getAllHRInterviews(): Promise<HydratedHRInterview[]> {
             ${applicationJoin}
         `);
 
-    query = query.order('scheduled_at', { ascending: true }).limit(100);
+    query = query.order('scheduled_at', { ascending: true }).order('id', { ascending: true }).limit(100);
 
     const data = await safeFetch<InterviewQueryRow[]>(
         query as unknown as PromiseLike<{ data: InterviewQueryRow[] | null; error: { code?: string; message?: string; hint?: string; details?: string } | null }>,
@@ -279,6 +362,38 @@ export async function createHRApplication(payload: CreateHRApplicationPayload) {
     if (payload.notes && payload.notes.length > MAX_APPLICATION_TEXT) {
         throw new Error('Statement is too long.');
     }
+    // Shape-check before the handle reaches an `.ilike()` identity lookup — a value
+    // carrying LIKE metacharacters is a wildcard, not a name. Fails closed on any
+    // pre-existing handle holding a space/dot (an /api/admin/import-stream arrival):
+    // that user cannot file until their handle is normalised.
+    if (!isValidRsiHandle(payload.rsiHandle)) {
+        throw new Error('That is not a valid RSI handle.');
+    }
+    // SELF-SCOPE. user:submit_application is gated on the `user:manage:self`
+    // pseudo-perm (api/services.ts), which short-circuits the permission check
+    // entirely — i.e. ANY valid session, Client included. Without this guard anyone
+    // could file for ANY roster handle, and the row that lands is not inert: it
+    // carries linked_user_id, which drives the Client->Member auto-promotion in
+    // updateApplicationStatus on Hired AND the referral_source-keyed cascade in
+    // deleteHRApplication, so an HR admin's ordinary approve/tidy-up mutates or
+    // destroys the VICTIM's account and pending transfer/job applications. The
+    // lookup below also hands back that user's discord_id.
+    // Recruiter tier may file for anyone (AddProspectModal routes HR staff's
+    // legitimate file-for-a-prospect flow through THIS action, not the
+    // hr:recruiter-gated twin); everyone else may file only for their OWN handle,
+    // which is what ClientApplyModal / RequestClearanceModal already send.
+    // payload.user is safe to trust: the dispatcher overwrites it with the
+    // authenticated user before the handler runs, so a forged actor is destroyed.
+    if (!isHrRecruiter(payload.user)) {
+        const own = payload.user?.rsiHandle;
+        if (!isValidRsiHandle(own) || own.trim().toLowerCase() !== payload.rsiHandle.trim().toLowerCase()) {
+            throw new SecurityDenial('You can only file an application for your own RSI handle.', {
+                auditEvent: 'authz.self_scope.denied',
+                fields: { userId: payload.userId },
+            });
+        }
+    }
+
     // 1. Check if RSI Handle belongs to a registered user
     const userQuery = supabase.from('users').select('id, discord_id, name').ilike('rsi_handle', escapeLikePattern(payload.rsiHandle));
 
@@ -1007,7 +1122,7 @@ export async function deletePersonnelPosition(id: number) {
 // The full ATS (recruiter notes, vetting data, interview scores/notes/
 // responses, applicant Discord IDs, transfer admin notes) is recruiter-grade.
 // The seeded Member role holds the base `hr:view` perm; it must NOT receive
-// case-file internals. Redact unless the caller is Admin or holds hr:recruiter.
+// case-file internals. Redact unless the caller holds hr:recruiter.
 // Job board (jobs/positions/templates) + basic application status stay visible
 // at hr:view.
 //
@@ -1016,9 +1131,29 @@ export async function deletePersonnelPosition(id: number) {
 // ONE redaction source of truth — a slice endpoint that skipped these would
 // re-leak the redacted fields.
 
-export function isHrRecruiter(requester?: { role?: string; permissions?: string[] } | null): boolean {
-    return requester?.role === 'Admin'
-        || (Array.isArray(requester?.permissions) && requester!.permissions!.includes('hr:recruiter'));
+// NO ROLE-NAME BYPASS: this used to read `requester?.role === 'Admin' || …`, and
+// `role` is inferred from the role row's free-text NAME (lib/db/mappers.ts), so a
+// permissionless custom role called "Commander" read every case file — through the
+// bundle, the three redacting hr_* slices AND the file-an-application write gate.
+// Admin and Dispatcher are both seeded with hr:recruiter, so the permission alone
+// takes nothing away.
+export function isHrRecruiter(requester?: { permissions?: string[] } | null): boolean {
+    return Array.isArray(requester?.permissions) && requester!.permissions!.includes('hr:recruiter');
+}
+
+/**
+ * HR STAFF — the wider set, for reads whose audience is "the people who run HR"
+ * rather than "the people who run recruitment".
+ *
+ * Transfers are the case in point. isHrRecruiter is hr:recruiter ALONE, so scoping
+ * the transfer list on it would hide every transfer from an hr:manager or hr:admin —
+ * both unambiguously HR staff, and hr:manager is the permission the case-file view
+ * checks for its own controls. Uses the same HR_STAFF_PERMS list the notification
+ * fan-out and the case-officer picker use, so "who runs HR" has one definition.
+ */
+export function isHrStaff(requester?: { permissions?: string[] } | null): boolean {
+    const perms = Array.isArray(requester?.permissions) ? requester!.permissions! : [];
+    return HR_STAFF_PERMS.some((p) => perms.includes(p));
 }
 
 // Empty-but-shape-correct stand-ins for the identity relations that the
@@ -1076,14 +1211,41 @@ export function redactInterviewsForViewer(interviews: HydratedHRInterview[], rec
     return recruiter ? interviews : interviews.map(redactInterview);
 }
 
-export function redactTransfersForViewer<T extends { reason?: string; adminNotes?: string }>(transfers: T[], recruiter: boolean): T[] {
-    return recruiter ? transfers : transfers.map((t) => ({ ...t, reason: '', adminNotes: undefined }));
+/**
+ * PROJECTION, not redaction, for a non-recruiter.
+ *
+ * Blanking `reason` and `adminNotes` left everything that actually identifies the
+ * request: WHO asked (the `user` embed carries name, avatar and rsi_handle), which
+ * unit they are in, which unit they want, and the current status. So every
+ * `hr:view` holder — a permission the seeded Member role carries — received the
+ * complete internal-mobility picture of the whole org: who is trying to leave which
+ * unit, and whether it was approved. The two free-text fields were the least of it.
+ *
+ * A non-recruiter is scoped to their OWN rows instead, which is exactly what the
+ * non-recruiter UI renders anyway (MyTransfersTab filters to self) — so this closes
+ * the read without changing a single screen. `viewerId` is the dispatcher-resolved
+ * caller; an absent one yields nothing, which is the deny direction.
+ *
+ * `adminNotes` is still stripped from the rows a non-recruiter DOES get — that is the
+ * reviewing officer's private note, and it is private on your own request too.
+ * `reason` is NOT stripped any more: on your own row it is text you wrote yourself,
+ * and blanking it made the member's own transfer tab show an empty field.
+ */
+export function redactTransfersForViewer<T extends { userId?: number; reason?: string; adminNotes?: string }>(
+    transfers: T[], recruiter: boolean, viewerId?: number,
+): T[] {
+    if (recruiter) return transfers;
+    const vid = Number(viewerId);
+    if (!Number.isFinite(vid) || vid <= 0) return [];
+    return transfers
+        .filter((t) => Number(t.userId) === vid)
+        .map((t) => ({ ...t, adminNotes: undefined }));
 }
 
 /** Transfers array producer — shared by getHRState and the hr_transfers
  *  realtime slice subset. */
 export async function getTransferRequests() {
-    const transferQuery = supabase.from('hr_transfer_requests').select('id, user_id, current_unit_id, target_unit_id, reason, status, admin_notes, created_at, updated_at, user:users!hr_transfer_requests_user_id_fkey(id, name, avatar_url, role_id, rsi_handle), targetUnit:units!hr_transfer_requests_target_unit_id_fkey(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted)').order('created_at', { ascending: false }).limit(100);
+    const transferQuery = supabase.from('hr_transfer_requests').select('id, user_id, current_unit_id, target_unit_id, reason, status, admin_notes, created_at, updated_at, user:users!hr_transfer_requests_user_id_fkey(id, name, avatar_url, role_id, rsi_handle), targetUnit:units!hr_transfer_requests_target_unit_id_fkey(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted)').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(100);
     type TransferRow = Parameters<typeof toTransferRequest>[0];
     const transfers = await safeFetch<TransferRow[]>(
         transferQuery as unknown as PromiseLike<{ data: TransferRow[] | null; error: { code?: string; message?: string; hint?: string; details?: string } | null }>,
@@ -1093,7 +1255,7 @@ export async function getTransferRequests() {
     return transfers.map(toTransferRequest);
 }
 
-export async function getHRState(requester?: { role?: string; permissions?: string[] } | null) {
+export async function getHRState(requester?: { id?: number; role?: string; permissions?: string[] } | null) {
     const [applicants, interviews, templates, jobs, safeTransfers, positions] = await Promise.all([
         getHRApplications(),
         getAllHRInterviews(),
@@ -1110,7 +1272,8 @@ export async function getHRState(requester?: { role?: string; permissions?: stri
             interviews: redactInterviewsForViewer(interviews, recruiter),
             templates,
             jobs,
-            transfers: redactTransfersForViewer(safeTransfers, recruiter),
+            // Transfers use the WIDER staff predicate — see isHrStaff.
+            transfers: redactTransfersForViewer(safeTransfers, isHrStaff(requester), requester?.id),
             positions,
         },
     };

@@ -3,6 +3,7 @@ import {
     OperationType, TaskPriority,
     OperationTemplatePayload, OperationTemplatePhase, OperationTemplateMilestone, OperationTemplateTask,
 } from '../../types';
+import { isSyncRestrictedWithheld } from '../../lib/markerSyncVisibility';
 import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
 import { useConfig } from '../../contexts/ConfigContext';
@@ -78,6 +79,7 @@ interface WizardState {
     // from the guild's text/announcement channels; org default pre-selects.
     postDiscordAnnouncement: boolean;
     discordAnnouncementChannelId: string;
+    discordStartNotice: boolean;
 }
 
 type Action =
@@ -132,6 +134,8 @@ const initialState: WizardState = {
     createDiscordEvent: false,
     postDiscordAnnouncement: false,
     discordAnnouncementChannelId: '',
+    // Defaults OFF. Publishing to a Discord channel is a deliberate act.
+    discordStartNotice: false,
 };
 
 function reducer(state: WizardState, action: Action): WizardState {
@@ -351,6 +355,7 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
                 createDiscordEvent: state.createDiscordEvent,
                 postDiscordAnnouncement: state.postDiscordAnnouncement,
                 discordAnnouncementChannelId: state.postDiscordAnnouncement ? state.discordAnnouncementChannelId : undefined,
+                discordStartNotice: state.discordStartNotice,
                 // Pass either the picked template ID OR the inline phases payload.
                 // Inline phases take precedence — a user who applied a template and
                 // then edited the tree expects their edits to persist.
@@ -886,6 +891,17 @@ const SecurityStep: React.FC<{
                             ))}
                         </div>
                     )}
+                    {isSyncRestrictedWithheld(limitingMarkers) && (
+                        // Owner decision D10 put `syncRestricted` behind admin:access, so the
+                        // "Sync Restricted" chips above never render for an ops planner. Saying
+                        // nothing would read as "no marker here blocks sharing"; this says the
+                        // truth, which is that the planner is not shown which ones do. The
+                        // restriction is still enforced server-side against the DB column
+                        // (lib/db/operations-federation.ts) whether or not it is labelled here.
+                        <p className="text-[10px] text-slate-500 italic mt-1">
+                            Joint Operation sharing restrictions are not shown at your permission level.
+                        </p>
+                    )}
                 </div>
             </div>
         </div>
@@ -977,6 +993,26 @@ const SecurityStep: React.FC<{
                                 <p className="text-[10px] text-slate-500 italic">Pre-selected from your org's default announcement channel.</p>
                             )}
                         </div>
+                    )}
+
+                    <Switch
+                        label="Post a 15-minute warning"
+                        hint="Posts a short 'starting soon' notice to the announcement channel 15 minutes before the scheduled start. No reactions, no ping. Changing the start time re-arms it."
+                        checked={state.discordStartNotice}
+                        onChange={v => dispatch({ type: 'set', key: 'discordStartNotice', value: v })}
+                        accent="discord"
+                        disabled={disabled}
+                        className="mt-4"
+                    />
+                    {state.discordStartNotice && !state.postDiscordAnnouncement && (
+                        // The notice posts ONLY to the operation's own announcement
+                        // channel — there is no org-wide fallback — so without the
+                        // announcement above it has nowhere to go. Say so here rather
+                        // than letting the operator find out by nothing happening.
+                        <p className="mt-2 text-[11px] text-amber-400 italic">
+                            Turn on &ldquo;Post Announcement Embed&rdquo; and pick a channel — the warning posts to that
+                            channel, and has nowhere to go without it.
+                        </p>
                     )}
                 </div>
             )}

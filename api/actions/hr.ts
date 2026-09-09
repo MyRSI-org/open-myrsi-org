@@ -256,4 +256,21 @@ export const hrActions = {
     // (no longer shipped in the bulk getHRApplications list). Recruiter-gated.
     'hr:get_application_data': ({ id }: { id: string }) => db.getApplicationVettingData(id),
     'hr:process_job_approval': ({ applicationId }: ProcessJobApprovalPayload) => db.processJobApproval(applicationId),
+    // The two HR pickers' data source. They exist so ScheduleInterviewModal and
+    // UnifiedCaseFileView stop filtering the bulk roster by another member's
+    // `permissions[]` — stripSensitiveUserFields no longer ships that to anyone.
+    //
+    // ZERO-ARGUMENT BY DESIGN: no client-supplied `scope` string reaches the
+    // permission lookup, so there is no prototype-pollution surface to defend, and
+    // fullPermissionMap (one permission per action) can express the two scopes'
+    // genuinely different entitlements. Both return { id, name, avatarUrl } only.
+    //
+    // REQUIRED fullPermissionMap entries in api/services.ts ('hr:' is a
+    // PROTECTED_PREFIX, so a missing entry is a hard 403):
+    //   'hr:get_eligible_interviewers': 'hr:recruiter'   (matches hr:create_interview)
+    //   'hr:get_eligible_officers':     'hr:manager'     (matches hr:assign_recruiter)
+    // NEVER widen either to 'hr:view' — that is a MEMBER_DEFAULT_PERMS entry, so it
+    // would hand every ordinary member an enumeration of the org's HR staff.
+    'hr:get_eligible_interviewers': () => db.getEligibleHRInterviewers(),
+    'hr:get_eligible_officers': () => db.getEligibleHROfficers(),
 };

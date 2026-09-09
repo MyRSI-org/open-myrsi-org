@@ -62,7 +62,17 @@ interface DeleteLocationPayload {
     locationId: number;
 }
 
-interface ListInventoryPayload {
+/** Catalog facets, shared by the list and the count so the two cannot drift. */
+interface InventoryFacetFields {
+    category?: unknown;
+    subcategory?: unknown;
+    sizeLabel?: unknown;
+    manufacturer?: unknown;
+    itemKind?: unknown;
+    attributes?: unknown;
+}
+
+interface ListInventoryPayload extends InventoryFacetFields {
     includeArchived?: boolean;
     locationId?: number | string | null;
     catalogId?: number | string | null;
@@ -71,11 +81,59 @@ interface ListInventoryPayload {
     offset?: number;
 }
 
-interface CountInventoryPayload {
+interface CountInventoryPayload extends InventoryFacetFields {
     includeArchived?: boolean;
     locationId?: number | string | null;
     catalogId?: number | string | null;
     search?: string;
+}
+
+const QM_CATEGORIES: readonly string[] = ['weapon', 'armor', 'component', 'consumable', 'misc'];
+
+/** Bounded free-text facet value. Null for anything that is not a usable string. */
+function facetStr(v: unknown, max = 80): string | null {
+    if (typeof v !== 'string') return null;
+    const t = v.trim();
+    return t ? t.slice(0, max) : null;
+}
+
+function facetCategory(v: unknown): QmCatalogCategory | null {
+    const s = facetStr(v, 20);
+    return s && QM_CATEGORIES.includes(s) ? (s as QmCatalogCategory) : null;
+}
+
+function facetKind(v: unknown): 'vehicle' | 'personal' | null {
+    return v === 'vehicle' || v === 'personal' ? v : null;
+}
+
+/**
+ * Attribute facets, validated against the SERVER's allowlist.
+ *
+ * The keys land in a PostgREST `@>` containment filter against a JSONB column, so an
+ * arbitrary caller-chosen key would let anyone probe for any attribute the catalogue
+ * happens to carry — and would make the facet surface unbounded regardless of what
+ * the ingest writes. Values are length-capped for the same reason.
+ */
+function facetAttributes(v: unknown): Record<string, string> | null {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const out: Record<string, string> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if (!(db.FACETABLE_ATTR_KEYS as readonly string[]).includes(k)) continue;
+        const s = facetStr(val, 60);
+        if (s) out[k] = s;
+    }
+    return Object.keys(out).length ? out : null;
+}
+
+function facetOptsFrom(p: InventoryFacetFields) {
+    return {
+        category: facetCategory(p.category),
+        subcategory: facetStr(p.subcategory),
+        sizeLabel: facetStr(p.sizeLabel, 20),
+        manufacturer: facetStr(p.manufacturer),
+        itemKind: facetKind(p.itemKind),
+        attributes: facetAttributes(p.attributes),
+    };
 }
 
 interface CreateInventoryPayload {
@@ -101,6 +159,14 @@ interface AdjustInventoryPayload {
     userId: number;
     inventoryId: number;
     delta: number;
+    reason: 'adjust' | 'loss' | 'destruction';
+    notes?: string | null;
+}
+
+interface SetInventoryTotalPayload {
+    userId: number;
+    inventoryId: number;
+    targetTotal: number;
     reason: 'adjust' | 'loss' | 'destruction';
     notes?: string | null;
 }
@@ -221,7 +287,11 @@ export const quartermasterActions = {
         db.getQmLocationById(locationId),
 
     // --- INVENTORY ---
-    'qm:list_inventory': async ({ includeArchived, locationId, catalogId, search, limit, offset }: ListInventoryPayload) =>
+    // The list and the count MUST parse facets through the same helper. They are two
+    // separate queries backing one screen, and a filter applied to only one of them
+    // shows a page of N rows above a pager that claims a different total — which is
+    // how the original search defect surfaced as "No inventory yet".
+    'qm:list_inventory': async ({ includeArchived, locationId, catalogId, search, limit, offset, ...facets }: ListInventoryPayload) =>
         db.listInventory({
             includeArchived: !!includeArchived,
             locationId: locationId != null ? Number(locationId) : null,
@@ -229,15 +299,21 @@ export const quartermasterActions = {
             search: typeof search === 'string' ? search : undefined,
             limit: typeof limit === 'number' ? limit : undefined,
             offset: typeof offset === 'number' ? offset : undefined,
+            ...facetOptsFrom(facets),
         }),
 
-    'qm:count_inventory': async ({ includeArchived, locationId, catalogId, search }: CountInventoryPayload) =>
+    'qm:count_inventory': async ({ includeArchived, locationId, catalogId, search, ...facets }: CountInventoryPayload) =>
         db.listInventoryCount({
             includeArchived: !!includeArchived,
             locationId: locationId != null ? Number(locationId) : null,
             catalogId: catalogId != null ? Number(catalogId) : null,
             search: typeof search === 'string' ? search : undefined,
+            ...facetOptsFrom(facets),
         }),
+
+    /** Filter options, derived from stock that actually exists. */
+    'qm:list_inventory_facets': async ({ includeArchived }: { includeArchived?: boolean }) =>
+        db.getArmoryFacets({ includeArchived: !!includeArchived }),
 
     'qm:create_inventory': async ({ userId, catalogId, customName, locationId, condition, initialQuantity, notes }: CreateInventoryPayload) =>
         db.createInventoryItem(userId, { catalogId, customName, locationId, condition, initialQuantity, notes }),
@@ -247,6 +323,11 @@ export const quartermasterActions = {
 
     'qm:adjust_inventory': async ({ userId, inventoryId, delta, reason, notes }: AdjustInventoryPayload) =>
         db.adjustInventoryStock(userId, { inventoryId, delta, reason, notes }),
+
+    // Absolute set-total. Distinct from adjust_inventory because the arithmetic must
+    // happen server-side under the row lock — see db.setInventoryTotal.
+    'qm:set_inventory_total': async ({ userId, inventoryId, targetTotal, reason, notes }: SetInventoryTotalPayload) =>
+        db.setInventoryTotal(userId, { inventoryId, targetTotal, reason, notes }),
 
     // --- ISSUANCES ---
     'qm:list_issuances': async ({ status, userIdFilter, inventoryId, limit }: ListIssuancesPayload) =>

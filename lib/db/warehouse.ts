@@ -1,7 +1,9 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
 import { log as baseLog } from '../log.js';
+import { MAX_STOCK_TOTAL } from '../stockLimits.js';
+import { filterContractIdsForParty } from './marketplace.js';
 import { toWarehousePlatformCommodity, toWarehousePlatformCategory } from './mappers.js';
-import { safeSearchTerm, clampListOffset } from '../pgrest.js';
+import { safeSearchTerm, clampListOffset, escapeLikePattern } from '../pgrest.js';
 import { stripHtml, stripHtmlSingleLine } from '../textSanitize.js';
 import type { Tables } from './rows.js';
 import {
@@ -75,8 +77,29 @@ function toStock(row: StockRow): WarehouseStock {
     };
 }
 
-function toMovement(row: MovementRow): WarehouseMovement {
+/** Remove a contract UUID from operator-visible free text, keeping the surrounding words.
+ *  'Marketplace sale <uuid>' becomes 'Marketplace sale'. */
+function stripContractId(notes: string | null | undefined, contractId: string): string | null {
+    if (!notes) return null;
+    const cleaned = notes.split(contractId).join('').replace(/\s{2,}/g, ' ').trim();
+    return cleaned || null;
+}
+
+/**
+ * `visibleContractIds` is the set of contracts the VIEWER is a party to. Everything
+ * contract-shaped is narrowed against it here, in the mapper, rather than being assigned
+ * onto the object afterwards — the mapper is where this codebase does its narrowing, and a
+ * later "let me finish the mapper" tidy-up that added `relatedContractId: row.x` next to
+ * its siblings would silently delete the party scope with nothing to catch it.
+ */
+function toMovement(row: MovementRow, visibleContractIds?: ReadonlySet<string>): WarehouseMovement {
+    const contractId = row.related_contract_id || null;
+    const partyVisible = !!contractId && !!visibleContractIds?.has(contractId);
     return {
+        // Everyone may know a movement CAME FROM a marketplace contract — that explains the
+        // stock change and is the ledger's job. Only a party gets the id.
+        fromContract: !!contractId,
+        relatedContractId: partyVisible ? contractId : null,
         id: row.id,
         stockId: row.stock_id,
         delta: row.delta,
@@ -101,7 +124,11 @@ function toMovement(row: MovementRow): WarehouseMovement {
         } : undefined,
         relatedRequestId: row.related_request_id || null,
         relatedMovementId: row.related_movement_id || null,
-        notes: row.notes || null,
+        // The leak that was already live: the delivery procs write the contract UUID INTO
+        // the notes string, and notes renders to every warehouse:view holder. Strip it for
+        // anyone who is not a party. Closing it here works on code deploy, against both the
+        // old and new function text, with no SQL editor involved.
+        notes: !contractId || partyVisible ? (row.notes || null) : stripContractId(row.notes, contractId),
         createdAt: row.created_at,
     };
 }
@@ -162,7 +189,7 @@ export async function listWarehouseCatalog(
         .select('id, name, category, quality_label, unit, description, archived_at, created_at, updated_at')
 
         .order('category', { ascending: true })
-        .order('name', { ascending: true })
+        .order('name', { ascending: true }).order('id', { ascending: true })
         .range(offset, offset + limit - 1);
     if (error && error.code === '42P01') return [];
     handleSupabaseError({ error, message: 'Failed to load warehouse catalog' });
@@ -189,7 +216,8 @@ export async function searchWarehouseCatalog(
 ): Promise<WarehouseCatalogSearchResult[]> {
     const q = (query || '').trim();
     if (!q) return [];
-    const safe = q.replace(/[\\%_]/g, (m) => '\\' + m);
+    // Shared helper — the inline copy missed PostgREST's `*` alias for `%`.
+    const safe = escapeLikePattern(q);
     const cap = Math.min(Math.max(limit, 1), 200);
 
     const results: WarehouseCatalogSearchResult[] = [];
@@ -200,7 +228,7 @@ export async function searchWarehouseCatalog(
             .select('id, name, category, quality_label, unit, archived_at')
             
             .ilike('name', `%${safe}%`)
-            .order('name', { ascending: true })
+            .order('name', { ascending: true }).order('id', { ascending: true })
             .limit(cap);
         if (error && error.code !== '42P01') {
             handleSupabaseError({ error, message: 'Failed to search warehouse custom catalog' });
@@ -223,7 +251,7 @@ export async function searchWarehouseCatalog(
         const { data, error } = await supabase.from('warehouse_platform_commodities')
             .select('id, name, kind')
             .ilike('name', `%${safe}%`)
-            .order('name', { ascending: true })
+            .order('name', { ascending: true }).order('id', { ascending: true })
             .limit(cap);
         if (error && error.code !== '42P01') {
             handleSupabaseError({ error, message: 'Failed to search warehouse platform catalog' });
@@ -736,7 +764,7 @@ export async function listWarehouseStock(
         ;
     if (opts.catalogId != null) q = q.eq('catalog_id', opts.catalogId);
     if (opts.locationId != null) q = q.eq('location_id', opts.locationId);
-    q = q.order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
+    q = q.order('updated_at', { ascending: false }).order('id', { ascending: false }).range(offset, offset + limit - 1);
     const { data, error } = await q;
     if (error && error.code === '42P01') return [];
     handleSupabaseError({ error, message: 'Failed to load warehouse stock' });
@@ -931,6 +959,53 @@ export async function adjustWarehouseStock(
     return data as string;
 }
 
+/**
+ * The warehouse twin of setInventoryTotal: set a stock row to an ABSOLUTE on-hand total,
+ * with the subtraction done server-side under the row lock rather than in the browser
+ * against a frozen snapshot. WhAdjustStockDialog carried the identical stale-delta
+ * defect, so shipping only the quartermaster half would have been half a fix.
+ *
+ * Returns the new movement id, or NULL when the row was ALREADY at the target — the
+ * movements table has CHECK (delta <> 0), so a no-op must post nothing. Callers must
+ * read null as success, not as a failed write.
+ */
+export async function setWarehouseStockTotal(
+    stockId: number,
+    targetTotal: number,
+    reason: WarehouseMovementReason,
+    actorUserId: number,
+    notes?: string | null,
+): Promise<string | null> {
+    const target = Math.trunc(Number(targetTotal));
+    if (!Number.isFinite(target) || target < 0) throw new Error('Target total must be a non-negative integer.');
+    if (target > MAX_STOCK_TOTAL) {
+        throw new Error(`Target total must not exceed ${MAX_STOCK_TOTAL}.`);
+    }
+    // 'initial' is excluded deliberately: a set-total is a correction to a row that
+    // already exists, never the seeding movement.
+    const allowed: WarehouseMovementReason[] = ['adjust', 'restock', 'loss', 'destruction'];
+    if (!allowed.includes(reason)) throw new Error(`Invalid adjustment reason: ${reason}`);
+
+    // Existence guard before calling the proc (mirrors adjustWarehouseStock).
+    const { data: row, error: lookupErr } = await supabase.from('warehouse_stock')
+        .select('id')
+        .eq('id', stockId)
+        .maybeSingle();
+    handleSupabaseError({ error: lookupErr, message: 'Failed to validate stock row' });
+    if (!row) throw new Error('Stock row not found.');
+
+    const { data, error } = await supabase.rpc('warehouse_set_stock_total', {
+        p_stock_id: stockId,
+        p_target_total: target,
+        p_reason: reason,
+        p_actor_id: actorUserId,
+        p_notes: notes?.trim() || null,
+    });
+    handleSupabaseError({ error, message: 'Failed to set warehouse stock total' });
+    broadcastToOrg('warehouse:stock_update', { stockId });
+    return (data as string | null) ?? null;
+}
+
 export async function transferWarehouseStock(
     fromStockId: number,
     toStockId: number,
@@ -974,13 +1049,20 @@ export interface MovementFilters {
     offset?: number;
 }
 
-export async function listWarehouseMovements(filters: MovementFilters = {}): Promise<WarehouseMovement[]> {
+/**
+ * `viewerId` scopes the contract-linked fields. Pass undefined to withhold them from
+ * everyone — which is what the caller does when the MARKETPLACE module is switched off,
+ * since `warehouse:` and `marketplace:` are independently toggleable namespaces and
+ * reaching marketplace data through a warehouse action would cross that gate. The gate
+ * itself lives in api/actions/warehouse.ts, next to the other feature checks.
+ */
+export async function listWarehouseMovements(filters: MovementFilters = {}, viewerId?: number): Promise<WarehouseMovement[]> {
     // Embed the joined stock row (catalog + location) on each movement so the
     // movements tab no longer has to read warehouseStock from DataContext just
     // to resolve stockId → name/quality/location.
     let q = supabase.from('warehouse_movements')
         .select(`
-            id, stock_id, delta, reason, actor_user_id, related_request_id, related_movement_id, notes, created_at,
+            id, stock_id, delta, reason, actor_user_id, related_request_id, related_movement_id, related_contract_id, notes, created_at,
             actor:users!warehouse_movements_actor_user_id_fkey(id, name, avatar_url),
             stock:warehouse_stock(
                 id, catalog_id, location_id,
@@ -1000,12 +1082,18 @@ export async function listWarehouseMovements(filters: MovementFilters = {}): Pro
     // warehouse:view member could otherwise request a huge embedded-join page.
     const moveLimit = Math.min(Math.max(filters.limit ?? 200, 1), 500);
     const moveOffset = clampListOffset(filters.offset);
-    q = q.range(moveOffset, moveOffset + moveLimit - 1);
+    q = q.order('id', { ascending: false }).range(moveOffset, moveOffset + moveLimit - 1);
 
     const { data, error } = await q;
     if (error && error.code === '42P01') return [];
     handleSupabaseError({ error, message: 'Failed to load warehouse movements' });
-    return ((data || []) as unknown as MovementRow[]).map(toMovement);
+    const rows = (data || []) as unknown as MovementRow[];
+
+    const contractIds = viewerId == null
+        ? []
+        : rows.map((r) => r.related_contract_id).filter((id): id is string => !!id);
+    const visible = await filterContractIdsForParty(contractIds, viewerId as number);
+    return rows.map((r) => toMovement(r, visible));
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +1209,7 @@ export async function listWithdrawalRequests(filters: RequestFilters = {}): Prom
     if (filters.stockId != null) q = q.eq('stock_id', filters.stockId);
     // Apply the clamped default UNCONDITIONALLY — an absent limit must not return
     // all rows unbounded (sibling fns clamp to 500).
-    q = q.limit(Math.min(Math.max(filters.limit ?? 200, 1), 500));
+    q = q.order('id', { ascending: false }).limit(Math.min(Math.max(filters.limit ?? 200, 1), 500));
 
     const { data, error } = await q;
     if (error && error.code === '42P01') return [];
@@ -1360,7 +1448,7 @@ export async function getPlatformCommodityCatalog(opts: ListPlatformCommoditiesO
     if (opts.platformCategoryId != null) qb = qb.eq('platform_category_id', opts.platformCategoryId);
     if (opts.illegalOnly) qb = qb.eq('is_illegal', true);
     if (opts.legalOnly) qb = qb.or('is_illegal.is.null,is_illegal.eq.false');
-    qb = qb.order('name', { ascending: true }).range(offset, offset + limit - 1);
+    qb = qb.order('name', { ascending: true }).order('id', { ascending: true }).range(offset, offset + limit - 1);
     const { data, error } = await qb;
     if (error && error.code === '42P01') return [];
     handleSupabaseError({ error, message: 'Failed to load platform commodity catalog' });

@@ -95,8 +95,11 @@ describe('canUserSeeOpInList — special-op participation gate', () => {
     it('allows an operations:manage holder', () => {
         expect(canUserSeeOpInList(mkUser({ permissions: ['operations:manage'] }), opViewer())).toBe(true);
     });
-    it('allows an Admin', () => {
-        expect(canUserSeeOpInList(mkUser({ role: 'Admin' } as Partial<User>), opViewer())).toBe(true);
+    it('allows the stamped system Admin (role identity)', () => {
+        expect(canUserSeeOpInList(mkUser({ isSystemAdmin: true } as Partial<User>), opViewer())).toBe(true);
+    });
+    it('DENIES a forged Admin role NAME with no permissions', () => {
+        expect(canUserSeeOpInList(mkUser({ role: 'Admin' } as Partial<User>), opViewer())).toBe(false);
     });
     it('allows an ACTIVE participant', () => {
         expect(canUserSeeOpInList(mkUser(), opViewer({ participants: [{ userId: 6, timeLeft: null }] }))).toBe(true);

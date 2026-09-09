@@ -381,7 +381,7 @@ export async function getIntelReportsForTarget(targetId: string): Promise<Hydrat
         .select('id, target_id, subject_type, threat_level, tags, summary, evidence_urls, external_author, affiliated_org, created_at, classification_level, createdBy:users!intel_reports_created_by_id_fkey(id, name, avatar_url, role_id), intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .ilike('target_id', escapeLikePattern(targetId));
 
-    query = query.order('created_at', { ascending: false }).limit(500);
+    query = query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(500);
     const data = await safeFetch<IntelReportRow[]>(query as unknown as SafeFetchQuery<IntelReportRow[]>, [], 'Failed to get reports');
     return data.map(toHydratedIntelReport);
 }
@@ -400,9 +400,12 @@ function embeddedMarkers(rows?: { marker?: unknown }[] | null): unknown[] {
 export async function getDossier(targetId: string, viewer?: OpViewer | null): Promise<DossierData> {
     // Escape the user-supplied handle so every .ilike below is an exact
     // (case-insensitive) match, never a wildcard pattern. Without this a targetId of
-    // '%' would match every report/warrant/request and dump the lot (bounded only by
-    // the clearance filter). Used for all the target/handle/affiliated_org lookups
-    // that derive from client input; orgName below comes from DB rows, not the client.
+    // '%' — or '*', which PostgREST rewrites to '%' — would match every
+    // report/warrant/request and dump the lot (bounded only by the clearance
+    // filter). orgName in the fan-out below is ALSO escaped: it comes from a DB
+    // row, but affiliated_org is free text an intel author writes (and that a
+    // federation peer can plant via syncTrustedFeeds), and stripHtmlSingleLine
+    // strips markup, not LIKE metacharacters. "From the DB" is not "trusted".
     const safeTarget = escapeLikePattern(targetId);
     const userQuery = supabase.from('users').select('id').ilike('rsi_handle', safeTarget);
     const { data: targetUser } = await userQuery.maybeSingle();
@@ -412,7 +415,7 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
     const latestQuery = supabase.from('intel_reports')
         .select('subject_type')
         .ilike('target_id', safeTarget)
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(1);
     const { data: latestReport } = await latestQuery.maybeSingle();
 
@@ -429,8 +432,10 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
 
     if (isOrg) {
         // --- ORGANIZATION DOSSIER ---
-        // Fetch reports for the Org
-        reportsQuery = reportsQuery.ilike('target_id', targetId);
+        // Fetch reports for the Org, escaped like every other target lookup in
+        // this function. This was the one site that skipped safeTarget, so a '_'
+        // (legal in an org name) or a '*' stayed live as a wildcard.
+        reportsQuery = reportsQuery.ilike('target_id', safeTarget);
 
         // Populate affiliates with unique people in this org
         const membersQuery = supabase.from('intel_reports')
@@ -504,7 +509,7 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
         for (const orgName of orgSet) {
             const q = supabase.from('intel_reports')
                 .select('id, target_id, subject_type, threat_level, tags, summary, evidence_urls, external_author, affiliated_org, created_at, classification_level, createdBy:users!intel_reports_created_by_id_fkey(id, name, avatar_url, role_id), intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
-                .ilike('target_id', orgName);
+                .ilike('target_id', escapeLikePattern(orgName));
             orgReportPromises.push(safeFetch<IntelReportRow[]>(q as unknown as SafeFetchQuery<IntelReportRow[]>, [], 'Failed to get org-affiliated reports'));
         }
     }
@@ -651,6 +656,7 @@ export async function getRecentIntelReports(subjectType?: string, limit = 50): P
 
     const cappedLimit = Math.min(Math.max(1, limit), 100);
     query = query.order('created_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(cappedLimit);
     if (subjectType) query = query.eq('subject_type', subjectType);
     const data = await safeFetch<IntelReportRow[]>(query as unknown as SafeFetchQuery<IntelReportRow[]>, [], 'Failed to get recent intel');
@@ -809,12 +815,39 @@ export async function listIntelReports(args: ListIntelReportsArgs): Promise<List
         });
     }
 
-    const hasMore = rows.length > limit;
-    if (hasMore) rows = rows.slice(0, limit);
+    // PAGE ACCOUNTING IS DERIVED FROM WHAT THE VIEWER CAN SEE.
+    //
+    // The SQL ceiling above filters by clearance LEVEL, but limiting MARKERS were
+    // applied by the caller after this function returned — so `hasMore` and the page
+    // size were computed over rows including compartmented reports the viewer cannot
+    // read. That is the same volume disclosure the level ceiling exists to prevent,
+    // one dimension over: a viewer could see "20 results, more available" on a query
+    // whose visible answer was three, and diff page counts across tag/threat filters
+    // to map how much compartmented traffic exists and roughly when.
+    //
+    // Filtering HERE also stops the marker gate being optional for future callers —
+    // the previous shape only worked because one handler remembered to re-filter.
+    const bypass = canViewAllClassifications(args.viewer, ['intel:manage']);
+    const visible = bypass ? rows : rows.filter((r) => passesClearance(
+        args.viewer,
+        (r as { classification_level?: number | null }).classification_level,
+        embeddedMarkers((r as { intel_report_limiting_markers?: { marker?: unknown }[] | null }).intel_report_limiting_markers),
+        ['intel:manage'],
+    ));
 
-    const items = rows.map(toHydratedIntelReport);
-    const last = rows[rows.length - 1];
-    const nextCursor = hasMore && last ? encodeIntelCursor(last.created_at, String(last.id)) : null;
+    // `hasMore` and the returned page come from the VISIBLE set; the cursor advances on
+    // the last row actually FETCHED. Those differ on purpose: advancing on the last
+    // visible row would re-serve the gated tail forever when a whole page is
+    // compartmented, so the cursor has to keep moving through rows the viewer cannot
+    // see. The cost is that a page can under-fill — the client keeps paging, which it
+    // already does — and the benefit is that the counts no longer describe them.
+    const fetchedMore = rows.length > limit;
+    const pageRows = visible.slice(0, limit);
+    const lastFetched = rows[Math.min(rows.length, limit) - 1];
+    const hasMore = fetchedMore || visible.length > limit;
+
+    const items = pageRows.map(toHydratedIntelReport);
+    const nextCursor = hasMore && lastFetched ? encodeIntelCursor(lastFetched.created_at, String(lastFetched.id)) : null;
 
     return { items, nextCursor, hasMore };
 }
@@ -867,7 +900,7 @@ export async function getIntelHubStats(user?: ClearanceUser | null): Promise<Int
     const { data } = await supabase.from('intel_reports')
         .select('id, threat_level, classification_level, created_at, intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .lte('classification_level', maxLevel)
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(INTEL_STATS_SCAN_CAP);
 
     let totalReports = 0;
@@ -905,7 +938,7 @@ export async function getIntelTargetIndex(user?: ClearanceUser | null): Promise<
     const seeAll = canViewAllClassifications(user, ['intel:manage']);
     let query = supabase.from('intel_reports')
         .select('target_id, threat_level, classification_level, intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(20000);
     if (!seeAll) {
         query = query.lte('classification_level', user?.clearanceLevel?.level ?? 0);
@@ -1033,7 +1066,9 @@ export async function searchIntelReports(query: string, subjectType?: string): P
         .select('id, target_id, subject_type, threat_level, tags, summary, evidence_urls, external_author, affiliated_org, created_at, classification_level, createdBy:users!intel_reports_created_by_id_fkey(id, name, avatar_url, role_id), feed:alliance_peers(label), intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .or(`target_id.ilike.%${safeQuery}%,summary.ilike.%${safeQuery}%,tags.cs.{${safeQuery}}`);
     if (subjectType) q = q.eq('subject_type', subjectType);
-    const { data } = await q.limit(50);
+    // Newest-first with a primary-key tiebreak: this is a search result capped at 50, and
+    // without a total order the same query can return a different 50 on each call.
+    const { data } = await q.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50);
     return ((data || []) as unknown as IntelReportRow[]).map(toHydratedIntelReport);
 }
 
@@ -1054,8 +1089,13 @@ export async function getIntelStats(user?: ClearanceUser | null) {
     // without it sees an activeWarrants count of 0 here too.
     const seeAll = canViewAllClassifications(user, ['intel:manage']);
 
-    const canSeeWarrants = user?.role === 'Admin'
-        || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
+    // NO ROLE-NAME BYPASS: this used to read `user?.role === 'Admin' || …`. `role`
+    // is inferred from the role row's free-text NAME (lib/db/mappers.ts), so a
+    // permissionless custom role called "Commander" cleared it. Admin, Dispatcher
+    // and Member are all seeded with warrant:view, so the permission alone takes
+    // nothing away. Kept in lock-step with api/actions/intel.ts (dossier) and the
+    // warrant:generate_report gate in api/services.ts.
+    const canSeeWarrants = Array.isArray(user?.permissions) && user.permissions.includes('warrant:view');
     const warrantsQuery = canSeeWarrants
         ? supabase.from('warrants').select('id', { count: 'exact', head: true }).eq('status', 'Active')
         : Promise.resolve({ count: 0 });
@@ -1063,7 +1103,7 @@ export async function getIntelStats(user?: ClearanceUser | null) {
     if (seeAll) {
         // Bypass: exact total via count-pushdown + a bounded breakdown sample.
         const countQuery = supabase.from('intel_reports').select('id', { count: 'exact', head: true });
-        const breakdownQuery = supabase.from('intel_reports').select('threat_level').limit(INTEL_STATS_BREAKDOWN_CAP);
+        const breakdownQuery = supabase.from('intel_reports').select('threat_level').order('id', { ascending: true }).limit(INTEL_STATS_BREAKDOWN_CAP);
         const [{ count: totalReports }, { data: breakdownRows }, { count: activeWarrants }] =
             await Promise.all([countQuery, breakdownQuery, warrantsQuery]);
         return {
@@ -1085,7 +1125,7 @@ export async function getIntelStats(user?: ClearanceUser | null) {
     const reportsQuery = supabase.from('intel_reports')
         .select('id, threat_level, classification_level, intel_report_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .lte('classification_level', maxLevel)
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(INTEL_STATS_SCAN_CAP);
     const [{ data: rows }, { count: activeWarrants }] = await Promise.all([reportsQuery, warrantsQuery]);
 
@@ -1239,6 +1279,17 @@ interface FeedSyncData {
  * Warrants ingest no longer needs an admin id: warrants.issued_by is nullable
  * and federated warrants carry "via <ally>" provenance (source_feed_id).
  */
+/** Decrypt one peer's outbound key without letting a single bad row abort the whole pass.
+ *  Returns '' on failure so only that peer's own fetch fails, and it fails as that peer. */
+function tryDecryptPeerKey(enc: string, label: string): string {
+    try {
+        return decryptSecret(enc);
+    } catch (e) {
+        log.warn('peer key undecryptable — skipping this feed only', { err: e, peer: label });
+        return '';
+    }
+}
+
 export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) {
     // Intel feeds are alliance_peers rows discriminated by pairing_state. Map them
     // back to the legacy feed shape this routine expects (api_key decrypted).
@@ -1263,7 +1314,15 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
         id: r.id,
         label: r.label,
         url: r.base_url,
-        api_key: r.outbound_key_enc ? decryptSecret(r.outbound_key_enc) : '',
+        // Per-peer isolation, and it is load-bearing. decryptSecret THROWS on failure, and
+        // this .map() runs BEFORE the feedError bail and before the per-feed feedResults
+        // error channel below — so one corrupt, foreign or old-key outbound_key_enc on ONE
+        // peer used to kill intel/warrant/bulletin ingest for EVERY peer and take the whole
+        // alliance_sync cron pass down with an opaque error. That needed a corrupted row
+        // before; with key rotation it is the normal mid-rotation state. An unreadable key
+        // becomes an empty api_key, which fails only that peer's own fetch and is reported
+        // against that peer.
+        api_key: r.outbound_key_enc ? tryDecryptPeerKey(r.outbound_key_enc, r.label) : '',
         // Dedicated peer-clock cursor; legacy fallback for upgraded rows only.
         cursor: r.intel_synced_at ?? r.last_contact_at,
         sync_reports: r.channels?.reports === true,

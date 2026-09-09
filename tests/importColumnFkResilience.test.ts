@@ -38,6 +38,7 @@ vi.mock('../lib/db/common', () => {
             update: (patch: any) => { pendingPatch = patch; return { eq: (_c: string, v: unknown) => { h.updates.push({ table, patch: pendingPatch, id: v }); return Promise.resolve({ error: null }); } }; },
             delete: () => ({ neq: () => Promise.resolve({ error: null }), eq: () => Promise.resolve({ error: null }), in: (col: string, vals: unknown[]) => { h.deletes.push({ table, col, vals }); return Promise.resolve({ error: null }); } }),
             eq: () => Promise.resolve({ data: [], error: null }),
+            order: () => b, // the importer orders every paged read; .range() without it is undefined across pages
             range: () => Promise.resolve({ data: [], error: null }), // empty catalog index
             then: (r: any) => Promise.resolve({ count: 0, error: null, data: [] }).then(r),
         };

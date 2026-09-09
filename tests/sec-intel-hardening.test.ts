@@ -60,8 +60,10 @@ import {
     normalizeWarrantStatus, normalizeWarrantUecReward,
 } from '../lib/db/intel';
 import { WarrantStatus } from '../types';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
-type Viewer = { id?: number; role?: string; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] };
+type Viewer = { id?: number; role?: string; isSystemAdmin?: boolean; permissions?: string[]; clearanceLevel?: { level?: number } | null; limitingMarkers?: unknown[] };
 const viewer = (over: Partial<Viewer> = {}): Viewer => ({ id: 6, role: 'Member', permissions: [], clearanceLevel: { level: 0 }, limitingMarkers: [], ...over });
 
 beforeEach(() => {
@@ -194,12 +196,19 @@ describe('c14 intel stats counts exclude marker-gated reports (clearance-markers
         expect(stats.threatBreakdown.Critical).toBe(1);
     });
 
-    it('Admin / intel:manage still see ALL reports via the count-pushdown path (bypass unchanged)', async () => {
+    it('the stamped system Admin / intel:manage still see ALL reports via the count-pushdown path (bypass unchanged)', async () => {
         statsFixture();
-        const admin = await getIntelStats(viewer({ role: 'Admin' }));
+        // The clearance bypass is role IDENTITY; activeWarrants is warrant:view, which
+        // Admin, Dispatcher and Member all hold — neither reads the role NAME now.
+        const admin = await getIntelStats(viewer({ isSystemAdmin: true, permissions: ['warrant:view'] }));
         expect(admin.totalReports).toBe(3);
         expect(admin.threatBreakdown.Critical).toBe(1);
         expect(admin.activeWarrants).toBe(2);
+
+        // A forged Admin role NAME gets neither the clearance bypass nor the warrants.
+        const forged = await getIntelStats(viewer({ role: 'Admin' }));
+        expect(forged.totalReports).toBe(2);
+        expect(forged.activeWarrants).toBe(0);
 
         const hub = await getIntelHubStats(viewer({ permissions: ['intel:manage'] }));
         expect(hub.totalReports).toBe(3);
@@ -247,5 +256,40 @@ describe('c18 federated warrant ingest normalisation (warrant-feed hygiene)', ()
         expect(normalizeWarrantUecReward(NaN)).toBeNull();
         // Absurd/overflow bounty is clamped, never stored verbatim.
         expect(normalizeWarrantUecReward(1e30)).toBe(1_000_000_000_000);
+    });
+});
+
+describe('intel list page accounting describes only what the viewer can see', () => {
+    // The SQL ceiling filters by clearance LEVEL, but limiting MARKERS were applied by
+    // the caller AFTER this function returned — so hasMore and the page size were
+    // computed over compartmented reports the viewer cannot read. That is the same
+    // volume disclosure the level ceiling exists to prevent, one dimension over: a
+    // viewer sees "more available" on a query whose visible answer is three, and can
+    // diff page counts across tag/threat filters to map compartmented traffic.
+    const src = readFileSync(resolve(__dirname, '..', 'lib', 'db', 'intel.ts'), 'utf8');
+    const fn = src.slice(src.indexOf('export async function listIntelReports'), src.indexOf('export interface IntelHubStats'));
+
+    it('applies the marker filter INSIDE the function, before the counts', () => {
+        expect(fn).toMatch(/passesClearance\(/);
+        expect(fn).toMatch(/embeddedMarkers\(/);
+        expect(fn.indexOf('passesClearance('), 'the filter runs after hasMore is computed')
+            .toBeLessThan(fn.indexOf('const hasMore'));
+    });
+
+    it('derives the returned page from the VISIBLE rows', () => {
+        expect(fn).toMatch(/const pageRows = visible\.slice\(0, limit\)/);
+        expect(fn).toMatch(/items = pageRows\.map/);
+    });
+
+    it('but advances the cursor on the last FETCHED row, so paging cannot stall', () => {
+        // Advancing on the last visible row would re-serve a fully compartmented page
+        // forever — the cursor has to move through rows the viewer cannot see.
+        expect(fn).toMatch(/lastFetched/);
+        expect(fn).toMatch(/encodeIntelCursor\(lastFetched\.created_at/);
+    });
+
+    it('the bypass population still short-circuits the filter', () => {
+        expect(fn).toMatch(/const bypass = canViewAllClassifications\(args\.viewer, \['intel:manage'\]\)/);
+        expect(fn).toMatch(/bypass \? rows :/);
     });
 });

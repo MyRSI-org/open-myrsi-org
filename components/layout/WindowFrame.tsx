@@ -300,10 +300,12 @@ const WindowFrame: React.FC<WindowFrameProps> = ({
     `;
 
     return createPortal(
-        <div 
+        <div
             ref={windowRef}
             className={containerClasses}
             style={styleObj}
+            role="dialog"
+            aria-label={title}
         >
             {/* Header / Drag Handle */}
             <div 
@@ -331,9 +333,11 @@ const WindowFrame: React.FC<WindowFrameProps> = ({
                     )}
                     <button
                         onClick={onClose}
+                        aria-label="Close"
+                        title="Close"
                         className="w-8 h-8 flex items-center justify-center rounded-md hover:bg-white/10 text-slate-400 hover:text-white transition-colors"
                     >
-                        <i className="fa-solid fa-xmark text-lg"></i>
+                        <i className="fa-solid fa-xmark text-lg" aria-hidden></i>
                     </button>
                 </div>
             </div>

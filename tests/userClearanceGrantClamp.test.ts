@@ -139,7 +139,10 @@ const lowActor = {
     limitingMarkers: [{ id: 100, code: 'ALPHA', name: 'Alpha' }],
 } as any;
 
-const adminActor = { id: 1, role: 'Admin', permissions: [], clearanceLevel: { id: 1, level: 1 }, limitingMarkers: [] } as any;
+// Role IDENTITY (lib/db/adminIdentity.ts). The clearance bypass no longer reads the
+// name-derived `role` tier, so `forgedAdminName` below is a NON-admin.
+const adminActor = { id: 1, isSystemAdmin: true, permissions: [], clearanceLevel: { id: 1, level: 1 }, limitingMarkers: [] } as any;
+const forgedAdminName = { id: 1, role: 'Admin', permissions: [], clearanceLevel: { id: 1, level: 1 }, limitingMarkers: [] } as any;
 const bypassActor = { id: 2, role: 'Member', permissions: ['intel:manage'], clearanceLevel: { id: 1, level: 1 }, limitingMarkers: [] } as any;
 
 beforeEach(() => {
@@ -168,8 +171,15 @@ describe('HIGH-2 — updateUserClearance author clamp', () => {
         await expect(updateUserClearance(42, 7, 1, [100], lowActor)).resolves.toBeUndefined();
     });
 
-    it('Admin actor may grant any level + marker', async () => {
+    it('the stamped system Admin may grant any level + marker', async () => {
         await expect(updateUserClearance(42, 1, 5, [100, 200, 300], adminActor)).resolves.toBeUndefined();
+    });
+
+    // ROLE NAME IS NOT AUTHORITY: a permissionless custom role called 'Commander'
+    // arrived as the Admin tier and could grant clearance above its own.
+    it('a forged Admin role NAME is clamped to its own level and held markers', async () => {
+        await expect(updateUserClearance(42, 1, 5, [100, 200, 300], forgedAdminName))
+            .rejects.toThrow(/clearance level above your own/i);
     });
 
     it('canViewAllClassifications (intel:manage) actor bypasses the clamp', async () => {
@@ -251,5 +261,88 @@ describe('HIGH-3 (partial) — createUser blocks duplicate discord_id', () => {
     it('treats a soft-deleted duplicate as NOT blocking (only live rows block)', async () => {
         h.tables.users = [{ id: 5, name: 'Old', discord_id: 'dup-1', deleted_at: '2026-01-01T00:00:00Z' }];
         await expect(createUser(newUser)).resolves.toBeTruthy();
+    });
+});
+
+describe('updateUser — identity/profile write boundary', () => {
+    const userUpdate = () => h.updates.find((u) => u.table === 'users')?.values ?? {};
+
+    it('DROPS rsiHandle — the generic admin path cannot rewrite a verified identity', async () => {
+        // admin:user:update is delegable and weaker than the verify flow; rewriting
+        // rsi_handle reassigns who the row IS and absorbs that handle's ad-hoc requests.
+        await expect(updateUser(42, { rsiHandle: 'Attacker', name: 'Renamed' }, adminActor)).resolves.toBeUndefined();
+        // Key-based, so an accidental `rsi_handle: undefined` still fails.
+        expect(Object.keys(userUpdate())).not.toContain('rsi_handle');
+        // ...while the legitimate sibling field on the same call still lands.
+        expect(userUpdate().name).toBe('Renamed');
+    });
+
+    it.each([
+        ['javascript:alert(1)'],
+        ['http://cdn.example/a.png'],
+        ['https://cdn.example/a.svg'],
+        ['https://user:pass@cdn.example/a.png'],
+        ['https://tracker.example/pixel'],
+    ])('clears a non-image / non-https avatarUrl (%s) to null', async (bad) => {
+        await expect(updateUser(42, { avatarUrl: bad }, adminActor)).resolves.toBeUndefined();
+        expect(userUpdate().avatar_url).toBeNull();
+    });
+
+    it('preserves a real Discord CDN avatar verbatim', async () => {
+        const real = 'https://cdn.discordapp.com/avatars/1/abc.png';
+        await expect(updateUser(42, { avatarUrl: real }, adminActor)).resolves.toBeUndefined();
+        expect(userUpdate().avatar_url).toBe(real);
+    });
+
+    it('strips markup out of name and never blanks it', async () => {
+        await updateUser(42, { name: '<img src=x onerror=alert(1)>Bob' }, adminActor);
+        expect(userUpdate().name).toBe('Bob');
+        h.updates = [];
+        // A name that is nothing BUT markup is a no-op, not a blanking.
+        await updateUser(42, { name: '<b></b>' }, adminActor);
+        expect(Object.keys(userUpdate())).not.toContain('name');
+    });
+});
+
+describe('createUser — pre-auth identity / avatar / name guards', () => {
+    // auth:finalize_setup is a PUBLIC_ACTION: rsiHandle, name and avatarUrl are all
+    // client-supplied and only discordId is bound by the identity grant.
+    const insertedUser = () => h.inserts.find((i) => i.table === 'users')?.values ?? {};
+    const payload = (over: Record<string, unknown> = {}) => ({
+        discordId: '9', name: 'Newbie', avatarUrl: 'https://cdn.discordapp.com/avatars/9/abc.png',
+        rsiHandle: 'Ok_Handle', isAdmin: false, ...over,
+    } as Parameters<typeof createUser>[0]);
+
+    beforeEach(() => {
+        // The suite-wide beforeEach seeds a live users row, and the mock builder's
+        // .ilike() is a no-op — so the handle-uniqueness pre-check would match it and
+        // throw before any assertion here could run.
+        h.tables.users = [];
+    });
+
+    it('clears an arbitrary-origin avatarUrl to null', async () => {
+        await createUser(payload({ avatarUrl: 'https://evil.example/x' }));
+        expect(insertedUser().avatar_url).toBeNull();
+        // The rest of the row still lands.
+        expect(insertedUser().rsi_handle).toBe('Ok_Handle');
+    });
+
+    it('keeps a genuine Discord avatar URL verbatim', async () => {
+        await createUser(payload());
+        expect(insertedUser().avatar_url).toBe('https://cdn.discordapp.com/avatars/9/abc.png');
+    });
+
+    it('strips markup out of the client-supplied name, falling back to the handle', async () => {
+        await createUser(payload({ name: '<script>alert(1)</script>Newbie' }));
+        expect(insertedUser().name).toBe('alert(1)Newbie');
+        h.inserts = [];
+        h.tables.users = [];
+        await createUser(payload({ name: '<b></b>' }));
+        expect(insertedUser().name).toBe('Ok_Handle');
+    });
+
+    it.each(['%', 'a/b', '', 'a'.repeat(61), 'has space', '../etc'])('refuses a malformed rsiHandle (%s) with no insert', async (handle) => {
+        await expect(createUser(payload({ rsiHandle: handle }))).rejects.toThrow(/valid RSI handle/i);
+        expect(h.inserts.some((i) => i.table === 'users')).toBe(false);
     });
 });

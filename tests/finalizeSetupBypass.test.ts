@@ -15,6 +15,10 @@ vi.mock('../lib/db', () => ({
     supabase: { from: () => ({ select: () => ({ eq: () => ({ single: async () => ({ data: null, error: null }), maybeSingle: async () => ({ data: null, error: null }) }) }) }) },
     getSystemRoles: async () => ({ admin: { id: 4 } }),
     findUserByDiscordId: async () => null,
+    // auth:finalize_setup now refuses a banned Discord id, AFTER the identity-grant
+    // check (checking before it would make this PUBLIC action an existence oracle
+    // for a caller-supplied id). Not banned by default.
+    findActiveBan: async () => null,
 }));
 vi.mock('../lib/discord', () => ({}));
 vi.mock('../lib/radio', () => ({}));
@@ -26,7 +30,12 @@ vi.mock('../lib/auth', () => ({
     // The grant carries the server-issued RSI verification code (vc).
     verifyIdentityGrant: (t: string) => (t === 'valid-identity' ? { discordId: 'd1', vc: 'MYRSI-XYZ' } : null),
 }));
-vi.mock('../lib/rsi', () => ({ verifyRsiHandle: vi.fn(async (_h: string, code: string) => { h.verifyRsiCalls++; h.lastVerifyCode = code; return true; }) }));
+// Only the outbound proof is stubbed; the REAL isValidRsiHandle runs, because the
+// pre-auth handle-shape gate is part of this action's contract.
+vi.mock('../lib/rsi', async () => ({
+    ...(await vi.importActual<typeof import('../lib/rsi')>('../lib/rsi')),
+    verifyRsiHandle: vi.fn(async (_h: string, code: string) => { h.verifyRsiCalls++; h.lastVerifyCode = code; return true; }),
+}));
 vi.mock('../lib/db/userFilters', () => ({ stripSensitiveUserFields: (u: any) => u }));
 
 import { authActions } from '../api/actions/auth';
@@ -61,6 +70,15 @@ describe('auth:finalize_setup RSI bypass', () => {
 
     it('requires an RSI handle', async () => {
         await expect(finalize({ ...base, rsiHandle: '', adminSetupToken: 'valid-grant', skipVerification: true })).rejects.toThrow(/RSI handle/i);
+    });
+
+    // finalize_setup is a PUBLIC_ACTION: the handle is unauthenticated input that drives
+    // an OUTBOUND request and then an .ilike() identity lookup. Both must be unreachable
+    // for a value that is not shaped like a citizen handle.
+    it.each(['%', 'a/b', 'a'.repeat(61), 'has space'])('rejects a malformed handle (%s) before any outbound call or insert', async (handle) => {
+        await expect(finalize({ ...base, rsiHandle: handle })).rejects.toThrow(/valid RSI handle/i);
+        expect(h.verifyRsiCalls).toBe(0);
+        expect(h.createUserCalls).toHaveLength(0);
     });
 });
 

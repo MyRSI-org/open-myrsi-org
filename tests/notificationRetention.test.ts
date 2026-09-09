@@ -37,6 +37,7 @@ const h = vi.hoisted(() => {
             delete: () => { verb = 'delete'; return builder; },
             lt: (col: string, val: string) => { ltCol = col; ltVal = val; return builder; },
             in: (_col: string, ids: number[]) => { inIds = ids; return builder; },
+            order: () => builder, // capped reads carry a PK tiebreak so truncation is deterministic
             limit: (n: number) => { lim = n; return builder; },
             then: (resolve: (v: { data: unknown; error: null }) => unknown) => {
                 if (verb === 'delete') {

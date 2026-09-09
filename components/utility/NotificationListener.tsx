@@ -5,6 +5,7 @@ import { useConfig } from '../../contexts/ConfigContext';
 import { UserRole } from '../../types';
 import { useNotification } from '../../contexts/NotificationContext';
 import { debugLog } from '../../lib/debugLog';
+import { permissionSatisfied } from '../../lib/permissionImplications';
 
 // Architectural note: this component used to subscribe directly to the org
 // realtime channel (`db-changes-{orgId}`) for its broadcast handlers. That
@@ -90,8 +91,15 @@ const NotificationListener: React.FC = () => {
             // intel:view so members without intel access don't learn intel
             // activity occurred; the clearance-filtered bulletin arrives via the
             // gated bulletin_slice refetch.
+            //
+            // permissionSatisfied, not a bare includes(): this reads the raw session
+            // copy of `user` rather than useAuth().hasPermission, so it was the one
+            // client intel gate the shared implication table
+            // (lib/permissionImplications.ts) did not reach — an
+            // intel:view:clearance-only role got the Intel nav, the dossiers and the
+            // bulletin_slice refetch from the server, and silently no toast.
             if (bulletinData?.type === 'new_bulletin') {
-                if (!user?.permissions?.includes('intel:view') && String(user?.role) !== UserRole.Admin) return;
+                if (!permissionSatisfied(user?.permissions, 'intel:view') && String(user?.role) !== UserRole.Admin) return;
                 const createdById = bulletinData.createdById ?? bulletinData.bulletin?.created_by_id;
                 // Skip if current user is the author
                 if (user && createdById === user.id) return;

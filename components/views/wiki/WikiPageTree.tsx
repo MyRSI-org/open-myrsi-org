@@ -175,6 +175,10 @@ const TreeNode: React.FC<TreeNodeProps> = ({
     );
 };
 
+// Sentinel for the ancestor-sync trackers below — a value no prop can ever equal, so the
+// first render always counts as a change.
+const NO_SYNC_YET = Symbol('no-sync-yet');
+
 const WikiPageTree: React.FC<WikiPageTreeProps> = ({ pages, selectedPageId, onSelect, onAddChild, onReorder, canEdit }) => {
     const canReorder = !!onReorder;
     const [dragState, setDragState] = useState<DragState>({ draggedId: null, targetId: null, position: null });
@@ -202,8 +206,15 @@ const WikiPageTree: React.FC<WikiPageTreeProps> = ({ pages, selectedPageId, onSe
     // instead of a synchronous setState in an effect. The functional updater
     // returns the SAME set reference when nothing is added, so React bails out
     // — no render loop — making this behavior-equivalent to the old effect.
-    const [prevSelectedPageId, setPrevSelectedPageId] = useState(selectedPageId);
-    const [prevPages, setPrevPages] = useState(pages);
+    //
+    // The trackers seed to a SENTINEL, not to the live props. Seeding them with the live
+    // values makes the mount render compare equal, so the sync is skipped exactly once —
+    // on the only render where the tree is still fully collapsed. That is latent today
+    // (WikiView starts selectedPageId at null and there is no router, so nothing can mount
+    // with a page already selected) but it is a trap for whoever adds deep-linking or
+    // restores the last-read page, and it is the invariant the hosted build holds.
+    const [prevSelectedPageId, setPrevSelectedPageId] = useState<string | null | typeof NO_SYNC_YET>(NO_SYNC_YET);
+    const [prevPages, setPrevPages] = useState<WikiPage[] | typeof NO_SYNC_YET>(NO_SYNC_YET);
     if (selectedPageId !== prevSelectedPageId || pages !== prevPages) {
         setPrevSelectedPageId(selectedPageId);
         setPrevPages(pages);

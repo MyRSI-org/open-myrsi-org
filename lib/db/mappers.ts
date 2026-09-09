@@ -27,8 +27,13 @@ import {
     AcademySession, AcademyLessonProgress, AcademyOutcomeResult, AcademyEnrollment,
     AcademyCourseStatus, AcademyCourseAccess, AcademyCourseDelivery,
     AcademySessionStatus, AcademyEnrollmentSource, AcademyEnrollmentStatus, AcademyOutcomeVerdict,
+    Blueprint, CraftableItem, BlueprintRequest, BlueprintRequestStatus, MarketplaceTrader,
 } from '../../types.js';
 import type { Tables, NullToUndefined } from './rows.js';
+// One-way edge into the strip's allow-list so the embed minifier and the roster
+// boundary share ONE definition of "safe to show another member". userFilters.ts
+// imports only ../../types.js, so this creates no cycle — keep it that way.
+import { buildRosterSafeUser } from './userFilters.js';
 
 // ---------------------------------------------------------------------------
 // Shared embed helpers
@@ -124,39 +129,49 @@ const unknownUser: User = {
     createdAt: new Date().toISOString()
 };
 
+/**
+ * DISPLAY / AUDIENCE tier (Client/Member/Dispatcher/Admin) for a role name +
+ * permission set. announcements.audience and external_tools.audience store these four
+ * literal strings (lib/db.ts), and contexts/SessionContext hands the same string to
+ * registerRealtimeAuth, so this ladder must keep producing them.
+ *
+ * IT IS NOT A PRIVILEGE FACT. Nothing in lib/** or api/** gates on it: authorization
+ * reads `permissions`, and "is this the org Admin" reads `isSystemAdmin` — role
+ * IDENTITY, lib/db/adminIdentity.ts. Pinned by tests/roleNameBoundary.test.ts.
+ *
+ * Names match BYTE-EXACTLY (after trimming) against the four seeded names. The aliases
+ * 'administrator' / 'commander' / 'director' / 'officer' / 'recruit' are gone — they
+ * were never seeded role names, roles.name is operator-supplied free text, and
+ * 'Recruit'/'Officer' are seeded RANK names an operator could reasonably reuse for a
+ * role. Case-insensitive matching went with them: roles_name_key is byte-exact, so
+ * 'admin' could coexist with 'Admin' and inherit its audience. The reserved-name guard
+ * in lib/db/system.ts (addRole/updateRole) blocks a SUPERSET of what this accepts, so
+ * the name branch is unforgeable for any new role.
+ *
+ * The permission fallback covers unrecognized names (renamed system roles, custom
+ * roles). It uses admin:access specifically — NOT any admin:* prefix, since
+ * permissions like admin:config:notices are granted to Dispatchers. Retained
+ * deliberately, which is why the userFilters.ts admin:access defusal must stay.
+ */
+export function inferUserRoleTier(roleName: string | null | undefined, permissions: string[]): UserRole {
+    const name = (roleName || '').trim();
+    if (name === 'Admin') return UserRole.Admin;
+    if (name === 'Dispatcher') return UserRole.Dispatcher;
+    if (name === 'Member') return UserRole.Member;
+    if (!name || name === 'Client') return UserRole.Client;
+    if (permissions.includes('admin:access')) return UserRole.Admin;
+    if (permissions.includes('request:dispatch') || permissions.includes('request:triage')) return UserRole.Dispatcher;
+    if (permissions.includes('request:accept') || permissions.includes('user:toggle_duty')) return UserRole.Member;
+    return UserRole.Client;
+}
+
 export const toUser = (dbUser: UserRowWithEmbeds | null | undefined): User | undefined => {
     if (!dbUser || typeof dbUser !== 'object') return undefined;
 
     // Compute permissions early so we can use them for role inference
     const permissions: string[] = dbUser.role?.role_permissions?.map((rp) => rp.permission?.name).filter(Boolean) as string[] || [];
 
-    // Determine the user's role tier (Client/Member/Dispatcher/Admin).
-    // Strategy:
-    //   1) Case-insensitive name matching (handles default + common renames)
-    //   2) Permission-based inference for unrecognized role names (renamed system roles or custom roles).
-    //      Uses admin:access specifically — NOT any admin:* prefix, since permissions like
-    //      admin:config:notices can be granted to Dispatchers without making them Admins.
-    let role: UserRole = UserRole.Client;
-    const roleName = (dbUser.role?.name || '').trim().toLowerCase();
-
-    if (['admin', 'administrator', 'commander', 'director'].includes(roleName)) {
-        role = UserRole.Admin;
-    } else if (['dispatcher', 'officer'].includes(roleName)) {
-        role = UserRole.Dispatcher;
-    } else if (['member', 'recruit'].includes(roleName)) {
-        role = UserRole.Member;
-    } else if (roleName && roleName !== 'client') {
-        // Unrecognized role name — infer tier from assigned permissions.
-        // admin:access is the "Access the Admin Dashboard" gate permission,
-        // only granted to the Admin system role by default.
-        if (permissions.includes('admin:access')) {
-            role = UserRole.Admin;
-        } else if (permissions.includes('request:dispatch') || permissions.includes('request:triage')) {
-            role = UserRole.Dispatcher;
-        } else if (permissions.includes('request:accept') || permissions.includes('user:toggle_duty')) {
-            role = UserRole.Member;
-        }
-    }
+    const role: UserRole = inferUserRoleTier(dbUser.role?.name, permissions);
 
     // Handle both aliased 'unit' and unaliased 'units' returned by PostgREST
     const unitData = dbUser.unit || dbUser.units;
@@ -228,23 +243,26 @@ export const toUser = (dbUser: UserRowWithEmbeds | null | undefined): User | und
     };
 };
 
-// Hard-blank the private/security fields on an already-mapped User so that
-// embedding it in a member-visible payload can never leak adminNotes /
-// personnelNotes / conductRecord / clearance / limiting markers / permissions /
-// discord id / RSI verification state — the omission is enforced, not incidental.
-// Operates on a mapped User (e.g. a getUserById result) where toMiniUser cannot.
-export const blankSensitiveUserFields = (full: User): User => ({
-    ...full,
-    discordId: '',
-    permissions: [],
-    adminNotes: undefined,
-    personnelNotes: undefined,
-    clearanceLevel: undefined,
-    limitingMarkers: [],
-    conductRecord: [],
-    rsiHandlePending: undefined,
-    rsiVerificationCode: undefined,
-});
+// Project an already-mapped User down to the SAME allow-list the roster strip gives a
+// non-self viewer, with none of its permission-gated restores. Operates on a mapped
+// User (e.g. a getUserById result) where toMiniUser cannot.
+//
+// This was a DENYLIST of ten keys spread over `...full`, which blanked adminNotes /
+// personnelNotes / conductRecord / clearance / limitingMarkers / permissions /
+// discordId / isSystemAdmin / the RSI verification pair — but left rsiVerified,
+// jobTitle, voiceChannelName, timezone, dateFormat, probationStart, probationEnd,
+// tenureStartDate and tokensValidFrom untouched. That was safe only incidentally: no
+// `users!` embed selects those columns today, and the one non-embed input
+// (lib/db/ops.ts minifyUser(owner)) is always the caller's OWN record because
+// `userId` is an ACTOR_ID_FIELD the dispatcher force-overwrites. Sharing
+// buildRosterSafeUser with lib/db/userFilters.ts makes the omission structural: the
+// embed boundary and the roster boundary can no longer drift apart, and a column a
+// future SELECT adds is absent by default rather than one denylist entry away.
+//
+// isSystemAdmin (a SERVER-INTERNAL fact stamped on the session actor by
+// lib/db/adminIdentity.ts) is not on the allow-list, so it is now ABSENT rather than
+// present-and-undefined — JSON-equivalent, and the browser must never gate on it.
+export const blankSensitiveUserFields = (full: User): User => buildRosterSafeUser(full);
 
 // minifyUser blanks a mapped User (or passes through nullish), for callers that
 // already hold a hydrated User and need a safe-to-embed projection.
@@ -425,6 +443,7 @@ type OperationRowWithEmbeds = NullToUndefined<Omit<Tables<'operations'>, 'status
     // Not real columns on the operations Row — read defensively by the body
     // (always undefined unless a query aliases them in).
     discord_event_id?: string | null;
+    discord_start_notice?: boolean | null;
     template_id?: number | null;
     limiting_markers?: Array<{ marker?: string | null }> | null;
     owner?: UserRowWithEmbeds | null;
@@ -438,6 +457,7 @@ type OperationRowWithEmbeds = NullToUndefined<Omit<Tables<'operations'>, 'status
     schedule_entries?: OperationScheduleEntryRow[] | null;
     tasks?: OperationTaskRow[] | null;
     command_nodes?: OperationCommandNodeRow[] | null;
+    ship_slots?: OperationShipSlotRow[] | null;
     board_elements?: OperationBoardElementRow[] | null;
     logistics?: Tables<'operation_logistics'>[] | null;
     aar_entries?: OperationAAREntryRow[] | null;
@@ -469,6 +489,7 @@ export const toHydratedOperation = (dbOp: OperationRowWithEmbeds): HydratedOpera
     maxParticipants: dbOp.max_participants,
     unitId: dbOp.unit_id,
     discordEventId: dbOp.discord_event_id || undefined,
+    discordStartNotice: !!dbOp.discord_start_notice,
     discordAnnouncementChannelId: dbOp.discord_announcement_channel_id || undefined,
     discordAnnouncementMessageId: dbOp.discord_announcement_message_id || undefined,
     // Template-of-origin link. NULL when no template was used or the op
@@ -508,6 +529,7 @@ export const toHydratedOperation = (dbOp: OperationRowWithEmbeds): HydratedOpera
     scheduleEntries: (dbOp.schedule_entries || []).map(toOperationScheduleEntry) as HydratedOperation['scheduleEntries'],
     tasks: (dbOp.tasks || []).map(toOperationTask) as HydratedOperation['tasks'],
     commandNodes: (dbOp.command_nodes || []).map(toOperationCommandNode) as HydratedOperation['commandNodes'],
+    shipSlots: (dbOp.ship_slots || []).map(toOperationShipSlot) as HydratedOperation['shipSlots'],
     boardElements: (dbOp.board_elements || []).map(toOperationBoardElement) as HydratedOperation['boardElements'],
     logistics: (dbOp.logistics || []).map(toOperationLogisticsItem) as HydratedOperation['logistics'],
     aarEntries: (dbOp.aar_entries || []).map(toAAREntry) as HydratedOperation['aarEntries'],
@@ -695,6 +717,70 @@ export const toOperationCommandNode = (row: OperationCommandNodeRow) => ({
     icon: row.icon || undefined,
     sortOrder: row.sort_order || 0,
     liveStatus: row.live_status || undefined,
+    createdAt: row.created_at,
+});
+
+// Ship slots + seat assignments. Hand-written row types: the tables are new, so
+// `Tables<'operation_ship_slots'>` is not in the generated database.types until the
+// next gen:types run against a database that has already had the schema applied —
+// a chicken-and-egg the operator should not have to solve. The service-role client
+// is untyped, so the queries work either way.
+interface OperationSlotAssignmentRow {
+    id: number;
+    operation_id: string;
+    slot_id: number;
+    user_id: number;
+    status: string;
+    user_ship_id: number | null;
+    created_at: string;
+    updated_at?: string | null;
+}
+
+interface OperationShipSlotRow {
+    id: number;
+    operation_id: string;
+    parent_slot_id: number | null;
+    ship_id: number | null;
+    label: string;
+    seat_role: string | null;
+    capacity: number;
+    sort_order: number;
+    notes: string | null;
+    created_at: string;
+    updated_at?: string | null;
+    ship?: { id: number; name: string; image_url: string | null } | null;
+    assignments?: OperationSlotAssignmentRow[] | null;
+}
+
+export const toOperationSlotAssignment = (row: OperationSlotAssignmentRow) => ({
+    id: row.id,
+    operationId: row.operation_id,
+    slotId: row.slot_id,
+    userId: row.user_id,
+    // Narrowed to the two legal values rather than passed through: status drives
+    // whether the panel shows an approve/deny control, and the CHECK constraint is
+    // the only other thing standing between a stray value and that branch.
+    status: (row.status === 'applied' ? 'applied' : 'assigned') as 'applied' | 'assigned',
+    userShipId: row.user_ship_id || undefined,
+    createdAt: row.created_at,
+});
+
+export const toOperationShipSlot = (row: OperationShipSlotRow) => ({
+    id: row.id,
+    operationId: row.operation_id,
+    parentSlotId: row.parent_slot_id || undefined,
+    shipId: row.ship_id || undefined,
+    ship: row.ship ? { id: row.ship.id, name: row.ship.name, imageUrl: row.ship.image_url || undefined } : undefined,
+    label: row.label,
+    seatRole: row.seat_role || undefined,
+    capacity: row.capacity ?? 1,
+    sortOrder: row.sort_order || 0,
+    notes: row.notes || undefined,
+    // `|| []` is load-bearing, not defensive noise: the slots and assignments reads
+    // are separate safeFetch calls that soft-fail INDEPENDENTLY to [], and this
+    // mapper also runs on list-path rows that carry no ship_slots at all. Every
+    // consumer may therefore assume `assignments` is an array.
+    assignments: (row.assignments || []).map(toOperationSlotAssignment),
     createdAt: row.created_at,
 });
 
@@ -1518,4 +1604,114 @@ export const toAcademyEnrollment = (db: Tables<'academy_enrollments'>): AcademyE
     enrolledAt: db.enrolled_at,
     lessonProgress: [],
     outcomeResults: [],
+});
+
+// ── Blueprints ───────────────────────────────────────────────────────────────
+
+/**
+ * The party embed carries `deleted_at` for ONE reason: to withhold the name.
+ *
+ * Member removal is a SOFT delete and the registry rows survive by design — a
+ * blueprint is org history. A departed member being named and avatared on the
+ * board indefinitely is not history, it is a stale identity, and this build's
+ * convention everywhere else (getMarketplaceTrader, getCraftNotifyIds) filters
+ * `deleted_at`. Nulling the party here keeps the row and drops the person.
+ */
+interface BlueprintPartyEmbed {
+    id: number;
+    name: string;
+    avatar_url: string | null;
+    rsi_handle: string | null;
+    deleted_at: string | null;
+}
+
+interface BlueprintRow {
+    id: number;
+    owner_id: number;
+    qm_catalog_id: number | null;
+    item_name: string;
+    category: string | null;
+    notes: string | null;
+    offers_crafting: boolean;
+    created_at: string;
+    updated_at: string;
+    owner?: BlueprintPartyEmbed | null;
+}
+
+interface BlueprintRequestRow {
+    id: number;
+    requester_id: number;
+    crafter_id: number | null;
+    blueprint_id: number | null;
+    qm_catalog_id: number | null;
+    item_name: string;
+    quantity: number;
+    materials_note: string | null;
+    offer_price_uec: number | string | null;
+    status: string;
+    claimed_at: string | null;
+    ready_at: string | null;
+    delivered_at: string | null;
+    completed_at: string | null;
+    cancelled_at: string | null;
+    cancel_reason: string | null;
+    created_at: string;
+    updated_at: string;
+    requester?: BlueprintPartyEmbed | null;
+    crafter?: BlueprintPartyEmbed | null;
+}
+
+const toBlueprintParty = (p: BlueprintPartyEmbed | null | undefined): MarketplaceTrader | undefined =>
+    (p && !p.deleted_at) ? {
+        id: p.id,
+        name: p.name,
+        avatarUrl: p.avatar_url ?? null,
+        rsiHandle: p.rsi_handle ?? null,
+    } : undefined;
+
+export const toBlueprint = (row: BlueprintRow): Blueprint => ({
+    id: row.id,
+    ownerId: row.owner_id,
+    qmCatalogId: row.qm_catalog_id ?? null,
+    itemName: row.item_name,
+    category: row.category ?? null,
+    notes: row.notes ?? null,
+    offersCrafting: row.offers_crafting === true,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    owner: toBlueprintParty(row.owner),
+});
+
+/**
+ * Takes ONLY the three item-identity columns, so a row that somehow arrived
+ * carrying owner_id cannot leak it through this mapper.
+ */
+export const toCraftableItem = (row: { qm_catalog_id: number | null; item_name: string; category: string | null }): CraftableItem => ({
+    qmCatalogId: row.qm_catalog_id ?? null,
+    itemName: row.item_name,
+    category: row.category ?? null,
+});
+
+export const toBlueprintRequest = (row: BlueprintRequestRow): BlueprintRequest => ({
+    id: row.id,
+    requesterId: row.requester_id,
+    crafterId: row.crafter_id ?? null,
+    blueprintId: row.blueprint_id ?? null,
+    qmCatalogId: row.qm_catalog_id ?? null,
+    itemName: row.item_name,
+    quantity: row.quantity ?? 1,
+    materialsNote: row.materials_note ?? null,
+    // bigint arrives as a string over PostgREST once it exceeds the JS-safe range.
+    offerPriceUec: row.offer_price_uec == null ? null : Number(row.offer_price_uec),
+    status: row.status as BlueprintRequestStatus,
+    claimedAt: row.claimed_at ?? null,
+    readyAt: row.ready_at ?? null,
+    deliveredAt: row.delivered_at ?? null,
+    completedAt: row.completed_at ?? null,
+    cancelledAt: row.cancelled_at ?? null,
+    cancelReason: row.cancel_reason ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    requester: toBlueprintParty(row.requester),
+    crafter: toBlueprintParty(row.crafter),
 });

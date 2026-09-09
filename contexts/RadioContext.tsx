@@ -212,6 +212,13 @@ export const RadioProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const connectToChannel = useCallback(async (channel: RadioChannel) => {
         if (!currentUser) return;
 
+        // The server is AUTHORITATIVE over which room this token can join: it
+        // re-parses the name and re-derives it from validated ids before minting the
+        // grant (resolveAndAuthorizeRadioRoom, lib/radio.ts). The three shapes it
+        // parses — radio-<channelId>, radio-unit-<unitId>, radio-req-<requestId> —
+        // MUST match what RadioWidget builds here, or squad and mission voice go
+        // silently unjoinable again. For an unauthorized channel radio:auth throws a
+        // 403 and setError below surfaces it.
         const roomName = `radio-${channel.id}`;
 
         if (!isEnabled) {

@@ -7,6 +7,8 @@ import { buildOAuthStateCookie, clearOAuthStateCookie, readOAuthStateCookie, non
 import { isOpaqueServerError, isSecurityDenial } from '../lib/errors.js';
 import { getClientIp } from '../lib/clientIp.js';
 import { checkAuthRateLimit } from '../lib/authRateLimit.js';
+import { permissionSatisfied } from '../lib/permissionImplications.js';
+import { CLIENT_DENIED_NAMESPACES, CLIENT_DENIED_MESSAGE } from '../lib/clientNamespaces.js';
 import { log as baseLog } from '../lib/log.js';
 
 const log = baseLog.child({ module: 'services' });
@@ -32,6 +34,11 @@ import { allianceActions } from './actions/alliances.js';
 import { operationsFederationActions } from './actions/operations-federation.js';
 import { notificationActions } from './actions/notifications.js';
 import { academyActions } from './actions/academy.js';
+import { blueprintActions } from './actions/blueprints.js';
+import { banActions } from './actions/bans.js';
+import { credentialFromRequest, SESSION_COOKIE_IS_SECURE, buildSessionCookie, clearSessionCookie , appendSetCookie } from '../lib/sessionCookie.js';
+import { checkUserRateLimit } from '../lib/userRateLimit.js';
+import { TOKEN_LIFETIME_MS } from '../lib/auth.js';
 
 type ActionHandler = (payload: any, token?: string) => Promise<unknown>;
 
@@ -39,13 +46,23 @@ type ActionHandler = (payload: any, token?: string) => Promise<unknown>;
 // at the public-action handler before the protected-prefix BOLA gate runs.
 export const PUBLIC_ACTIONS: readonly string[] = ['auth:begin_oauth', 'auth:discord_callback', 'auth:finalize_setup', 'auth:redeem_setup_code', 'system:get_push_config', 'system:preflight'];
 
+/**
+ * The ONLY actions a banned member may still reach.
+ *
+ * Everything else is refused by the ban gate below. These three are what makes a
+ * ban accountable rather than a silent wall: the member can see WHY they were
+ * banned, appeal it once, and log out. Keep this list minimal — every entry is a
+ * surface reachable by someone the org has deliberately locked out.
+ */
+const BAN_EXEMPT_ACTIONS: readonly string[] = ['user:logout', 'ban:my_notice', 'ban:submit_appeal'];
+
 // Action prefixes that require a permission entry in fullPermissionMap. Any
 // authenticated request to an action with one of these prefixes is gated by
 // the BOLA/permission check below. 'user:' is included so the self-service user
 // actions are gated explicitly (each maps to the user:manage:self pseudo-permission,
 // i.e. any authenticated caller) rather than being implicitly open — that closes the
 // fail-open trap where a map entry on a user:* action would silently do nothing.
-export const PROTECTED_PREFIXES: readonly string[] = ['admin:', 'hr:', 'intel:', 'warrant:', 'unit:', 'operation:', 'request:', 'broadcast:', 'api:', 'wiki:', 'fleet:', 'gov:', 'radio:', 'warehouse:', 'finance:', 'qm:', 'system:', 'discord:', 'org:', 'catalog:', 'alliance:', 'mirror:', 'marketplace:', 'user:', 'notifications:', 'academy:'];
+export const PROTECTED_PREFIXES: readonly string[] = ['admin:', 'hr:', 'intel:', 'warrant:', 'unit:', 'operation:', 'request:', 'broadcast:', 'api:', 'wiki:', 'fleet:', 'gov:', 'radio:', 'warehouse:', 'finance:', 'qm:', 'system:', 'discord:', 'org:', 'catalog:', 'alliance:', 'mirror:', 'marketplace:', 'user:', 'notifications:', 'academy:', 'ban:', 'blueprint:'];
 
 // Optional-feature namespaces: action prefixes whose WHOLE namespace fails closed
 // server-side when the module is toggled OFF (Admin → Optional Features) — not just
@@ -69,6 +86,7 @@ export const OPTIONAL_FEATURE_NAMESPACES: Readonly<Record<string, {
     'marketplace:': { feature: 'marketplace',   source: 'features',   label: 'Marketplace' },
     'warehouse:':   { feature: 'warehouse',     source: 'features',   label: 'Warehouse' },
     'academy:':     { feature: 'academy',       source: 'features',   label: 'Academy' },
+    'blueprint:':   { feature: 'blueprints',    source: 'features',   label: 'Blueprint Manager' },
     'finance:':     { feature: 'finances',      source: 'features',   label: 'Finances' },
     'qm:':          { feature: 'quartermaster', source: 'features',   label: 'Quartermaster' },
     'gov:':         { feature: 'government',     source: 'government', label: 'Government', exempt: ['gov:update_feature_config'] },
@@ -89,6 +107,24 @@ export const OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS: ReadonlySet<string> = new 
     'operation:reset_readiness',
     'operation:add_participant',
     'operation:update_participant',
+    // Seating and approving-into-a-seat both write member state on someone else's
+    // behalf, so they sit beside add/update_participant rather than with the slot
+    // CRUD above. An owner holding only operations:create + operations:view may
+    // DESIGN ships and seats on their own operation and may not SEAT anyone in them
+    // — a deliberate split, and the reason assignSlot requires the target to
+    // already be a participant rather than enrolling them.
+    // remove_slot_assignment is deliberately NOT here. With decideSlotApplication
+    // now restricted to rows whose status is 'applied', denying an application and
+    // un-seating a member are genuinely different acts: the first admits someone,
+    // the second only clears a row on the owner's own operation and notifies nobody
+    // — the same shape as delete_task, which is bypassable.
+    'operation:assign_slot',
+    'operation:decide_slot_application',
+    // Posts a bot message to a channel the CALLER names. Without this an op owner
+    // holding only operations:create could aim the org's announcement — and, on the
+    // create path, its role ping — at any channel the bot can see. The handler also
+    // shape-checks the id; this is the other half.
+    'operation:repost_announcement',
     'operation:broadcast_alert',
     'operation:update_status',
     // Federation diplomacy: inviting/revoking an allied peer shares the op (and its
@@ -205,12 +241,19 @@ export const fullPermissionMap: Record<string, string> = {
     'radio:op_auth': 'user:manage:self',
     'radio:status': 'user:manage:self',
     'system:search_locations': 'user:manage:self',
-    // Reference-data lookups (clearances, markers, global search). Reference
-    // tables, available to any authenticated user — same shape as
-    // system:search_locations above. Behaviour-neutral entries added so the
-    // BOLA prefix gate does not 403 legitimate callers.
-    'system:get_clearances': 'user:manage:self',
-    'system:get_markers': 'user:manage:self',
+    // 'system:get_clearances' / 'system:get_markers' entries REMOVED together with their
+    // handlers in api/actions/system.ts (Phase 3 item 5, owner decision D3). Both were
+    // gated 'user:manage:self' — any authenticated session, an external customer
+    // included — and served the org's whole classification ladder and its limiting-marker
+    // codeword list, with ZERO callers repo-wide.
+    // BOTH HALVES GO IN ONE COMMIT: tests/permissionMapCoverage.test.ts pins
+    // actions ⊆ map AND map ⊆ actions, so deleting either half alone is red — and
+    // deleting the map entry alone would hard-403 the still-registered action for EVERY
+    // caller including the seeded Admin ('system:' is a PROTECTED_PREFIXES entry).
+    // THIS DOES NOT CLOSE THE TAXONOMY: the `authenticated` PostgREST grant
+    // (schema.sql private.rt_client_tables) still serves security_clearances and
+    // security_limiting_markers to any session holding a realtime token. Phase 3 item 7
+    // owns that. Do not re-add either action.
     // org:claim: any authenticated user can attempt; the claim code itself is
     // the privilege guard (validateClaimCode TTL + rate limit).
     'org:claim': 'user:manage:self',
@@ -240,6 +283,7 @@ export const fullPermissionMap: Record<string, string> = {
     'qm:list_locations':                'qm:view',
     'qm:get_location':                  'qm:view',
     'qm:list_inventory':                'qm:view',
+    'qm:list_inventory_facets':         'qm:view',
     'qm:count_inventory':               'qm:view',
     'qm:list_issuances':                'qm:view',
     'qm:get_issuance':                  'qm:view',
@@ -252,6 +296,7 @@ export const fullPermissionMap: Record<string, string> = {
     'qm:create_inventory':              'qm:manage',
     'qm:update_inventory':              'qm:manage',
     'qm:adjust_inventory':              'qm:manage',
+    'qm:set_inventory_total':           'qm:manage',
     'qm:fulfil_issuance':               'qm:manage',
     'qm:issue_direct':                  'qm:manage',
     'qm:issue_bulk':                    'qm:manage',
@@ -280,6 +325,7 @@ export const fullPermissionMap: Record<string, string> = {
     'warehouse:create_stock':           'warehouse:manage',
     'warehouse:delete_stock':           'warehouse:manage',
     'warehouse:adjust_stock':           'warehouse:manage',
+    'warehouse:set_stock_total':        'warehouse:manage',
     'warehouse:transfer_stock':         'warehouse:manage',
     'warehouse:approve_withdrawal':     'warehouse:manage',
     'warehouse:deny_withdrawal':        'warehouse:manage',
@@ -364,14 +410,23 @@ export const fullPermissionMap: Record<string, string> = {
     // family at the high-bar admin:db:destroy perm (NOT seeded to Dispatcher) and
     // additionally assert the genuine Admin role in each handler, mirroring the
     // danger-zone (full_reset/full_wipe) and platform-lifecycle pattern.
+    'admin:security:list_events': 'admin:security:view_audit',
     'admin:db:check': 'admin:db:destroy',
     'admin:db:repair': 'admin:db:destroy',
     'admin:db:prune': 'admin:db:destroy',
-    // Domain-scoped destructive resets require the domain's management perm, not
-    // bare dashboard access (a finance-blind dashboard user must not erase the
-    // treasury / quartermaster audit trail).
-    'admin:db:reset_finances': 'finance:manage',
-    'admin:db:reset_quartermaster': 'qm:manage',
+    'admin:db:rotate_secrets': 'admin:db:destroy',
+    // Domain-scoped destructive resets (raw mass DELETEs over the treasury ledger /
+    // accounts and every quartermaster table). Gated at the same high bar as the
+    // rest of the family, NOT at the domain perm: 'admin:' is not one of
+    // OPTIONAL_FEATURE_NAMESPACES' prefixes, so the module-off gate above never
+    // fires for these — this map entry is the only gate the dispatcher applies, and
+    // a domain perm here let any delegated finance:manage / qm:manage holder (a
+    // custom "Treasurer" role, say) wipe a module that was never enabled. The
+    // domain-competence bar it used to carry ("a finance-blind dashboard user must
+    // not erase the treasury") is NOT retired: the handlers assert the genuine Admin
+    // role AND that same domain perm (assertDomainResetPerm, api/actions/admin.ts).
+    'admin:db:reset_finances': 'admin:db:destroy',
+    'admin:db:reset_quartermaster': 'admin:db:destroy',
     // Catastrophic full-DB destruction: a dedicated high-bar perm (NOT seeded to
     // Dispatcher). The handler additionally requires the genuine Admin role + a
     // server-validated confirmation phrase.
@@ -391,6 +446,20 @@ export const fullPermissionMap: Record<string, string> = {
     'admin:revoke_user_sessions': 'admin:user:update_role',
     'admin:update_features': 'admin:config:features',
 
+    // ── Org bans ──
+    // place / lift / list / review are ONE permission on purpose: splitting them
+    // would let an org grant "can ban" without "can lift", which is exactly the
+    // unrecoverable state the recoverability guard in ban:place exists to prevent.
+    'ban:place': 'admin:user:ban',
+    'ban:lift': 'admin:user:ban',
+    'ban:list': 'admin:user:ban',
+    'ban:list_appeals': 'admin:user:ban',
+    'ban:review_appeal': 'admin:user:ban',
+    // The self side, reachable WHILE BANNED (see BAN_EXEMPT_ACTIONS). Both are
+    // dispatcher-scoped to the actor's own id and take no target.
+    'ban:my_notice': 'user:manage:self',
+    'ban:submit_appeal': 'user:manage:self',
+
     // Global Catalog Management (ships / items / commodities / locations)
     'catalog:list_ships': 'admin:config:catalog',
     'catalog:sync_ships': 'admin:config:catalog',
@@ -404,6 +473,7 @@ export const fullPermissionMap: Record<string, string> = {
     'catalog:update_item_category': 'admin:config:catalog',
     'catalog:delete_item_category': 'admin:config:catalog',
     'catalog:sync_items': 'admin:config:catalog',
+    'catalog:sync_item_attributes': 'admin:config:catalog',
     'catalog:update_item': 'admin:config:catalog',
     'catalog:delete_item': 'admin:config:catalog',
     'catalog:list_commodities': 'admin:config:catalog',
@@ -426,6 +496,7 @@ export const fullPermissionMap: Record<string, string> = {
     // (any Discord member could see them), so we gate at the lowest needed
     // permission.
     'discord:list_guild_channels': 'operations:create',
+    'discord:list_channels_admin': 'admin:config:discord',
 
     // HR Actions
     'hr:get_state': 'hr:view',
@@ -439,6 +510,13 @@ export const fullPermissionMap: Record<string, string> = {
     'hr:delete_application': 'hr:manager',
     'hr:assign_recruiter': 'hr:manager',
     'hr:create_interview': 'hr:recruiter',
+    // Eligibility pickers for the two actions above. Each mirrors the gate of the
+    // action it feeds, so the picker can never enumerate HR staff to a caller who
+    // could not perform the write. Deliberately NOT 'hr:view' — that is a
+    // MEMBER_DEFAULT_PERMS entry, so it would hand every member a roster of the
+    // org's recruiters and case officers.
+    'hr:get_eligible_interviewers': 'hr:recruiter',
+    'hr:get_eligible_officers': 'hr:manager',
     'hr:update_interview': 'hr:recruiter',
     'hr:update_interview_interviewer': 'hr:manager',
     'hr:delete_interview': 'hr:manager',
@@ -472,13 +550,27 @@ export const fullPermissionMap: Record<string, string> = {
     'hr:get_application_data': 'hr:recruiter',
     'hr:process_job_approval': 'hr:recruiter',
 
-    // User self-service. All of these act on the caller's OWN record (the dispatcher
-    // forces userId to the authenticated user), so the gate is simply "any signed-in
-    // user" via the user:manage:self pseudo-permission. user:get_position_history
-    // does its own cross-user check inside the handler. Every user:* action must
-    // appear here now that 'user:' is a protected prefix (permissionMapCoverage pins it).
+    // User self-service. These act on the caller's OWN record (the dispatcher forces
+    // userId to the authenticated user), so the gate is simply "any signed-in user" via
+    // the user:manage:self pseudo-permission — with ONE exception, user:toggle_duty,
+    // immediately below. user:get_position_history does its own cross-user check inside
+    // the handler. Every user:* action must appear here now that 'user:' is a protected
+    // prefix (permissionMapCoverage pins it).
     'user:logout': 'user:manage:self',
-    'user:toggle_duty': 'user:manage:self',
+    // NOT 'user:manage:self': going on duty is a STAFF capability, and this build already
+    // says so everywhere else — 'user:toggle_duty' is an entry in STAFF_VIEW_PERMS
+    // (lib/staffPerms.ts, "only personnel go on duty"), a Member and Dispatcher seeded
+    // default (lib/roleDefaultPermissions.ts), a real permission row (schema.sql §7,
+    // lib/db/system.ts GLOBAL_PERMISSIONS), and both UI entry points gate on it. The
+    // pseudo-perm was the ONLY place that disagreed, which let an external customer flip
+    // their own is_duty and appear in every staff duty picker that does not filter by
+    // tier. Mapping the action to the permission of the same name changes nothing for
+    // Member/Dispatcher/Admin and closes the Client. Toggling SOMEONE ELSE's duty is
+    // 'admin:toggle_duty' -> 'admin:user:update', unchanged.
+    // ACCEPTED: the BOLA gate has no isSystemAdmin bypass ("Admin role bypasses via
+    // permissions"), so an Admin role stripped of this permission through the Roles UI
+    // loses its own self-toggle. The seeder grants Admin every permission.
+    'user:toggle_duty': 'user:toggle_duty',
     'user:heartbeat': 'user:manage:self',
     'user:initiate_rsi_update': 'user:manage:self',
     'user:verify_rsi_update': 'user:manage:self',
@@ -562,6 +654,18 @@ export const fullPermissionMap: Record<string, string> = {
     'operation:add_command_node': 'operations:manage',
     'operation:update_command_node': 'operations:manage',
     'operation:delete_command_node': 'operations:manage',
+
+    // Ship slots + seats. Organiser DESIGNS and ASSIGNS under operations:manage;
+    // a member applies for and withdraws from a seat under operations:view — the
+    // same tier as join / rsvp / toggle_ready / fulfill_logistics.
+    'operation:add_ship_slot': 'operations:manage',
+    'operation:update_ship_slot': 'operations:manage',
+    'operation:delete_ship_slot': 'operations:manage',
+    'operation:assign_slot': 'operations:manage',
+    'operation:decide_slot_application': 'operations:manage',
+    'operation:remove_slot_assignment': 'operations:manage',
+    'operation:apply_for_slot': 'operations:view',
+    'operation:withdraw_slot': 'operations:view',
     'operation:add_board_element': 'operations:manage',
     'operation:update_board_element': 'operations:manage',
     'operation:delete_board_element': 'operations:manage',
@@ -703,7 +807,6 @@ export const fullPermissionMap: Record<string, string> = {
     'marketplace:get_categories': 'marketplace:view',
     'marketplace:browse': 'marketplace:view',
     'marketplace:get_listing': 'marketplace:view',
-    'marketplace:get_rep': 'marketplace:view',
     'marketplace:get_profile': 'marketplace:view',
     'marketplace:get_contract_ratings': 'marketplace:view',
     'marketplace:report': 'marketplace:view',
@@ -717,7 +820,6 @@ export const fullPermissionMap: Record<string, string> = {
     'marketplace:cancel': 'marketplace:contract',
     'marketplace:rate': 'marketplace:contract',
     'marketplace:my_contracts': 'marketplace:contract',
-    'marketplace:get_contract': 'marketplace:contract',
     'marketplace:get_milestones': 'marketplace:contract',
     'marketplace:toggle_milestone': 'marketplace:contract',
     'marketplace:delete_milestone': 'marketplace:contract',
@@ -767,6 +869,9 @@ export const fullPermissionMap: Record<string, string> = {
     'academy:create_outcome': 'academy:instruct',
     'academy:update_outcome': 'academy:instruct',
     'academy:delete_outcome': 'academy:instruct',
+    'academy:reorder_modules': 'academy:instruct',
+    'academy:reorder_lessons': 'academy:instruct',
+    'academy:reorder_outcomes': 'academy:instruct',
     'academy:create_session': 'academy:instruct',
     'academy:update_session': 'academy:instruct',
     'academy:set_session_status': 'academy:instruct',
@@ -778,12 +883,51 @@ export const fullPermissionMap: Record<string, string> = {
     'academy:certify_and_complete': 'academy:manage',
     'academy:self_enroll': 'user:manage:self',
     'academy:withdraw_enrollment': 'user:manage:self',
+    // Asking for a seat is a self-service act — the gate that matters is on the
+    // DECISION, not the ask. Withdraw is self-scoped inside the db layer (the row's
+    // student_id must equal the caller), so user:manage:self is the whole control.
+    'academy:request_enrollment': 'user:manage:self',
+    'academy:withdraw_enrollment_request': 'user:manage:self',
+    'academy:list_my_enrollment_requests': 'user:manage:self',
+    'academy:decide_enrollment_request': 'academy:instruct',
+    'academy:list_enrollment_requests': 'academy:instruct',
     'academy:mark_lesson': 'user:manage:self',
     'academy:get_enrollment': 'user:manage:self',
     'academy:get_catalog_course': 'user:manage:self',
     'academy:get_course': 'academy:view',
+    'academy:list_course_reviews': 'academy:instruct',
     'academy:get_session': 'academy:view',
     'academy:list_recommended': 'academy:manage',
+    'academy:report_completions': 'academy:manage',
+    'academy:report_course_activity': 'academy:manage',
+    'academy:report_cert_holders': 'academy:manage',
+    'academy:report_member_transcript': 'academy:manage',
+
+    // ── Blueprints ────────────────────────────────────────────────────────────
+    // Five permissions, four rungs. `:view` is the read tier for BOTH registry
+    // reads — the craftable list is a de-duplicated item picker, not a second,
+    // lower boundary (see lib/db/blueprints.ts). `:register` covers the caller's
+    // OWN registry rows and is where the ownership guards live; `:request` is the
+    // asking side; `:craft` is the fulfilling side and is what puts the open board
+    // in reach; `:manage` moderates other members' rows — and even it cannot set
+    // someone else's offers_crafting, because that flag is consent.
+    //
+    // confirm_received is deliberately on `:request`, not `:craft`: only the
+    // member who raised the ask may say they received it, and the db layer refuses
+    // a manage bypass there too.
+    'blueprint:list_registry': 'blueprint:view',
+    'blueprint:list_craftable': 'blueprint:view',
+    'blueprint:list_requests': 'blueprint:view',
+    'blueprint:register': 'blueprint:register',
+    'blueprint:update': 'blueprint:register',
+    'blueprint:delete': 'blueprint:register',
+    'blueprint:create_request': 'blueprint:request',
+    'blueprint:confirm_received': 'blueprint:request',
+    'blueprint:cancel_request': 'blueprint:request',
+    'blueprint:claim_request': 'blueprint:craft',
+    'blueprint:release_request': 'blueprint:craft',
+    'blueprint:mark_ready': 'blueprint:craft',
+    'blueprint:mark_delivered': 'blueprint:craft',
 };
 
 export const actions: Record<string, ActionHandler> = {
@@ -807,6 +951,8 @@ export const actions: Record<string, ActionHandler> = {
     ...operationsFederationActions,
     ...notificationActions,
     ...academyActions,
+    ...blueprintActions,
+    ...banActions,
 };
 
 // Validate permission-map coverage against the actions registry.
@@ -872,6 +1018,48 @@ export function validatePermissionMap(): { missing: string[]; stale: string[] } 
     return { missing, stale };
 }
 
+// Denials go to BOTH sinks from one place so the two cannot drift. log.warn keeps the
+// operational signal in stdout for whoever is tailing it; recordSecurityEvent makes the
+// same event answerable months later, once the container that held that stdout is gone.
+// "Which account tried to reset the treasury, and when?" is not a question you can
+// answer by grepping a redeployed container.
+//
+// FIRE-AND-FORGET ON PURPOSE. recordSecurityEvent never rejects, and an audit write must
+// never be able to turn a 403 into a 500: a denial that fails loudly because its audit
+// row could not be written is a worse outcome than a missing row, and a 500 is retried
+// or handled more permissively than a 403 on several paths. Losing the audit row is bad;
+// losing the denial is worse.
+function auditDenial(event: string, ctx: {
+    action?: string | null;
+    user?: { id?: number; rsiHandle?: string } | null;
+    ip?: string | null;
+    details?: Record<string, unknown>;
+}): void {
+    const userId = ctx.user?.id;
+    log.warn(event, { userId, action: ctx.action ?? undefined, ...(ctx.details || {}) });
+    // recordSecurityEvent is contracted never to REJECT, but it can still be ABSENT or
+    // throw synchronously — a partial test double, a barrel that failed to load, a future
+    // refactor. `void` does not catch either of those, so the contract has to be made
+    // structural here or it is only aspirational: an undefined emitter would turn every
+    // 403 in this file into a 500, which is precisely the inversion the comment above
+    // says must not happen.
+    try {
+        void db.recordSecurityEvent({
+            event,
+            action: ctx.action ?? null,
+            actorUserId: typeof userId === 'number' ? userId : null,
+            // The handle is kept so the row still identifies someone after the account is
+            // deleted and actor_user_id goes NULL. It is not a secret: it is the public
+            // RSI handle already shown on every roster row.
+            actorLabel: ctx.user?.rsiHandle ?? null,
+            actorIp: ctx.ip ?? null,
+            details: ctx.details,
+        });
+    } catch (err) {
+        log.warn('security event emit threw', { err });
+    }
+}
+
 export default async function handler(req: Request, res: Response) {
     if (req.method !== 'POST') {
         return res.status(405).json({ message: 'Method not allowed' });
@@ -879,18 +1067,21 @@ export default async function handler(req: Request, res: Response) {
 
     const { action, payload } = req.body;
 
+    // Hoisted to handler scope: every denial path below records it on the audit row,
+    // so an operator can see WHERE a probe came from and not just that it happened.
+    const ip = getClientIp(req);
+
     // --- AUTH RATE LIMITING ---
     // Per-IP cap on `auth:*` actions (10/min/IP), applied before context
     // resolution so rejected requests short-circuit the DB lookups. The global
     // 100 req/min/IP limit alone left too much room for OAuth probing.
     if (typeof action === 'string' && action.startsWith('auth:')) {
-        const ip = getClientIp(req);
         const check = checkAuthRateLimit(ip);
         if (!check.ok) {
             // Log the trip so an operator can spot credential probing / OAuth
             // hammering, matching the permission-denied and blackhole logs. IP and
             // action only — no credential data.
-            log.warn('auth rate limit tripped', { ip, action, retryAfter: check.retryAfter });
+            auditDenial('auth.rate_limited', { action, ip, details: { retryAfter: check.retryAfter } });
             res.setHeader('Retry-After', String(check.retryAfter));
             return res.status(429).json({
                 success: false,
@@ -904,8 +1095,8 @@ export default async function handler(req: Request, res: Response) {
     // Single-org: no subdomain/tenant resolution. There is exactly one org and
     // no organization_id column, so nothing is injected into the payload here.
 
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    // DUAL-ACCEPT: the session credential may arrive as an HttpOnly cookie (preferred) or, for a session issued before the cookie existed, the Authorization header. A hard cutover would log out every live session on deploy.
+    const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
     const publicActions = PUBLIC_ACTIONS;
 
     // --- MAINTENANCE MODE + FORCE LOGOUT ENFORCEMENT ---
@@ -926,7 +1117,7 @@ export default async function handler(req: Request, res: Response) {
             if (!forceLogoutBypass.includes(action) && platformSettings?.force_logout_timestamp && token) {
                 const decoded = verifyToken(token);
                 if (decoded && isSessionForceLoggedOut(decoded, platformSettings.force_logout_timestamp)) {
-                    return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+                    appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE)); return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
                 }
             }
 
@@ -936,8 +1127,24 @@ export default async function handler(req: Request, res: Response) {
                 if (token) {
                     const decoded = verifyToken(token);
                     if (decoded) {
-                        const adminUser = await db.getUserById(decoded.userId);
-                        if (adminUser?.role === 'Admin') isAdmin = true;
+                        // Own try/catch: getUserById is fail-closed and THROWS on a
+                        // read fault. The outer catch below only warns, and the 503
+                        // return lives inside it — so letting the throw escape here
+                        // would skip the maintenance gate entirely and open the
+                        // platform to everyone on a DB blip. Unknown ⇒ not Admin.
+                        let adminUser: Awaited<ReturnType<typeof db.getUserById>> = null;
+                        try { adminUser = await db.getUserById(decoded.userId); }
+                        catch (err) { log.warn('maintenance admin check failed; treating as non-admin', { err }); }
+                        // Role IDENTITY (stamped by getUserById). Deliberately NOT
+                        // admin:access: the seeded Dispatcher holds it, and handing a
+                        // Dispatcher the maintenance bypass would defeat the window the
+                        // operator declared. On the DENY path only, re-resolve
+                        // cache-free — the stamp reads a 5-minute memo that an org
+                        // import leaves pointing at deleted role ids, and lifting
+                        // maintenance is the escape hatch with no other in-app exit.
+                        // resolveIsSystemAdminFresh never throws. Unknown ⇒ not Admin.
+                        if (adminUser?.isSystemAdmin === true) isAdmin = true;
+                        else if (adminUser) isAdmin = await db.resolveIsSystemAdminFresh(adminUser.roleId);
                     }
                 }
                 if (!isAdmin) {
@@ -974,7 +1181,7 @@ export default async function handler(req: Request, res: Response) {
                 // Fail closed BEFORE the code is exchanged. Clear the cookie so a
                 // retry starts a fresh begin_oauth round.
                 res.setHeader('Set-Cookie', clearOAuthStateCookie(reqSecure));
-                log.warn('oauth state binding failed', { hasCookie: !!cookieNonce, hasNonce: typeof sentNonce === 'string' });
+                auditDenial('auth.oauth_state.denied', { action, ip, details: { hasCookie: !!cookieNonce, hasNonce: typeof sentNonce === 'string' } });
                 return res.status(403).json({ success: false, message: 'OAuth state validation failed. Please try signing in again.', code: 'OAUTH_STATE_INVALID' });
             }
             // One-time use: clear the cookie now that it has been consumed.
@@ -995,13 +1202,22 @@ export default async function handler(req: Request, res: Response) {
             return res.status(400).json({ message: `Invalid action: ${action}` });
         }
         try {
-            const result = await actions[action](payload, token);
+            const result = await actions[action](payload, token ?? undefined);
+            // MINT THE SESSION COOKIE. The two login actions (auth:discord_callback,
+            // auth:finalize_setup) sign the token inside their handlers, and a handler has no
+            //  — so the cookie is set here, where the result is still in hand. The token
+            // stays in the JSON body as well: dual-accept means a client that cannot use the
+            // cookie (an operator on plain HTTP whose browser refused it) is not locked out.
+            const issued = (result as { token?: unknown } | null)?.token;
+            if (typeof issued === 'string' && issued) {
+                appendSetCookie(res, buildSessionCookie(issued, SESSION_COOKIE_IS_SECURE, TOKEN_LIFETIME_MS / 1000));
+            }
             return res.status(200).json({ success: true, data: result });
         } catch (error: any) {
             if (isSecurityDenial(error)) {
                 // BOLA/authz denial: audit-log the event + diagnostic fields
                 // server-side; only the safe, generic message crosses the wire.
-                log.warn(error.auditEvent || 'authz.denied', { action, ...error.fields });
+                auditDenial(error.auditEvent || 'authz.denied', { action, ip, details: error.fields });
                 return res.status(error.status || 403).json({ success: false, message: error.message });
             }
             const requestId = randomUUID();
@@ -1039,7 +1255,53 @@ export default async function handler(req: Request, res: Response) {
     // admin revokes the user's sessions, or bans/deletes them). Same check the read
     // paths use, so the two can't drift. Returns force_logout for the client to act on.
     if (isSessionRevokedByWatermark(decodedUser, fullUser.tokensValidFrom)) {
-        return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+        appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE)); return res.status(401).json({ message: 'Session expired. Please log in again.', force_logout: true });
+    }
+
+    // ───────────────────────── ORG BAN GATE ─────────────────────────
+    // FIRST gate on this path, above the client-tier denial and the permission gate.
+    //
+    // It MUST sit above the permission gate, because 'user:' maps to the
+    // user:manage:self pseudo-permission — which stops nobody. Without this a banned
+    // member could still call user:heartbeat (staying on the duty roster),
+    // user:toggle_duty, user:apply_job, user:submit_application, user:subscribe_push
+    // and user:delete_self.
+    //
+    // It sits immediately BELOW the watermark check on purpose, and ban:place
+    // deliberately does NOT stamp tokens_valid_from — see the long note there. If it
+    // did, a banned member would be 401'd above this line and could never reach the
+    // two exempt actions, killing the appeal flow.
+    //
+    // FAILS CLOSED, but never INTO a ban screen: a read fault is a retryable 503, not
+    // an accusation. Telling an innocent member they are banned because a query
+    // failed is its own kind of incident.
+    let activeBan;
+    try {
+        activeBan = await db.findActiveBan({ userId: fullUser.id, discordId: fullUser.discordId });
+    } catch (e) {
+        // Not a bare catch: a TypeError in the gate ITSELF would otherwise become a
+        // permanent, silent 503 for every user on every request — fail-closed, but a
+        // full outage nobody can see. BanCheckUnavailable is the expected shape.
+        // Checked by NAME, not instanceof. The class crosses a barrel re-export, and an
+        // instanceof there is fragile in exactly the situation this branch exists for — a
+        // partially-loaded module. The name is set in the constructor and survives.
+        if ((e as Error)?.name !== 'BanCheckUnavailable') {
+            log.error('ban gate failed unexpectedly', { action, userId: fullUser.id, err: e });
+        }
+        return res.status(503).json({
+            success: false, code: 'BAN_CHECK_UNAVAILABLE',
+            message: 'Unable to verify account status. Please try again.',
+        });
+    }
+    if (activeBan && !BAN_EXEMPT_ACTIONS.includes(action)) {
+        auditDenial('authz.org_ban.denied', {
+            action, user: fullUser, ip,
+            details: { banId: activeBan.id },
+        });
+        return res.status(403).json({
+            success: false, code: 'ORG_BANNED',
+            message: 'Your access to this organization has been suspended.',
+        });
     }
 
     // --- PAYLOAD INJECTION ---
@@ -1078,6 +1340,44 @@ export default async function handler(req: Request, res: Response) {
         return res.status(400).json({ message: `Invalid action: ${action}` });
     }
 
+    // CLIENT-TIER NAMESPACE DENIAL. An org's external customers (accounts on the seeded
+    // system Client role) are not members of the org's internal product surfaces.
+    // Registry: lib/clientNamespaces.ts. Predicate: db.isClientCaller
+    // (lib/db/clientRoleLock.ts) — a ROLE-SLOT test, deliberately not a permission test.
+    //
+    // SECOND-HIGHEST GATE ON THIS PATH — below the ORG BAN GATE above, and above
+    // everything below. api/query.ts puts the same registry in the same position on the
+    // read path, so the two surfaces still carry ONE ordering invariant instead of two.
+    // (It was the highest until org bans landed. A ban outranks a tier because it is the
+    // one denial that must survive the member's row being deleted, and because the two
+    // ban-exempt actions have to be reachable by someone every other gate refuses.)
+    // Concretely:
+    //   · ABOVE the permission gate, because the permission gate is exactly what fails
+    //     here: academy:self_enroll and its siblings map to the 'user:manage:self'
+    //     pseudo-permission, so "any authenticated session" is the entire gate today.
+    //     Running above it also means a stray staff grant on the Client role cannot buy
+    //     past the denial — assertRoleIsNotClient stops the Roles UI writing one, but the
+    //     seeder, repairDatabase, the org importer and hand-run SQL are four writers it
+    //     does not cover.
+    //   · ABOVE the optional-feature gate, so a customer gets ONE refusal for a denied
+    //     namespace whatever the module's state, and the tier answer never depends on an
+    //     unrelated settings read.
+    // This is NOT a module-state non-disclosure control and nothing here may claim it is:
+    // getMainState ships orgMeta.features to EVERY caller (lib/db.ts says so in as many
+    // words) and the raw 'orgFeatures' settings key rides the same `main` bundle, so a
+    // Client already has every module's enable state at boot. Phase 3 item 8
+    // (settings-projection) owns that.
+    //
+    // BELOW the own-property existence check above, so an unknown action still 400s and
+    // `action` is known to be a string here. isClientCaller is resolved only once a prefix
+    // has matched, so the common path adds no work — and getSystemRoles is memoised for
+    // five minutes besides.
+    const clientDeniedPrefix = CLIENT_DENIED_NAMESPACES.find(p => action.startsWith(p));
+    if (clientDeniedPrefix && await db.isClientCaller(user)) {
+        auditDenial('authz.client_namespace.denied', { action, user, ip, details: { prefix: clientDeniedPrefix } });
+        return res.status(403).json({ success: false, message: CLIENT_DENIED_MESSAGE });
+    }
+
     // Optional-feature gate: when a module is toggled OFF, its whole action
     // namespace fails closed HERE — before the permission gate, so a disabled
     // feature is denied regardless of role (including the permission-LESS academy
@@ -1107,8 +1407,15 @@ export default async function handler(req: Request, res: Response) {
                 if (requiredPerm === 'user:manage:self') {
                     // Allowed — skip further permission checks
                 } else {
-                const hasPerm = user?.permissions?.includes(requiredPerm);
-                const hasClearanceView = requiredPerm === 'intel:view' && user?.permissions?.includes('intel:view:clearance');
+                // permissionSatisfied applies the shared implication table
+                // (lib/permissionImplications.ts): intel:view:clearance satisfies
+                // intel:view, and manage ⊇ instruct ⊇ view on the Academy ladder.
+                // Ladders only climb, so nothing here lets a weaker permission
+                // satisfy a stronger gate. The intel synonym used to be an inline
+                // compare HERE and a second one in api/query.ts — two copies of one
+                // rule, which is how a gate that permits a write but refuses the
+                // read-back gets built.
+                const hasPerm = permissionSatisfied(user?.permissions, requiredPerm);
 
                 // Op-owner bypass: an op's owner satisfies operations:manage for
                 // owner-appropriate edit/lifecycle actions on their OWN op. Only
@@ -1150,13 +1457,13 @@ export default async function handler(req: Request, res: Response) {
                     isRequestLead = req?.lead_responder_id === user.id;
                 }
 
-                if (!hasPerm && !hasClearanceView && !isOpOwner && !isUnitLeader && !isBulletinAuthor && !isRequestLead) {
-                    log.warn('permission denied', { userId: user?.id, action, requiredPerm });
+                if (!hasPerm && !isOpOwner && !isUnitLeader && !isBulletinAuthor && !isRequestLead) {
+                    auditDenial('authz.permission.denied', { action, user, ip, details: { requiredPerm } });
                     return res.status(403).json({ message: 'Insufficient permissions' });
                 }
                 }
             } else {
-                log.warn('permission denied — unmapped action', { action });
+                auditDenial('authz.unmapped_action.denied', { action, user, ip });
                 return res.status(403).json({ message: 'Insufficient permissions' });
             }
         }
@@ -1164,27 +1471,116 @@ export default async function handler(req: Request, res: Response) {
         // warrant:generate_report authors an intel report (intel:create gate above)
         // FROM a warrant's caution-note text. Reading that warrant content is
         // warrant:view-gated everywhere else (the warrants/warrant_slice read subsets,
-        // the intel dossier, getIntelStats). Require warrant:view (or Admin) in
+        // the intel dossier, getIntelStats). Require warrant:view in
         // ADDITION to intel:create, so an intel:create-only holder can't launder
         // warrant:view-gated caution text into a classification-0 report using a
         // warrant id obtained from the id-only realtime broadcast.
         if (action === 'warrant:generate_report') {
-            const canViewWarrants = user?.role === 'Admin' || (Array.isArray(user?.permissions) && user.permissions.includes('warrant:view'));
+            // Permission only — no role-name bypass (see lib/db/intel.ts getIntelStats).
+            const canViewWarrants = Array.isArray(user?.permissions) && user.permissions.includes('warrant:view');
             if (!canViewWarrants) {
-                log.warn('permission denied', { userId: user?.id, action, requiredPerm: 'warrant:view' });
+                auditDenial('authz.permission.denied', { action, user, ip, details: { requiredPerm: 'warrant:view' } });
                 return res.status(403).json({ message: 'Insufficient permissions' });
+            }
+        }
+
+        // admin:list_testimonial_candidates is a SEARCHABLE listing of the free-text
+        // service_requests.client_feedback column (getTestimonialCandidates ilikes over it
+        // and returns the quote plus the INTERNAL request id). That column is redacted
+        // per-viewer on every OTHER read path by redactRequestFeedbackForViewer
+        // (lib/db/requests.ts), gated on request:view:feedback. admin:config:branding is a
+        // delegatable comms/PR bucket the seeded Dispatcher does NOT hold alongside feedback
+        // access, so branding alone would be a second, searchable route around that boundary.
+        // Require request:view:feedback in ADDITION to the mapped branding perm;
+        // the predicate matches redactRequestFeedbackForViewer's maySee exactly so the list
+        // route and the redaction route cannot drift. (The handler asserts it again, so a
+        // future in-process caller can't reach the listing ungated.)
+        if (action === 'admin:list_testimonial_candidates') {
+            // Permission only — matches redactRequestFeedbackForViewer's maySee (no
+            // role-name bypass) so the redaction and listing routes cannot drift.
+            const canReadFeedback = Array.isArray(user?.permissions) && user.permissions.includes('request:view:feedback');
+            if (!canReadFeedback) {
+                log.warn('permission denied', { userId: user?.id, action, requiredPerm: 'request:view:feedback' });
+                return res.status(403).json({ message: 'Insufficient permissions' });
+            }
+        }
+
+        // Publishing a testimonial makes its free-text client_feedback readable off the
+        // UNAUTHENTICATED public page (api/public.ts -> getPublicFeaturedTestimonials), so
+        // ADDING an id to featuredTestimonialIds is an indirect READ of feedback the caller
+        // may not hold request:view:feedback for. The ids are no obstacle: canSeeAllRequests
+        // admits every request:accept holder, so a plain Member already has every rated
+        // request id with clientFeedback nulled. Gate only the ADD — reorder/remove of
+        // already-published ids, and the clear (a missing/non-array value), need no feedback
+        // read and stay available to admin:config:branding.
+        if (action === 'admin:update_public_page_config' && Array.isArray(payload?.featuredTestimonialIds)) {
+            // Permission only — matches redactRequestFeedbackForViewer's maySee (no
+            // role-name bypass) so the redaction and listing routes cannot drift.
+            const canReadFeedback = Array.isArray(user?.permissions) && user.permissions.includes('request:view:feedback');
+            const incoming = (payload.featuredTestimonialIds as unknown[]).filter((x): x is string => typeof x === 'string');
+            if (incoming.length > 0 && !canReadFeedback) {
+                // Distinct from the generic denial above: the caller already cleared the
+                // branding gate and can read their own permission list client-side, so this
+                // leaks nothing — while a bare 'Insufficient permissions' on a whole-config
+                // save that merely carried a stale featured list would be undiagnosable.
+                const denial = 'Publishing a new testimonial requires the View Client Feedback permission.';
+                // The baseline read is confined to this deny-candidate branch, so an Admin's
+                // save costs no extra round-trip. getPublicSettings THROWS on any error other
+                // than 42P01, so catch and DENY: an unreadable baseline must never be treated
+                // as "already contains these ids", and a 403 is fail-closed AND diagnosable
+                // where an escaped throw would surface as an opaque 500.
+                let current: Set<string>;
+                try {
+                    const currentIds = (await db.getPublicSettings()).publicPageConfig?.featuredTestimonialIds;
+                    current = new Set(Array.isArray(currentIds) ? currentIds : []);
+                } catch (err) {
+                    log.warn('permission denied — featured testimonial baseline unreadable', { userId: user?.id, action, err });
+                    return res.status(403).json({ message: denial });
+                }
+                const addedIds = incoming.filter(id => !current.has(id));
+                if (addedIds.length > 0) {
+                    // Count only — the ids are per-request identifiers, not log material.
+                    log.warn('permission denied', { userId: user?.id, action, requiredPerm: 'request:view:feedback', addedCount: addedIds.length });
+                    return res.status(403).json({ message: denial });
+                }
             }
         }
     }
 
+    // PER-IDENTITY THROTTLE. A fifth sibling of the four per-action cost controls that already
+    // exist (AI, submissions, radio, uploads) — deliberately NOT a consolidation of them. Those
+    // bound the cost of specific expensive actions; this is an abuse floor across every
+    // mutation, so it is looser than all of them. Keyed on the authenticated user id, which the
+    // dispatcher injected above and the client cannot influence.
+    if (typeof user?.id === 'number') {
+        const userLimit = checkUserRateLimit(user.id);
+        if (!userLimit.ok) {
+            auditDenial('auth.user_rate_limited', { action, user, ip, details: { retryAfter: userLimit.retryAfter } });
+            res.setHeader('Retry-After', String(userLimit.retryAfter));
+            return res.status(429).json({ success: false, message: 'Too many requests. Please slow down and try again shortly.' });
+        }
+    }
+
+    // Clearing the cookie belongs HERE, not in the handler: handlers receive (payload, token)
+    // and have no `res`. BEFORE dispatch, not after, and deliberately so: the client can only
+    // remove its localStorage copy, never the HttpOnly cookie, so if this sat in the success
+    // branch a failing `user:logout` (offline, or revokeUserSessions throwing) would show the
+    // user a logout, land them on `/`, and leave a live 24-hour cookie that signs them straight
+    // back in on the next page load. On a shared machine that is a real exposure — and a
+    // regression, because removing the localStorage token alone used to be sufficient.
+    // res.append rather than setHeader so an OAuth-state Set-Cookie is not clobbered.
+    if (action === 'user:logout') {
+        appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE));
+    }
+
     try {
-        const result = await actions[action](payload, token);
+        const result = await actions[action](payload, token ?? undefined);
         return res.status(200).json({ success: true, data: result });
     } catch (error: any) {
         if (isSecurityDenial(error)) {
             // BOLA/authz denial: audit-log the event + diagnostic fields (ids,
             // clearance) server-side; only the safe, generic message is returned.
-            log.warn(error.auditEvent || 'authz.denied', { userId: user?.id, action, ...error.fields });
+            auditDenial(error.auditEvent || 'authz.denied', { action, user, ip, details: error.fields });
             return res.status(error.status || 403).json({ success: false, message: error.message });
         }
         const requestId = randomUUID();

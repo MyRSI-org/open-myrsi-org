@@ -11,7 +11,7 @@ import { useData } from '../../../contexts/DataContext';
 import { useAcademy } from '../../../contexts/AcademyContext';
 import { useNotification } from '../../../contexts/NotificationContext';
 import { CourseDetailView } from './CourseDetailView';
-import type { AcademyCourse, AcademySession, AcademyEnrollment, AcademyEnrollmentStatus } from '../../../types';
+import type { AcademyCourse, AcademySession, AcademyEnrollment, AcademyEnrollmentStatus, AcademyEnrollmentRequest } from '../../../types';
 
 // ── Shared constants / helpers ───────────────────────────────────────────────
 const OK_TOAST = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50';
@@ -86,18 +86,39 @@ export const CatalogTab: React.FC = () => {
     const [detail, setDetail] = useState<CatalogDetail | null>(null);
     const [loadingId, setLoadingId] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
+    // My OWN seat requests, keyed by session. Fetched with the course detail rather
+    // than at boot: it is per-viewer state that only the open course page renders, and
+    // the boot payload is not the place for it (hydrate what's displayed, when it is).
+    const [myRequests, setMyRequests] = useState<Map<string, AcademyEnrollmentRequest>>(() => new Map());
+
+    // Latest row per session. listMyEnrollmentRequests returns newest-first, so the
+    // FIRST row for a session is the current one — a re-ask after a denial must not be
+    // masked by the denial it replaced.
+    const loadMyRequests = useCallback(async () => {
+        try {
+            const rows = await rpcAction('academy:list_my_enrollment_requests', {}) as AcademyEnrollmentRequest[];
+            const map = new Map<string, AcademyEnrollmentRequest>();
+            for (const r of rows || []) if (!map.has(r.sessionId)) map.set(r.sessionId, r);
+            setMyRequests(map);
+        } catch {
+            // A request-list fault must not blank the course page. The gated CTA falls
+            // back to offering the ask, and a duplicate ask is refused server-side.
+            setMyRequests(new Map());
+        }
+    }, [rpcAction]);
 
     const openCourse = useCallback(async (courseId: string) => {
         setLoadingId(courseId);
         try {
             const d = await rpcAction('academy:get_catalog_course', { courseId }) as CatalogDetail;
             setDetail(d);
+            if (d?.course?.access === 'gated') await loadMyRequests();
         } catch (err) {
             addToast('Failed to Load Course', <i className="fa-solid fa-xmark" />, ERR_TOAST, { description: errMsg(err) });
         } finally {
             setLoadingId(null);
         }
-    }, [rpcAction, addToast]);
+    }, [rpcAction, addToast, loadMyRequests]);
 
     const [search, setSearch] = useState('');
     const filtered = useMemo(() => {
@@ -131,8 +152,35 @@ export const CatalogTab: React.FC = () => {
         }
     }, [rpcAction, refreshMyAcademy, addToast, detail]);
 
+    const requestSeat = useCallback(async (sessionId: string, message: string) => {
+        setBusy(true);
+        try {
+            await rpcAction('academy:request_enrollment', { sessionId, message: message || undefined });
+            await loadMyRequests();
+            addToast('Request Sent', <i className="fa-solid fa-paper-plane" />, OK_TOAST, { description: 'The instructors have been notified.' });
+        } catch (err) {
+            addToast('Request Failed', <i className="fa-solid fa-xmark" />, ERR_TOAST, { description: errMsg(err) });
+        } finally {
+            setBusy(false);
+        }
+    }, [rpcAction, loadMyRequests, addToast]);
+
+    const cancelRequest = useCallback(async (requestId: string) => {
+        setBusy(true);
+        try {
+            await rpcAction('academy:withdraw_enrollment_request', { requestId });
+            await loadMyRequests();
+            addToast('Request Withdrawn', <i className="fa-solid fa-check" />, OK_TOAST);
+        } catch (err) {
+            addToast('Withdrawal Failed', <i className="fa-solid fa-xmark" />, ERR_TOAST, { description: errMsg(err) });
+        } finally {
+            setBusy(false);
+        }
+    }, [rpcAction, loadMyRequests, addToast]);
+
     if (detail) {
-        return <CourseDetailView detail={detail} busy={busy} enrolledSessionIds={enrolledSessionIds} onEnrol={enrol} onBack={() => setDetail(null)} />;
+        return <CourseDetailView detail={detail} busy={busy} enrolledSessionIds={enrolledSessionIds} myRequests={myRequests}
+            onEnrol={enrol} onRequest={requestSeat} onCancelRequest={cancelRequest} onBack={() => setDetail(null)} />;
     }
 
     return (

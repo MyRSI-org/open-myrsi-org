@@ -68,12 +68,21 @@ describe('clearance filter', () => {
         expect(out).toHaveLength(2);
     });
 
-    it('Admin and bypass-permission holders see every classification', () => {
-        const admin = { clearanceLevel: { level: 0 }, limitingMarkers: [], permissions: [], role: 'Admin' };
-        const manager = { clearanceLevel: { level: 0 }, limitingMarkers: [], permissions: ['intel:manage'], role: 'Member' };
+    it('the stamped system Admin and bypass-permission holders see every classification', () => {
+        const admin = { clearanceLevel: { level: 0 }, limitingMarkers: [], permissions: [], isSystemAdmin: true };
+        const manager = { clearanceLevel: { level: 0 }, limitingMarkers: [], permissions: ['intel:manage'] };
         const items = [item(0), item(3, ['NOFORN'])];
         expect(filterByClearance(items, admin, ['intel:manage'])).toHaveLength(2);
         expect(filterByClearance(items, manager, ['intel:manage'])).toHaveLength(2);
+    });
+
+    // ROLE NAME IS NOT AUTHORITY: canViewAllClassifications keys on role IDENTITY, so
+    // a permissionless custom role called 'Commander' (name-derived Admin tier) no
+    // longer reads classified intel/wiki/ops.
+    it('a forged Admin role NAME with no permissions sees only unclassified items', () => {
+        const forged = { clearanceLevel: { level: 0 }, limitingMarkers: [], permissions: [], role: 'Admin' } as unknown as Parameters<typeof filterByClearance>[1];
+        const items = [item(0), item(3, ['NOFORN'])];
+        expect(filterByClearance(items, forged, ['intel:manage'])).toHaveLength(1);
     });
 
     it('a null/clearance-less viewer only sees unclassified, unmarked items', () => {

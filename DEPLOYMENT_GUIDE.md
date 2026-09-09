@@ -45,15 +45,18 @@ Copy `.env.example` to `.env` and fill it in (or set them in your host's environ
 | `SUPABASE_SERVICE_ROLE_KEY` | **Required.** Server-only; bypasses RLS |
 | `SUPABASE_JWT_SECRET` | **Required for live updates.** Project JWT secret (Dashboard → Settings → API → JWT Secret). The server mints short-lived per-user tokens with it to authorize the private realtime channels; unset = realtime disabled (fail-closed), and the app still works via manual refresh |
 | `JWT_SECRET` | Recommended. Session-token signing secret; falls back to the service-role key |
-| `SECRETS_ENCRYPTION_KEY` | Recommended. Encrypts at-rest secrets. Do not change once set |
+| `SECRETS_ENCRYPTION_KEY` | **Required in production** (the server refuses to start without it, and rejects anything under 32 characters). Encrypts at-rest secrets. Changeable — see [Rotating the encryption key](#rotating-the-encryption-key) |
+| `SECRETS_ENCRYPTION_KEY_PREVIOUS` | Only while rotating. The *old* key, kept readable so existing secrets still decrypt. Remove it once the rotation is finished |
+| `BALLOT_PEPPER` | Optional. Pins the value used to de-duplicate secret-ballot votes so a key rotation cannot re-open a vote in progress — see the rotation section |
+| `SESSION_COOKIE_SECURE` | Optional. Leave blank to derive it from `APP_URL`. Set to `1` if TLS terminates upstream and the app only sees plain HTTP; set to `0` only for a deliberate plain-HTTP LAN deployment. Getting it wrong in the strict direction means the browser silently discards the login cookie and **nobody can sign in**, so the server warns at boot rather than guessing strictly |
 | `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET` | Required for Discord login |
 | `DISCORD_BOT_TOKEN` / `DISCORD_GUILD_ID` | Optional — bot features |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` | Web push |
 | `GEMINI_API_KEY`, `LIVEKIT_*`, `UEX_API_KEY` | Optional |
 
-The server fails fast on boot if `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing in production.
+The server fails fast on boot if `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` or `SECRETS_ENCRYPTION_KEY` is missing in production — and also if `SECRETS_ENCRYPTION_KEY` is shorter than 32 characters.
 
-Image uploads work out of the box. If you want to change the defaults, three optional variables let you: `MEDIA_MAX_UPLOAD_BYTES` (largest single image, default 5 MB), `MEDIA_MAX_STORAGE_BYTES` (total space uploads may use, default 250 MB), and `MEDIA_GC_DRY_RUN=true` (makes the nightly cleanup only *report* unused images instead of deleting them — handy while you build confidence).
+Image uploads work out of the box. If you want to change the defaults, five optional variables let you: `MEDIA_MAX_UPLOAD_BYTES` (largest single image, default 5 MB), `MEDIA_MAX_STORAGE_BYTES` (total space uploads may use, default 250 MB), `MEDIA_GC_DRY_RUN=true` (makes the nightly cleanup only *report* unused images instead of deleting them — handy while you build confidence), and two that control how long a link to a private image stays valid: `MEDIA_SIGN_TTL_SECONDS` (default 900, i.e. 15 minutes — used when a page is shown to a reader) and `MEDIA_SIGN_TTL_EDITOR_SECONDS` (default 3600, i.e. an hour — used for the preview of an image you have just uploaded but not yet saved, so a long editing session doesn't lose it). Both are clamped to between 1 minute and 24 hours. Lowering the first is safe; images simply get re-fetched more often.
 
 ---
 
@@ -83,6 +86,15 @@ Set the environment variables from step 2, then run the app under a process mana
 4. **Set your public domain in the static SEO files.** `public/sitemap.xml`, `public/robots.txt`, and the `og:url` meta in `index.html` ship with a `https://yourdomain.com` placeholder — replace it with your actual domain so crawlers and social-share cards point at your instance. Everything else is runtime-driven: page title, description, and OG image come from **Admin → Branding** (the server rewrites the meta tags per request from your config and the `X-Forwarded-Host` header), and `og:image` falls back to the bundled `/media/opengraph.jpg`. Only those three static files need a manual edit.
 
 > **Using Coolify?** It issues a Let's Encrypt certificate for the single hostname automatically (HTTP-01 challenge) and forwards the proxy headers for you — no manual reverse-proxy config needed.
+
+### Health check
+
+`GET /healthz` returns `200 {"status":"ok"}` as soon as the app is accepting requests. It is a **liveness** check: it deliberately does not touch the database, so a brief Supabase hiccup does not take every instance out of rotation and turn a degraded read path into a total outage. It is uncached and never counts toward the abuse blocker, so you can poll it as often as you like.
+
+- **Coolify** — set *Health Check Path* to `/healthz`.
+- **Docker** — `HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:3000/healthz || exit 1`
+
+Before this existed, a probe pointed at `/` would answer `200` even while the database was unreachable, because the page still renders with default branding — so it reported healthy during an outage. If you have a probe on `/`, move it.
 
 ---
 
@@ -135,6 +147,20 @@ The importer already strips `systemConfig.appUrl` from an **Admin → Import** o
 
 Two related things do **not** need changing when you move: Discord OAuth uses the browser's own origin (register the new redirect URL in the Discord Developer Portal), and web-push deep links are origin-relative.
 
+### Rotating the encryption key
+
+`SECRETS_ENCRYPTION_KEY` encrypts your stored credentials — the Discord client secret and bot token, the LiveKit key and secret, the Gemini key, and alliance pairing material. If it is ever exposed, you can change it without downtime and without re-entering anything:
+
+1. **Keep the old key.** Set `SECRETS_ENCRYPTION_KEY_PREVIOUS` to your *current* value, and set `SECRETS_ENCRYPTION_KEY` to the new one. Generate a new key with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
+2. **Restart.** Everything keeps working immediately: new secrets are written under the new key, and existing ones are still read using the old one.
+3. **Re-encrypt.** Open **Admin → Database Tools** and click **Rotate Encryption Key**. This rewrites every stored secret under the new key. It is safe to run more than once, and anything it cannot read is reported and left untouched rather than overwritten.
+4. **Check.** Click **Run Diagnostics**. The *Secret Encryption* row should read `OK` and tell you the previous key is no longer needed.
+5. **Remove `SECRETS_ENCRYPTION_KEY_PREVIOUS`** and restart once more. The old key is now out of your environment.
+
+**If you have already changed the key and things are failing**, this is also the recovery path: put the old value into `SECRETS_ENCRYPTION_KEY_PREVIOUS`, restart, and follow from step 3. The server still starts in this state, so nothing is lost as long as you still have the old key. If you *don't* have it, the affected credentials cannot be recovered and must be re-entered in the admin console — Diagnostics will tell you how many are affected.
+
+**One caveat, only if you use secret ballots.** Votes on a secret-ballot motion are de-duplicated using a value derived from the encryption key, so changing the key would let anyone who had already voted on a motion *currently in voting* cast a second vote. Two ways to avoid it: conclude any in-progress secret ballot before you rotate, or set `BALLOT_PEPPER` to your **old** `SECRETS_ENCRYPTION_KEY` value before starting and leave it in place permanently. Diagnostics warns you if a secret ballot is mid-vote while a rotation is in flight. Elections are unaffected — they have their own separate one-vote guard.
+
 ---
 
 ## 7. Updating an Existing Deployment
@@ -144,6 +170,40 @@ There is **no migrations folder** — `schema.sql` is the single, **re-runnable*
 1. **Update the code** — `git pull` and rebuild/redeploy the app as usual (Coolify redeploy, or `npm ci && npm run build` then restart). This alone updates the app but **not** the database.
 2. **Re-run `schema.sql`** — open **Supabase → SQL Editor**, paste the new `schema.sql`, and run it. It is fully idempotent: every statement is guarded (`CREATE … IF NOT EXISTS`, duplicate-safe `DO` blocks, `CREATE OR REPLACE`, `ON CONFLICT`), so it **adds what's new and leaves your existing data untouched**. Do **not** run `reset_db.sql` (that wipes everything).
 3. **Repair Database** — open **Admin → Database Tools → Repair Database**. This converges the things a schema re-run can't: it re-grants the Admin role every permission, tops up role grants, and refreshes seeded reference data. (This is also the fix if Catalogs or a new feature show "access denied" after an update.)
+
+> **This release narrows database privileges — re-running `schema.sql` is required, not optional.**
+> The schema used to grant `authenticated` (the role the browser holds for live
+> updates) SELECT on *every* table. It now revokes that and re-grants only the
+> twelve reference tables the live-update channels actually read. Deleting a
+> `GRANT` from a re-runnable script revokes nothing by itself, so the revoke only
+> takes effect once you run the new file against your database. Run it in the
+> **Supabase SQL Editor** — which runs as `postgres`, the role that created your
+> tables — and not through a pooler or a different database user: `ALTER DEFAULT
+> PRIVILEGES` only affects defaults recorded for the role that runs it. If live
+> updates stop arriving afterwards, the run did not complete; re-run it.
+
+> **This release also closes reference-table live updates to the org's external
+> customers — so run Repair Database as well, not just when something looks wrong.**
+> The realtime `authenticated_select` policy now requires the caller to be org
+> PERSONNEL as well as a live member, so a Client account no longer reads the role
+> table, the unit tree or the classification taxonomy — including the marker flag
+> that records which compartments must never leave the org — straight out of
+> PostgREST. Staff are recognised either by holding any permission beyond the six an
+> org may grant a customer, or by sitting on the seeded Admin role; that second arm
+> reads the role's `is_system` stamp, and a database whose roles arrived through an
+> org import can carry roles without it. **Run Repair Database (step 3) after
+> re-running `schema.sql`** — an Admin whose permission rows were pruned AND whose
+> role is unstamped would otherwise lose live reference-table updates until you do.
+> Customers lose nothing they can see except live refreshes of their own service
+> picker while a tab is open; the picker's data still arrives normally.
+
+> **15.7.0-open adds the Blueprint Manager, which is OFF by default.** Enable it in
+> **Admin → Optional Features**. On an EXISTING install the Member and Dispatcher
+> roles do not receive its five permissions until you **run Repair Database once**
+> — a one-shot backfill grants them, and it will not re-grant anything you have
+> deliberately revoked, now or later. Fresh installs are seeded with them already.
+> Blueprints and crafting requests are NOT carried by an org import; the on/off
+> toggle is.
 
 The applied schema version is recorded in `settings.schema_version`. A release that changes the schema will say so in its notes — when in doubt after pulling new code, re-running `schema.sql` + Repair Database is always safe.
 

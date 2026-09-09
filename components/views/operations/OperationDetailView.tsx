@@ -112,9 +112,17 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
 
     const [fullDetails, setFullDetails] = useState<HydratedOperation | null>(null);
 
+    // Generation guard. Two get_details calls can be in flight at once (the mount fetch, a
+    // realtime refresh, an explicit refreshDetails after an action), and they can land out of
+    // order — so without this a SLOW earlier response overwrites a FRESH later one and the plan
+    // silently reverts. Same guard the row-sliced hydration path uses for exactly this reason.
+    const detailGenRef = useRef(0);
+
     const fetchFullDetails = useCallback(async () => {
+        const gen = ++detailGenRef.current;
         try {
             const result = await rpcAction('operation:get_details', { operationId: initialOperation.id });
+            if (gen !== detailGenRef.current) return; // superseded by a newer fetch
             if (result) setFullDetails(result);
         } catch (err) {
             console.error('Failed to fetch operation details:', err);
@@ -129,18 +137,39 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
     useEffect(() => { void (async () => { await fetchFullDetails(); })(); }, [fetchFullDetails]);
 
     // Refetch the per-op detail bundle when a realtime operation_update broadcast lands.
-    // Gated by id so unrelated ops don't refetch; trailing-debounced so a burst of remote
-    // edits collapses to one get_details instead of one per broadcast.
+    // Gated by id so unrelated ops don't refetch.
+    //
+    // LEADING + trailing, not trailing-only. Trailing-only re-armed the timer on EVERY
+    // broadcast, so a sustained stream closer together than the delay starved this refetch
+    // indefinitely — and that stream is the normal case, not an exotic one: pre-mission
+    // planning (dragging tasks, reordering phases, assigning ORBAT nodes, participants
+    // flipping live status) emits a continuous burst. The symptom was an ops planner watching
+    // a remote commander rebuild the task board while their own plan sat frozen, with the
+    // header ticking away beside it because THAT rides the fast row-slice leg.
+    //
+    // Leading edge fires the first event of a burst immediately; the trailing edge still
+    // collapses the tail into one call, so the request count is unchanged for a burst and
+    // strictly better for a lone event.
+    const DETAIL_REFRESH_MS = 400;
     useEffect(() => {
         let timer: number | null = null;
+        let lastRun = 0;
         const handler = (e: Event) => {
             const detail = (e as CustomEvent).detail as { operationId?: string } | undefined;
             if (detail?.operationId !== initialOperation.id) return;
+            const now = Date.now();
+            if (now - lastRun >= DETAIL_REFRESH_MS) {
+                lastRun = now;
+                if (timer !== null) { window.clearTimeout(timer); timer = null; }
+                fetchFullDetails();
+                return;
+            }
             if (timer !== null) window.clearTimeout(timer);
             timer = window.setTimeout(() => {
                 timer = null;
+                lastRun = Date.now();
                 fetchFullDetails();
-            }, 400);
+            }, DETAIL_REFRESH_MS);
         };
         window.addEventListener('app:realtime:operation-detail-refresh', handler);
         return () => {
@@ -170,15 +199,24 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
             logistics: fullDetails.logistics,
             aarEntries: fullDetails.aarEntries,
             alliedOrgs: fullDetails.alliedOrgs,
-            roe: fullDetails.roe ?? listOp.roe,
-            commanderNotes: fullDetails.commanderNotes ?? listOp.commanderNotes,
-            // commsPlan lives on the operations table, so listOp (refreshed via realtime) is at
-            // least as fresh as fullDetails. Prefer it; fall back to fullDetails only if empty.
+            // EVERYTHING BELOW LIVES ON THE `operations` TABLE, so it is carried by BOTH
+            // sources — and the two sources are not equally fresh. `listOp` comes from the
+            // row-slice leg, which is undebounced and fires within one round trip of a
+            // broadcast; `fullDetails` comes from the debounced get_details leg. So for these
+            // columns listOp is at worst as fresh as fullDetails and usually fresher, and
+            // preferring fullDetails means showing a value the client already knows is stale.
+            //
+            // commsPlan was fixed by hand for exactly this reason; the other six had the same
+            // bug and are now fixed as a class rather than one at a time. The fallback to
+            // fullDetails covers the case where listOp is the initialOperation prop rather than
+            // a row from the live operations array.
+            roe: listOp.roe ?? fullDetails.roe,
+            commanderNotes: listOp.commanderNotes ?? fullDetails.commanderNotes,
             commsPlan: listOp.commsPlan?.length ? listOp.commsPlan : fullDetails.commsPlan,
-            aarSummary: fullDetails.aarSummary ?? listOp.aarSummary,
-            aarLessonsLearned: fullDetails.aarLessonsLearned ?? listOp.aarLessonsLearned,
-            aarSubmittedAt: fullDetails.aarSubmittedAt ?? listOp.aarSubmittedAt,
-            aarSubmittedBy: fullDetails.aarSubmittedBy ?? listOp.aarSubmittedBy,
+            aarSummary: listOp.aarSummary ?? fullDetails.aarSummary,
+            aarLessonsLearned: listOp.aarLessonsLearned ?? fullDetails.aarLessonsLearned,
+            aarSubmittedAt: listOp.aarSubmittedAt ?? fullDetails.aarSubmittedAt,
+            aarSubmittedBy: listOp.aarSubmittedBy ?? fullDetails.aarSubmittedBy,
         };
     }, [listOp, fullDetails]);
 

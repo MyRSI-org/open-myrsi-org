@@ -140,9 +140,15 @@ const InterviewTable: React.FC<InterviewTableProps> = ({ interviews, fmt, openEd
 const MyInterviewsTab: React.FC = () => {
     const { refreshHR } = useData();
     const { hrInterviews } = useHR();
-    const { currentUser } = useAuth();
+    const { currentUser, hasPermission } = useAuth();
     const fmt = useFormatDate();
     const { openConductInterviewModal, openScheduleInterviewModal, openEditInterviewModal } = useModalRegistry();
+
+    // hr:create_interview — and the hr:get_eligible_interviewers RPC that fills the
+    // modal's Lead Interviewer picker — are both hr:recruiter. This tab is reachable on
+    // hr:admin alone (HRHubView), so gate the entry point rather than opening a modal
+    // that cannot be submitted.
+    const canRecruit = hasPermission('hr:recruiter');
 
     // Ensure we have fresh data
     useEffect(() => {
@@ -169,12 +175,14 @@ const MyInterviewsTab: React.FC = () => {
                     </h2>
                     <p className="text-slate-400 text-sm mt-1">Upcoming scheduled protocols assigned to you.</p>
                 </div>
-                <button
-                    onClick={() => openScheduleInterviewModal()}
-                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/40 rounded-lg shadow-lg shadow-emerald-900/30 transition whitespace-nowrap"
-                >
-                    <i className="fa-solid fa-calendar-plus"></i>Schedule Interview
-                </button>
+                {canRecruit && (
+                    <button
+                        onClick={() => openScheduleInterviewModal()}
+                        className="flex items-center gap-2 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/40 rounded-lg shadow-lg shadow-emerald-900/30 transition whitespace-nowrap"
+                    >
+                        <i className="fa-solid fa-calendar-plus"></i>Schedule Interview
+                    </button>
+                )}
             </div>
 
             <div className="space-y-3">

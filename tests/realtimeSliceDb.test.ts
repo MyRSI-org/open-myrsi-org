@@ -12,6 +12,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 //   3. Bulk mutations ship the successfully-updated userIds on their
 //      user_update broadcast (and ONLY those — skipped ids must not be
 //      included, or the client would request-and-evict them).
+//   4. getUserById — the session resolver for both server surfaces — separates
+//      "no such row" (PGRST116 → null) from "the read failed" (throw), and the
+//      getActorLabel wrapper keeps post-commit audit-log attribution tolerant.
 
 const h = vi.hoisted(() => ({
     // Called for every awaited query; tests swap it per scenario.
@@ -51,7 +54,7 @@ vi.mock('../lib/db/common', () => {
     };
 });
 
-import { getUsersByIdsLite, bulkSetUsersVip } from '../lib/db/users';
+import { getUsersByIdsLite, bulkSetUsersVip, getUserById, getActorLabel } from '../lib/db/users';
 import { getOperationByIdLite, canUserSeeOpInList } from '../lib/db/ops';
 import type { User, HydratedOperation } from '../types';
 
@@ -89,6 +92,62 @@ describe('getUsersByIdsLite', () => {
         h.resolveQuery = () => { throw new Error('should not query'); };
         expect(await getUsersByIdsLite([])).toEqual([]);
         expect(h.queryCount).toBe(0);
+    });
+});
+
+// getUserById is the session resolver on BOTH server surfaces. Returning null
+// for a read FAULT as well as for genuine absence let a DB blip masquerade as a
+// deletion: api/services.ts turns null into a 401 whose only client handling is
+// to CLEAR the session token, so a transient Postgres error logged the whole org
+// out; api/query.ts turns it into a user_detail 404 reading "member deleted".
+describe('getUserById fail-closed identity resolution', () => {
+    it('THROWS when the read fails — a DB fault must never read as "account not found"', async () => {
+        h.resolveQuery = () => ({ data: null, error: { code: '08006', message: 'connection failure' } });
+        await expect(getUserById(7)).rejects.toThrow(/failed to load user/i);
+    });
+
+    it('returns null on genuine absence (PGRST116) without a wasted fallback round-trip', async () => {
+        h.resolveQuery = () => ({ data: null, error: { code: 'PGRST116', message: 'no rows' } });
+        expect(await getUserById(7)).toBeNull();
+        // The fallback runs the same filters and the same role:roles!inner join,
+        // so it cannot find a row the first query missed.
+        expect(h.queryCount).toBe(1);
+    });
+
+    it('still falls back to the lite projection when only the full query fails', async () => {
+        h.resolveQuery = () => (h.queryCount === 1
+            ? { data: null, error: { code: '42703', message: 'column does not exist' } }
+            : { data: liteRow(7, 'Seven'), error: null });
+        expect((await getUserById(7))?.id).toBe(7);
+        expect(h.queryCount).toBe(2);
+    });
+
+    it('returns null — not a throw — when the fallback PROVES absence after a real first error', async () => {
+        h.resolveQuery = () => (h.queryCount === 1
+            ? { data: null, error: { code: '42703', message: 'column does not exist' } }
+            : { data: null, error: { code: 'PGRST116', message: 'no rows' } });
+        expect(await getUserById(7)).toBeNull();
+        expect(h.queryCount).toBe(2);
+    });
+
+    it('THROWS when BOTH queries fail for a real reason', async () => {
+        h.resolveQuery = () => ({ data: null, error: { code: '42703', message: 'column does not exist' } });
+        await expect(getUserById(7)).rejects.toThrow(/failed to load user/i);
+        expect(h.queryCount).toBe(2);
+    });
+
+    it('getActorLabel degrades to "Unknown" instead of throwing — an audit label is not an authorization input', async () => {
+        // ops.ts looks the actor up AFTER the mutation committed, and
+        // add_uec_to_operation / add_cost_to_operation are not idempotent: a throw
+        // here would report a successful aUEC deposit as failed and invite a
+        // double-crediting retry.
+        h.resolveQuery = () => ({ data: null, error: { code: '08006', message: 'connection failure' } });
+        expect(await getActorLabel(7)).toBe('Unknown');
+    });
+
+    it('getActorLabel still returns the real name when the read succeeds', async () => {
+        h.resolveQuery = () => ({ data: liteRow(7, 'Seven'), error: null });
+        expect(await getActorLabel(7)).toBe('Seven');
     });
 });
 
@@ -153,8 +212,11 @@ describe('canUserSeeOpInList', () => {
     it('owner bypass', () => {
         expect(canUserSeeOpInList(mkUser({ id: 5 }), opWith())).toBe(true);
     });
-    it('Admin role bypass', () => {
-        expect(canUserSeeOpInList(mkUser({ role: 'Admin' } as Partial<User>), opWith())).toBe(true);
+    it('stamped system Admin bypass (role IDENTITY, not the role name)', () => {
+        expect(canUserSeeOpInList(mkUser({ isSystemAdmin: true } as Partial<User>), opWith())).toBe(true);
+    });
+    it('a forged Admin role NAME with no permissions gets NO bypass', () => {
+        expect(canUserSeeOpInList(mkUser({ role: 'Admin' } as Partial<User>), opWith())).toBe(false);
     });
     it('operations:manage bypass', () => {
         expect(canUserSeeOpInList(mkUser({ permissions: ['operations:manage'] }), opWith())).toBe(true);

@@ -43,6 +43,8 @@ interface DiscordRequestPayload {
 interface CreateRequestPayload {
     newRequest: Partial<ServiceRequest>;
     userId: number;
+    /** Dispatcher-injected actor. Read only for the ad-hoc client-binding duty check. */
+    user?: { permissions?: string[] };
 }
 
 interface TriageRequestPayload {
@@ -107,16 +109,19 @@ interface UpdateStatusPayload {
 interface DispatchMembersPayload {
     requestId: string;
     memberIds: number[];
+    userId: number;
 }
 
 interface ResponderPayload {
     requestId: string;
     memberId: number;
+    userId: number;
 }
 
 interface SetLeadPayload {
     requestId: string;
     memberId?: number;
+    userId: number;
 }
 
 interface PartyMemberPayload {
@@ -230,8 +235,11 @@ export const requestActions = {
         await notifyDiscordNewRequest(payload);
         return request;
     },
-    'request:create_adhoc': async ({ newRequest, userId }: CreateRequestPayload) => {
-        const request = await db.createAdHocServiceRequest(newRequest, userId);
+    'request:create_adhoc': async ({ newRequest, userId, user }: CreateRequestPayload) => {
+        // `user` is the dispatcher-injected actor. It decides only whether this caller
+        // may BIND the resolved handle to a real member (a dispatch duty) — never who
+        // the actor is, which stays the forced `userId`.
+        const request = await db.createAdHocServiceRequest(newRequest, userId, user);
         const payload = { ...request };
 
         // id-only realtime broadcast (see request:create above).
@@ -247,31 +255,41 @@ export const requestActions = {
     'request:accept': ({ requestId, memberId, userId, user }: AcceptRequestPayload & { user?: { id: number; role?: string; permissions?: string[] } }) => db.acceptRequest(requestId, memberId, userId, user),
     // start/complete are Member-default but act on a caller-supplied id — verify
     // the caller is a responder on (or has duty over) the request first.
+    // `user` is injected unconditionally by the dispatcher for every object payload, so its
+    // absence means a malformed payload — from which requestId is undefined too. Throwing is
+    // still the right default: a security precondition must not sit behind
+    // `if (caller-supplied-shape)`, where a future payload change could skip it silently.
     'request:start': async ({ requestId, userId, user }: StartRequestPayload) => {
-        if (user) await db.assertRequestResponderOrDuty(requestId, user);
+        if (!user) throw new Error('Forbidden: unidentified caller.');
+        await db.assertRequestResponderOrDuty(requestId, user, 'start');
         return db.updateRequestStatus(requestId, ServiceRequestStatus.InProgress, userId, 'Mission started.', undefined, undefined);
     },
     'request:complete': async ({ requestId, report, userId, user }: CompleteRequestPayload) => {
-        if (user) await db.assertRequestResponderOrDuty(requestId, user);
+        if (!user) throw new Error('Forbidden: unidentified caller.');
+        await db.assertRequestResponderOrDuty(requestId, user, 'complete');
         return db.completeRequest(requestId, report, userId, user);
     },
     // cancel/rate act on a caller-supplied request id and are held by every
     // Client — verify ownership (or a duty permission) first so a Client cannot
     // cancel/rate another user's request.
     'request:cancel': async ({ requestId, userId, user }: CancelRequestPayload & { user?: { id: number; role?: string; permissions?: string[] } }) => {
-        if (user) await db.assertRequestOwnerOrDuty(requestId, user);
+        if (!user) throw new Error('Forbidden: unidentified caller.');
+        await db.assertRequestOwnerOrDuty(requestId, user, 'cancel');
         return db.updateRequestStatus(requestId, ServiceRequestStatus.Cancelled, userId, 'Request cancelled by client.', undefined, undefined);
     },
     'request:rate': async ({ requestId, rating, feedback, user }: RateRequestPayload & { user?: { id: number; role?: string; permissions?: string[] } }) => {
-        if (user) await db.assertRequestOwnerOrDuty(requestId, user);
-        return db.rateRequest(requestId, rating, feedback);
+        if (!user) throw new Error('Forbidden: unidentified caller.');
+        await db.assertRequestOwnerOrDuty(requestId, user, 'rate');
+        return db.rateRequest(requestId, rating, feedback, user);
     },
     'request:add_note': ({ requestId, note, userId }: AddNotePayload) => db.addRequestNote(requestId, note, userId),
     'request:update_status': ({ requestId, status, notes, report, userId }: UpdateStatusPayload) => db.updateRequestStatus(requestId, status, userId, notes, report, undefined),
-    'request:dispatch_members': ({ requestId, memberIds }: DispatchMembersPayload) => db.dispatchMembers(requestId, memberIds),
-    'request:add_responder': ({ requestId, memberId }: ResponderPayload) => db.addResponderToRequest(requestId, memberId),
+    // userId is force-injected by the dispatcher's ACTOR_ID_FIELDS, so it is always the
+    // authenticated actor — these pass it only to suppress a self-notification.
+    'request:dispatch_members': ({ requestId, memberIds, userId }: DispatchMembersPayload) => db.dispatchMembers(requestId, memberIds, userId),
+    'request:add_responder': ({ requestId, memberId, userId }: ResponderPayload) => db.addResponderToRequest(requestId, memberId, userId),
     'request:remove_responder': ({ requestId, memberId }: ResponderPayload) => db.removeResponderFromRequest(requestId, memberId),
-    'request:set_lead': ({ requestId, memberId }: SetLeadPayload) => db.setLeadResponder(requestId, memberId),
+    'request:set_lead': ({ requestId, memberId, userId }: SetLeadPayload) => db.setLeadResponder(requestId, memberId, userId),
     'request:add_party_member': ({ requestId, handle }: PartyMemberPayload) => db.addRequestPartyMember(requestId, handle),
     'request:remove_party_member': ({ requestId, handle }: PartyMemberPayload) => db.removeRequestPartyMember(requestId, handle),
     'request:refuse': ({ requestId, notes, userId }: RefuseRequestPayload) => db.updateRequestStatus(requestId, ServiceRequestStatus.Refused, userId, notes, undefined, undefined),

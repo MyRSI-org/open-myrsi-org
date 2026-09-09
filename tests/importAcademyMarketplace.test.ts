@@ -31,6 +31,9 @@ vi.mock('../lib/db/common', () => {
             delete: () => ({ neq: () => Promise.resolve({ error: null }), eq: () => Promise.resolve({ error: null }), in: () => Promise.resolve({ error: null }) }),
             eq: () => Promise.resolve({ data: [], error: null }),
             in: () => b,
+            // .range() paging without an ORDER BY is undefined across pages, so the
+            // importer now orders every paged read. The double must model it.
+            order: () => b,
             range: () => Promise.resolve({ data: h.rows[table] || [], error: null }),
             then: (r: (v: unknown) => unknown) => Promise.resolve({ count: h.counts[table] ?? 0, error: null, data: h.rows[table] || [] }).then(r),
         };

@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 // The header field is attacker-controlled input in the same sense the settings row is,
 // so this channel is deliberately narrow, and these tests pin the narrowness:
 //   * a fixed allowlist of the FIVE keys this fork gates on (hosted also sends
-//     starcomms/blueprints, which do not exist here),
+//     starcomms, which does not exist here),
 //   * strict `=== true` coercion (no truthy object/string can enable anything),
 //   * rebuilt into this fork's `{ enabled }` shape — a bare boolean reads as OFF
 //     through isFeatureEnabled, so a pass-through would silently do nothing,
@@ -63,7 +63,7 @@ beforeEach(() => { h.inserts = []; h.updates = []; h.deletes = []; h.settingsRow
 
 const ALL_SEVEN = {
     marketplace: false, warehouse: true, academy: true,
-    starcomms: false, finances: true, quartermaster: true, blueprints: false,
+    starcomms: false, finances: true, quartermaster: true, blueprints: true,
 };
 
 function exportWith(features: unknown, extraRows: string[] = []): string {
@@ -84,7 +84,7 @@ function writtenFeatures(): Record<string, unknown> | null {
 }
 
 describe('module toggles carried on the export header', () => {
-    it('writes the fork\'s five keys in the NESTED { enabled } shape the predicate reads', async () => {
+    it('writes the fork\'s six keys in the NESTED { enabled } shape the predicate reads', async () => {
         const result = await importOrgData(exportWith(ALL_SEVEN));
         expect(writtenFeatures()).toEqual({
             marketplace: { enabled: false },
@@ -92,15 +92,17 @@ describe('module toggles carried on the export header', () => {
             academy: { enabled: true },
             finances: { enabled: true },
             quartermaster: { enabled: true },
+            blueprints: { enabled: true },
         });
-        expect(result.modulesEnabled.sort()).toEqual(['Academy', 'Finances', 'Quartermaster', 'Warehouse']);
+        expect(result.modulesEnabled.sort()).toEqual(['Academy', 'Blueprint Manager', 'Finances', 'Quartermaster', 'Warehouse']);
     });
 
     it('ignores hosted-only module keys that do not exist in this fork', async () => {
         await importOrgData(exportWith(ALL_SEVEN));
         const written = writtenFeatures()!;
         expect(written).not.toHaveProperty('starcomms');
-        expect(written).not.toHaveProperty('blueprints');
+        // blueprints IS known here now — the toggle rides, the registry rows do not.
+        expect(written).toHaveProperty('blueprints');
         // government is toggled by its own settings row (governmentsConfig), which the
         // export already carries — it must never appear in this blob.
         expect(written).not.toHaveProperty('government');
@@ -147,7 +149,7 @@ describe('module toggles carried on the export header', () => {
     });
 
     it('writes nothing when the header field carries no key this fork knows', async () => {
-        const result = await importOrgData(exportWith({ starcomms: true, blueprints: true }));
+        const result = await importOrgData(exportWith({ starcomms: true }));
         expect(writtenFeatures()).toBeNull();
         expect(result.modulesEnabled).toEqual([]);
     });

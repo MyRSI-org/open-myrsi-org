@@ -16,6 +16,8 @@
 // Allowlists differ by mode so the same helpers serve both the rich wiki
 // surface and the constrained public blurb.
 
+import { isAllowedIframeSrc, normalizeEmbedSrc } from './embedHosts.js';
+
 export type TiptapValidatorMode = 'wiki' | 'minimal';
 
 // ---------------------------------------------------------------------------
@@ -107,24 +109,10 @@ export function safeUrl(raw: unknown, opts: { allowMailto?: boolean } = {}): str
 // Embed host allow-list — the SAME hosts the CSP frame-src permits and the client
 // wiki IframeExtension renders. Enforced at the WRITE boundary (sanitizeNode) so an
 // off-allowlist iframe/youtube src never reaches storage, rather than relying only
-// on the client render check + CSP frame-src downstream. Kept here (isomorphic,
-// dependency-free) as the single source of truth; the client extension imports it.
+// on the client render check + CSP frame-src downstream. The list itself lives in
+// lib/embedHosts (isomorphic, dependency-free) as the single source of truth — this
+// module and the client extension both import it, so they cannot drift.
 // KEEP IN SYNC with the CSP frame-src directive in server.ts. (api-1/fe-3)
-export const ALLOWED_EMBED_HOSTS = [
-    'www.youtube.com', 'www.youtube-nocookie.com', 'player.vimeo.com',
-    'docs.google.com', 'drive.google.com', 'calendar.google.com', 'www.google.com',
-    'open.spotify.com', 'codepen.io', 'stackblitz.com',
-];
-export function isAllowedEmbedHost(src: string | null | undefined): boolean {
-    if (!src) return false;
-    try {
-        const u = new URL(src);
-        if (u.protocol !== 'https:') return false;
-        return ALLOWED_EMBED_HOSTS.some((h) => u.hostname === h || u.hostname.endsWith('.' + h));
-    } catch {
-        return false;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Sanitizer
@@ -162,13 +150,27 @@ function sanitizeNode(node: any, cfg: AllowConfig, depth = 0): any | null {
 
     // URL-bearing nodes: drop if the URL is unsafe.
     if (node.type === 'image' || node.type === 'youtube' || node.type === 'iframe') {
-        const src = safeUrl(node.attrs?.src);
+        let src = safeUrl(node.attrs?.src);
         if (!src) return null;
         // iframe/youtube embeds must additionally point at an allow-listed host
         // (parity with CSP frame-src + the client render check), enforced at the
         // write boundary. Images are scheme-checked only — any https image host is
         // fine (img-src allows https:).
-        if ((node.type === 'iframe' || node.type === 'youtube') && !isAllowedEmbedHost(src)) return null;
+        if (node.type === 'iframe' || node.type === 'youtube') {
+            // Normalise ONLY a src that would otherwise be DELETED. @tiptap/extension-youtube
+            // stores the URL exactly as PASTED and rewrites it at render time only, so
+            // `youtu.be/ID` (what the Share button emits), bare `youtube.com/watch?v=ID`
+            // and `m.`/`music.youtube.com` all arrived here off-allow-list and the node was
+            // silently DESTROYED on save. Rewriting only the off-allow-list case makes the
+            // transform monotone: an already-allow-listed src is stored byte-for-byte as the
+            // author wrote it, so no embed parameter (list, index, loop, rel, …) is ever
+            // dropped from content that works today, and nothing that survives today can
+            // start failing. normalizeEmbedSrc is safe running in FRONT of the allow-list —
+            // it dispatches on url.hostname by equality and BUILDS its output from a
+            // hard-coded origin plus an 11-char id, so no input can steer it elsewhere.
+            src = isAllowedIframeSrc(src) ? src : (normalizeEmbedSrc(src) ?? src);
+            if (!isAllowedIframeSrc(src)) return null;
+        }
         const cleanAttrs = sanitizeAttrs(node.type, { ...node.attrs, src }, cfg);
         return { type: node.type, attrs: cleanAttrs };
     }

@@ -1,6 +1,8 @@
 import { supabase } from './common.js';
 import { cache } from '../cache.js';
 import { CLIENT_DEFAULT_PERMS } from '../clientRolePermissions.js';
+import { MEMBER_DEFAULT_PERMS, DISPATCHER_DEFAULT_PERMS } from '../roleDefaultPermissions.js';
+import { markOptionalModuleDefaultsApplied } from './roleDefaults.js';
 import { log as baseLog } from '../log.js';
 import type { Tables } from './rows.js';
 
@@ -70,10 +72,11 @@ export async function seedInstall() {
 
     const rolePerms: Tables<'role_permissions'>[] = [];
 
-    // Define Permission Sets
+    // Define Permission Sets (single source of truth: lib/roleDefaultPermissions.ts,
+    // shared with the one-shot repair backfill so the two cannot drift into two lists)
     const clientPerms = [...CLIENT_DEFAULT_PERMS];
-    const memberPerms = ['alliance:view', 'user:receive:eam', 'fleet:view', 'fleet:manage_own', 'hr:view', 'intel:view', 'intel:view:clearance', 'intel:create', 'warrant:view', 'operations:view', 'request:create', 'request:create_adhoc', 'request:accept', 'request:start', 'request:complete', 'request:cancel', 'request:rate', 'user:toggle_duty', 'user:view:roster', 'user:manage:self', 'wiki:view', 'gov:view', 'gov:participate', 'marketplace:view', 'marketplace:list', 'marketplace:contract'];
-    const dispatcherPerms = ['alliance:view', 'radio:manage', 'admin:broadcast:eam', 'user:receive:eam', 'fleet:view', 'fleet:manage_own', 'fleet:manage', 'hr:view', 'hr:recruiter', 'hr:manager', 'hr:admin', 'hr:manage:positions', 'admin:manage:documents', 'intel:view', 'intel:view:clearance', 'intel:create', 'intel:manage', 'warrant:view', 'warrant:create', 'warrant:manage', 'operations:view', 'operations:create', 'operations:manage', 'unit:manage:own', 'request:create', 'request:create_adhoc', 'request:triage', 'request:dispatch', 'request:accept', 'request:start', 'request:complete', 'request:cancel', 'request:delete', 'request:manage_responders', 'request:set_lead', 'request:update', 'request:rate', 'request:view:feedback', 'admin:access', 'admin:config:notices', 'admin:view:roster', 'admin:view:clients', 'user:manage:conduct_record', 'user:toggle_duty', 'admin:award:certification', 'admin:award:commendation', 'user:view:roster', 'user:manage:self', 'wiki:view', 'wiki:add_page', 'wiki:edit_page', 'wiki:delete_page', 'gov:view', 'gov:participate', 'gov:electoral_officer', 'gov:manage', 'marketplace:view', 'marketplace:list', 'marketplace:contract'];
+    const memberPerms = [...MEMBER_DEFAULT_PERMS];
+    const dispatcherPerms = [...DISPATCHER_DEFAULT_PERMS];
     const adminPerms = permissions.map(p => p.name);
 
     const assign = (roleName: string, permNames: string[]) => {
@@ -85,16 +88,46 @@ export async function seedInstall() {
         });
     };
 
+    // The Member/Dispatcher defaults are a STARTING POINT, not a definition, so seed
+    // them only onto a tier that holds nothing yet. seedInstall is re-entered from
+    // repairDatabase's catastrophic branch (roleCount < 4, or an Admin role holding
+    // < 5 perms — reachable through the Roles UI, which has no floor) and this upsert
+    // is purely additive, so without the freshness check a Repair click would restore
+    // every default the operator had deliberately revoked. Admin keeps its
+    // unconditional grant — that branch fires precisely BECAUSE Admin is short — and
+    // Client keeps its, since repair clamps that tier back to CLIENT_DEFAULT_PERMS
+    // anyway. Fails CLOSED: an unreadable count is treated as "already populated".
+    const freshTiers = new Set<string>();
+    for (const tier of ['Member', 'Dispatcher']) {
+        const rId = roleMap[tier];
+        if (!rId) continue;
+        const { count, error } = await supabase.from('role_permissions')
+            .select('role_id', { count: 'exact', head: true }).eq('role_id', rId);
+        if (error) { log.error('role permission freshness check failed; skipping tier', { tier, err: error }); continue; }
+        if (count === 0) freshTiers.add(tier);
+        else log.info('tier already holds permissions; leaving its grants alone', { tier, count });
+    }
+
     assign('Client', clientPerms);
-    assign('Member', memberPerms);
-    assign('Dispatcher', dispatcherPerms);
+    if (freshTiers.has('Member')) assign('Member', memberPerms);
+    if (freshTiers.has('Dispatcher')) assign('Dispatcher', dispatcherPerms);
     assign('Admin', adminPerms);
 
+    let seededBothTiers = false;
     if (rolePerms.length > 0) {
         // Upsert permissions (role_id, permission_id) is PK
         const { error: rpError } = await supabase.from('role_permissions').upsert(rolePerms, { ignoreDuplicates: true });
         if (rpError) log.error('role permissions seed failed', { err: rpError });
+        else seededBothTiers = freshTiers.size === 2;
     }
+
+    // A fresh install is BORN with the optional-module defaults, so the one-shot
+    // repair backfill must never fire on it — otherwise the first Repair after an
+    // operator revokes finance:view from Member hands it straight back, and Repair is
+    // step 3 of every upgrade in DEPLOYMENT_GUIDE.md. Stamped only when BOTH tiers
+    // actually took the full default set; a partial or skipped seed leaves the
+    // backfill re-armable.
+    if (seededBothTiers) await markOptionalModuleDefaultsApplied();
 
     // 4. Seed Default Rank & Unit
     // Check if exists first

@@ -6,7 +6,7 @@
 // useAcademy(); rpcAction + certifications from useData(); the member picker
 // from useMembers().allUsers. Purple accent throughout.
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { useMembers } from '../../../contexts/MembersContext';
 import { useAcademy } from '../../../contexts/AcademyContext';
@@ -15,7 +15,8 @@ import { LessonContentEditor } from './LessonRichText';
 import ImageInput from '../../common/ImageInput';
 import type {
     AcademyCourse, AcademySession, AcademyEnrollment, AcademyModule, AcademyLesson,
-    AcademyOutcome, AcademyOutcomeVerdict, AcademyCourseStatus, AcademySessionStatus, User,
+    AcademyOutcome, AcademyOutcomeVerdict, AcademyCourseStatus, AcademySessionStatus,
+    AcademyEnrollmentRequest, User,
 } from '../../../types';
 
 // ── Shared styling tokens ────────────────────────────────────────────────────
@@ -135,11 +136,34 @@ const UserPicker: React.FC<{
     );
 };
 
+// ── Curriculum reordering ────────────────────────────────────────────────────
+// A move submits the WHOLE sibling list, never a single nudge. The server refuses a
+// subset outright (academy_apply_order counts the parent's children and rolls back if
+// the array is not all of them), which is deliberate: writing positions for two of
+// twenty modules collides with the eighteen it was not told about.
+const moveInList = <T,>(items: readonly T[], index: number, dir: -1 | 1): T[] | null => {
+    const to = index + dir;
+    if (index < 0 || index >= items.length || to < 0 || to >= items.length) return null;
+    const next = items.slice();
+    const [row] = next.splice(index, 1);
+    next.splice(to, 0, row);
+    return next;
+};
+
+const MoveButtons: React.FC<{ busy: boolean; first: boolean; last: boolean; label: string; onMove: (dir: -1 | 1) => void }> = ({ busy, first, last, label, onMove }) => (
+    <span className="flex flex-col leading-none shrink-0">
+        <button type="button" disabled={busy || first} onClick={() => onMove(-1)} title="Move up" aria-label={'Move ' + label + ' up'}
+            className="text-slate-600 hover:text-purple-400 disabled:opacity-20 disabled:hover:text-slate-600 px-1"><i className="fa-solid fa-caret-up text-xs"></i></button>
+        <button type="button" disabled={busy || last} onClick={() => onMove(1)} title="Move down" aria-label={'Move ' + label + ' down'}
+            className="text-slate-600 hover:text-purple-400 disabled:opacity-20 disabled:hover:text-slate-600 px-1"><i className="fa-solid fa-caret-down text-xs"></i></button>
+    </span>
+);
+
 // ════════════════════════════════════════════════════════════════════════════
 // COURSE BUILDER
 // ════════════════════════════════════════════════════════════════════════════
 
-const LessonRow: React.FC<{ lesson: AcademyLesson; busy: boolean; onSave: (patch: { title: string; content: string; videoUrl: string }) => void; onDelete: () => void; }> = ({ lesson, busy, onSave, onDelete }) => {
+const LessonRow: React.FC<{ lesson: AcademyLesson; busy: boolean; first: boolean; last: boolean; onMove: (dir: -1 | 1) => void; onSave: (patch: { title: string; content: string; videoUrl: string }) => void; onDelete: () => void; }> = ({ lesson, busy, first, last, onMove, onSave, onDelete }) => {
     const [editing, setEditing] = useState(false);
     const [title, setTitle] = useState(lesson.title);
     const [content, setContent] = useState(lesson.content ?? '');
@@ -153,6 +177,7 @@ const LessonRow: React.FC<{ lesson: AcademyLesson; busy: boolean; onSave: (patch
                     <p className="text-sm text-white truncate">{lesson.title}</p>
                     {lesson.videoUrl && <p className="text-[10px] text-purple-400/70 font-mono truncate">{lesson.videoUrl}</p>}
                 </div>
+                <MoveButtons busy={busy} first={first} last={last} label="lesson" onMove={onMove} />
                 <button type="button" onClick={() => setEditing(true)} className="text-slate-500 hover:text-purple-400 px-1"><i className="fa-solid fa-pen text-xs"></i></button>
                 <button type="button" disabled={busy} onClick={onDelete} className="text-slate-500 hover:text-red-400 px-1"><i className="fa-solid fa-trash text-xs"></i></button>
             </div>
@@ -171,7 +196,7 @@ const LessonRow: React.FC<{ lesson: AcademyLesson; busy: boolean; onSave: (patch
     );
 };
 
-const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; rpcAction: (action: string, payload: any) => Promise<any>; run: (fn: () => Promise<unknown>, ok?: string) => void; confirm: ReturnType<typeof useNotification>['confirm']; }> = ({ mod, busy, rpcAction, run, confirm }) => {
+const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; first: boolean; last: boolean; onMove: (dir: -1 | 1) => void; rpcAction: (action: string, payload: any) => Promise<any>; run: (fn: () => Promise<unknown>, ok?: string) => void; confirm: ReturnType<typeof useNotification>['confirm']; }> = ({ mod, busy, first, last, onMove, rpcAction, run, confirm }) => {
     const [renaming, setRenaming] = useState(false);
     const [title, setTitle] = useState(mod.title);
     const [lessonTitle, setLessonTitle] = useState('');
@@ -184,6 +209,11 @@ const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; rpcAction: (acti
         if (!t) return;
         run(() => rpcAction('academy:create_lesson', { moduleId: mod.id, title: t, content: lessonContent || null, videoUrl: lessonVideo.trim() || null }), 'Lesson added');
         setLessonTitle(''); setLessonContent(''); setLessonVideo(''); setAdding(false);
+    };
+    const moveLesson = (index: number, dir: -1 | 1) => {
+        const next = moveInList(mod.lessons, index, dir);
+        if (!next) return;
+        run(() => rpcAction('academy:reorder_lessons', { moduleId: mod.id, orderedIds: next.map(l => l.id) }), 'Lessons reordered');
     };
     const removeModule = async () => {
         const ok = await confirm({ title: 'Delete module?', message: `"${mod.title}" and all its lessons will be removed.`, confirmText: 'Delete', variant: 'danger' });
@@ -203,6 +233,7 @@ const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; rpcAction: (acti
                     <>
                         <i className="fa-solid fa-folder text-purple-400"></i>
                         <h4 className="text-sm font-bold text-white flex-1 truncate">{mod.title}</h4>
+                        <MoveButtons busy={busy} first={first} last={last} label="module" onMove={onMove} />
                         <button type="button" onClick={() => setRenaming(true)} className="text-slate-500 hover:text-purple-400 px-1"><i className="fa-solid fa-pen text-xs"></i></button>
                         <button type="button" disabled={busy} onClick={removeModule} className="text-slate-500 hover:text-red-400 px-1"><i className="fa-solid fa-trash text-xs"></i></button>
                     </>
@@ -210,8 +241,9 @@ const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; rpcAction: (acti
             </div>
 
             <div className="space-y-1.5">
-                {mod.lessons.map(l => (
+                {mod.lessons.map((l, i) => (
                     <LessonRow key={l.id} lesson={l} busy={busy}
+                        first={i === 0} last={i === mod.lessons.length - 1} onMove={dir => moveLesson(i, dir)}
                         onSave={patch => run(() => rpcAction('academy:update_lesson', { lessonId: l.id, title: patch.title, content: patch.content || null, videoUrl: patch.videoUrl.trim() || null }), 'Lesson saved')}
                         onDelete={() => run(() => rpcAction('academy:delete_lesson', { lessonId: l.id }), 'Lesson deleted')} />
                 ))}
@@ -237,7 +269,7 @@ const ModuleCard: React.FC<{ mod: AcademyModule; busy: boolean; rpcAction: (acti
     );
 };
 
-const OutcomeRow: React.FC<{ outcome: AcademyOutcome; busy: boolean; run: (fn: () => Promise<unknown>, ok?: string) => void; rpcAction: (action: string, payload: any) => Promise<any>; confirm: ReturnType<typeof useNotification>['confirm']; }> = ({ outcome, busy, run, rpcAction, confirm }) => {
+const OutcomeRow: React.FC<{ outcome: AcademyOutcome; busy: boolean; first: boolean; last: boolean; onMove: (dir: -1 | 1) => void; run: (fn: () => Promise<unknown>, ok?: string) => void; rpcAction: (action: string, payload: any) => Promise<any>; confirm: ReturnType<typeof useNotification>['confirm']; }> = ({ outcome, busy, first, last, onMove, run, rpcAction, confirm }) => {
     const [editing, setEditing] = useState(false);
     const [title, setTitle] = useState(outcome.title);
 
@@ -262,6 +294,7 @@ const OutcomeRow: React.FC<{ outcome: AcademyOutcome; busy: boolean; run: (fn: (
                         className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${outcome.required ? 'bg-purple-500/10 text-purple-300 border-purple-500/30' : 'bg-slate-700/30 text-slate-400 border-slate-600/40'}`}>
                         {outcome.required ? 'Required' : 'Optional'}
                     </button>
+                    <MoveButtons busy={busy} first={first} last={last} label="outcome" onMove={onMove} />
                     <button type="button" onClick={() => setEditing(true)} className="text-slate-500 hover:text-purple-400 px-1"><i className="fa-solid fa-pen text-xs"></i></button>
                     <button type="button" disabled={busy} onClick={remove} className="text-slate-500 hover:text-red-400 px-1"><i className="fa-solid fa-trash text-xs"></i></button>
                 </>
@@ -302,6 +335,16 @@ const CourseEditor: React.FC<{ course: AcademyCourse; canManage: boolean; onBack
         if (!t) return;
         run(() => rpcAction('academy:create_outcome', { courseId: course.id, title: t, required: outcomeRequired }), 'Outcome added');
         setOutcomeTitle('');
+    };
+    const moveModule = (index: number, dir: -1 | 1) => {
+        const next = moveInList(course.modules, index, dir);
+        if (!next) return;
+        run(() => rpcAction('academy:reorder_modules', { courseId: course.id, orderedIds: next.map(m => m.id) }), 'Modules reordered');
+    };
+    const moveOutcome = (index: number, dir: -1 | 1) => {
+        const next = moveInList(course.outcomes, index, dir);
+        if (!next) return;
+        run(() => rpcAction('academy:reorder_outcomes', { courseId: course.id, orderedIds: next.map(o => o.id) }), 'Outcomes reordered');
     };
     const addInstructors = (ids: number[]) => {
         setPickingInstructor(false);
@@ -366,8 +409,10 @@ const CourseEditor: React.FC<{ course: AcademyCourse; canManage: boolean; onBack
             {/* Modules */}
             <section className="space-y-3">
                 <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Modules &amp; Lessons</h3>
-                {course.modules.map(m => (
-                    <ModuleCard key={m.id} mod={m} busy={busy} rpcAction={rpcAction} run={run} confirm={confirm} />
+                {course.modules.map((m, i) => (
+                    <ModuleCard key={m.id} mod={m} busy={busy}
+                        first={i === 0} last={i === course.modules.length - 1} onMove={dir => moveModule(i, dir)}
+                        rpcAction={rpcAction} run={run} confirm={confirm} />
                 ))}
                 <div className="flex flex-col sm:flex-row sm:items-center gap-2">
                     <input value={moduleTitle} onChange={e => setModuleTitle(e.target.value)} placeholder="New module title" className={INPUT} />
@@ -378,8 +423,10 @@ const CourseEditor: React.FC<{ course: AcademyCourse; canManage: boolean; onBack
             {/* Outcomes */}
             <section className="space-y-3">
                 <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Competency Outcomes</h3>
-                {course.outcomes.map(o => (
-                    <OutcomeRow key={o.id} outcome={o} busy={busy} run={run} rpcAction={rpcAction} confirm={confirm} />
+                {course.outcomes.map((o, i) => (
+                    <OutcomeRow key={o.id} outcome={o} busy={busy}
+                        first={i === 0} last={i === course.outcomes.length - 1} onMove={dir => moveOutcome(i, dir)}
+                        run={run} rpcAction={rpcAction} confirm={confirm} />
                 ))}
                 <div className="flex flex-col sm:flex-row sm:items-center gap-2">
                     <input value={outcomeTitle} onChange={e => setOutcomeTitle(e.target.value)} placeholder="New outcome title" className={INPUT} />
@@ -606,6 +653,79 @@ const EnrollmentPanel: React.FC<{ enrollment: AcademyEnrollment; course: Academy
     );
 };
 
+// Pending seat requests for one session.
+//
+// Fetched HERE rather than folded into academy:get_session: the queue is staff-only
+// (academy:instruct), get_session is the panel every instructor opens, and a member
+// list of who asked for what does not belong in a payload that exists to render a
+// roster. Its own action keeps the gate on the data rather than on the screen.
+const SeatRequestQueue: React.FC<{
+    sessionId: string;
+    names: Map<number, string>;
+    busy: boolean;
+    onDecide: (requestId: string, decision: 'approve' | 'deny', reason: string) => Promise<void>;
+    reloadKey: number;
+}> = ({ sessionId, names, busy, onDecide, reloadKey }) => {
+    const { rpcAction } = useData();
+    const [requests, setRequests] = useState<AcademyEnrollmentRequest[]>([]);
+    const [reasons, setReasons] = useState<Record<string, string>>({});
+
+    useEffect(() => {
+        let alive = true;
+        void (async () => {
+            try {
+                const rows = await rpcAction('academy:list_enrollment_requests', { sessionId }) as AcademyEnrollmentRequest[];
+                if (alive) setRequests(Array.isArray(rows) ? rows : []);
+            } catch {
+                // A queue that fails to load shows as empty, never as stale: an instructor
+                // acting on a decided request would get the already-decided refusal anyway.
+                if (alive) setRequests([]);
+            }
+        })();
+        return () => { alive = false; };
+    }, [rpcAction, sessionId, reloadKey]);
+
+    if (requests.length === 0) return null;
+
+    return (
+        <section className="space-y-2">
+            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                Seat Requests ({requests.length})
+            </h3>
+            <div className="space-y-1.5">
+                {requests.map(r => (
+                    <div key={r.id} className="bg-amber-500/5 border border-amber-500/25 rounded-md p-3 space-y-2">
+                        <div className="flex items-start gap-2">
+                            <i className="fa-solid fa-hand text-amber-400/80 mt-0.5" aria-hidden></i>
+                            <div className="min-w-0 flex-1">
+                                <p className="text-sm text-white truncate">{names.get(r.studentId) || `Member #${r.studentId}`}</p>
+                                {r.message && <p className="text-[11px] text-slate-400 mt-0.5 whitespace-pre-wrap break-words">{r.message}</p>}
+                                <p className="text-[10px] text-slate-600 mt-0.5">Asked {new Date(r.createdAt).toLocaleString()}</p>
+                            </div>
+                        </div>
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                            <input
+                                value={reasons[r.id] || ''}
+                                onChange={e => setReasons(prev => ({ ...prev, [r.id]: e.target.value }))}
+                                maxLength={500} disabled={busy}
+                                placeholder="Reason (shown to them if declined)"
+                                aria-label="Decision reason"
+                                className="flex-1 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-xs text-white placeholder:text-slate-600 outline-hidden focus:border-purple-500/50 disabled:opacity-50"
+                            />
+                            <div className="flex items-center gap-2 shrink-0">
+                                <button type="button" disabled={busy} onClick={() => void onDecide(r.id, 'deny', (reasons[r.id] || '').trim())}
+                                    className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-red-400 hover:bg-red-500/10 rounded-md disabled:opacity-40">Decline</button>
+                                <button type="button" disabled={busy} onClick={() => void onDecide(r.id, 'approve', (reasons[r.id] || '').trim())}
+                                    className="px-3 py-1.5 text-[11px] font-black uppercase tracking-widest rounded-md bg-emerald-600 hover:bg-emerald-500 text-white disabled:bg-slate-700 disabled:text-slate-500">Approve</button>
+                            </div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </section>
+    );
+};
+
 const SessionDetail: React.FC<{ data: { session: AcademySession; enrollments: AcademyEnrollment[] }; canManage: boolean; onBack: () => void; onReload: () => Promise<void>; }> = ({ data, canManage, onBack, onReload }) => {
     const { rpcAction } = useData();
     const { allUsers } = useMembers();
@@ -617,6 +737,25 @@ const SessionDetail: React.FC<{ data: { session: AcademySession; enrollments: Ac
     const [selectedEnrollmentId, setSelectedEnrollmentId] = useState<string | null>(null);
     const [enrollmentDetail, setEnrollmentDetail] = useState<{ enrollment: AcademyEnrollment; course: AcademyCourse } | null>(null);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+    // Bumped after every decision so the queue re-reads. A decision can also change the
+    // roster (an approval claims a seat), so onReload runs alongside it.
+    const [requestTick, setRequestTick] = useState(0);
+
+    const memberNames = useMemo(() => new Map(allUsers.map(u => [u.id, u.name])), [allUsers]);
+
+    const decideRequest = async (requestId: string, decision: 'approve' | 'deny', reason: string) => {
+        try {
+            await rpcAction('academy:decide_enrollment_request', { requestId, decision, reason: reason || undefined });
+            addToast(decision === 'approve' ? 'Request approved' : 'Request declined', <i className="fa-solid fa-check"></i>, OK_CLS);
+            setRequestTick(t => t + 1);
+            await onReload();
+        } catch (err: any) {
+            addToast(err?.message || 'Failed to record the decision', <i className="fa-solid fa-xmark"></i>, ERR_CLS);
+            // Re-read either way: the usual failure IS "already decided by someone else",
+            // and leaving the stale row on screen invites a second attempt at it.
+            setRequestTick(t => t + 1);
+        }
+    };
 
     const st = SESSION_STATUS[session.status];
     const activeEnrollments = enrollments.filter(e => e.status !== 'withdrawn');
@@ -684,6 +823,8 @@ const SessionDetail: React.FC<{ data: { session: AcademySession; enrollments: Ac
                     <i className={`fa-solid ${session.enrollmentOpen ? 'fa-lock-open' : 'fa-lock'} mr-2`}></i>Enrolment {session.enrollmentOpen ? 'Open' : 'Closed'}
                 </button>
             </section>
+
+            <SeatRequestQueue sessionId={session.id} names={memberNames} busy={busy} onDecide={decideRequest} reloadKey={requestTick} />
 
             {/* Roster */}
             <section className="space-y-3">

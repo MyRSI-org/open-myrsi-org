@@ -17,6 +17,9 @@ import { useData } from '../../../contexts/DataContext';
 import { useAcademy } from '../../../contexts/AcademyContext';
 import { useNotification } from '../../../contexts/NotificationContext';
 import type { AcademyCourse, AcademyEnrollment } from '../../../types';
+
+/** One approve/reject decision. Mirrors what academy:list_course_reviews returns. */
+type CourseReview = { id: number; decision: 'approved' | 'rejected'; note: string | null; reviewedBy: number; createdAt: string };
 import WindowFrame from '../../layout/WindowFrame';
 
 const OK_TOAST = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50';
@@ -37,7 +40,16 @@ export const ApprovalsTab: React.FC = () => {
 
     // The course under review, its full fetched detail, and the in-flight guard.
     const [reviewCourse, setReviewCourse] = useState<AcademyCourse | null>(null);
+    // The reviewer's note. Required on a reject and refused server-side without it —
+    // a course returned to draft with no statement of what was wrong leaves the author
+    // guessing, which is the whole reason this field exists.
+    const [reviewNote, setReviewNote] = useState('');
     const [detail, setDetail] = useState<AcademyCourse | null>(null);
+    // The prior decision trail for the open course. Recording a reject reason is
+    // pointless if the next reviewer cannot see what the last one said — a resubmitted
+    // course is reviewed AGAINST that note. Fetched with the course, gated
+    // academy:instruct, and never shown outside this modal.
+    const [reviews, setReviews] = useState<CourseReview[]>([]);
     const [busy, setBusy] = useState(false);
 
     const okToast = useCallback((message: string) => {
@@ -55,18 +67,30 @@ export const ApprovalsTab: React.FC = () => {
     const openReview = useCallback(async (course: AcademyCourse) => {
         setReviewCourse(course);
         setDetail(null);
+        setReviews([]);
         try {
             const full = await rpcAction('academy:get_course', { courseId: course.id }) as AcademyCourse;
             setDetail(full);
         } catch (err) {
             errToast(err);
             setReviewCourse(null);
+            return;
+        }
+        try {
+            const trail = await rpcAction('academy:list_course_reviews', { courseId: course.id }) as CourseReview[];
+            setReviews(Array.isArray(trail) ? trail : []);
+        } catch {
+            // A missing trail is not a reason to block the review — the curriculum
+            // above is what the decision is actually made on.
+            setReviews([]);
         }
     }, [rpcAction, errToast]);
 
     const closeReview = useCallback(() => {
         setReviewCourse(null);
+        setReviewNote('');
         setDetail(null);
+        setReviews([]);
     }, []);
 
     // ── Mutations (each re-hydrates the shared slice) ────────────────────────
@@ -74,7 +98,7 @@ export const ApprovalsTab: React.FC = () => {
         if (!reviewCourse) return;
         setBusy(true);
         try {
-            await rpcAction('academy:approve_course', { courseId: reviewCourse.id });
+            await rpcAction('academy:approve_course', { courseId: reviewCourse.id, note: reviewNote.trim() || undefined });
             okToast('Course approved and published.');
             await refreshAcademy();
             closeReview();
@@ -83,21 +107,27 @@ export const ApprovalsTab: React.FC = () => {
         } finally {
             setBusy(false);
         }
-    }, [reviewCourse, rpcAction, okToast, errToast, refreshAcademy, closeReview]);
+    }, [reviewCourse, reviewNote, rpcAction, okToast, errToast, refreshAcademy, closeReview]);
 
     const reject = useCallback(async () => {
         if (!reviewCourse) return;
+        // Checked here only so the reviewer is told before the round-trip. The server
+        // refuses a note-less reject regardless — this is a courtesy, not the control.
+        if (!reviewNote.trim()) {
+            errToast(new Error('Add a note explaining what needs to change before returning this course.'));
+            return;
+        }
         const ok = await confirm({
-            title: 'Reject to Draft?',
-            message: 'This returns the course to its authors as a draft for revision. No students are affected.',
-            confirmText: 'Reject to Draft',
+            title: 'Return to Draft?',
+            message: 'This returns the course to its authors as a draft, with your note attached. No students are affected.',
+            confirmText: 'Return to Draft',
             variant: 'warning',
         });
         if (!ok) return;
         setBusy(true);
         try {
-            await rpcAction('academy:reject_course', { courseId: reviewCourse.id });
-            okToast('Course returned to draft.');
+            await rpcAction('academy:reject_course', { courseId: reviewCourse.id, note: reviewNote.trim() });
+            okToast('Course returned to draft with your feedback.');
             await refreshAcademy();
             closeReview();
         } catch (err) {
@@ -105,7 +135,7 @@ export const ApprovalsTab: React.FC = () => {
         } finally {
             setBusy(false);
         }
-    }, [reviewCourse, rpcAction, confirm, okToast, errToast, refreshAcademy, closeReview]);
+    }, [reviewCourse, reviewNote, rpcAction, confirm, okToast, errToast, refreshAcademy, closeReview]);
 
     const setAccess = useCallback(async (course: AcademyCourse, access: 'open' | 'gated') => {
         if (course.access === access || busy) return;
@@ -341,15 +371,52 @@ export const ApprovalsTab: React.FC = () => {
                             )}
                         </div>
 
+                        {reviews.length > 0 && (
+                            <div className="px-5 pb-4">
+                                <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Previous decisions</h4>
+                                <ul className="space-y-1.5">
+                                    {reviews.map(r => (
+                                        <li key={r.id} className="flex items-start gap-2 text-xs bg-slate-900/40 border border-slate-800 rounded-md px-3 py-2">
+                                            <i className={`fa-solid ${r.decision === 'approved' ? 'fa-circle-check text-emerald-400' : 'fa-rotate-left text-amber-400'} mt-0.5`} aria-hidden />
+                                            <div className="min-w-0 flex-1">
+                                                <p className="text-slate-300">
+                                                    {r.decision === 'approved' ? 'Approved' : 'Returned to draft'}
+                                                    <span className="text-slate-600 ml-2">{new Date(r.createdAt).toLocaleString()}</span>
+                                                </p>
+                                                {r.note && <p className="text-slate-400 mt-0.5 whitespace-pre-wrap break-words">{r.note}</p>}
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
                         {/* Action bar */}
-                        <div className="p-5 border-t border-slate-800 flex items-center justify-end gap-2 shrink-0">
+                        <div className="p-5 border-t border-slate-800 shrink-0 space-y-3">
+                            <div>
+                                <label htmlFor="academy-review-note" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1.5">
+                                    Reviewer note <span className="text-slate-600">(required to return, optional to approve)</span>
+                                </label>
+                                <textarea
+                                    id="academy-review-note"
+                                    value={reviewNote}
+                                    onChange={(e) => setReviewNote(e.target.value)}
+                                    maxLength={2000}
+                                    rows={3}
+                                    disabled={busy}
+                                    placeholder="What needs to change before this can be published?"
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white placeholder:text-slate-600 outline-hidden focus:border-indigo-500/50 resize-none disabled:opacity-50"
+                                />
+                            </div>
+                            <div className="flex items-center justify-end gap-2">
                             <button
                                 type="button"
                                 onClick={() => void reject()}
-                                disabled={busy || !detail}
+                                disabled={busy || !detail || !reviewNote.trim()}
+                                title={!reviewNote.trim() ? 'Add a note explaining what needs to change' : undefined}
                                 className="px-4 py-2 text-xs font-bold uppercase tracking-widest text-amber-400 rounded-lg hover:bg-amber-500/10 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                Reject to Draft
+                                Return to Draft
                             </button>
                             <button
                                 type="button"
@@ -359,6 +426,7 @@ export const ApprovalsTab: React.FC = () => {
                             >
                                 {busy ? <i className="fa-solid fa-spinner animate-spin" aria-hidden /> : 'Approve & Publish'}
                             </button>
+                            </div>
                         </div>
                     </div>
                 </WindowFrame>

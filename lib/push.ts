@@ -170,6 +170,35 @@ async function loadRecipientProfiles(userIds: number[]): Promise<Map<number, Rec
 }
 
 /**
+ * Intersect a recipient list with the users who still exist and are NOT
+ * soft-deleted, preserving the caller's order.
+ *
+ * `deleteUser` (lib/db/users.ts) only stamps deleted_at/name/tokens_valid_from:
+ * it drops neither the removed member's push_subscriptions nor their
+ * operation_participants rows, so a removed member stays inside every id-derived
+ * fan-out until something intersects them out. `sendPushToUsers` enforces the
+ * same rule at the query itself, so this is for callers that must DECIDE
+ * something before sending (e.g. whether to claim a reminder row at all).
+ *
+ * FAIL CLOSED: `null` means the probe faulted. A read error must never be read
+ * as "nobody is deleted" — callers send nothing.
+ */
+export async function filterLiveRecipients(userIds: number[]): Promise<number[] | null> {
+    if (userIds.length === 0) return [];
+    const { data, error } = await supabase
+        .from('users')
+        .select('id')
+        .in('id', userIds)
+        .is('deleted_at', null);
+    if (error) {
+        log.error('recipient liveness probe failed', { code: error.code, message: error.message });
+        return null;
+    }
+    const live = new Set<number>((data || []).map((u: { id: number }) => u.id));
+    return userIds.filter((id) => live.has(id));
+}
+
+/**
  * Send to specific user IDs.
  *
  * Pass a static `PushPayload` for plain notifications, OR a builder function
@@ -180,10 +209,38 @@ async function loadRecipientProfiles(userIds: number[]): Promise<Map<number, Rec
  */
 export async function sendPushToUsers(userIds: number[], payload: PushPayload | PushPayloadBuilder) {
     if (userIds.length === 0) return;
-    const { data: subs } = await supabase
+    // The `users!inner` join + `deleted_at IS NULL` is the choke point that keeps
+    // REMOVED members out of every per-user fan-out. deleteUser soft-deletes and
+    // leaves the ejected member's subscriptions (and their operation_participants
+    // rows) intact, so without this an op alert / reminder / dispatch ping keeps
+    // reaching a device the org has revoked. Enforcing it in THIS query rather
+    // than at each call site means a new caller cannot forget — and an error
+    // returns no rows, so the failure mode is "no push", never "push to everyone".
+    const joined = await supabase
         .from('push_subscriptions')
-        .select('id, user_id, subscription')
-        .in('user_id', userIds);
+        .select('id, user_id, subscription, user:users!inner(deleted_at)')
+        .in('user_id', userIds)
+        .is('user.deleted_at', null);
+    let subs: any[] | null = joined.data;
+    let error: { code?: string; message?: string } | null = joined.error;
+    if (error?.code === 'PGRST200') {
+        // PostgREST cannot resolve the users relationship (an install whose
+        // push_subscriptions table predates the FK). Apply the SAME rule with an
+        // extra round-trip instead of dropping every push on the floor — the
+        // pre-filter is itself fail-closed, so this is not a way around the gate.
+        const live = await filterLiveRecipients(userIds);
+        if (!live || live.length === 0) return;
+        const retry = await supabase
+            .from('push_subscriptions')
+            .select('id, user_id, subscription')
+            .in('user_id', live);
+        subs = retry.data;
+        error = retry.error;
+    }
+    if (error) {
+        log.error('push subscription lookup failed', { code: error.code, message: error.message });
+        return;
+    }
 
     const isBuilder = typeof payload === 'function';
     const profiles = isBuilder ? await loadRecipientProfiles(userIds) : undefined;

@@ -33,6 +33,10 @@ export const catalogActions = {
     'catalog:update_item_category': ({ id, updates }: { id: number; updates: Record<string, unknown> }) => db.updatePlatformItemCategory(id, updates),
     'catalog:delete_item_category': ({ id }: { id: number }) => db.deletePlatformItemCategory(id),
     'catalog:sync_items': () => db.syncPlatformItemCatalog(),
+    // Separate from the item sync on purpose: it hits a different UEX endpoint per
+    // category and the item sync deliberately does not touch the attributes column,
+    // so the two are independent and order does not matter.
+    'catalog:sync_item_attributes': () => db.syncPlatformItemAttributes(),
     'catalog:update_item': ({ itemId, updates }: { itemId: number; updates: Record<string, unknown> }) => db.updatePlatformItem(itemId, updates),
     'catalog:delete_item': ({ itemId }: { itemId: number }) => db.deletePlatformItem(itemId),
 

@@ -38,7 +38,11 @@ const WikiEditor: React.FC<WikiEditorProps> = ({ content, editable, onSave, onCa
         if (!file || !editor || !uploadFeature) return;
         try {
             const res = await apiService.uploadOrgMedia(file, uploadFeature);
-            if (res.url) editor.chain().focus().setImage({ src: res.url }).run();
+            // The upload OUTLIVES the editor if the author cancels or navigates while it is
+            // in flight; inserting into a destroyed instance throws out of an async handler,
+            // where nothing catches it. This is the only genuinely async editor touch in the
+            // file, and the sibling MinimalRichEditor does not have it either.
+            if (res.url && !editor.isDestroyed) editor.chain().focus().setImage({ src: res.url }).run();
         } catch (err) {
             alert(`Image upload failed: ${err instanceof Error ? err.message : 'unknown error'}`);
         }
@@ -85,7 +89,7 @@ const WikiEditor: React.FC<WikiEditorProps> = ({ content, editable, onSave, onCa
         ],
         content: content && Object.keys(content).length > 0 ? content : undefined,
         editable,
-        onUpdate: onChange ? ({ editor: e }) => onChange(e.getJSON()) : undefined,
+        onUpdate: onChange ? ({ editor: e }) => { if (!e.isDestroyed) onChange(e.getJSON()); } : undefined,
         editorProps: {
             attributes: {
                 class: 'wiki-editor-content prose prose-invert prose-slate prose-base md:prose-lg max-w-none focus:outline-hidden min-h-[60vh] md:min-h-[400px] p-4',
@@ -93,20 +97,28 @@ const WikiEditor: React.FC<WikiEditorProps> = ({ content, editable, onSave, onCa
         },
     });
 
+    // Tiptap v3 can destroy and recreate the editor instance across React renders, so an
+    // effect closure can hold a reference to an instance that is already gone. getJSON() /
+    // setContent() on one dereferences a null schema and throws — and renderActiveView is
+    // wrapped in an ErrorBoundary, so the whole dashboard content area is replaced by the
+    // error fallback and the in-progress document is lost. The sibling MinimalRichEditor
+    // already carries these guards; this mirrors it rather than inventing a variant.
     useEffect(() => {
-        if (editor) {
-            editor.setEditable(editable);
-        }
+        if (editor && !editor.isDestroyed) editor.setEditable(editable);
     }, [editor, editable]);
 
     useEffect(() => {
-        if (editor && content && Object.keys(content).length > 0) {
-            const currentContent = editor.getJSON();
-            // Only update if content actually differs to prevent cursor reset
-            if (JSON.stringify(currentContent) !== JSON.stringify(content)) {
+        if (!editor || editor.isDestroyed || !content || Object.keys(content).length === 0) return;
+        // isDestroyed alone is NOT sufficient: the command/state managers can be momentarily
+        // unset on a still-live instance while Tiptap recreates it under React, and reading
+        // editor.commands then throws. The initial content is already applied via useEditor's
+        // `content` option, so skipping a transient sync is harmless. Do not remove the catch.
+        try {
+            // Only update if content actually differs, to prevent a cursor reset.
+            if (JSON.stringify(editor.getJSON()) !== JSON.stringify(content)) {
                 editor.commands.setContent(content);
             }
-        }
+        } catch { /* editor not ready yet — initial content stands */ }
     }, [content, editor]);
 
     if (!editor) return null;

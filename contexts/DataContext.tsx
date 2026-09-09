@@ -43,6 +43,24 @@ const ROW_SLICE_SUBSETS = new Set([
     'users_slice', 'operation_slice', 'warrant_slice', 'bulletin_slice', 'wiki_page_slice',
 ]);
 
+// Keyless subsets that ALSO bypass the drop-dedupe, for the same reason and with the
+// same replacement (one in-flight fetch plus one trailing catch-up — lib/sliceCoalescer).
+//
+// users_presence is the whole list. The dedupe's stated job is suppressing the
+// broadcast + postgres_changes double-fire for one DB write — but neither `users` nor
+// `user_presence` is in the realtime publication (schema.sql private.rt_client_tables()
+// returns ranks/units/roles/locations/radio_channels/personnel_positions/
+// security_clearances/security_limiting_markers/specialization_tags/certifications/
+// commendations/service_types), so duty_update has NO postgres_changes twin and the
+// dedupe here can only ever LOSE. It stamps its timestamp at fetch START and has no
+// pending flag and no trailing fetch, so a second duty flip landing 0.1-2.0s into a
+// fetch is dropped PERMANENTLY: the last staffer goes off duty, someone comes on 1.5s
+// later, and every external customer reads "Services Unavailable" while the org is
+// crewed — with no self-heal until an unrelated duty flip somewhere in the org.
+const COALESCED_SUBSETS = new Set([
+    'users_presence',
+]);
+
 // Pillar 1 (views hydrate only what they display, when on screen): these
 // domains are NOT in the boot payload — their data exists client-side only
 // after their view loads it. Realtime events for a domain this user never
@@ -349,6 +367,14 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         intelSummary: GenGuard;
         bulletins: GenGuard;
         wikiPages: GenGuard;
+        // anyStaffOnDuty is written by BOTH a slow full fetch (main / initial-state)
+        // and a fast targeted fetch (users_presence / users_slice), which is the exact
+        // hazard these guards exist for. The existing slots are key-SPECIFIC — the main
+        // branch guards only `data.users` and then hands the WHOLE payload to
+        // setStateFromData -> applyStateData, so a new top-level key sails straight
+        // through. refreshMainState is {force:true} and fires on every mount of both
+        // customer request gates, so the overlap is routine, not exotic.
+        anyStaffOnDuty: GenGuard;
     }>(() => ({
         users: makeGenGuard(),
         operations: makeGenGuard(),
@@ -356,6 +382,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         intelSummary: makeGenGuard(),
         bulletins: makeGenGuard(),
         wikiPages: makeGenGuard(),
+        anyStaffOnDuty: makeGenGuard(),
     }));
     // Union-coalescers (lib/sliceCoalescer.ts): a burst of broadcasts
     // accumulates ids into a pending set while one drain-loop is in flight,
@@ -367,6 +394,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // LATEST fetchDataSubset through fetchDataSubsetRef.
     const fetchDataSubsetRef = useRef<(subset: string, options?: FetchDataSubsetOptions) => Promise<void> | void>(() => {});
     const userSliceCoalescerRef = useRef<SliceCoalescer<number> | null>(null);
+    // Keyless coalescer for users_presence: a constant key drives the same
+    // one-in-flight + one-trailing-catch-up drain loop the slice families use, so a
+    // burst of duty flips costs at most two fetches and NO flip is ever dropped.
+    // See COALESCED_SUBSETS.
+    const presenceCoalescerRef = useRef<SliceCoalescer<string> | null>(null);
     const opSliceCoalescerRef = useRef<SliceCoalescer<string> | null>(null);
     const warrantSliceCoalescerRef = useRef<SliceCoalescer<string> | null>(null);
     const bulletinSliceCoalescerRef = useRef<SliceCoalescer<string> | null>(null);
@@ -385,12 +417,19 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const warrantsGen = guards.warrants.begin();
         const bulletinsGen = guards.bulletins.begin();
         const wikiGen = guards.wikiPages.begin();
+        const dutyGen = guards.anyStaffOnDuty.begin();
         const data = await apiService.getInitialState();
         if (!guards.users.tryApply(usersGen)) delete data.users;
         if (!guards.operations.tryApply(opsGen)) delete data.operations;
         if (!guards.warrants.tryApply(warrantsGen)) delete data.warrants;
         if (!guards.bulletins.tryApply(bulletinsGen)) delete data.activeBulletins;
         if (!guards.wikiPages.tryApply(wikiGen)) delete data.wikiPages;
+        // initial-state is the ONLY page-load carrier of anyStaffOnDuty for a caller
+        // with no roster, and it is the slowest response in the app. Deleting the key
+        // on a lost race leaves the fresher users_presence answer standing —
+        // MembersContext's setter is typeof-boolean guarded, so an absent key is a
+        // no-op there.
+        if (!guards.anyStaffOnDuty.tryApply(dutyGen)) delete data.anyStaffOnDuty;
         setStateFromData(data);
         return data;
     }, [setStateFromData, guards]);
@@ -408,8 +447,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             else if (!loadedLazyDomainsRef.current.has(lazyDomain)) return;
         }
 
-        const isSliceSubset = ROW_SLICE_SUBSETS.has(subset);
-        if (!isSliceSubset) {
+        const bypassesDedupe = ROW_SLICE_SUBSETS.has(subset) || COALESCED_SUBSETS.has(subset);
+        if (!bypassesDedupe) {
             const now = Date.now();
             const lastFetch = recentFetchesRef.current.get(subset) || 0;
             // Skip the 2-second dedupe when the caller explicitly requests a
@@ -456,9 +495,21 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     userSliceCoalescerRef.current = makeSliceCoalescer<number>(
                         async (batch) => {
                             const gen = guards.users.begin();
+                            const dutyGen = guards.anyStaffOnDuty.begin();
                             const data = await apiService.getUsersSlice(batch);
                             if (guards.users.tryApply(gen)) {
                                 setMembersAllUsers(prev => mergeUsersSlice(prev, data.users || [], batch));
+                            }
+                            // A role change or soft-delete emits user_update, which the
+                            // client routes HERE and never to users_presence — so this
+                            // is the only leg that keeps the availability scalar fresh
+                            // across a demotion. (Once the Phase 3 item 3 staff gate
+                            // lands, a non-staff caller never reaches this branch; their
+                            // replacement carrier is the users_presence leg in
+                            // contexts/DataCoreContext.tsx's user_update handler.)
+                            if (typeof (data as { anyStaffOnDuty?: unknown }).anyStaffOnDuty !== 'undefined'
+                                && guards.anyStaffOnDuty.tryApply(dutyGen)) {
+                                applyStateData({ anyStaffOnDuty: (data as { anyStaffOnDuty?: boolean | null }).anyStaffOnDuty });
                             }
                         },
                         (error) => {
@@ -637,17 +688,56 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 }
                 await wikiSliceCoalescerRef.current([pageId]);
             } else if (subset === 'users_presence') {
-                const data = await apiService.getStateSubset('users_presence');
-                const rows: Array<{ userId: number; isDuty: boolean; lastActiveAt: string | null }> = data.usersPresence || [];
-                if (rows.length > 0) {
-                    const presenceMap = new Map(rows.map((p) => [p.userId, p]));
-                    // allUsers slice lives in MembersContext now; write through its setter
-                    // so presence updates merge into the canonical user list.
-                    setMembersAllUsers((prev) => prev.map((u: any) => {
-                        const p = presenceMap.get(u.id);
-                        return p ? { ...u, isDuty: p.isDuty, lastActiveAt: p.lastActiveAt } : u;
-                    }));
+                // One in-flight fetch plus one trailing catch-up (lib/sliceCoalescer
+                // makeSliceCoalescer, driven by a constant key because this subset has
+                // no ids). This REPLACES the 2s drop-dedupe for this subset — see
+                // COALESCED_SUBSETS — so a burst of duty flips costs at most two fetches
+                // and no flip is ever silently lost.
+                if (!presenceCoalescerRef.current) {
+                    presenceCoalescerRef.current = makeSliceCoalescer<string>(
+                        async () => {
+                            const dutyGen = guards.anyStaffOnDuty.begin();
+                            const data = await apiService.getStateSubset('users_presence');
+                            // Fan the availability scalar out FIRST and INDEPENDENTLY of
+                            // the presence rows. duty_update dispatches solely
+                            // users_presence, and MembersContext's registered setter is
+                            // the only way this value reaches state — so it must land
+                            // even when `usersPresence` is empty, which is exactly the
+                            // rosterless-caller case and exactly the value gating their
+                            // request form. Generation-guarded so a slow main /
+                            // initial-state cannot clobber this fresher answer.
+                            //
+                            // Only the one key is handed to applyStateData because the
+                            // presence response is not a state bundle and no other slice
+                            // setter has any business seeing it. (This does NOT remove
+                            // the dependency on setters being key-guarded — DataCore's
+                            // applyStateData fans ANY object out to EVERY registered
+                            // setter with no key filtering; it is simply the narrower
+                            // payload.)
+                            if (guards.anyStaffOnDuty.tryApply(dutyGen)) {
+                                applyStateData({ anyStaffOnDuty: data.anyStaffOnDuty });
+                            }
+                            const rows: Array<{ userId: number; isDuty: boolean; lastActiveAt: string | null }> = data.usersPresence || [];
+                            if (rows.length > 0) {
+                                const presenceMap = new Map(rows.map((p) => [p.userId, p]));
+                                // allUsers slice lives in MembersContext now; write through its setter
+                                // so presence updates merge into the canonical user list.
+                                setMembersAllUsers((prev) => prev.map((u: any) => {
+                                    const p = presenceMap.get(u.id);
+                                    return p ? { ...u, isDuty: p.isDuty, lastActiveAt: p.lastActiveAt } : u;
+                                }));
+                            }
+                        },
+                        (error) => {
+                            // Same fallback shape as users_slice. `main` also carries
+                            // anyStaffOnDuty, so a full refetch recovers the scalar;
+                            // non-force, so the 2s dedupe still collapses storms there.
+                            console.error('users_presence fetch failed; falling back to full main refetch:', error);
+                            void fetchDataSubsetRef.current('main');
+                        },
+                    );
                 }
+                await presenceCoalescerRef.current(['presence']);
             } else if (subset === 'warehouse') {
                 // Route the response through applyStateData; it fans out to
                 // Warehouse's three registered slice setters.
@@ -687,6 +777,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 applyStateData(data);
             } else if (subset === 'main') {
                 const gen = guards.users.begin();
+                const dutyGen = guards.anyStaffOnDuty.begin();
                 const data = await apiService.getStateSubset('main');
                 if (!guards.users.tryApply(gen)) {
                     // A fresher users_slice patch (or newer full fetch)
@@ -695,6 +786,10 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     // guard by key, so deleting `users` skips only that write).
                     delete data.users;
                 }
+                // Same race, different key: `main` is a 13-way Promise.all plus
+                // getAllSettings while users_presence is two small queries, so the fast
+                // path routinely resolves first and this one routinely overwrites it.
+                if (!guards.anyStaffOnDuty.tryApply(dutyGen)) delete data.anyStaffOnDuty;
                 setStateFromData(data);
             } else {
                 // Unknown subset → legacy full-state refresh through the
@@ -867,7 +962,12 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Bulletin CRUD lives in IntelContext; destructured above and re-exposed below.
 
-    const broadcastEAM = useCallback((message: string) => rpcAction('broadcast:eam', { message }), [rpcAction]);
+    // pingTarget is a LOUDNESS choice ('none' | 'here' | 'role'), never a role id —
+    // the role itself is admin-configured and read server-side, so no caller-chosen
+    // mention target can reach Discord. Optional: omitting it keeps the historical
+    // @here + configured-role behaviour.
+    const broadcastEAM = useCallback((message: string, pingTarget?: 'none' | 'here' | 'role') =>
+        rpcAction('broadcast:eam', { message, ...(pingTarget ? { pingTarget } : {}) }), [rpcAction]);
 
     const fetchUserDetail = useCallback(async (userId: number): Promise<User | null> => {
         try {

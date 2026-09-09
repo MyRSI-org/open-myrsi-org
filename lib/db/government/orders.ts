@@ -128,7 +128,7 @@ export async function listGovernmentOrders(viewerUserId?: number): Promise<Gover
         .select(ORDER_SELECT)
 
         .order('issued_at', { ascending: false, nullsFirst: false })
-        .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
         .limit(200);
 
     const rows = (data || []) as GovernmentOrderRow[];
@@ -209,7 +209,17 @@ export async function updateGovernmentOrder(orderId: string, patch: Partial<Gove
     const ex = existing as { issuer_user_id?: number; status?: string } | null;
     if (!ex) throw new Error('Order not found.');
     if (ex.issuer_user_id !== userId) throw new Error('Only the author can edit this order.');
-    if (ex.status !== 'draft' && patch.status !== 'active') {
+    // ONLY A DRAFT IS EDITABLE. The guard used to read
+    // `ex.status !== 'draft' && patch.status !== 'active'`, which the CALLER controls
+    // half of: echoing `status: 'active'` in the patch satisfied it for an order in ANY
+    // state, and every content field below was then applied. So the author of an
+    // in-force — or already REVOKED — executive order could silently rewrite its title,
+    // body, preamble, rationale, number and effective date while it stood, with no new
+    // issuance and nothing in the record marking that the text had changed.
+    //
+    // The draft → active publish is a separate, explicit transition handled below; it
+    // is the only thing `patch.status` may still do, and only from 'draft'.
+    if (ex.status !== 'draft') {
         throw new Error('Published orders cannot be edited. Revoke and issue a replacement if needed.');
     }
 

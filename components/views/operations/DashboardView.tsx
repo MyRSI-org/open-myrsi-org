@@ -244,7 +244,7 @@ const QuickRequestForm: React.FC = () => {
     const { createRequest } = useRequests();
     const { setActiveView } = useNavigation();
     const { refreshMainState, refreshRequests } = useData();
-    const { members } = useMembers();
+    const { anyStaffOnDuty } = useMembers();
     const { brandingConfig, heroCardConfig, serviceTypes } = useConfig();
 
     const activeServiceTypes = useMemo(() => serviceTypes.filter(t => t.isActive), [serviceTypes]);
@@ -270,8 +270,6 @@ const QuickRequestForm: React.FC = () => {
     if (activeServiceTypes.length > 0 && !activeServiceTypes.find(t => t.name === serviceType)) {
         setServiceType(activeServiceTypes[0].name);
     }
-
-    const onDutyCount = useMemo(() => members.filter(m => m.isDuty).length, [members]);
 
     const handleSubmit = useCallback((e: React.FormEvent) => {
         e.preventDefault();
@@ -312,7 +310,34 @@ const QuickRequestForm: React.FC = () => {
         );
     }
 
-    if (onDutyCount === 0) {
+    // Tri-state. `null` = the server could not answer: render neither the form
+    // (unknown must not widen) nor "there are no units on duty" (a fabricated fact).
+    // The only re-probe a stranded customer has is the {force:true} refreshMainState()
+    // in the mount effect above, so the frame carries an explicit retry.
+    if (anyStaffOnDuty === null) {
+        return (
+            <div className="flex flex-col items-center justify-center h-full text-center p-8 space-y-4 bg-slate-900/50 rounded-lg border border-slate-700/50">
+                <div className="w-20 h-20 bg-slate-800 rounded-full flex items-center justify-center text-slate-500 mb-2 ring-4 ring-slate-800 shadow-inner">
+                    <i className="fa-solid fa-triangle-exclamation text-3xl"></i>
+                </div>
+                <div>
+                    <h3 className="text-white font-bold text-xl">Availability Unknown</h3>
+                    <p className="text-slate-400 text-sm mt-2 max-w-xs mx-auto leading-relaxed">
+                        We could not confirm whether any {brandingConfig.name || 'organization'} units are on duty.
+                    </p>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => { void refreshMainState(); }}
+                    className="text-xs font-bold text-sky-400 hover:text-white uppercase tracking-widest mt-4"
+                >
+                    Retry
+                </button>
+            </div>
+        );
+    }
+
+    if (!anyStaffOnDuty) {
         return (
             <div className="flex flex-col items-center justify-center h-full text-center p-8 space-y-4 bg-slate-900/50 rounded-lg border border-slate-700/50">
                 <div className="w-20 h-20 bg-slate-800 rounded-full flex items-center justify-center text-slate-500 mb-2 ring-4 ring-slate-800 shadow-inner">

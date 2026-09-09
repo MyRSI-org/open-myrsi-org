@@ -422,28 +422,43 @@ const IntelligenceManagementTab: React.FC = () => {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800">
-                                {keys.map(key => (
-                                    <tr key={key.id} className="hover:bg-slate-800/30 transition-colors">
-                                        <td className="p-3 font-medium text-white">{key.label}</td>
+                                {keys.map(key => {
+                                    const revoked = !!key.revokedAt;
+                                    return (
+                                    <tr key={key.id} className={`transition-colors ${revoked ? 'opacity-50' : 'hover:bg-slate-800/30'}`}>
+                                        <td className="p-3 font-medium text-white">
+                                            {key.label}
+                                            {/* A revoked key stays listed BECAUSE it is the record — that is the
+                                                point of soft revocation. Marked so nobody mistakes it for live. */}
+                                            {revoked && <span className="ml-2 text-[10px] font-black uppercase tracking-widest text-red-300 border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 rounded-sm">Revoked</span>}
+                                            {!revoked && Array.isArray(key.scopes) && (
+                                                <span className="ml-2 text-[10px] font-mono uppercase tracking-wider text-slate-400">{key.scopes.join(' · ')}</span>
+                                            )}
+                                        </td>
                                         <td className="p-3 font-mono text-xs text-slate-400">{key.keyPrefix}</td>
                                         <td className="p-3 text-sm text-slate-400">{fmt(key.createdAt)}</td>
                                         <td className="p-3 text-sm text-slate-400">
                                             {key.lastUsedAt ? fmt(key.lastUsedAt) : 'Never'}
                                         </td>
                                         <td className="p-3 text-right">
-                                            <button
-                                                onClick={() => handleDeleteKey(key.id)}
-                                                className="text-red-400 hover:text-red-300 p-2 hover:bg-red-500/10 rounded-sm transition-colors"
-                                                title="Revoke Key"
-                                            >
-                                                <i className="fa-solid fa-trash"></i>
-                                            </button>
+                                            {revoked ? (
+                                                <span className="text-[11px] text-slate-500 italic pr-2">{key.revokedReason || 'revoked'}</span>
+                                            ) : (
+                                                <button
+                                                    onClick={() => handleDeleteKey(key.id)}
+                                                    className="text-red-400 hover:text-red-300 p-2 hover:bg-red-500/10 rounded-sm transition-colors"
+                                                    title="Revoke Key"
+                                                >
+                                                    <i className="fa-solid fa-ban"></i>
+                                                </button>
+                                            )}
                                         </td>
                                     </tr>
-                                ))}
+                                    );
+                                })}
                                 {keys.length === 0 && (
                                     <tr>
-                                        <td colSpan={5} className="p-4 text-center text-slate-500 italic">No active API keys.</td>
+                                        <td colSpan={5} className="p-4 text-center text-slate-500 italic">No API keys.</td>
                                     </tr>
                                 )}
                             </tbody>

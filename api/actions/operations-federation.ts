@@ -6,12 +6,17 @@
 import * as db from '../../lib/db.js';
 
 interface InviteAllyPayload { operationId: string; peerId: string }
-interface MirrorIdPayload { id: string; user?: { role?: string; permissions?: string[] } }
+interface MirrorIdPayload { id: string; user?: { permissions?: string[] } }
 interface MirrorRsvpPayload { id: string; rsvpStatus: string; shipText?: string; isReady?: boolean; userId: number }
 
-/** Diplomacy admins may view pending (un-accepted) mirror invites; others may not. */
-function canSeePendingMirror(user?: { role?: string; permissions?: string[] }): boolean {
-    return user?.role === 'Admin' || (user?.permissions || []).includes('alliance:manage');
+/**
+ * Diplomacy admins may view pending (un-accepted) mirror invites; others may not.
+ * Permission only — the `role === 'Admin'` disjunct is gone: `role` is NAME-derived,
+ * so a permissionless custom role called "Commander" saw every pending peer invite.
+ * The seeded Admin holds alliance:manage.
+ */
+function canSeePendingMirror(user?: { permissions?: string[] }): boolean {
+    return (user?.permissions || []).includes('alliance:manage');
 }
 
 export const operationsFederationActions = {

@@ -42,7 +42,7 @@ const StatusDot: React.FC<{ status: string }> = ({ status }) => {
 const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId, onBack }) => {
     const { rpcAction, refreshHR, refreshMainState, optimisticUpdate, isFetching, fetchUserDetail } = useData();
     const {
-        members, allUsers, securityClearances, limitingMarkers, units, roles, ranks,
+        allUsers, securityClearances, limitingMarkers, units, roles, ranks,
         updateUserClearance, promoteUserToMember, updateUserRecord,
     } = useMembers();
     const { hrConfig } = useConfig();
@@ -262,9 +262,33 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
         return caseFile?.status === ApplicationStatus.Hired || caseFile?.status === ApplicationStatus.Rejected || caseFile?.status === ApplicationStatus.Accepted;
     }, [caseFile?.status]);
 
-    const availableOfficers = useMemo(() => {
-        return members.filter(m => m.permissions.includes('hr:recruiter') || m.permissions.includes('hr:admin') || m.permissions.includes('hr:manager'));
-    }, [members]);
+    // Assigning a case officer is hr:assign_recruiter → 'hr:manager' (api/services.ts).
+    // The control used to be enabled for hr:recruiter too, so that caller's save has
+    // always 403'd silently into the catch in handleAssignOfficer. Gate the picker on
+    // the permission the SAVE actually needs.
+    const canAssignOfficer = hasPermission('hr:manager');
+
+    // Eligible case officers. Was `members.filter(m => m.permissions.includes(...))`
+    // off the bulk roster; another member's permission array is no longer shipped to
+    // any viewer (lib/db/userFilters.ts), so eligibility is resolved server-side at the
+    // ROLE level and returns id/name only for the <option> list.
+    //
+    // rpcAction re-throws, so the .catch is required — otherwise every open by a
+    // non-manager is an unhandled rejection. Failing to EMPTY is the fail-closed side.
+    const [availableOfficers, setAvailableOfficers] = useState<Array<{ id: number; name: string }>>([]);
+    useEffect(() => {
+        // Bare return, never a synchronous setState (cascading renders, and
+        // react-hooks/set-state-in-effect). The list starts empty and the select it
+        // feeds only renders under the same canAssignOfficer condition.
+        if (!canAssignOfficer) return;
+        let cancelled = false;
+        rpcAction('hr:get_eligible_officers', {})
+            .then((rows: Array<{ id: number; name: string }> | null | undefined) => {
+                if (!cancelled) setAvailableOfficers(Array.isArray(rows) ? rows : []);
+            })
+            .catch(() => { if (!cancelled) setAvailableOfficers([]); });
+        return () => { cancelled = true; };
+    }, [canAssignOfficer, rpcAction]);
 
     // Linked Transfer Request (if applicable)
     const transferRequest = useMemo(() => {
@@ -750,15 +774,25 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
                                         <p className="text-xs text-slate-500 uppercase font-bold mb-1">Case Officer</p>
                                         <div className="flex gap-2 items-center">
                                             {caseFile.assignedRecruiter && <img src={caseFile.assignedRecruiter.avatarUrl} className="h-6 w-6 rounded-full object-cover shrink-0" alt="Recruiter" />}
-                                            <select
-                                                value={caseFile.assignedRecruiterId || ''}
-                                                onChange={(e) => handleAssignOfficer(e.target.value)}
-                                                className={`bg-slate-900/50 border border-slate-600 text-white text-xs rounded-sm p-2 flex-1 outline-hidden transition-opacity ${isAssigning ? 'opacity-50 cursor-wait' : ''}`}
-                                                disabled={isCompleted || (!canManage && !canRecruit) || isAssigning}
-                                            >
-                                                <option value="">{isAssigning ? 'Assigning...' : 'Unassigned'}</option>
-                                                {availableOfficers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-                                            </select>
+                                            {canAssignOfficer ? (
+                                                <select
+                                                    value={caseFile.assignedRecruiterId || ''}
+                                                    onChange={(e) => handleAssignOfficer(e.target.value)}
+                                                    className={`bg-slate-900/50 border border-slate-600 text-white text-xs rounded-sm p-2 flex-1 outline-hidden transition-opacity ${isAssigning ? 'opacity-50 cursor-wait' : ''}`}
+                                                    disabled={isCompleted || isAssigning}
+                                                >
+                                                    <option value="">{isAssigning ? 'Assigning...' : 'Unassigned'}</option>
+                                                    {availableOfficers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                                                </select>
+                                            ) : (
+                                                /* Without hr:manager the eligibility list is not fetched and the
+                                                   save 403s, so an enabled select would render an ASSIGNED case
+                                                   as "Unassigned" beside the assigned officer's avatar. Show the
+                                                   real value read-only instead. */
+                                                <p className="bg-slate-900/50 border border-slate-700 text-slate-300 text-xs rounded-sm p-2 flex-1">
+                                                    {caseFile.assignedRecruiter?.name || 'Unassigned'}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
 
@@ -1029,7 +1063,11 @@ const UnifiedCaseFileView: React.FC<UnifiedCaseFileViewProps> = ({ applicationId
                             <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-6">
                                 <div className="flex justify-between items-center mb-4">
                                     <h3 className="text-lg font-bold text-white">Interview Records</h3>
-                                    {!isCompleted && (
+                                    {/* hr:create_interview is hr:recruiter, and so is the
+                                        eligibility RPC that fills the modal's Lead
+                                        Interviewer picker. Don't offer the entry point to
+                                        callers who reach this tab on hr:admin/hr:manager. */}
+                                    {!isCompleted && canRecruit && (
                                         <button
                                             onClick={() => openScheduleInterviewModal(caseFile)}
                                             className="flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase tracking-widest text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/40 rounded-lg shadow-lg shadow-emerald-900/30 transition"

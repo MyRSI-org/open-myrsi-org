@@ -43,7 +43,11 @@ const getClearanceColor = (level: number) => {
 const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onClose, applicant }) => {
     const { rpcAction, refreshHR, fetchUserDetail } = useData();
     const { securityClearances, limitingMarkers, allUsers, updateUserClearance } = useMembers();
-    const { currentUser } = useAuth();
+    const { currentUser, hasPermission } = useAuth();
+    // hr:create_interview — and the hr:get_eligible_interviewers RPC behind the modal's
+    // Lead Interviewer picker — are both hr:recruiter. Gate the entry point so an
+    // hr:admin/hr:manager-only vetting officer isn't handed an unsubmittable form.
+    const canRecruit = hasPermission('hr:recruiter');
     const fmt = useFormatDate();
     const { openScheduleInterviewModal, openEditInterviewModal, openConductInterviewModal, openWindow, openCaseDetailsModal } = useModalRegistry();
     const [activeTab, setActiveTab] = useState<'overview' | 'background' | 'interview' | 'adjudication'>('overview');
@@ -357,9 +361,11 @@ const SecurityVettingModal: React.FC<SecurityVettingModalProps> = ({ isOpen, onC
                         <div className="max-w-3xl space-y-4">
                             <div className="flex justify-between items-center">
                                 <h3 className="text-sm font-bold text-white uppercase tracking-wider">Interviews</h3>
-                                <button onClick={() => openScheduleInterviewModal(applicant)} className="bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 px-3 py-1.5 rounded-sm text-[10px] font-bold uppercase transition-colors">
-                                    <i className="fa-solid fa-plus mr-1"></i> Schedule
-                                </button>
+                                {canRecruit && (
+                                    <button onClick={() => openScheduleInterviewModal(applicant)} className="bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 px-3 py-1.5 rounded-sm text-[10px] font-bold uppercase transition-colors">
+                                        <i className="fa-solid fa-plus mr-1"></i> Schedule
+                                    </button>
+                                )}
                             </div>
                             {applicant.interviews.map(int => (
                                 <div key={int.id} className="bg-slate-950/30 border border-slate-700/50 rounded-lg p-3 flex justify-between items-center">

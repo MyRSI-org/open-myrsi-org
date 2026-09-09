@@ -1,5 +1,6 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
 import { clampListOffset } from '../pgrest.js';
+import { log as baseLog } from '../log.js';
 import { toTreasuryAccount, toLedgerEntry } from './mappers.js';
 import type { Tables } from './rows.js';
 import type {
@@ -22,6 +23,16 @@ const LEDGER_SELECT = `
     created_by:users!treasury_ledger_entries_created_by_user_id_fkey(id, name, avatar_url, rsi_handle),
     approved_by:users!treasury_ledger_entries_approved_by_user_id_fkey(id, name, avatar_url, rsi_handle)
 `;
+
+const log = baseLog.child({ module: 'db.finances' });
+
+const DEFAULT_LEDGER_LIMIT = 200;
+/** Rows per page for the paged UI list. */
+const MAX_LEDGER_LIMIT = 500;
+/** Rows an export may reach — the deliberate, permission-gated bulk path. */
+const MAX_LEDGER_EXPORT_LIMIT = 5000;
+/** Rows per export round-trip. */
+const LEDGER_EXPORT_PAGE = MAX_LEDGER_LIMIT;
 
 // ---------------------------------------------------------------------------
 // Accounts
@@ -124,9 +135,15 @@ export interface ListLedgerOpts {
     offset?: number;
 }
 
-export async function listLedgerEntries(
-    opts: ListLedgerOpts = {},
-): Promise<LedgerEntry[]> {
+type LedgerFilterOpts = Omit<ListLedgerOpts, 'limit' | 'offset'>;
+type LedgerRow = Parameters<typeof toLedgerEntry>[0];
+
+/**
+ * The one ledger page query. Shared by the list path and the CSV export so the
+ * two can never drift on WHAT they select or filter, and so no caller can build
+ * an unbounded ledger read — limit/offset arrive already clamped.
+ */
+function ledgerPageQuery(opts: LedgerFilterOpts, limit: number, offset: number) {
     let q = supabase.from('treasury_ledger_entries')
         .select(LEDGER_SELECT)
         ;
@@ -139,28 +156,46 @@ export async function listLedgerEntries(
     if (opts.fromDate) q = q.gte('created_at', opts.fromDate);
     if (opts.toDate) q = q.lte('created_at', opts.toDate);
 
-    const limit = Math.max(1, Math.min(500, opts.limit ?? 200));
-    q = q.order('created_at', { ascending: false }).limit(limit);
-    const offset = clampListOffset(opts.offset);
-    if (offset) q = q.range(offset, offset + limit - 1);
-
-    const { data, error } = await q;
-    if (error && error.code === '42P01') return [];
-    handleSupabaseError({ error, message: 'Failed to load ledger' });
-    return (data || []).map(r => toLedgerEntry(r as unknown as Parameters<typeof toLedgerEntry>[0]));
+    // created_at alone is NOT a total order — a transfer writes both legs in one
+    // statement, and imports/adjustments share a timestamp — so a window over it
+    // is non-repeatable and offset paging can skip or repeat rows. id is the uuid
+    // PK, so it breaks every tie: stable and repeatable, but arbitrary, NOT
+    // chronological — don't read the second sort key as time.
+    q = q.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(limit);
+    if (offset > 0) q = q.range(offset, offset + limit - 1);
+    return q;
 }
 
+export async function listLedgerEntries(
+    opts: ListLedgerOpts = {},
+): Promise<LedgerEntry[]> {
+    const limit = Math.max(1, Math.min(MAX_LEDGER_LIMIT, opts.limit ?? DEFAULT_LEDGER_LIMIT));
+    const offset = clampListOffset(opts.offset);
+
+    const { data, error } = await ledgerPageQuery(opts, limit, offset);
+    if (error && error.code === '42P01') return [];
+    handleSupabaseError({ error, message: 'Failed to load ledger' });
+    return (data || []).map(r => toLedgerEntry(r as unknown as LedgerRow));
+}
+
+/**
+ * Single-entry fetch backing the finance:get_entry RPC — the realtime row-slice
+ * path: FinancesView splices the returned row in place, and null means EVICT
+ * (the entry was deleted/reversed away). So null must mean genuine absence
+ * ONLY. EVERY error throws — 42P01 included — so a transient DB blip can never
+ * masquerade as "this ledger entry was deleted"; the client's catch does a full
+ * refetch instead.
+ */
 export async function getLedgerEntry(
     entryId: string,
 ): Promise<LedgerEntry | null> {
     const { data, error } = await supabase.from('treasury_ledger_entries')
         .select(LEDGER_SELECT)
         .eq('id', entryId)
-        
+
         .maybeSingle();
-    if (error && error.code === '42P01') return null;
     handleSupabaseError({ error, message: 'Failed to load ledger entry' });
-    return data ? toLedgerEntry(data as unknown as Parameters<typeof toLedgerEntry>[0]) : null;
+    return data ? toLedgerEntry(data as unknown as LedgerRow) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,53 +449,46 @@ export async function recordAdjustment(
 // Overview — powers the first tab
 // ---------------------------------------------------------------------------
 
+/**
+ * The overview numbers come from ONE SQL aggregate, not from summing rows in Node.
+ *
+ * This is a correctness fix, not a performance one. Both former reads pulled whole result
+ * sets across the wire and added them up here — and PostgREST enforces `db-max-rows`
+ * SERVER-SIDE, returning a SHORT page with NO error. A busy org's balance was therefore
+ * silently wrong with nothing anywhere to notice it, which is exactly what
+ * tests/uncappableReadContracts.test.ts names about this function: "a short read is a wrong
+ * balance presented as fact". That contract could never have caught it either — it asserts
+ * the absence of a `.limit()`, and not having one does not make a read complete.
+ *
+ * The 30-day read also discarded its error outright (`const { data: recentConfirmed } = …`),
+ * so any fault rendered the net as a confident 0.
+ */
 export async function getFinancesOverview(): Promise<FinancesOverview> {
-    const accounts = await listTreasuryAccounts();
-    const totalBalance = accounts
-        .filter((a) => a.isActive)
-        .reduce((sum, a) => sum + a.balanceCached, 0);
+    const [accounts, statsResult, recentEntries] = await Promise.all([
+        listTreasuryAccounts(),
+        supabase.rpc('finance_overview_stats'),
+        listLedgerEntries({ limit: 10 }),
+    ]);
 
-    // Pending aggregates in a single query for efficiency
-    const { data: pendingRows, error: pErr } = await supabase.from('treasury_ledger_entries')
-        .select('entry_type, amount')
-        
-        .eq('status', 'pending');
-    if (pErr && pErr.code !== '42P01') handleSupabaseError({ error: pErr, message: 'Failed to load pending totals' });
+    handleSupabaseError({ error: statsResult.error, message: 'Failed to load finance overview' });
 
-    let pendingDepositsCount = 0;
-    let pendingDepositsAmount = 0;
-    let pendingWithdrawalsCount = 0;
-    let pendingWithdrawalsAmount = 0;
-    for (const r of pendingRows || []) {
-        const amt = Math.abs(Number(r.amount));
-        if (r.entry_type === 'deposit') {
-            pendingDepositsCount += 1;
-            pendingDepositsAmount += amt;
-        } else if (r.entry_type === 'withdrawal') {
-            pendingWithdrawalsCount += 1;
-            pendingWithdrawalsAmount += amt;
-        }
-    }
+    // THROW on a missing row rather than defaulting to {}. The sibling aggregates use
+    // `(data && data[0]) || {}`, which in finance would render a fabricated ZERO TREASURY
+    // from an empty-but-errorless RPC — a wrong balance presented as fact, which is the one
+    // outcome this whole function is written to avoid. For quartermaster that shape produces a
+    // wrong count; here it produces a wrong BALANCE.
+    const row = (statsResult.data as Array<Record<string, unknown>> | null)?.[0];
+    if (!row) throw new Error('Failed to load finance overview: the aggregate returned no row.');
 
-    // 30-day net (confirmed only)
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-    const { data: recentConfirmed } = await supabase.from('treasury_ledger_entries')
-        .select('amount')
-        
-        .eq('status', 'confirmed')
-        .gte('created_at', thirtyDaysAgo);
-    const thirtyDayNet = (recentConfirmed || []).reduce((s: number, r: { amount: number }) => s + Number(r.amount), 0);
-
-    const recentEntries = await listLedgerEntries({ limit: 10 });
-
+    const n = (v: unknown): number => Number(v ?? 0);
     return {
         accounts,
-        totalBalance,
-        pendingDepositsCount,
-        pendingDepositsAmount,
-        pendingWithdrawalsCount,
-        pendingWithdrawalsAmount,
-        thirtyDayNet,
+        totalBalance: n(row.total_balance),
+        pendingDepositsCount: n(row.pending_deposits_count),
+        pendingDepositsAmount: n(row.pending_deposits_amount),
+        pendingWithdrawalsCount: n(row.pending_withdrawals_count),
+        pendingWithdrawalsAmount: n(row.pending_withdrawals_amount),
+        thirtyDayNet: n(row.thirty_day_net),
         recentEntries,
     };
 }
@@ -470,7 +498,11 @@ export async function getFinancesOverview(): Promise<FinancesOverview> {
 // ---------------------------------------------------------------------------
 
 export interface ExportLedgerOpts extends ListLedgerOpts {
-    // Same filter shape as listLedgerEntries; exports up to 5000 rows.
+    // Same filter shape as listLedgerEntries, with two differences:
+    //  - `limit` is a ceiling on the whole file (clamped to
+    //    MAX_LEDGER_EXPORT_LIMIT); absent or non-positive means the full window.
+    //  - `offset` is IGNORED. An export always starts at the newest matching
+    //    entry so a stale client offset cannot silently behead the file.
 }
 
 /**
@@ -496,17 +528,52 @@ export function csvEscape(value: unknown): string {
     return str;
 }
 
+/**
+ * Ledger CSV. This used to delegate to listLedgerEntries with limit 5000, which
+ * that function silently clamped to 500: an "audit export" of a 3000-entry
+ * ledger was quietly the newest 500 rows, in a file with nothing saying so, and
+ * the client toasted "Export ready" either way. It now pages to its own ceiling
+ * and, when it does hit that ceiling, says so IN THE FILE — a server log the
+ * auditor never sees does not fix "a partial export that looks complete".
+ */
 export async function exportLedgerCsv(
     opts: ExportLedgerOpts = {},
 ): Promise<string> {
-    const rows = await listLedgerEntries({ ...opts, limit: 5000 });
+    const requested = Math.trunc(Number(opts.limit));
+    // Absent / non-numeric / non-positive means "the whole window", not a 1-row
+    // file — the caller asked for an export, not for nothing.
+    const ceiling = Number.isFinite(requested) && requested > 0
+        ? Math.min(requested, MAX_LEDGER_EXPORT_LIMIT)
+        : MAX_LEDGER_EXPORT_LIMIT;
+
+    const rows: LedgerRow[] = [];
+    let truncated = false;
+    let offset = 0;
+    for (;;) {
+        // Ask for ONE row past the ceiling so "exactly full" is distinguishable
+        // from "there was more".
+        const want = Math.min(LEDGER_EXPORT_PAGE, ceiling + 1 - rows.length);
+        const { data, error } = await ledgerPageQuery(opts, want, offset);
+        if (error && error.code === '42P01') break; // migration not run — nothing to export
+        handleSupabaseError({ error, message: 'Failed to load ledger for export' });
+        const page = (data || []) as unknown as LedgerRow[];
+        if (page.length === 0) break;
+        rows.push(...page);
+        // Advance by rows RECEIVED, not requested: PostgREST enforces its own
+        // server-side max-rows and returns a SHORT page with no error, so a short
+        // page must not be mistaken for the end of the ledger.
+        offset += page.length;
+        if (rows.length > ceiling) { rows.splice(ceiling); truncated = true; break; }
+    }
+    const entries = rows.map(r => toLedgerEntry(r));
+
     const header = [
         'created_at', 'account_id', 'entry_type', 'amount', 'status',
         'memo', 'counterparty_name', 'counterparty_text',
         'created_by', 'approved_by', 'approved_at', 'notes', 'entry_id',
     ];
     const lines = [header.join(',')];
-    for (const r of rows) {
+    for (const r of entries) {
         lines.push([
             r.createdAt,
             r.accountId,
@@ -522,6 +589,16 @@ export async function exportLedgerCsv(
             r.notes,
             r.id,
         ].map(csvEscape).join(','));
+    }
+
+    if (truncated) {
+        const oldestIncluded = entries[entries.length - 1]?.createdAt ?? 'unknown';
+        log.warn('ledger CSV export hit its row ceiling — the file is a partial (newest-first) window', { ceiling, exported: entries.length });
+        // Full-width so the file stays rectangular through a spreadsheet import,
+        // and LAST so rows 1..N remain a clean, parseable ledger.
+        const notice = new Array(header.length).fill('');
+        notice[0] = `** TRUNCATED — this export contains only the ${entries.length} most recent matching entries (ceiling ${ceiling}). Entries older than ${oldestIncluded} are NOT included. Re-export with a narrower fromDate/toDate range to obtain the remainder. **`;
+        lines.push(notice.map(csvEscape).join(','));
     }
     return lines.join('\n');
 }

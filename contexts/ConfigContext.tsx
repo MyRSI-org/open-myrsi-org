@@ -38,6 +38,10 @@ export type {
 const defaultIconUrl = '/media/cross-swords.png';
 
 export interface ConfigContextValue {
+    /** Admin-only alarm: the running code needs api_keys columns this database does not have,
+     *  so API-key authentication is being refused. Server sends it only to admin:db:destroy
+     *  holders. */
+    schemaUpdateRequired: boolean;
     brandingConfig: BrandingConfig;
     themeConfig: Partial<ThemeConfig>;
     discordConfig: DiscordConfig;
@@ -118,6 +122,7 @@ const ConfigContext = createContext<ConfigContextValue | null>(null);
 export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { rpcAction, registerSliceSetter } = useDataCore();
 
+    const [schemaUpdateRequired, setSchemaUpdateRequired] = useState(false);
     const [brandingConfig, setBrandingConfig] = useState<BrandingConfig>({ name: '', iconUrl: defaultIconUrl });
     const [themeConfig, setThemeConfig] = useState<Partial<ThemeConfig>>({ enabled: false });
     const [discordConfig, setDiscordConfig] = useState<DiscordConfig>({});
@@ -185,6 +190,9 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     // returned by getInitialState / getStateSubset on the server.
     useEffect(() => {
         const cleanups = [
+            // Absent means 'not an admin' OR 'nothing wrong' — both resolve to false, which is
+            // the right default: a member must never see it, and a resolved problem must clear.
+            registerSliceSetter('schemaUpdateRequired', (data: any) => setSchemaUpdateRequired(data.schemaUpdateRequired === true)),
             registerSliceSetter('brandingConfig', (data: any) => { if (data.brandingConfig) setBrandingConfig(data.brandingConfig); }),
             registerSliceSetter('themeConfig', (data: any) => { if (data.themeConfig) setThemeConfig(data.themeConfig); }),
             registerSliceSetter('discordConfig', (data: any) => { if (data.discordConfig) setDiscordConfig(data.discordConfig); }),
@@ -310,6 +318,7 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     const value = useMemo<ConfigContextValue>(() => ({
+        schemaUpdateRequired,
         brandingConfig, themeConfig, discordConfig, heroCardConfig, openGraphConfig, radioConfig,
         aiConfig, wikiHomeConfig, hrConfig, publicPageConfig,
         serviceTypes, externalTools, locations, radioChannels,
@@ -326,6 +335,7 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         listTestimonialCandidates,
         registerRefreshMainState, registerRefreshDiscord, registerRefreshExternalTools,
     }), [
+        schemaUpdateRequired,
         brandingConfig, themeConfig, discordConfig, heroCardConfig, openGraphConfig, radioConfig,
         aiConfig, wikiHomeConfig, hrConfig, publicPageConfig,
         serviceTypes, externalTools, locations, radioChannels,
