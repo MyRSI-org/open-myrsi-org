@@ -8,6 +8,21 @@ import { log as baseLog } from "./log.js";
 
 const log = baseLog.child({ module: 'lib.ai' });
 
+// Both calls below are one-shot prompts awaited inside an RPC, so each is bounded here rather
+// than by SDK defaults. From @google/genai 2.29.0 a client with no httpOptions.timeout sends with
+// headersTimeout/bodyTimeout 0 — no client-side bound at all, where it used to inherit undici's
+// 300s — leaving Google's ~10-minute server cap as the only limit on a hung call. The SDK
+// enforces this timeout with its own abort timer, and with no retryOptions there is one attempt.
+export const GEMINI_TIMEOUT_MS = 120_000;
+// 2.29.0 also re-sends by default while a response ends in finish_reason CONTINUATION, each
+// request billed and timed separately and with no cap on the count. One RPC = one request, which
+// is also what the per-user AI rate limit counts.
+const ONE_SHOT = { automaticContinuation: false } as const;
+
+function geminiClient(apiKey: string): GoogleGenAI {
+    return new GoogleGenAI({ apiKey, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
+}
+
 export async function generateDossierSummary(dossier: DossierData): Promise<string> {
     // 1. Fetch AI and Branding settings
     const { data: settings, error } = await supabase
@@ -92,7 +107,7 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
     log.debug('using gemini model', { model: modelName, migratedFrom: modelName !== RAW_MODEL ? RAW_MODEL : undefined });
 
     try {
-        const ai = new GoogleGenAI({ apiKey });
+        const ai = geminiClient(apiKey);
 
         const prompt = `
             You are a military intelligence officer for a private security company (${orgName}).
@@ -124,6 +139,7 @@ export async function generateDossierSummary(dossier: DossierData): Promise<stri
         const response = await ai.models.generateContent({
             model: modelName,
             contents: prompt,
+            config: ONE_SHOT,
         });
 
         const summaryText = response.text || "AI failed to generate summary.";
@@ -263,8 +279,8 @@ If a section has no entries, infer cautiously from the available information rat
 `;
 
     try {
-        const ai = new GoogleGenAI({ apiKey });
-        const response = await ai.models.generateContent({ model: modelName, contents: prompt });
+        const ai = geminiClient(apiKey);
+        const response = await ai.models.generateContent({ model: modelName, contents: prompt, config: ONE_SHOT });
         const text = (response.text || '').trim();
 
         let summary = '';

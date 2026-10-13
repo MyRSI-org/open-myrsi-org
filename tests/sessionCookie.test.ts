@@ -240,22 +240,48 @@ describe('wiring — a predicate nothing calls is not a control', () => {
     // middleware. A gate placed after the parser would be reading a body already buffered.
     it('runs the CSRF gate BEFORE the body parsers', () => {
         const csrfAt = src.indexOf('const CSRF_GUARDED_PATHS');
-        const parserAt = src.indexOf('app.use(bodyLimitChooser(');
+        const parserAt = src.indexOf("app.use('/api', bodyLimitChooser(");
         expect(csrfAt).toBeGreaterThan(-1);
         expect(parserAt).toBeGreaterThan(csrfAt);
+    });
+
+    // The parsers verify a token to pick the cap and then buffer up to 10mb, so a limiter
+    // mounted after them can only shape the reply, never shed the load.
+    it('runs the global /api limiter BEFORE the body parsers, and both before the auth-action selector', () => {
+        const limiterAt = src.indexOf("app.use('/api', apiLimiter)");
+        const parserAt = src.indexOf("app.use('/api', bodyLimitChooser(");
+        const authActionAt = src.indexOf("app.use('/api/services', (req, res, next)");
+        expect(limiterAt).toBeGreaterThan(-1);
+        expect(authActionAt).toBeGreaterThan(-1);
+        expect(parserAt).toBeGreaterThan(limiterAt);
+        expect(authActionAt).toBeGreaterThan(parserAt);
+    });
+
+    // A path-less parser runs for a POST to ANY path, and outside /api no limiter applies — a
+    // stray POST to a SPA path bought a token verify and a 128kb parse, uncounted, and a
+    // malformed one 400'd in the error handler before the terminal handler's abuse counter ran.
+    it('scopes the body parsers to /api, the same scope as the limiter', () => {
+        expect(src).not.toMatch(/app\.use\(\s*bodyLimitChooser\(/);
     });
 
     it('splits the body cap and exempts the two streaming surfaces on BOTH parsers', () => {
         expect(src).toContain("const ANON_BODY_LIMIT = '128kb'");
         expect(src).toContain("const AUTHED_BODY_LIMIT = '10mb'");
-        expect(src).toContain('app.use(bodyLimitChooser((limit) => express.json({ limit })))');
-        expect(src).toContain('app.use(bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })))');
-        // One chooser feeds both parsers, so the two caps cannot drift.
-        const chooser = src.slice(src.indexOf('function bodyLimitChooser'));
-        expect(chooser.slice(0, 1400)).toContain("req.path === '/api/admin/import-stream'");
-        expect(chooser.slice(0, 1400)).toContain("req.path.startsWith('/api/alliance/')");
-        // GET/HEAD short-circuit, so a static asset hit does not pay for a token verify.
-        expect(chooser.slice(0, 1400)).toContain("req.method === 'GET' || req.method === 'HEAD'");
+        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.json({ limit })))");
+        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })))");
+        // One chooser feeds both parsers, so the two caps cannot drift. Bounded by the next
+        // mount rather than a character count: the tree is CRLF locally and LF in CI.
+        const start = src.indexOf('function bodyLimitChooser');
+        const chooser = src.slice(start, src.indexOf('app.use(compression())', start));
+        expect(start).toBeGreaterThan(-1);
+        // Under the '/api' mount the router strips the prefix from req.path, so the checks must
+        // run against the rebuilt path or both go false.
+        expect(chooser).toContain('const fullPath = req.baseUrl + req.path;');
+        expect(chooser).toContain("fullPath === '/api/admin/import-stream'");
+        expect(chooser).toContain("fullPath.startsWith('/api/alliance/')");
+        expect(chooser).not.toMatch(/req\.path(\s*===|\.startsWith)/);
+        // GET/HEAD short-circuit, so a read does not pay for a token verify.
+        expect(chooser).toContain("req.method === 'GET' || req.method === 'HEAD'");
     });
 
     // Exported and tested but never called in production, so their maps only grew; once full,
@@ -317,12 +343,13 @@ describe('runtime — Express matching and parser selection', () => {
             const authed = parserFor('10mb');
             return (req, res, next) => {
                 if (req.method === 'GET' || req.method === 'HEAD') return next();
-                if (req.path === '/api/admin/import-stream') return next();
-                if (req.path.startsWith('/api/alliance/')) return authed(req, res, next);
+                const fullPath = req.baseUrl + req.path;
+                if (fullPath === '/api/admin/import-stream') return next();
+                if (fullPath.startsWith('/api/alliance/')) return authed(req, res, next);
                 return (req.headers['x-fake-auth'] === '1' ? authed : anon)(req, res, next);
             };
         };
-        app.use(chooser((limit) => express.json({ limit })));
+        app.use('/api', chooser((limit) => express.json({ limit })));
         app.all(/(.*)/, (req, res) => {
             res.json({ bodyType: typeof req.body, keys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : null });
         });
@@ -347,6 +374,33 @@ describe('runtime — Express matching and parser selection', () => {
     it('an ordinary dispatch is parsed', async () => {
         const r = await call(buildApp(), 'POST', '/api/services', JSON.stringify({ action: 'x' }), { 'sec-fetch-site': 'same-origin' });
         expect(r.json?.keys).toEqual(['action']);
+    });
+
+    // The '/api' mount strips the prefix from req.path. Checked against the bare path, the
+    // alliance branch goes false and federation drops to the anonymous 128kb cap — peers push
+    // operation snapshots, so that is a silent break, not a tightening.
+    it('a federation POST keeps the generous cap under the /api mount', async () => {
+        const r = await call(buildApp(), 'POST', '/api/alliance/op-mirror/push', JSON.stringify({ pad: 'x'.repeat(200 * 1024) }));
+        expect(r.status).toBe(200);
+        expect(r.json?.keys).toEqual(['pad']);
+    });
+
+    it('an anonymous dispatch over the anonymous cap is still refused', async () => {
+        const r = await call(buildApp(), 'POST', '/api/services', JSON.stringify({ pad: 'x'.repeat(200 * 1024) }), { 'sec-fetch-site': 'same-origin' });
+        expect(r.status).toBe(413);
+    });
+
+    // Outside /api no limiter applies, so nothing there may buy a parse.
+    it('a POST outside /api is never parsed', async () => {
+        const r = await call(buildApp(), 'POST', '/operations/board', JSON.stringify({ action: 'x' }));
+        expect(r.json?.bodyType).toBe('undefined');
+    });
+
+    // Parsed path-less, this 400s in the error handler and never reaches the terminal handler's
+    // abuse counter.
+    it('a malformed body outside /api reaches the terminal handler, not the parser error path', async () => {
+        const r = await call(buildApp(), 'POST', '/operations/board', '{not json');
+        expect(r.status).toBe(200);
     });
 
     // BLOCKER: `strict routing` and `case sensitive routing` are both DISABLED by default, so

@@ -319,26 +319,27 @@ function bodyLimitChooser(parserFor: (limit: string) => express.RequestHandler):
     const anon = parserFor(ANON_BODY_LIMIT);
     const authed = parserFor(AUTHED_BODY_LIMIT);
     return (req, res, next) => {
-        // No body to parse. Short-circuits before any credential work so express.static asset
-        // hits do not pay for a token verify and a Cookie-header parse.
+        // No body to parse. Short-circuits before any credential work so /api/query reads do
+        // not pay for a token verify and a Cookie-header parse.
         if (req.method === 'GET' || req.method === 'HEAD') return next();
+        // Mounted at '/api', and the router strips the mount prefix from req.path, so the path
+        // has to be rebuilt. Against the bare req.path both checks below go false: import-stream
+        // gets its body eaten and federation is silently demoted to the anonymous cap.
+        const fullPath = req.baseUrl + req.path;
         // import-stream has its OWN express.text parser on the route, so it must reach the route
         // unparsed. This is the only path that may skip a parser entirely.
-        if (req.path === '/api/admin/import-stream') return next();
+        if (fullPath === '/api/admin/import-stream') return next();
         // Alliance federation is x-api-key server-to-server, so `callerIsAuthenticated` (which
         // looks for a SESSION credential) is always false for it. It must still be PARSED —
         // these two mounts are the only JSON parser in the app, so falling through to next()
         // here leaves req.body undefined and silently breaks five of the seven federation POST
         // routes: /pair 403s as "forbidden", op-mirror/push 500s, rsvp writes undefined fields.
         // Given the generous cap, not the anonymous one: peers push operation snapshots.
-        if (req.path.startsWith('/api/alliance/')) return authed(req, res, next);
+        if (fullPath.startsWith('/api/alliance/')) return authed(req, res, next);
         return (callerIsAuthenticated(req) ? authed : anon)(req, res, next);
     };
 }
 
-// Middleware to parse JSON bodies (Vercel functions expect parsed body)
-app.use(bodyLimitChooser((limit) => express.json({ limit })));
-app.use(bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })));
 app.use(compression());
 
 // Explicit connect-src list for the CSP, replacing a bare `https:` (which let the
@@ -492,6 +493,16 @@ const apiLimiter = rateLimit({
     keyGenerator: (req) => ipKeyGenerator(getClientIp(req as express.Request)),
 });
 app.use('/api', apiLimiter);
+
+// Body parsing goes BELOW the limiter. These mounts verify a token to choose a 128kb/10mb cap
+// and then buffer the body, so above it that work ran uncounted and a 429 still paid for the
+// parse it was meant to prevent. Scoped to '/api', the same scope as the limiter: nothing
+// outside /api reads req.body, and a path-less mount parsed a stray POST to any SPA path with no
+// limiter at all, where a malformed body 400'd in the error handler before the terminal
+// handler's abuse counter could see it. Keep them above the authActionLimiter selector below,
+// which reads req.body.action.
+app.use('/api', bodyLimitChooser((limit) => express.json({ limit })));
+app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })));
 
 // Public page endpoints — unauth, GET-only, tighter per-(ip+slug) rate limit.
 // The global apiLimiter already applies; this is an additional cap to deter
