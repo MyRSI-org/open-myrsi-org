@@ -24,11 +24,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+          # Without it setup-node takes the runner's cached 24.x (24.21.0 on 2026-10-18), below
+          # the engines floor of 24.22.1, the Node 24 security release. npm only warns on that.
+          check-latest: true
           cache: 'npm'
 
       # `npm ci` fails if package.json and package-lock.json have drifted,
@@ -58,11 +61,14 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+          # Without it setup-node takes the runner's cached 24.x (24.21.0 on 2026-10-18), below
+          # the engines floor of 24.22.1, the Node 24 security release. npm only warns on that.
+          check-latest: true
           cache: 'npm'
 
       - name: Install
@@ -71,3 +77,10 @@ jobs:
       # Same gate as `npm run audit` — prod deps only, high and above.
       - name: Audit production dependencies
         run: npm run audit
+
+      # Every installed package must carry a valid registry signature, and any provenance
+      # attestation must verify. --min-release-age=0 turns off .npmrc's 3-day filter for this
+      # check only: the age rule is enforced when versions are resolved (and by Dependabot's
+      # cooldown), and applying it here would hold back a same-week security fix.
+      - name: Verify registry signatures and provenance
+        run: npm audit signatures --min-release-age=0

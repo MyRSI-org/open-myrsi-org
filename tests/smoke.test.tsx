@@ -22,6 +22,7 @@ describe('App Smoke Test', () => {
         render(<App />);
         // Should show the splash screen because it enters the Suspense boundary for DashboardApp
         const loadingElement = await screen.findByText(/Establishing Uplink/i);
-        expect(loadingElement).toBeInTheDocument();
+        // Plain-DOM form of jest-dom's toBeInTheDocument (dropped with jest-dom on the vitest 5 move).
+        expect(document.body.contains(loadingElement)).toBe(true);
     });
 });

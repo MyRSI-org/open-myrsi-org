@@ -12,19 +12,54 @@
 //     credentialed request to 169.254.169.254 / 10.x and exfiltrate the key;
 //   - pins the vetted DNS answer into the connection — a TTL-0 rebind between
 //     the check and the connect cannot re-route us. TLS SNI + cert validation
-//     still run against the original hostname.
-// Do NOT call bare fetch() against peer/feed URLs — that re-opens both holes.
+//     still run against the original hostname;
+//   - caps the response body AFTER Content-Encoding is decoded, so a small
+//     gzip/br/zstd bomb cannot inflate past the ceiling.
+// Do NOT call bare fetch() against peer/feed URLs — that re-opens all three holes.
 
 import { lookup } from 'node:dns/promises';
 import { Agent, fetch as undiciFetch } from 'undici';
 import { isPrivateIpv4, isPrivateIpv6Address } from './linkUrl.js';
 
-// Cap the response body centrally on the pinning dispatcher so every outbound
-// peer/feed fetch inherits the ceiling — consumers do an unbounded res.json()/
-// res.text() afterwards and a hostile peer streaming GBs would OOM us (several
-// of these run unattended on cron). undici aborts + errors once the body exceeds
-// maxResponseSize. Generous so no legitimate peer payload is truncated.
+// Cap the response body centrally so every outbound peer/feed fetch inherits the
+// ceiling — consumers do an unbounded res.json()/res.text() afterwards and a
+// hostile peer streaming GBs would OOM us (several of these run unattended on
+// cron). Enforced twice: on the wire by the pinning Agent's maxResponseSize, and
+// on the DECODED body by readCappedBody(). The second is the one that holds:
+// undici counts maxResponseSize against wire bytes before fetch decodes
+// Content-Encoding, and a server picks the encoding whatever we ask for, so
+// 65 KB of gzip inflated to 64 MB straight past a 1 MB maxResponseSize (verified
+// against undici 8.12.3). Generous so no legitimate peer payload is truncated.
 export const MAX_OUTBOUND_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+// Statuses whose Response must carry a null body (the constructor throws otherwise).
+const NULL_BODY_STATUSES = new Set([204, 205]);
+
+/**
+ * Reads `res`'s DECODED body, counting bytes as they arrive, and throws once the
+ * count passes `limit`, cancelling the stream so the rest is never read or
+ * inflated. Null when the response has no body.
+ */
+async function readCappedBody(res: Response, limit: number): Promise<Uint8Array<ArrayBuffer> | null> {
+    if (!res.body) return null;
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) {
+            await reader.cancel().catch(() => undefined);
+            throw new Error(`Peer response exceeds ${limit} bytes once decoded — refused (SSRF guard)`);
+        }
+        chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+    return out;
+}
 
 /** Dev-only escape hatch matching validatePeerBaseUrl()'s loopback bypass. */
 function devLoopbackAllowed(): boolean {
@@ -80,9 +115,13 @@ export interface SsrfSafeFetchInit {
  * The one true outbound fetch for operator/peer-supplied URLs (see header).
  * Callers own scheme/shape validation of the URL (validatePeerBaseUrl /
  * sanitizePublicLinkUrl) and the abort signal / timeout; this helper owns
- * resolve-validate-pin and the no-redirect policy. 3xx responses are a hard
- * error — federation peers and feeds are our own software and never redirect
- * legitimately.
+ * resolve-validate-pin, the no-redirect policy and the body ceiling. 3xx
+ * responses are a hard error — federation peers and feeds are our own software
+ * and never redirect legitimately.
+ *
+ * The body is read here, decoded and capped, before this resolves: callers get
+ * an in-memory Response (no Content-Encoding, a truthful Content-Length), and
+ * their abort signal bounds the whole body read, not just the headers.
  */
 export async function ssrfSafeFetch(url: string, init?: SsrfSafeFetchInit): Promise<Response> {
     const vetted = await assertResolvesToPublicHost(url);
@@ -102,9 +141,9 @@ export async function ssrfSafeFetch(url: string, init?: SsrfSafeFetchInit): Prom
             // HTTP/2 on our credentialed outbound request — the IP-pin and
             // redirect refusal below are written and tested against h1.
             allowH2: false,
-            // Central response-byte ceiling: undici aborts + errors once the
-            // body exceeds this, so callers' downstream res.json()/res.text()
-            // can never buffer a hostile peer's giant body.
+            // Wire-level ceiling: undici aborts + errors once the still-encoded
+            // body exceeds this. It counts bytes BEFORE decoding, so it is only
+            // the early stop; readCappedBody() below caps the decoded body.
             maxResponseSize: MAX_OUTBOUND_RESPONSE_BYTES,
             connect: {
                 // net/tls call lookup with either (err, addresses[]) [all:true,
@@ -132,10 +171,36 @@ export async function ssrfSafeFetch(url: string, init?: SsrfSafeFetchInit): Prom
             ...(dispatcher ? { dispatcher } : {}),
         } as any) as unknown as Response;
 
+        // Every refusal before the body is read cancels it first. An unread body keeps
+        // the socket and the per-call Agent alive for as long as the peer cares to
+        // keep sending: undici suspends bodyTimeout while the stream is paused, and
+        // dispatcher.close() waits for the in-flight request.
         if (res.status >= 300 && res.status < 400) {
+            await res.body?.cancel().catch(() => undefined);
             throw new Error(`Peer responded with a redirect (${res.status}) — refused (SSRF guard)`);
         }
-        return res;
+        // undici passes through any 3-digit status, but a Response can only be
+        // rebuilt with 200-599. Refuse anything else with a clear error rather than
+        // let the constructor's RangeError surface instead.
+        if (res.status < 200 || res.status > 599) {
+            await res.body?.cancel().catch(() => undefined);
+            throw new Error(`Peer responded with an invalid HTTP status (${res.status}) — refused`);
+        }
+        const body = await readCappedBody(res, MAX_OUTBOUND_RESPONSE_BYTES);
+        const headers = new Headers(res.headers);
+        // The body is already decoded: drop the wire encoding, and make the length
+        // describe these bytes, not the compressed ones a caller might pre-check.
+        headers.delete('content-encoding');
+        if (body) headers.set('content-length', String(body.byteLength));
+        else headers.delete('content-length');
+        return new Response(NULL_BODY_STATUSES.has(res.status) ? null : body, {
+            status: res.status,
+            // undici decodes the reason phrase as UTF-8, so a raw Latin-1 byte arrives
+            // as U+FFFD, which the Response constructor rejects. Keep only the
+            // characters a reason phrase may hold (HTAB, SP, VCHAR, obs-text).
+            statusText: (res.statusText || '').replace(/[^\t\x20-\x7e\x80-\xff]/g, ''),
+            headers,
+        });
     } finally {
         // Release the per-call pinning Agent's sockets promptly (it is unique to
         // this request's vetted IP and never reused). Best-effort.

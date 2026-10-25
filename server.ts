@@ -4,8 +4,9 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import compression from 'compression';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { randomBytes, createHash, randomUUID } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { getClientIp } from './lib/clientIp.js';
+import { terminalErrorHandler } from './lib/terminalErrorHandler.js';
 import { getBuildId } from './lib/buildId.js';
 import { SESSION_COOKIE_IS_SECURE, credentialFromRequest, clearSessionCookie } from './lib/sessionCookie.js';
 import { checkRequestOrigin, allowedOriginsFor } from './lib/csrfOrigin.js';
@@ -501,8 +502,11 @@ app.use('/api', apiLimiter);
 // limiter at all, where a malformed body 400'd in the error handler before the terminal
 // handler's abuse counter could see it. Keep them above the authActionLimiter selector below,
 // which reads req.body.action.
-app.use('/api', bodyLimitChooser((limit) => express.json({ limit })));
-app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })));
+// inflate:false on EVERY body parser in this file: no client or federation peer sends a compressed
+// body, and decoding one runs before auth, where a few KB of gzip fills a 10mb cap (body-parser
+// 2.4.0 also added zstd). Refused as 415 encoding.unsupported in the terminal handler.
+app.use('/api', bodyLimitChooser((limit) => express.json({ limit, inflate: false })));
+app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit, inflate: false })));
 
 // Public page endpoints — unauth, GET-only, tighter per-(ip+slug) rate limit.
 // The global apiLimiter already applies; this is an additional cap to deter
@@ -641,7 +645,7 @@ const importStreamPreAuth: express.RequestHandler = (req, res, next) => {
     next();
 };
 
-app.post('/api/admin/import-stream', importStreamPreAuth, express.text({ type: () => true, limit: '64mb' }), async (req, res) => {
+app.post('/api/admin/import-stream', importStreamPreAuth, express.text({ type: () => true, limit: '64mb', inflate: false }), async (req, res) => {
     noStore(res);
     try {
         // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
@@ -780,7 +784,7 @@ const orgUploadLimiter = rateLimit({
 app.post(
     '/api/org/upload',
     orgUploadLimiter,
-    express.raw({ type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif'], limit: MAX_UPLOAD_BYTES }),
+    express.raw({ type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif'], limit: MAX_UPLOAD_BYTES, inflate: false }),
     (req, res) => {
         orgUploadHandler(req, res).catch((e) => {
             log.error('org upload handler error', { err: e });
@@ -1169,41 +1173,8 @@ app.all(/(.*)/, (req, res) => {
     return res.redirect(303, '/');
 });
 
-/**
- * Terminal error handler. There was none, so a body-parser fault escaped to Express's
- * finalhandler and answered a JSON API with an HTML error page — including, outside production,
- * a stack trace and absolute filesystem paths. Splitting the body cap makes 413 a routine
- * outcome rather than a curiosity, so the shape of that response now matters.
- *
- * Four arguments, and `_next` must stay: Express identifies an error handler by ARITY, so
- * dropping the unused parameter silently turns this back into ordinary middleware that never
- * runs. Registered last, after every route.
- */
-app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    const type = (err as { type?: string } | null)?.type;
-    const status = (err as { status?: number; statusCode?: number } | null)?.status
-        ?? (err as { statusCode?: number } | null)?.statusCode
-        ?? 500;
-
-    if (type === 'entity.too.large') {
-        log.warn('request body over cap', { path: req.originalUrl, method: req.method, ip: getClientIp(req) });
-        res.setHeader('Cache-Control', 'no-store');
-        res.status(413).json({ message: 'That upload is too large.' });
-        return;
-    }
-    if (type === 'entity.parse.failed') {
-        res.setHeader('Cache-Control', 'no-store');
-        res.status(400).json({ message: 'Malformed request body.' });
-        return;
-    }
-
-    // Anything else: log it server-side with an id, return an opaque message. The raw error
-    // text never crosses the wire — it can carry file paths and query fragments.
-    const requestId = randomUUID();
-    log.error('unhandled request error', { requestId, path: req.originalUrl, method: req.method, err });
-    res.setHeader('Cache-Control', 'no-store');
-    if (!res.headersSent) res.status(status >= 400 && status < 600 ? status : 500).json({ message: 'An internal server error occurred.', requestId });
-});
+// Terminal error handler (lib/terminalErrorHandler.ts). Registered last, after every route.
+app.use(terminalErrorHandler);
 
 // Cron jobs run in-process, each wrapped in withCronLease (a table-based lease,
 // see lib/cronLock.ts) so they are safe under multi-instance deploys: only the

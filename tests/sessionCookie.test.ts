@@ -1,7 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import express from 'express';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import {
     SESSION_COOKIE, SESSION_COOKIE_SECURE, sessionCookieName, resolveCookieSecure,
     isValidSessionTokenShape, buildSessionCookie, clearSessionCookie, readSessionCookie,
@@ -9,6 +10,7 @@ import {
 } from '../lib/sessionCookie';
 import { checkRequestOrigin, allowedOriginsFor } from '../lib/csrfOrigin';
 import { checkUserRateLimit, pruneUserRateLimitBuckets, __resetUserRateLimitForTest, USER_PER_MINUTE } from '../lib/userRateLimit';
+import { terminalErrorHandler } from '../lib/terminalErrorHandler';
 
 // The session token lived in localStorage, so any scripting foothold lifted a live 24-hour
 // session. Moving it to an HttpOnly cookie closes that, but a cookie is attached by the browser
@@ -267,8 +269,8 @@ describe('wiring — a predicate nothing calls is not a control', () => {
     it('splits the body cap and exempts the two streaming surfaces on BOTH parsers', () => {
         expect(src).toContain("const ANON_BODY_LIMIT = '128kb'");
         expect(src).toContain("const AUTHED_BODY_LIMIT = '10mb'");
-        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.json({ limit })))");
-        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit })))");
+        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.json({ limit, inflate: false })))");
+        expect(src).toContain("app.use('/api', bodyLimitChooser((limit) => express.urlencoded({ extended: true, limit, inflate: false })))");
         // One chooser feeds both parsers, so the two caps cannot drift. Bounded by the next
         // mount rather than a character count: the tree is CRLF locally and LF in CI.
         const start = src.indexOf('function bodyLimitChooser');
@@ -282,6 +284,24 @@ describe('wiring — a predicate nothing calls is not a control', () => {
         expect(chooser).not.toMatch(/req\.path(\s*===|\.startsWith)/);
         // GET/HEAD short-circuit, so a read does not pay for a token verify.
         expect(chooser).toContain("req.method === 'GET' || req.method === 'HEAD'");
+    });
+
+    // Decompressing a request body runs before auth, and nothing sends one compressed: a few KB
+    // of gzip would fill the 10mb federation cap. Every parser, present and future, refuses it.
+    // Matched on the call, `express.<kind>(`, so the explanatory comments cannot satisfy it.
+    it('passes inflate:false to EVERY body parser', () => {
+        const calls = [...src.matchAll(/express\.(json|urlencoded|text|raw)\(\s*(\{[^}]*\})?/g)];
+        expect(calls.map((m) => m[1]).sort()).toEqual(expect.arrayContaining(['json', 'raw', 'text', 'urlencoded']));
+        for (const m of calls) expect(m[2] ?? '(no options)', `express.${m[1]}`).toContain('inflate: false');
+    });
+
+    // Express only treats a 4-argument function as an error handler if it comes after the routes.
+    it('registers the terminal error handler after every route', () => {
+        const at = src.indexOf('app.use(terminalErrorHandler)');
+        expect(at).toBeGreaterThan(-1);
+        const routes = [...src.matchAll(/\bapp\.(get|post|put|patch|delete|all)\(/g)];
+        expect(routes.length).toBeGreaterThan(0);
+        expect(at).toBeGreaterThan(routes[routes.length - 1].index!);
     });
 
     // Exported and tested but never called in production, so their maps only grew; once full,
@@ -309,7 +329,7 @@ describe('runtime — Express matching and parser selection', () => {
     // Rebuilt here rather than importing server.ts, which opens a listener, registers cron jobs
     // and needs a database. The SHAPE is what is under test: the same mount strategy and the
     // same chooser branches.
-    async function call(app: express.Express, method: string, path: string, body?: string, headers: Record<string, string> = {}) {
+    async function call(app: express.Express, method: string, path: string, body?: string | Uint8Array<ArrayBuffer>, headers: Record<string, string> = {}) {
         const server = app.listen(0);
         try {
             const port = (server.address() as { port: number }).port;
@@ -318,7 +338,11 @@ describe('runtime — Express matching and parser selection', () => {
                 headers: { 'Content-Type': 'application/json', ...headers },
                 body,
             });
-            return { status: res.status, json: await res.json().catch(() => null) as Record<string, unknown> | null };
+            return {
+                status: res.status,
+                cacheControl: res.headers.get('cache-control'),
+                json: await res.json().catch(() => null) as Record<string, unknown> | null,
+            };
         } finally {
             server.close();
         }
@@ -349,10 +373,13 @@ describe('runtime — Express matching and parser selection', () => {
                 return (req.headers['x-fake-auth'] === '1' ? authed : anon)(req, res, next);
             };
         };
-        app.use('/api', chooser((limit) => express.json({ limit })));
+        app.use('/api', chooser((limit) => express.json({ limit, inflate: false })));
+        app.use('/api', chooser((limit) => express.urlencoded({ extended: true, limit, inflate: false })));
         app.all(/(.*)/, (req, res) => {
             res.json({ bodyType: typeof req.body, keys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : null });
         });
+        // The REAL terminal handler, not a copy, so the error statuses below are server.ts's.
+        app.use(terminalErrorHandler);
         return app;
     }
 
@@ -388,6 +415,73 @@ describe('runtime — Express matching and parser selection', () => {
     it('an anonymous dispatch over the anonymous cap is still refused', async () => {
         const r = await call(buildApp(), 'POST', '/api/services', JSON.stringify({ pad: 'x'.repeat(200 * 1024) }), { 'sec-fetch-site': 'same-origin' });
         expect(r.status).toBe(413);
+        expect(r.cacheControl).toBe('no-store');
+    });
+
+    // inflate:false: a compressed body is refused before anything decodes it. Without it, ~10 KB
+    // of gzip inflates to fill the federation cap before any credential check (body-parser 2.4.0
+    // added zstd to that). The 415 comes from the terminal handler, not the generic 'internal
+    // error' branch that would log every refused request at error level.
+    it.each([
+        ['gzip', new Uint8Array(gzipSync(JSON.stringify({ pad: 'x'.repeat(5 * 1024 * 1024) })))],
+        ['deflate', new Uint8Array(Buffer.from('not really deflate'))],
+        ['zstd', new Uint8Array(Buffer.from('not really zstd'))],
+        ['x-unknown', new Uint8Array(Buffer.from('{}'))],
+    ])('refuses a %s-encoded body with 415, unparsed', async (encoding, body) => {
+        for (const path of ['/api/services', '/api/alliance/op-mirror/push']) {
+            const r = await call(buildApp(), 'POST', path, body, { 'Content-Encoding': encoding, 'sec-fetch-site': 'same-origin' });
+            expect(r.status, path).toBe(415);
+            expect(r.json?.message, path).toBe('Unsupported request body encoding.');
+            expect(r.cacheControl, path).toBe('no-store');
+        }
+    });
+
+    it.each([
+        ['application/json; charset=latin1', '{}'],
+        ['application/x-www-form-urlencoded; charset=koi8-r', 'a=1'],
+    ])('refuses an unsupported charset (%s) with the same 415', async (contentType, body) => {
+        const r = await call(buildApp(), 'POST', '/api/services', body, { 'Content-Type': contentType, 'sec-fetch-site': 'same-origin' });
+        expect(r.status).toBe(415);
+        expect(r.json?.message).toBe('Unsupported request body encoding.');
+        expect(r.cacheControl).toBe('no-store');
+    });
+
+    it('still serves an identity body after refusing a compressed one', async () => {
+        const app = buildApp();
+        expect((await call(app, 'POST', '/api/services', new Uint8Array(gzipSync('{}')), { 'Content-Encoding': 'gzip', 'sec-fetch-site': 'same-origin' })).status).toBe(415);
+        const r = await call(app, 'POST', '/api/services', JSON.stringify({ action: 'x' }), { 'Content-Encoding': 'identity', 'sec-fetch-site': 'same-origin' });
+        expect(r.status).toBe(200);
+        expect(r.json?.keys).toEqual(['action']);
+    });
+
+    // A handler that fails AFTER sending headers. The handler used to setHeader first, which
+    // throws ERR_HTTP_HEADERS_SENT and hands the error to Express's finalhandler (which
+    // console.errors the whole error object). It must destroy the socket instead, never end it
+    // cleanly, so the client cannot mistake the truncated body for a complete one.
+    it('cuts the connection when an error follows the headers, and never reaches finalhandler', async () => {
+        const app = express();
+        // finalhandler only console.errors outside env 'test' (NODE_ENV under vitest), so without
+        // this the old fall-through would be silent here and the spy below could not catch it.
+        app.set('env', 'production');
+        app.get('/stream', (_req, res, next) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.write('{"partial":');
+            setTimeout(() => next(new Error('upstream died mid-stream')), 20);
+        });
+        app.use(terminalErrorHandler);
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const server = app.listen(0);
+        try {
+            const port = (server.address() as { port: number }).port;
+            const res = await fetch(`http://127.0.0.1:${port}/stream`);
+            expect(res.status).toBe(200);
+            // A clean res.end() would resolve here with the truncated '{"partial":'.
+            await expect(res.text()).rejects.toThrow();
+            expect(consoleError).not.toHaveBeenCalled();
+        } finally {
+            consoleError.mockRestore();
+            server.close();
+        }
     });
 
     // Outside /api no limiter applies, so nothing there may buy a parse.

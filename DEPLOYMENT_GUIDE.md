@@ -7,7 +7,7 @@ This build serves the org dashboard from a single domain. There is **no** billin
 ## Prerequisites
 
 1. **Supabase project** — for the database + realtime.
-2. **A host** — any Node 24+ runtime (a VPS, a container, or a PaaS — your choice).
+2. **A host** — any Node 24.22.1+ runtime (a VPS, a container, or a PaaS — your choice).
 3. **A domain** — e.g. `yourdomain.com`, pointed at the host. A single record.
 4. **A Discord application** — for login (and optionally a bot for role sync / event posting).
 5. *(Optional)* Google Gemini key, LiveKit credentials, UEX API key.
@@ -70,7 +70,7 @@ npm run build     # type-checks, builds the client to dist/, compiles the server
 npm start         # node dist-server/server.js — serves the frontend + API on $PORT (default 3000)
 ```
 
-Set the environment variables from step 2, then run the app under a process manager (systemd, pm2, Docker, or your platform's runner) so it restarts on crash/reboot. Node ≥ 24 is required (`engines` in `package.json`).
+Set the environment variables from step 2, then run the app under a process manager (systemd, pm2, Docker, or your platform's runner) so it restarts on crash/reboot. Node ≥ 24.22.1 is required (`engines` in `package.json`): it is the Node 24 security release, and npm only warns on an older one, so check `node -v` on your host. PaaS build images can lag behind.
 
 > **Using Coolify (or another Nixpacks/PaaS host)?** New Resource → Public/Private Repository → this repo, branch `main`. Build Pack: Nixpacks, with Install `npm install`, Build `npm run build`, Start `npm start`. Add the env vars from step 2 and set a single application domain. Most container/PaaS hosts work the same way.
 

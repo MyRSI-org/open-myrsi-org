@@ -35,9 +35,9 @@ beforeEach(() => {
 
 const expectBoundedCall = () => {
     expect(sdk.ctor).toHaveBeenCalledTimes(1);
-    expect(sdk.ctor).toHaveBeenCalledWith({ apiKey: 'test-key', httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
+    expect(sdk.ctor).toHaveBeenCalledWith({ apiKey: 'test-key', vertexai: false, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
     expect(sdk.generate).toHaveBeenCalledTimes(1);
-    expect(sdk.generate.mock.calls[0][0]).toMatchObject({ config: { automaticContinuation: false } });
+    expect(sdk.generate.mock.calls[0][0]).toMatchObject({ config: { automaticContinuation: false, store: false } });
 };
 
 describe('Gemini calls are bounded explicitly, not by SDK defaults', () => {
@@ -79,6 +79,43 @@ describe('the installed SDK honours httpOptions.timeout on its default transport
             expect(elapsed).toBeGreaterThanOrEqual(150);
             expect(elapsed).toBeLessThan(3000);
         } finally {
+            server.closeAllConnections();
+            await new Promise<void>((r) => server.close(() => r()));
+        }
+    }, 5000);
+});
+
+// lib/ai.ts opts every prompt out of Gemini request logging (store:false) and pins the Developer
+// API (vertexai:false), because Vertex mode rejects `store`. This proves the installed SDK puts
+// the flag on the wire, and that the pin beats a stray GOOGLE_GENAI_USE_VERTEXAI, so an SDK
+// bump that drops either fails here instead of logging prompts or failing every AI call.
+describe('the installed SDK sends store:false and stays on the Developer API', () => {
+    it('puts store:false on the wire even with a Vertex env var set', async () => {
+        const { GoogleGenAI } = await vi.importActual<typeof import('@google/genai')>('@google/genai');
+        let url = '';
+        let body = '';
+        const server: Server = createServer((req, res) => {
+            url = req.url ?? '';
+            req.setEncoding('utf8');
+            req.on('data', (c: string) => { body += c; });
+            req.on('end', () => {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] }));
+            });
+        });
+        await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+        const { port } = server.address() as AddressInfo;
+        vi.stubEnv('GOOGLE_GENAI_USE_VERTEXAI', 'true');
+        try {
+            const ai = new GoogleGenAI({ apiKey: 'k', vertexai: false, httpOptions: { baseUrl: `http://127.0.0.1:${port}`, timeout: 2000 } });
+            const res = await ai.models.generateContent({ model: 'm', contents: 'x', config: { automaticContinuation: false, store: false } });
+            expect(res.text).toBe('ok');
+            expect(JSON.parse(body).store).toBe(false);
+            // The Developer API path. Vertex posts to /v1beta1/projects/... or, in API-key express
+            // mode, /v1beta1/publishers/google/models/..., which a looser match would accept.
+            expect(url).toMatch(/^\/v1beta\/models\/m:generateContent(\?|$)/);
+        } finally {
+            vi.unstubAllEnvs();
             server.closeAllConnections();
             await new Promise<void>((r) => server.close(() => r()));
         }

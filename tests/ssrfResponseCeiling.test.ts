@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// ssrfSafeFetch() returns a raw Response and consumers do an unbounded
-// res.json()/res.text(), so a hostile peer streaming GBs could OOM us (several
-// callers run unattended on cron). A central response-byte ceiling
-// (maxResponseSize) is wired onto the IP-pinning undici Agent so the body is
-// aborted and errored rather than buffered unbounded.
+// Consumers of ssrfSafeFetch() do an unbounded res.json()/res.text(), so a
+// hostile peer streaming GBs could OOM us (several callers run unattended on
+// cron). A wire-level ceiling (maxResponseSize) is wired onto the IP-pinning
+// undici Agent so an oversized body is aborted early. It counts bytes BEFORE
+// Content-Encoding is decoded, so the cap that actually holds is the decoded
+// one, pinned against a real server in ssrfDecodedCeiling.test.ts.
 //
 // The undici Agent is stubbed to capture its constructor opts; fetch is stubbed
 // global.

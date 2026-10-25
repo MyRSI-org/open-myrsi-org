@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Vite-build-646cff?style=flat-square&logo=vite&logoColor=white" alt="Vite">
   <img src="https://img.shields.io/badge/Supabase-Postgres%20%C2%B7%20Realtime-3ecf8e?style=flat-square&logo=supabase&logoColor=white" alt="Supabase">
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript">
-  <img src="https://img.shields.io/badge/Node-%E2%89%A524-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node >=24">
+  <img src="https://img.shields.io/badge/Node-%E2%89%A524.22.1-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node >=24.22.1">
   <img src="https://img.shields.io/badge/license-Noncommercial-f59e0b?style=flat-square" alt="Noncommercial license">
 </p>
 

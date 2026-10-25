@@ -17,10 +17,16 @@ export const GEMINI_TIMEOUT_MS = 120_000;
 // 2.29.0 also re-sends by default while a response ends in finish_reason CONTINUATION, each
 // request billed and timed separately and with no cap on the count. One RPC = one request, which
 // is also what the per-user AI rate limit counts.
-const ONE_SHOT = { automaticContinuation: false } as const;
+// store:false (2.31.0+) opts each request out of Gemini API request logging and takes precedence
+// over the Google project's own logging setting: the prompts carry intel reports, caution notes
+// and AAR content, so they are never kept on Google's side whatever that project is set to.
+const ONE_SHOT = { automaticContinuation: false, store: false } as const;
 
+// vertexai:false pins the Gemini Developer API. Without it the SDK honours the
+// GOOGLE_GENAI_USE_VERTEXAI / GOOGLE_GENAI_USE_ENTERPRISE env vars, and in that mode `store`
+// throws, so every AI call would fail on a stray env var.
 function geminiClient(apiKey: string): GoogleGenAI {
-    return new GoogleGenAI({ apiKey, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
+    return new GoogleGenAI({ apiKey, vertexai: false, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
 }
 
 export async function generateDossierSummary(dossier: DossierData): Promise<string> {

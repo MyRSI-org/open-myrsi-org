@@ -19,6 +19,11 @@ updates:
       time: "06:00"
       timezone: "Australia/Brisbane"
     open-pull-requests-limit: 10
+    # Matches min-release-age=3 in .npmrc, so Dependabot never proposes a version that the
+    # local policy would refuse to resolve. CI's `npm ci` does not apply that policy, so for
+    # Dependabot PRs this cooldown is the gate.
+    cooldown:
+      default-days: 3
     commit-message:
       prefix: "chore(deps)"
       prefix-development: "chore(deps-dev)"
@@ -66,8 +71,8 @@ updates:
           - "patch"
 
   # ---------------------------------------------------------------------------
-  # GitHub Actions — no workflows committed yet; this keeps them pinned-current
-  # from the day the first one lands.
+  # GitHub Actions — the workflows pin each action to a commit SHA with its
+  # version in a trailing comment; this bumps the SHA and the comment together.
   # ---------------------------------------------------------------------------
   - package-ecosystem: "github-actions"
     directory: "/"
