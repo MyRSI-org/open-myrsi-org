@@ -10,7 +10,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 //
 //  Visibility — special operations are invite-only: their existence + planning
 //       content (roe / commander notes / comms plan / tasks / board) is visible
-//       ONLY to the owner, operations:manage holders, and ACTIVE participants. A
+//       ONLY to the owner, operations:manage holders, and participants. READS admit
+//       current AND former participants (a row whose time_left was stamped when the
+//       op concluded — owner-approved 2026-11-02); WRITES stay ACTIVE-only. A
 //       clearance-0 special op must NOT be readable / actionable by every member.
 //       Mirrored across the list (canUserSeeOpInList), the slice
 //       (getOperationByIdLite), the detail handler (operation:get_details), and
@@ -50,7 +52,12 @@ vi.mock('../lib/db/common', () => {
 // handler test drives the real operation:get_details with a mocked db barrel +
 // the real (pure) clearance helpers.
 const dbSpies = vi.hoisted(() => ({ getFullOperationDetails: vi.fn() }));
-vi.mock('../lib/db', () => dbSpies);
+// The handler's participation term is the SHARED read predicate, so the barrel stand-in
+// carries the REAL hasOpReadParticipation (lib/db/ops does not import the barrel).
+vi.mock('../lib/db', async () => ({
+    ...dbSpies,
+    hasOpReadParticipation: (await import('../lib/db/ops')).hasOpReadParticipation,
+}));
 vi.mock('../lib/discord', () => ({
     createGuildScheduledEvent: vi.fn(), deleteGuildScheduledEvent: vi.fn(), updateGuildScheduledEvent: vi.fn(),
     listGuildChannels: vi.fn(), postOperationAnnouncementEmbed: vi.fn(), editOperationAnnouncementEmbed: vi.fn(),
@@ -104,8 +111,14 @@ describe('canUserSeeOpInList — special-op participation gate', () => {
     it('allows an ACTIVE participant', () => {
         expect(canUserSeeOpInList(mkUser(), opViewer({ participants: [{ userId: 6, timeLeft: null }] }))).toBe(true);
     });
-    it('still DENIES a participant who has LEFT (timeLeft set)', () => {
-        expect(canUserSeeOpInList(mkUser(), opViewer({ participants: [{ userId: 6, timeLeft: '2026-01-02' }] }))).toBe(false);
+    // CONVERTED (owner decision 2026-11-02): a FORMER participant — still on the roster
+    // when the op concluded, so time_left is stamped — keeps READ access. Leaving or
+    // being removed deletes the row, so that member has no row and stays denied.
+    it('ALLOWS a FORMER participant (timeLeft stamped at conclusion) to read', () => {
+        expect(canUserSeeOpInList(mkUser(), opViewer({ participants: [{ userId: 6, timeLeft: '2026-01-02' }] }))).toBe(true);
+    });
+    it('still DENIES someone whose row is gone (left / removed): other members\' rows do not count', () => {
+        expect(canUserSeeOpInList(mkUser(), opViewer({ participants: [{ userId: 7, timeLeft: null }, { userId: 8, timeLeft: '2026-01-02' }] }))).toBe(false);
     });
     it('regression: a NON-special clearance-0 op stays visible to an ordinary member', () => {
         expect(canUserSeeOpInList(mkUser(), opViewer({ isSpecial: false }))).toBe(true);
@@ -181,6 +194,23 @@ describe('assertOpVisibleToUser — special-op action gate', () => {
         await expect(assertOpVisibleToUser('op1', mkUser())).rejects.toThrow(/special operation/i);
     });
 
+    it('DENIES a FORMER participant from ACTING (the default term requires time_left IS NULL)', async () => {
+        const seen: Array<Array<{ method: string; args: unknown[] }>> = [];
+        h.resolveQuery = ({ table, calls }) => {
+            if (table === 'operations') return { data: opRowFixture(), error: null };
+            seen.push(calls);
+            // A former participant's row exists but has time_left set, so the ACTIVE
+            // lookup (which filters time_left IS NULL) finds nothing.
+            const active = calls.some((c) => c.method === 'is' && c.args[0] === 'time_left' && c.args[1] === null);
+            return { data: active ? null : { user_id: 6 }, error: null };
+        };
+        await expect(assertOpVisibleToUser('op1', mkUser())).rejects.toThrow(/special operation/i);
+        await expect(assertOpVisibleToUser('op1', mkUser(), { access: 'act' })).rejects.toThrow(/special operation/i);
+        // …but the READ form admits the same member.
+        await expect(assertOpVisibleToUser('op1', mkUser(), { access: 'read' })).resolves.toBeUndefined();
+        expect(seen.map((c) => c.some((x) => x.method === 'is'))).toEqual([true, true, false]);
+    });
+
     it('ALLOWS an active participant to act on a special op', async () => {
         h.resolveQuery = ({ table }) => {
             if (table === 'operations') return { data: opRowFixture(), error: null };
@@ -228,6 +258,14 @@ describe('operation:get_details — special-op deny + PIN redaction', () => {
     it('returns the op to an active participant with the PIN redacted', async () => {
         dbSpies.getFullOperationDetails.mockResolvedValue({
             ownerId: 5, isSpecial: true, clearanceLevel: 0, limitingMarkers: [], participants: [{ userId: 6, timeLeft: null }], joinCode: 'PIN',
+        });
+        const op = await actions['operation:get_details']({ operationId: 'op1', user: detailUser });
+        expect(op.joinCode).toBeUndefined();
+    });
+
+    it('returns the op to a FORMER participant (time_left stamped at conclusion), PIN still redacted', async () => {
+        dbSpies.getFullOperationDetails.mockResolvedValue({
+            ownerId: 5, isSpecial: true, clearanceLevel: 0, limitingMarkers: [], participants: [{ userId: 6, timeLeft: '2026-01-02T00:00:00Z' }], joinCode: 'PIN',
         });
         const op = await actions['operation:get_details']({ operationId: 'op1', user: detailUser });
         expect(op.joinCode).toBeUndefined();

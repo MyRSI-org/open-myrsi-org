@@ -357,9 +357,10 @@ export const quartermasterActions = {
     'qm:fulfil_issuance': async ({ userId, issuanceId }: FulfilIssuancePayload) => {
         const ok = await db.fulfilIssuance(userId, issuanceId);
         if (ok) {
-            // Notify the recipient that their request was fulfilled.
-            const issuances = await db.listIssuances({ limit: 1 });
-            const issuance = issuances.find((i) => i.id === issuanceId);
+            // Notify the recipient that their request was fulfilled. Read THIS row by
+            // primary key: a newest-1 list read only ever matched when the fulfilled
+            // issuance happened to be the most recently created one in the table.
+            const issuance = await db.getIssuanceById(issuanceId);
             if (issuance && issuance.issuedToUserId !== userId) {
                 // Durable inbox notification (also emits realtime + OS push).
                 await db.createNotification(issuance.issuedToUserId, {

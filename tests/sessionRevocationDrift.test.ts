@@ -34,6 +34,21 @@ describe('F3 — /api/admin/import-stream enforces per-user revocation', () => {
         expect(watermarkAt).toBeGreaterThan(-1);
         expect(importerAt).toBeGreaterThan(watermarkAt);
     });
+    // The same ladder now ALSO runs in the pre-auth, ahead of the 64 MB parser, so a valid but
+    // revoked / force-logged-out / banned / non-Admin session cannot make the server buffer the
+    // body. Two copies of one rule — both pinned, so neither can silently lose a rung. Ordering
+    // against the parser is proven at runtime in tests/rawRoutePreAuth.test.ts; this pins the
+    // rungs themselves. Bounded by the route registration, not a character count (CRLF vs LF).
+    it('runs every rung in the PRE-AUTH too, and mounts it ahead of the parser', () => {
+        const preStart = server.indexOf('const importStreamPreAuth');
+        expect(preStart).toBeGreaterThan(-1);
+        const pre = server.slice(preStart, routeStart);
+        expect(pre).toContain('isSessionForceLoggedOut(decoded, platformSettings?.force_logout_timestamp)');
+        expect(pre).toContain('isSessionRevokedByWatermark(decoded, user?.tokensValidFrom)');
+        expect(pre).toMatch(/await findActiveBan\(/);
+        expect(pre).toContain('user.isSystemAdmin !== true');
+        expect(server).toMatch(/app\.post\('\/api\/admin\/import-stream', importStreamPreAuth, express\.text\(/);
+    });
 });
 
 describe('F4 — realtime RLS folds in tokens_valid_from (iat watermark)', () => {

@@ -296,7 +296,7 @@ export default [
                 patterns: [{
                     group: [
                         '**/lib/db', '**/lib/db/**',
-                        '**/lib/secrets', '**/lib/crypto', '**/lib/auth', '**/lib/discord',
+                        '**/lib/secrets', '**/lib/crypto', '**/lib/constantTime', '**/lib/joinPinLockout', '**/lib/auth', '**/lib/discord',
                         '**/lib/push', '**/lib/radio', '**/lib/ai', '**/lib/pgrest',
                         '**/lib/ssrf', '**/lib/firstBoot', '**/lib/cronLock', '**/lib/seeder',
                         '**/lib/supabaseServer', '**/lib/abuseFilter', '**/lib/buildId',

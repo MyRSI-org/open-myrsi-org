@@ -313,6 +313,22 @@ export async function createIntelReport(reportData: Record<string, unknown>) {
     // label a report above their own clearance or apply a marker they don't hold;
     // intel:manage holders (read-side bypass) classify freely.
     assertCanClassify(reportData.user as ClearanceUser | undefined, (reportData.classificationLevel as number | undefined) ?? 0, markerIds, ['intel:manage']);
+
+    // Validate the marker ids BEFORE the row exists. Checked after the insert, an
+    // invalid id threw with the report already committed — unmarked, so readable
+    // by every intel:view holder at its level. Verify the ids belong to this org
+    // (don't trust arbitrary client-supplied ids), and fail closed on a read error
+    // rather than reading it as "no markers".
+    if (markerIds && markerIds.length > 0) {
+        const { data: validMarkers, error: markerReadErr } = await supabase.from('security_limiting_markers')
+            .select('id')
+            .in('id', markerIds);
+        if (markerReadErr) throw new Error('Failed to verify limiting markers for intel report');
+        if (!validMarkers || validMarkers.length !== markerIds.length) {
+            throw new Error('One or more limiting markers are not valid for this organization.');
+        }
+    }
+
     const { data, error } = await supabase.from('intel_reports').insert({
         target_id: stripHtmlSingleLine(reportData.targetId as string, 200),
         subject_type: reportData.subjectType as string | undefined,
@@ -328,31 +344,56 @@ export async function createIntelReport(reportData: Record<string, unknown>) {
     handleSupabaseError({ error, message: 'Failed to create intel report' });
 
     if (data && markerIds && markerIds.length > 0) {
-        // Verify the supplied marker IDs all belong to this org — without it,
-        // a caller could attach another tenant's marker definitions to their
-        // own report.
-        const { data: validMarkers } = await supabase.from('security_limiting_markers')
-            .select('id')
-            .in('id', markerIds)
-            ;
-        if (!validMarkers || validMarkers.length !== markerIds.length) {
-            throw new Error('One or more limiting markers are not valid for this organization.');
-        }
+        // supabase-js RESOLVES a failed insert as `{ error }`, so an unread error
+        // left the report committed with NO markers — visible to every intel:view
+        // holder at its level. There is no transaction here, so compensate: delete
+        // the just-inserted row and throw, before anything is broadcast.
         const markers = markerIds.map((mid) => ({ report_id: data.id, marker_id: mid }));
-        await supabase.from('intel_report_limiting_markers').insert(markers);
+        const { error: markerInsertErr } = await supabase.from('intel_report_limiting_markers').insert(markers);
+        if (markerInsertErr) {
+            const { error: rollbackErr } = await supabase.from('intel_reports').delete().eq('id', data.id);
+            if (rollbackErr) {
+                // Nothing further can be done in-process; surface it loudly so an
+                // operator can remove or re-mark the orphan by id.
+                log.error('intel report rollback failed after limiting-marker attach error — report left unmarked', { reportId: data.id, message: rollbackErr.message });
+            }
+            throw new Error('Failed to attach limiting markers to intel report');
+        }
     }
     await broadcastIntelUpdate({ kind: 'report' });
 }
 
 export async function updateIntelReport(id: string, updates: Record<string, unknown>) {
-    // Verify existence before any mutation.
-    const { data: existing } = await supabase.from('intel_reports').select('id')
+    // Verify existence before any mutation, and read the current marker set in the
+    // same read (embedded, so it is the WHOLE set — a capped list read could miss
+    // one). Unreadable → refuse: the marker diff below cannot be computed safely.
+    const { data: existing, error: existingErr } = await supabase.from('intel_reports').select('id, intel_report_limiting_markers(marker_id)')
         .eq('id', id)
 
         .maybeSingle();
+    if (existingErr) throw new Error('Failed to read limiting markers for intel report');
     if (!existing) throw new Error('Intel report not found');
 
+    // There is no transaction, and supabase-js RESOLVES a failed write as `{ error }`.
+    // The old delete-all-then-insert replace ignored both, so a failed re-insert
+    // STRIPPED the compartment — visible to every intel:view holder at its level.
+    // Restoring afterwards is not enough (the restore can fail too), so order the
+    // writes instead: ADD the new markers, then write the row, then REMOVE the
+    // dropped ones. Every intermediate state is at least as restrictive as the
+    // before or the after state, so any failure throws with the report
+    // over-marked, never under-marked, and a retry converges.
     const markerIds = updates.markerIds as number[] | undefined;
+    const previousIds = new Set((existing.intel_report_limiting_markers || []).map((m) => m.marker_id));
+    const nextIds = new Set(markerIds || []);
+    const toAdd = [...nextIds].filter((mid) => !previousIds.has(mid));
+    const toRemove = [...previousIds].filter((mid) => !nextIds.has(mid));
+
+    if (toAdd.length > 0) {
+        const { error: markerInsertErr } = await supabase.from('intel_report_limiting_markers')
+            .insert(toAdd.map((mid) => ({ report_id: id, marker_id: mid })));
+        if (markerInsertErr) throw new Error('Failed to attach limiting markers to intel report');
+    }
+
     const { error } = await supabase.from('intel_reports').update({
         threat_level: normalizeThreatLevel(updates.threatLevel),
         tags: sanitizeFeedTags(updates.tags),
@@ -364,10 +405,14 @@ export async function updateIntelReport(id: string, updates: Record<string, unkn
     }).eq('id', id);
     handleSupabaseError({ error, message: 'Failed to update intel report' });
 
-    await supabase.from('intel_report_limiting_markers').delete().eq('report_id', id);
-    if (markerIds && markerIds.length > 0) {
-        const markers = markerIds.map((mid) => ({ report_id: id, marker_id: mid }));
-        await supabase.from('intel_report_limiting_markers').insert(markers);
+    if (toRemove.length > 0) {
+        // Still over-marked if this fails (the union of old and new), but the
+        // requested set was not applied, so never report success.
+        const { error: markerDeleteErr } = await supabase.from('intel_report_limiting_markers')
+            .delete()
+            .eq('report_id', id)
+            .in('marker_id', toRemove);
+        if (markerDeleteErr) throw new Error('Failed to update limiting markers for intel report');
     }
     await broadcastIntelUpdate({ kind: 'report' });
 }
@@ -518,7 +563,7 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
     // solely to feed canUserSeeOpInList below — they are NOT part of the mapped
     // projection returned to the browser. The participants embed is inner-joined to
     // the dossier SUBJECT (so it lists only ops the subject is in); it does NOT
-    // describe the VIEWER, so the viewer's own active participations are fetched
+    // describe the VIEWER, so the viewer's own participations are fetched
     // separately (viewerParticipationPromise) to drive the special-op gate.
     const opsQuery = targetUserId
         ? safeFetch((() => {
@@ -531,17 +576,19 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
     // has no clearance/marker barrier (the join PIN is the gate), so the
     // clearance-only filter would leak its existence/name/status/description to any
     // intel:view holder. Engage canUserSeeOpInList's special-op participation gate
-    // by passing is_special + the VIEWER's active participation. The dossier ops
-    // embed can't supply that (it's the subject's), so fetch the viewer's own
-    // active operation_participants once, in parallel. Skipped for the
-    // operations:manage / Admin bypass population (they see every special op) and
-    // when there is no viewer id (fails closed → no participation → special ops
-    // hidden).
+    // by passing is_special + the VIEWER's participation. The dossier ops embed
+    // can't supply that (it's the subject's), so fetch the viewer's own
+    // operation_participants once, in parallel — ANY row, current or former, with no
+    // time_left filter: this is a READ, so it uses the same term as every other op
+    // read (hasOpReadParticipation — a former participant keeps read access).
+    // Skipped for the operations:manage / Admin bypass population (they see every
+    // special op) and when there is no viewer id (fails closed → no participation →
+    // special ops hidden). A read fault resolves to the empty set — hidden, never shown.
     const viewerCanSeeAllOps = canViewAllClassifications(viewer, ['operations:manage']);
     const viewerParticipationPromise: Promise<Set<string>> =
         !isOrg && targetUserId && viewer?.id != null && !viewerCanSeeAllOps
             ? safeFetch<{ operation_id: string }[]>(
-                supabase.from('operation_participants').select('operation_id').eq('user_id', viewer.id).is('time_left', null) as unknown as SafeFetchQuery<{ operation_id: string }[]>,
+                supabase.from('operation_participants').select('operation_id').eq('user_id', viewer.id) as unknown as SafeFetchQuery<{ operation_id: string }[]>,
                 [], 'Failed to get viewer participation',
             ).then((rows) => new Set((rows || []).map((p) => String(p.operation_id))))
             : Promise.resolve(new Set<string>());
@@ -564,7 +611,7 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
             null, 'Failed to get summary')
         : Promise.resolve(null);
 
-    const [reports, warrants, requests, opsData, summary, orgReportArrays, viewerActiveOpIds] = await Promise.all([
+    const [reports, warrants, requests, opsData, summary, orgReportArrays, viewerOpIds] = await Promise.all([
         safeFetch(reportsQuery, [], 'Failed to get reports'),
         isOrg ? Promise.resolve([]) : safeFetch(warrantQuery, [], 'Failed to get warrants'),
         isOrg ? Promise.resolve([]) : safeFetch(requestsQuery, [], 'Failed to get requests'),
@@ -611,8 +658,10 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
     // (owner_id/clearance_level/markers/is_special) are consumed here and dropped
     // from the mapped projection. is_special engages the invite-only
     // participation gate: a clearance-0 special op is shown only to the owner, the
-    // operations:manage / Admin bypass population, or an ACTIVE participant
-    // (viewerActiveOpIds), matching the list/slice/detail/action paths.
+    // operations:manage / Admin bypass population, or a participant — current or
+    // former (viewerOpIds, any roster row) — matching the list/slice/detail/sub-
+    // resource-read paths. The roster row's time_left is not read: the read term
+    // ignores it, so the projection handed to the predicate carries only the id.
     type DossierOpRow = Tables<'operations'> & { limiting_markers?: { marker?: unknown }[] };
     const mappedOperations = ((opsData || []) as unknown as DossierOpRow[])
         .filter((op) => !!viewer && canUserSeeOpInList(viewer, {
@@ -620,8 +669,8 @@ export async function getDossier(targetId: string, viewer?: OpViewer | null): Pr
             clearanceLevel: op.clearance_level ?? 0,
             limitingMarkers: embeddedMarkers(op.limiting_markers),
             isSpecial: op.is_special,
-            participants: viewerActiveOpIds.has(String(op.id))
-                ? [{ userId: viewer.id as number, timeLeft: null }]
+            participants: viewerOpIds.has(String(op.id))
+                ? [{ userId: viewer.id as number }]
                 : [],
         }))
         .map((op) => ({
@@ -1680,11 +1729,24 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                             }
 
                             // Attach the resolved markers (all codes were known —
-                            // verified above).
+                            // verified above). A failed junction insert RESOLVES as
+                            // `{ error }`; unread, the ally report stayed committed
+                            // with NO markers. Compensate: delete the row and count
+                            // the item as failed (it is not new, not nudged).
                             if (inserted && markerIdsToAttach.length > 0) {
-                                await supabase.from('intel_report_limiting_markers').insert(
+                                const { error: markerInsertErr } = await supabase.from('intel_report_limiting_markers').insert(
                                     markerIdsToAttach.map((mid) => ({ report_id: inserted.id, marker_id: mid }))
                                 );
+                                if (markerInsertErr) {
+                                    feedReportErrors++;
+                                    const { error: rollbackErr } = await supabase.from('intel_reports').delete().eq('id', inserted.id);
+                                    if (rollbackErr) {
+                                        log.error('feed report rollback failed after limiting-marker attach error — report left unmarked', { reportId: inserted.id, feedLabel: feed.label, message: rollbackErr.message });
+                                    } else {
+                                        log.error('feed report limiting-marker attach failed — report removed', { feedLabel: feed.label, externalId: r.id, message: markerInsertErr.message });
+                                    }
+                                    continue;
+                                }
                             }
 
                             feedNewReports++;
@@ -1839,10 +1901,23 @@ export async function syncTrustedFeeds(force?: boolean, onlyPeerIds?: string[]) 
                             // resolved above — compartment preserved). Without this
                             // an ingested compartmented bulletin lands with NO
                             // markers, readable by everyone at/below its level.
+                            // A failed junction insert RESOLVES as `{ error }`, so
+                            // it must be read: delete the row and count the item as
+                            // failed (not new, never nudged).
                             if (insertedBulletin?.id && bulletinMarkerIds.length > 0) {
-                                await supabase.from('intel_bulletin_limiting_markers').insert(
+                                const { error: markerInsertErr } = await supabase.from('intel_bulletin_limiting_markers').insert(
                                     bulletinMarkerIds.map((mid) => ({ bulletin_id: insertedBulletin.id, marker_id: mid })),
                                 );
+                                if (markerInsertErr) {
+                                    feedBulletinErrors++;
+                                    const { error: rollbackErr } = await supabase.from('intel_bulletins').delete().eq('id', insertedBulletin.id);
+                                    if (rollbackErr) {
+                                        log.error('feed bulletin rollback failed after limiting-marker attach error — bulletin left unmarked', { bulletinId: insertedBulletin.id, feedLabel: feed.label, message: rollbackErr.message });
+                                    } else {
+                                        log.error('feed bulletin limiting-marker attach failed — bulletin removed', { feedLabel: feed.label, title: cleanTitle, message: markerInsertErr.message });
+                                    }
+                                    continue;
+                                }
                             }
                             if (insertedBulletin?.id) newBulletinIds.push(insertedBulletin.id);
                             feedNewBulletins++;
@@ -2069,6 +2144,41 @@ function broadcastBulletinUpdate(eventData?: Record<string, unknown>) {
     broadcastToOrg('bulletin_update', eventData || {});
 }
 
+/**
+ * RESTRICTED := classification_level > 0 OR the bulletin carries any limiting
+ * marker — the same two dimensions the in-app read path hides a bulletin on
+ * (filterIntelByClearance → passesClearance). Mirrors operationIsRestricted
+ * (lib/db/ops.ts) for the intel side.
+ *
+ * The single definition behind every EGRESS gate that leaves this deployment for
+ * an audience the server cannot filter per-recipient: the staff push fan-out and
+ * the Discord intel-channel embed (both in api/actions/intel.ts). Testing the
+ * level alone let a Level-0 compartmented bulletin post in full to Discord and
+ * land its title on every staff lock screen, while the marker hid it in-app.
+ *
+ * FAIL-CLOSED: supabase-js RESOLVES `{ data: null, error }` / `{ count: null, error }`
+ * rather than throwing, so an unread `error` would collapse a classified bulletin
+ * to level 0 and a markered one to zero markers — falsely unrestricting it and
+ * publishing it exactly when the DB blips. Any probe fault, a missing row, or an
+ * unreadable count returns true.
+ */
+export async function bulletinIsRestricted(bulletinId: string): Promise<boolean> {
+    const { data: row, error: rowErr } = await supabase
+        .from('intel_bulletins')
+        .select('classification_level')
+        .eq('id', bulletinId)
+        .maybeSingle();
+    if (rowErr || !row) return true;
+    if ((row.classification_level || 0) > 0) return true;
+    // Head-only probe: the count, no row data.
+    const { count: markerCount, error: markerErr } = await supabase
+        .from('intel_bulletin_limiting_markers')
+        .select('bulletin_id', { count: 'exact', head: true })
+        .eq('bulletin_id', bulletinId);
+    if (markerErr || typeof markerCount !== 'number') return true;
+    return markerCount > 0;
+}
+
 export async function createIntelBulletin(data: Record<string, unknown>): Promise<IntelBulletin> {
     const durationMinutes = (data.durationMinutes as number | undefined) ?? 60;
     const isIndefinite = durationMinutes === 0;
@@ -2081,6 +2191,22 @@ export async function createIntelBulletin(data: Record<string, unknown>): Promis
     // bypass), so the author must not label a bulletin above their own clearance
     // or apply a marker they don't hold. intel:manage holders classify freely.
     assertCanClassify(data.user as ClearanceUser | undefined, (data.classificationLevel as number | undefined) ?? 0, markerIds, ['intel:manage']);
+
+    // Validate the marker ids BEFORE the row exists. Checked after the insert, an
+    // invalid id threw with the bulletin already committed — unmarked, so readable
+    // by every intel:view holder at its level. Mirror createIntelReport: verify the
+    // ids belong to this org (don't trust arbitrary client-supplied ids), and fail
+    // closed on a read error rather than reading it as "no markers".
+    if (markerIds && markerIds.length > 0) {
+        const { data: validMarkers, error: markerReadErr } = await supabase.from('security_limiting_markers')
+            .select('id')
+            .in('id', markerIds);
+        if (markerReadErr) throw new Error('Failed to verify limiting markers for intel bulletin');
+        if (!validMarkers || validMarkers.length !== markerIds.length) {
+            throw new Error('One or more limiting markers are not valid for this organization.');
+        }
+    }
+
     const { data: row, error } = await supabase.from('intel_bulletins').insert({
         title: stripHtmlSingleLine(data.title, 200),
         body: stripHtml(data.body, 8000),
@@ -2097,16 +2223,21 @@ export async function createIntelBulletin(data: Record<string, unknown>): Promis
     if (!row) throw new Error('Failed to create intel bulletin');
 
     if (markerIds && markerIds.length > 0) {
-        // Mirror createIntelReport: verify the marker ids belong to this org
-        // before attaching (don't trust arbitrary client-supplied ids).
-        const { data: validMarkers } = await supabase.from('security_limiting_markers')
-            .select('id')
-            .in('id', markerIds);
-        if (!validMarkers || validMarkers.length !== markerIds.length) {
-            throw new Error('One or more limiting markers are not valid for this organization.');
-        }
+        // supabase-js RESOLVES a failed insert as `{ error }`, so an unread error
+        // left the bulletin committed with NO markers — visible to every intel:view
+        // holder at its level. There is no transaction here, so compensate: delete
+        // the just-inserted row and throw, before anything is broadcast or pushed.
         const markers = markerIds.map((mid) => ({ bulletin_id: row.id, marker_id: mid }));
-        await supabase.from('intel_bulletin_limiting_markers').insert(markers);
+        const { error: markerInsertErr } = await supabase.from('intel_bulletin_limiting_markers').insert(markers);
+        if (markerInsertErr) {
+            const { error: rollbackErr } = await supabase.from('intel_bulletins').delete().eq('id', row.id);
+            if (rollbackErr) {
+                // Nothing further can be done in-process; surface it loudly so an
+                // operator can remove or re-mark the orphan by id.
+                log.error('intel bulletin rollback failed after limiting-marker attach error — bulletin left unmarked', { bulletinId: row.id, message: rollbackErr.message });
+            }
+            throw new Error('Failed to attach limiting markers to intel bulletin');
+        }
     }
 
     // The realtime 'db-changes' channel is readable by any holder of the public

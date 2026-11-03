@@ -16,6 +16,7 @@ import {
     tallyApproval,
     tallyPreferentialFull,
     tallyProportional,
+    findSeatCutoffTie,
 } from './internal.js';
 import { appointPositionHolder } from './structure.js';
 import type { Tables } from '../rows.js';
@@ -544,21 +545,28 @@ export async function concludeElection(electionId: number) {
         }
     }
 
-    // Check for tie (when not using proportional)
-    if (result.isConclusive && result.winners.length >= 2 && elType !== ElectionType.ProportionalRepresentation) {
-        const topVotes = result.winners[0].voteCount;
-        const tied = result.winners.filter(w => w.voteCount === topVotes);
-        if (tied.length > maxWinners) {
-            if (election.allow_runoff) {
-                await createRunoffElection(election, result);
-                status = 'Runoff';
-                conclusionReason = `Tie between ${tied.length} candidates — runoff triggered`;
-                result.isConclusive = false;
-            } else {
-                conclusionReason = `Tie between ${tied.length} candidates — no clear winner`;
-                result.isConclusive = false;
-            }
+    // Check for tie (when not using proportional). Compared across ALL results, not
+    // `winners`: every tally slices winners to maxWinners, so a tie counted inside it
+    // could never exceed maxWinners and a dead heat was "won" on ballot order.
+    //
+    // Two producers, one path. A tie straddling the seat CUTOFF (the last seat's count
+    // equals the first loser's — A 5, B 3, C 3 for two seats) is found here; it used to
+    // be missed because only a tie at the TOP was checked. The ranked-choice count
+    // reports its own deciding ties (final round, or an elimination that decides the
+    // seats) on `result.tie`, with isConclusive already false. Both are skipped once a
+    // gate above has settled the outcome: a failed quorum (Cancelled) or a failed
+    // threshold (Runoff / inconclusive) is not re-decided as a tie.
+    const tie = elType === ElectionType.ProportionalRepresentation ? null
+        : result.tie ?? (result.isConclusive ? findSeatCutoffTie(result.allResults, maxWinners) : null);
+    if (tie && status === 'Concluded') {
+        if (election.allow_runoff) {
+            await createRunoffElection(election, result);
+            status = 'Runoff';
+            conclusionReason = `${tie.label} — runoff triggered`;
+        } else {
+            conclusionReason = `${tie.label} — no clear winner`;
         }
+        result.isConclusive = false;
     }
 
     // A tally that could not be COMPUTED must never be persisted as a normal
@@ -575,20 +583,23 @@ export async function concludeElection(electionId: number) {
 
     const now = new Date().toISOString();
 
-    // Update candidate vote counts and mark winners
+    // Update candidate vote counts and mark winners. These writes and the status write
+    // below fail CLOSED: a discarded error let a winner be seated on an election the DB
+    // still showed as Voting. Refusing here leaves it in Voting, to be re-run.
     for (const r of result.allResults) {
         const isWinner = result.isConclusive && result.winners.some(w => w.candidateId === r.candidateId);
-        await supabase.from('government_election_candidates')
+        const { error: candErr } = await supabase.from('government_election_candidates')
             .update({
                 vote_count: r.voteCount,
                 vote_percentage: r.percentage,
                 is_winner: isWinner,
             })
             .eq('id', r.candidateId);
+        handleSupabaseError({ error: candErr, message: 'Failed to record the election result' });
     }
 
     // Update election status
-    await supabase.from('government_elections')
+    const { error: statusErr } = await supabase.from('government_elections')
         .update({
             status,
             concluded_at: now,
@@ -598,6 +609,7 @@ export async function concludeElection(electionId: number) {
             updated_at: now,
         })
         .eq('id', electionId);
+    handleSupabaseError({ error: statusErr, message: 'Failed to record the election result' });
 
     // Auto-appoint winners to positions
     if (result.isConclusive && status === 'Concluded') {
@@ -629,7 +641,13 @@ export async function concludeElection(electionId: number) {
 
 async function createRunoffElection(parentElection: Tables<'government_elections'>, tallyResult: TallyResult) {
     const topN = parentElection.runoff_top_n || 2;
-    const topCandidates = tallyResult.allResults.slice(0, topN);
+    // The top N, widened to take in everyone tied with the N-th: cutting a tie at the
+    // boundary would decide who reaches the runoff by ballot order, the very thing a
+    // runoff exists to avoid (A 5, B 3, C 3 with N = 2 used to carry A and B, never C).
+    let cut = Math.min(Math.max(topN, 1), tallyResult.allResults.length);
+    while (cut < tallyResult.allResults.length
+        && tallyResult.allResults[cut].voteCount === tallyResult.allResults[cut - 1].voteCount) cut++;
+    const topCandidates = tallyResult.allResults.slice(0, cut);
 
     const { data: runoff, error } = await supabase.from('government_elections')
         .insert({

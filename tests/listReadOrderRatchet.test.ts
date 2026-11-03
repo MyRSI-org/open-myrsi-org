@@ -180,8 +180,10 @@ const UNCAPPED_BASELINE: Record<string, number> = {
     'lib/db/government/elections.ts': 3,
     // Was 2. getVotesForElection now pages to exhaustion on a total order and verifies
     // the total against an exact count — an unbounded read there did not fail on
-    // truncation, it tallied a subset and reported a winner.
-    'lib/db/government/internal.ts': 1,
+    // truncation, it tallied a subset and reported a winner. Then 1 → 0: the ranked-choice
+    // read in tallyPreferentialFull pages the same way on (rank_order, id), so a ranked
+    // election past the server's row cap concludes instead of being refused.
+    'lib/db/government/internal.ts': 0,
     'lib/db/government/legislation.ts': 5,
     'lib/db/government/orders.ts': 2,
     'lib/db/hr.ts': 12,

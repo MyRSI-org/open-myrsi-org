@@ -408,6 +408,9 @@ class ApiService {
             // Machine-readable alongside the human message, so a caller can branch on
             // the cause instead of matching on prose.
             if (code) (err as Error & { code?: string }).code = code;
+            // The HTTP status too: logout must tell "the session is already dead" (401)
+            // from "the request was refused before it did anything" (429, 503).
+            (err as Error & { status?: number }).status = response.status;
             throw err;
         }
 

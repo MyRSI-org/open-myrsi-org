@@ -3,6 +3,21 @@ import { configDefaults } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
+// Security-critical files are held to >= 90% on every coverage metric, per file: the
+// dispatcher, read path and server boundary; auth, session and OAuth state; the
+// sanitisers; the SSRF and clearance predicates; secret handling; rate limiting and abuse
+// blocking; log redaction; the unauthenticated public API, uploads and first-boot setup.
+const SECURITY_CRITICAL_FILES = [
+  'server.ts', 'api/services.ts', 'api/query.ts', 'api/actions/auth.ts', 'api/public.ts', 'api/orgUpload.ts',
+  'lib/auth.ts', 'lib/sessionCookie.ts', 'lib/sessionSecretPolicy.ts', 'lib/oauthState.ts', 'lib/oauthStateCookie.ts',
+  'lib/csrfOrigin.ts', 'lib/constantTime.ts', 'lib/joinPinLockout.ts', 'lib/joinPinPolicy.ts', 'lib/firstBoot.ts',
+  'lib/tiptapValidate.ts', 'lib/htmlSanitize.ts', 'lib/textSanitize.ts',
+  'lib/ssrf.ts', 'lib/linkUrl.ts', 'lib/clearance.ts',
+  'lib/crypto.ts', 'lib/secrets.ts', 'lib/supabaseKeyGuard.ts', 'lib/log.ts',
+  'lib/abuseFilter.ts', 'lib/clientIp.ts', 'lib/userRateLimit.ts', 'lib/authRateLimit.ts',
+  'lib/terminalErrorHandler.ts', 'lib/errors.ts',
+];
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
   return {
@@ -23,29 +38,31 @@ export default defineConfig(({ mode }) => {
       // Keep vitest's default excludes, plus the reference-only / non-app trees.
       exclude: [...configDefaults.exclude, 'porting/**', 'legacy-portal/**', 'supabase-reports/**'],
       coverage: {
-        // Regression floor scoped to the server/business-logic surface (lib +
-        // api); the untested UI is excluded so the gate isn't dominated by
-        // component churn. `all: true` counts untested files so the baseline is
-        // honest. Thresholds sit just under the measured baseline — ratchet up
-        // as coverage grows, never down.
+        // The coverage STANDARD for the server/business-logic surface (lib + api +
+        // server.ts). These are fixed thresholds, not a floor under the last
+        // measurement, and every measured file must meet them on its own: a well
+        // tested module cannot hide an untested one. `all: true` counts files no test
+        // imports, so a new untested file fails the gate. UI components are outside
+        // the gate; behaviour changes there are pinned by their own tests.
         provider: 'v8',
         all: true,
-        include: ['lib/**', 'api/**'],
-        exclude: ['**/*.d.ts'],
+        // server.ts is the security boundary (rate limiters, CSRF gate, body parsers,
+        // the import-stream inline auth, boot guards), so it is measured like the rest
+        // of the server. The generated Supabase schema types are not code under test.
+        include: ['lib/**', 'api/**', 'server.ts'],
+        exclude: ['**/*.d.ts', 'lib/database.types.ts'],
         reporter: ['text-summary'],
         thresholds: {
-          // Ratcheted 6 Sep 26 (catch-up phase 6: org bans, ship seats, armoury
-          // facets, Discord feature layer, marketplace barter, Academy v1.2,
-          // Blueprint Manager) to sit ~1pt under the measured baseline
-          // (lines 56.02 / statements 53.58 / functions 44.92 / branches 47.37).
-          // Previously 54/51/42/45 against a 54.66/52.38/43.60/46.27 baseline,
-          // 50/48/39/42 before that, 41/39/32/35 before that, and 40/38/31/34
-          // before that.
-          // This is a regression FLOOR — ratchet it up, never down.
-          lines: 55,
-          statements: 52,
-          functions: 43,
-          branches: 46,
+          // Every measured file: >= 80% statements, functions and lines, >= 75% branches.
+          perFile: true,
+          statements: 80,
+          functions: 80,
+          lines: 80,
+          branches: 75,
+          // Security-critical files: >= 90% on all four (glob entries need their own perFile).
+          ...Object.fromEntries(SECURITY_CRITICAL_FILES.map((file) => [
+            file, { statements: 90, functions: 90, lines: 90, branches: 90, perFile: true },
+          ])),
         },
       },
     },

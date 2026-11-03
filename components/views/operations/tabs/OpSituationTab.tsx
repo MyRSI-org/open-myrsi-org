@@ -6,18 +6,26 @@ import { useFleet } from '../../../../contexts/FleetContext';
 
 import ShipPickerDropdown, { ShipPickerSelection } from '../../fleet/ShipPickerDropdown';
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { isFormerRow } from '../participantRoster';
+import FormerParticipantBadge from '../FormerParticipantBadge';
 
 interface OpSituationTabProps {
     operation: HydratedOperation;
     canManage: boolean;
+    /** ACT term — the viewer holds an ACTIVE row. Gates the ready / RSVP / withdraw bar. */
     isParticipant: boolean;
-    activeParticipants: HydratedOperation['participants'];
+    /**
+     * The rows this tab LISTS and COUNTS (participantRoster displayRoster): the whole
+     * roster on a concluded op, otherwise the active rows. Display only — never used to
+     * decide what the viewer may do.
+     */
+    rosterParticipants: HydratedOperation['participants'];
     onRefresh: () => void;
     loadingAction: string | null;
     onAction: (action: () => Promise<void>, actionName: string) => Promise<void>;
 }
 
-const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, isParticipant, activeParticipants, onRefresh, loadingAction, onAction }) => {
+const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, isParticipant, rosterParticipants, onRefresh, loadingAction, onAction }) => {
     const { currentUser } = useAuth();
     const { toggleParticipantReady, leaveOperation, joinOperationWithShip, rsvpOperation } = useOperations();
     const fmt = useFormatDate();
@@ -70,17 +78,17 @@ const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, i
         }
     };
 
-    const readyCount = activeParticipants.filter(p => p.isReady).length;
-    const totalCount = activeParticipants.length;
+    const readyCount = rosterParticipants.filter(p => p.isReady).length;
+    const totalCount = rosterParticipants.length;
     const readyPct = totalCount > 0 ? Math.round((readyCount / totalCount) * 100) : 0;
 
     const rsvpStats = useMemo(() => {
-        const accepted = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Accepted).length;
-        const tentative = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Tentative).length;
-        const declined = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Declined).length;
-        const pending = activeParticipants.filter(p => !p.rsvpStatus || p.rsvpStatus === RSVPStatus.Pending).length;
+        const accepted = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Accepted).length;
+        const tentative = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Tentative).length;
+        const declined = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Declined).length;
+        const pending = rosterParticipants.filter(p => !p.rsvpStatus || p.rsvpStatus === RSVPStatus.Pending).length;
         return { accepted, tentative, declined, pending };
-    }, [activeParticipants]);
+    }, [rosterParticipants]);
 
     const ownerName = operation.owner?.name || 'Unknown Commander';
     const ownerAvatar = operation.owner?.avatarUrl || '';
@@ -209,7 +217,7 @@ const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, i
                                 <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/20">
                                     <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest mb-1">Capacity</p>
                                     <p className="text-xs font-mono font-bold text-white">
-                                        {activeParticipants.length}{operation.maxParticipants ? ` / ${operation.maxParticipants}` : ''} <span className="text-slate-500">PAX</span>
+                                        {rosterParticipants.length}{operation.maxParticipants ? ` / ${operation.maxParticipants}` : ''} <span className="text-slate-500">PAX</span>
                                     </p>
                                 </div>
 
@@ -331,7 +339,7 @@ const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, i
 
                             {/* Participant Status Chips */}
                             <div className="space-y-1.5 max-h-80 overflow-y-auto custom-scrollbar pr-1">
-                                {activeParticipants.map(p => (
+                                {rosterParticipants.map(p => (
                                     <div key={p.userId}
                                         className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border transition-all ${
                                             p.isReady
@@ -351,6 +359,7 @@ const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, i
                                             <p className="text-[11px] font-bold text-white truncate flex items-center gap-1">
                                                 {p.user?.name || 'Unknown'}
                                                 {p.userId === operation.ownerId && <i className="fa-solid fa-crown text-[8px] text-amber-400"></i>}
+                                                {isFormerRow(p) && <FormerParticipantBadge />}
                                             </p>
                                             {(p.roleRequested || p.ship || p.shipUtilized) && (
                                                 <p className="text-[9px] text-slate-500 truncate">
@@ -367,7 +376,7 @@ const OpSituationTab: React.FC<OpSituationTabProps> = ({ operation, canManage, i
                                         )}
                                     </div>
                                 ))}
-                                {activeParticipants.length === 0 && (
+                                {rosterParticipants.length === 0 && (
                                     <div className="text-center py-8">
                                         <i className="fa-solid fa-user-slash text-2xl text-slate-700 mb-2"></i>
                                         <p className="text-xs text-slate-600 italic">No active participants</p>

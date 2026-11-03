@@ -409,12 +409,6 @@ export async function createUser(userData: { discordId: string, name: string, av
             .ilike('unregistered_client_rsi_handle', escapeLikePattern(userData.rsiHandle))
             .is('client_id', null);
 
-        try {
-            /* single-org: no member count recalculation */;
-        } catch (err) {
-            log.error('member count update failed after user creation', { err });
-        }
-
         await broadcastUserUpdate(data.id);
     }
 
@@ -1167,9 +1161,6 @@ export async function bulkDemoteUsersToClient(
         }
     }
 
-    if (updated > 0) {
-        try { /* single-org: no member count recalculation */; } catch (e) { log.error('bulkDemoteUsersToClient updateOrgMemberCount failed', { err: e }); }
-    }
     await broadcastToOrg('user_update', { bulk: true, count: updated, userIds: updatedIds });
 
     return { updated, total: targetUserIds.length, skipped };
@@ -1236,9 +1227,6 @@ export async function bulkPromoteUsersToMember(
         }
     }
 
-    if (updated > 0) {
-        try { /* single-org: no member count recalculation */; } catch (e) { log.error('bulkPromoteUsersToMember updateOrgMemberCount failed', { err: e }); }
-    }
     await broadcastToOrg('user_update', { bulk: true, count: updated, userIds: updatedIds });
 
     return { updated, total: targetUserIds.length, skipped };
@@ -1993,7 +1981,10 @@ export async function getReputationHistoryForUser(userId: number) {
 
 export async function getRatingHistoryForUser(userId: number) {
     const { data: participation, error: partError } = await supabase.from('request_responders').select('request_id').eq('user_id', userId);
-    if (partError) throw new Error(partError.message);
+    // handleSupabaseError, not a plain Error re-wrapping the PostgREST message: that is
+    // exactly the shape isOpaqueServerError lets through, so the relation/column detail
+    // reached the client verbatim.
+    handleSupabaseError({ error: partError, message: 'Failed to get rating history' });
     const requestIds = (participation as Array<Pick<Tables<'request_responders'>, 'request_id'>>).map((p) => p.request_id);
     if (requestIds.length === 0) return [];
     const { data: ratings, error: ratingsError } = await supabase.from('service_requests')
@@ -2318,7 +2309,7 @@ export async function syncAllMemberRoles() {
 
 export async function savePushSubscription(
     userId: number,
-    subscription: { endpoint: string; keys: { p256dh: string; auth: string } },
+    subscription: { endpoint: string; keys: { p256dh: string; auth: string }; expirationTime?: number | null },
 ) {
     // The endpoint is fully client-controlled and the service-role server later
     // POSTs to it. Reject anything that isn't an https URL on a known Web-Push
@@ -2327,9 +2318,21 @@ export async function savePushSubscription(
     if (!isAllowedPushEndpoint(subscription?.endpoint)) {
         throw new Error('Invalid push subscription endpoint.');
     }
-    if (!subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+    const p256dh: unknown = subscription?.keys?.p256dh;
+    const auth: unknown = subscription?.keys?.auth;
+    if (typeof p256dh !== 'string' || !p256dh || typeof auth !== 'string' || !auth) {
         throw new Error('Invalid push subscription keys.');
     }
+    // The jsonb `subscription` column is what sendBatch hands to web-push, so it holds
+    // exactly what web-push needs and nothing else — rebuilt field by field, never the
+    // argument itself. Storing the argument is how every row came to carry a stale copy
+    // of the subscriber's full user record (the dispatcher injects it as payload.user).
+    const expirationTime: unknown = subscription.expirationTime;
+    const stored: { endpoint: string; keys: { p256dh: string; auth: string }; expirationTime?: number | null } = {
+        endpoint: subscription.endpoint,
+        keys: { p256dh, auth },
+        ...((typeof expirationTime === 'number' && Number.isFinite(expirationTime)) || expirationTime === null ? { expirationTime } : {}),
+    };
 
     // Delete existing sub for this endpoint to prevent duplicates/stale
     await supabase.from('push_subscriptions').delete().eq('endpoint', subscription.endpoint);
@@ -2348,10 +2351,34 @@ export async function savePushSubscription(
 
     const { error } = await supabase.from('push_subscriptions').insert({
         user_id: userId,
-        endpoint: subscription.endpoint,
-        p256dh: subscription.keys.p256dh,
-        auth: subscription.keys.auth,
-        subscription: subscription // Store full object for easy reuse with web-push lib
+        endpoint: stored.endpoint,
+        p256dh: stored.keys.p256dh,
+        auth: stored.keys.auth,
+        subscription: stored,
     });
     handleSupabaseError({ error, message: 'Failed to save push subscription' });
+}
+
+/** Real push endpoints run to a few hundred characters; anything past this is not one. */
+const MAX_PUSH_ENDPOINT_LENGTH = 2048;
+
+/**
+ * Drop the push subscription a signing-out browser holds — and only if it is the
+ * caller's. Called by user:logout with the dispatcher-forced userId and the endpoint
+ * the browser sent, so both filters are load-bearing: the endpoint is client-supplied,
+ * and the user_id pin is what stops a crafted one deleting another member's row.
+ *
+ * Best-effort, never throws: the browser unsubscribes itself as well, which kills the
+ * endpoint at the push service and lets sendBatch's 404/410 cleanup reap the row if
+ * this delete misses. The endpoint is never logged — it is a delivery capability.
+ */
+export async function deleteOwnPushSubscription(userId: number, endpoint: unknown): Promise<void> {
+    if (!Number.isInteger(userId) || userId <= 0) return;
+    if (typeof endpoint !== 'string' || !endpoint || endpoint.length > MAX_PUSH_ENDPOINT_LENGTH) return;
+    try {
+        const { error } = await supabase.from('push_subscriptions').delete().eq('user_id', userId).eq('endpoint', endpoint);
+        if (error) log.error('failed to drop push subscription on logout', { userId, code: error.code, message: error.message });
+    } catch (e) {
+        log.error('failed to drop push subscription on logout', { userId, err: e });
+    }
 }

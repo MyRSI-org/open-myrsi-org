@@ -17,6 +17,7 @@ import { CLIENT_DENIED_SUBSETS, CLIENT_DENIED_MESSAGE } from '../lib/clientNames
 import { signDocMediaForClient } from '../lib/orgMediaDocs.js';
 import { log as baseLog } from '../lib/log.js';
 import { credentialFromRequest, SESSION_COOKIE_IS_SECURE, clearSessionCookie , appendSetCookie } from '../lib/sessionCookie.js';
+import { isBrowserSafeSupabaseKey } from '../lib/supabaseKeyGuard.js';
 
 const log = baseLog.child({ module: 'api.query' });
 
@@ -222,14 +223,14 @@ export function emptyFeatureState(subset: string): Record<string, unknown> {
     }
 }
 
-// Mirror the BOLA permission check in api/services.ts: org-owner bypass, then the
-// shared implication table (lib/permissionImplications.ts) — intel:view:clearance
-// satisfies intel:view, and manage ⊇ instruct ⊇ view on the Academy ladder. Keyed on
-// the required-permission STRING, so every *_slice subset that reuses its bundle's
-// string inherits the same implication and list/slice gates cannot drift.
-function callerHasSubsetPermission(currentUser: any, ctx: any, requiredPerm: string): boolean {
+// Mirror the BOLA permission check in api/services.ts through the shared implication
+// table (lib/permissionImplications.ts) — intel:view:clearance satisfies intel:view, and
+// manage ⊇ instruct ⊇ view on the Academy ladder. Keyed on the required-permission
+// STRING, so every *_slice subset that reuses its bundle's string inherits the same
+// implication and list/slice gates cannot drift. Single-org: there is no org-owner
+// bypass (the multi-tenant build's tenant-owner short-circuit is gone).
+function callerHasSubsetPermission(currentUser: any, requiredPerm: string): boolean {
     if (!requiredPerm) return true;
-    if (ctx?.ownerId && currentUser?.auth_user_id && ctx.ownerId === currentUser.auth_user_id) return true;
     return permissionSatisfied(currentUser?.permissions, requiredPerm);
 }
 
@@ -435,9 +436,23 @@ export function stripSecrets(state: any): any {
 
 // --- SUB-HANDLERS ---
 
+// The anon key rides two UNAUTHENTICATED responses (target=config and every initial-state
+// branch), so it is published to anyone who asks. Shipped only when lib/supabaseKeyGuard.ts
+// positively recognises it as a publishable key: a service-role key pasted into
+// SUPABASE_ANON_KEY would otherwise hand every visitor an RLS bypass. The boot check in
+// server.ts refuses to start on a SECRET key in production, but an UNRECOGNISED value (a
+// leftover placeholder, a future key format) deliberately boots everywhere — so for that case
+// this per-request guard is the only thing withholding it. It also covers a dev server (which
+// only logs) and a key changed under a running process.
+function browserSafeAnonKey(): string | undefined {
+    const key = process.env.SUPABASE_ANON_KEY;
+    return isBrowserSafeSupabaseKey(key, process.env.SUPABASE_SERVICE_ROLE_KEY) ? key : undefined;
+}
+
 async function handleConfig(req: Request, res: Response) {
     const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+    // Fails closed to the same 500 as an unset key — never the key, never which rule it broke.
+    const supabaseAnonKey = browserSafeAnonKey();
     if (!supabaseUrl || !supabaseAnonKey) {
         return res.status(500).json({ message: 'Server configuration error.' });
     }
@@ -565,12 +580,17 @@ export async function handleManifest(req: Request, res: Response) {
 
 async function handleInitialState(req: Request, res: Response) {
     const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+    const supabaseAnonKey = browserSafeAnonKey();
     // Admin-ness is resolved server-side from the session JWT — by role IDENTITY
     // (users.role_id vs the system Admin role, lib/db/adminIdentity.ts), never by
     // the role's NAME — and enforced by the per-action permission gate in
     // services.ts. Never derived from anything sent to the client.
-    const clientConfig = { supabaseUrl, supabaseAnonKey };
+    //
+    // A key the guard refuses is OMITTED, not nulled: every branch below (both
+    // unauthenticated ones included) ships this object, and the client only starts
+    // realtime when the field is present, so the app still boots — without live
+    // updates — instead of publishing the key.
+    const clientConfig = supabaseAnonKey ? { supabaseUrl, supabaseAnonKey } : { supabaseUrl };
 
     // First-run gating flag for the onboarding wizard (cheap settings read; false on db error).
     let setupCompleted = false;
@@ -739,7 +759,7 @@ async function handleInitialState(req: Request, res: Response) {
         // reads it. Kept as defence in depth — and kept ANNOTATED so a later reader who
         // deletes one copy does not leave the other looking unexplained.
         const wikiHome = (state as { wikiHomeConfig?: { welcomeContent?: unknown } }).wikiHomeConfig;
-        if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, null, 'wiki:view')) {
+        if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, 'wiki:view')) {
             // longLived: this rides the BOOT BUNDLE, which nothing on the client re-mints on a
             // timer — a tab left visible here never triggers a `main` refetch, so the short
             // read TTL would show broken images. The lifetime differs; the gate above does not.
@@ -890,7 +910,7 @@ async function handleState(req: Request, res: Response) {
         // Org membership alone is not sufficient — a Client-tier member must not be
         // able to read the warrant/KOS list, intel reports, or HR records.
         const requiredPerm = SUBSET_REQUIRED_PERMISSION[subset as string];
-        if (requiredPerm && !callerHasSubsetPermission(currentUser, null, requiredPerm)) {
+        if (requiredPerm && !callerHasSubsetPermission(currentUser, requiredPerm)) {
             log.warn('subset permission denied', { userId: currentUser.id, subset, requiredPerm });
             return res.status(403).json({ message: 'Insufficient permissions' });
         }
@@ -943,7 +963,7 @@ async function handleState(req: Request, res: Response) {
                 // payload (fail-broken and immediately visible: images stop rendering), never
                 // widen it. Do not "fix" the redundancy by widening either side.
                 const wikiHome = (viewerSettings as { wikiHomeConfig?: { welcomeContent?: unknown } }).wikiHomeConfig;
-                if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, null, 'wiki:view')) {
+                if (wikiHome?.welcomeContent && callerHasSubsetPermission(currentUser, 'wiki:view')) {
                     // longLived — same reason as the initial-state twin above: `main` is not
                     // re-minted on a timer, so this content outlives the short read TTL.
                     wikiHome.welcomeContent = await signDocMediaForClient(wikiHome.welcomeContent, { longLived: true });
@@ -958,7 +978,7 @@ async function handleState(req: Request, res: Response) {
                 // Gated on admin:db:destroy, the same high bar as Database Tools — this names
                 // internal schema detail and must never reach a member. It is a cached boolean
                 // set by verifyApiKey's own error path, so it costs no query.
-                if (isApiKeySchemaOutdated() && callerHasSubsetPermission(currentUser, null, 'admin:db:destroy')) {
+                if (isApiKeySchemaOutdated() && callerHasSubsetPermission(currentUser, 'admin:db:destroy')) {
                     (state as Record<string, unknown>).schemaUpdateRequired = true;
                 }
                 break;
@@ -1422,13 +1442,12 @@ export default async function handler(req: Request, res: Response) {
 
     // Maintenance mode + force logout enforcement on authenticated data queries
     if (target === 'state' || target === 'initial-state') {
+        // initial-state must ALWAYS pass through so the frontend can boot and render
+        // the maintenance screen. Only 'state' (subset refresh) calls are blocked.
+        const skipMaintenanceBlock = target === 'initial-state';
         try {
             const platformSettings = await db.getPlatformSettings();
             const isMaintenanceActive = platformSettings?.maintenance_mode === true;
-
-            // initial-state must ALWAYS pass through so the frontend can boot and render
-            // the maintenance screen. Only 'state' (subset refresh) calls are blocked.
-            const skipMaintenanceBlock = target === 'initial-state';
 
             // Force logout: enforce regardless of maintenance state on 'state' calls
             // (skipped on initial-state so the app can boot and render a maintenance/
@@ -1483,6 +1502,18 @@ export default async function handler(req: Request, res: Response) {
                 }
             }
         } catch (e) {
+            // FAIL CLOSED. This block IS the force-logout and maintenance gates, and both of
+            // their refusals live inside the try, so a catch that only warned SKIPPED both
+            // gates for the request whenever anything in here threw. getPlatformSettings is
+            // written never to throw (it serves last-known-good), so this is the backstop for
+            // a future change to that contract: with the platform state unreadable, a 'state'
+            // read is refused with the maintenance copy, Admin or not. initial-state keeps
+            // its documented exemption from both gates and still boots. Twin of the
+            // api/services.ts dispatcher; keep the two matched.
+            if (!skipMaintenanceBlock) {
+                log.error('failed to check platform enforcement; refusing', { target, err: e });
+                return res.status(503).json({ message: 'The organization dashboard is currently undergoing maintenance. Please try again later.' });
+            }
             log.warn('failed to check platform enforcement', { err: e });
         }
     }

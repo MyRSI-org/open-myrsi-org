@@ -541,18 +541,40 @@ describe('wiring — the dispatcher accepts and issues the cookie', () => {
         expect(src).not.toContain("res.append('Set-Cookie'");
     });
 
-    // The logout clear must run BEFORE dispatch, not in the success branch. The client can only
-    // remove its localStorage copy, never the HttpOnly cookie — so a failing user:logout
-    // (offline, or revokeUserSessions throwing) would show a logout, land the user on `/`, and
-    // leave a live 24-hour cookie that signs them straight back in on the next page load.
-    it('clears the cookie on logout even when the handler throws', () => {
-        const clearAt = src.indexOf("if (action === 'user:logout')");
-        const dispatchAt = src.indexOf('const result = await actions[action](payload, token ?? undefined);', clearAt - 2000);
-        expect(clearAt).toBeGreaterThan(-1);
-        // The clear sits above the try/dispatch, not inside its success path.
-        expect(src.slice(clearAt, clearAt + 400)).toContain('appendSetCookie');
-        expect(clearAt).toBeLessThan(src.indexOf('const result = await actions[action](payload, token ?? undefined);', clearAt));
-        expect(dispatchAt).toBeGreaterThan(-1);
+    // The logout clear must run BEFORE EVERY GATE, not merely before dispatch. The client can
+    // only remove its localStorage copy, never the HttpOnly cookie — so any refusal that answers
+    // a user:logout without the clear (the maintenance 503, a force-logout or watermark 401, the
+    // ban-check 503, the per-user 429) shows a logout, lands the user on `/`, and leaves a live
+    // 24-hour cookie that signs them straight back in on the next page load. "Before dispatch"
+    // alone was false comfort: the clear sat BELOW all of those and the old assertion passed.
+    // tests/logoutCookieClear.test.ts drives the real handler through each refusal; this pins
+    // the position so a refactor cannot sink it back down.
+    it('clears the cookie on logout before EVERY gate that can refuse the request', () => {
+        // Normalised: the tree is CRLF locally and LF in CI.
+        const s = src.replace(/\r\n/g, '\n');
+        const handlerAt = s.indexOf('export default async function handler(');
+        const clearAt = s.indexOf("if (action === 'user:logout')", handlerAt);
+        expect(handlerAt).toBeGreaterThan(-1);
+        expect(clearAt).toBeGreaterThan(handlerAt);
+        expect(s.slice(clearAt, clearAt + 200)).toContain('appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE))');
+        // ONE logout clear. A second, late copy is exactly what made the old assertion pass.
+        expect(s.split("if (action === 'user:logout')").length - 1).toBe(1);
+        const gates: Array<[string, string]> = [
+            ['maintenance 503', "message: 'The platform is currently undergoing maintenance."],
+            ['force-logout 401', 'isSessionForceLoggedOut(decoded, platformSettings.force_logout_timestamp)'],
+            ['missing-token 401', "'Unauthorized: Missing token'"],
+            ['watermark 401', 'isSessionRevokedByWatermark(decodedUser, fullUser.tokensValidFrom)'],
+            ['ban-check 503', "code: 'BAN_CHECK_UNAVAILABLE'"],
+            ['ban 403', "code: 'ORG_BANNED'"],
+            ['permission gate', 'PROTECTED_PREFIXES.some(p => action.startsWith(p))'],
+            ['per-user 429', 'const userLimit = checkUserRateLimit(user.id);'],
+            ['dispatch', 'const result = await actions[action](payload, token ?? undefined);'],
+        ];
+        for (const [name, needle] of gates) {
+            const at = s.indexOf(needle, handlerAt);
+            expect(at, `${name}: anchor not found — update this test with the gate`).toBeGreaterThan(-1);
+            expect(clearAt, `the logout cookie clear must precede the ${name}`).toBeLessThan(at);
+        }
     });
 
     // A revoked cookie left planted for 24 hours is a session someone else can resume. Every

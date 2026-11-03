@@ -385,6 +385,40 @@ export interface TallyResult {
     totalVotes: number;
     isConclusive: boolean;
     reason?: string;
+    /**
+     * Set when the count itself ends on a tie that decides who is seated (the
+     * ranked-choice count reports it here; concludeElection detects a seat-cutoff tie
+     * in the other methods with findSeatCutoffTie). concludeElection sends either
+     * through its tie path: a runoff if allowed, otherwise no clear winner.
+     */
+    tie?: SeatTie;
+}
+
+/** A tie that decides a seat: who is tied, and how the conclusion should describe it. */
+export interface SeatTie {
+    candidateIds: number[];
+    label: string;
+}
+
+/**
+ * A TIE THAT STRADDLES THE SEAT CUTOFF decides nothing on the ballots — only on the
+ * order the rows happened to be sorted in.
+ *
+ * The old check only looked for a tie at the TOP of the table (more candidates tied
+ * for first than there are seats). A tie for the LAST seat slipped through: with
+ * A 5, B 3, C 3 for two seats, A is clearly in, but B against C is a dead heat, and the
+ * stable sort seated whichever candidate's first ballot came first. So: if the last
+ * candidate inside the seats has the same count as the first candidate outside them,
+ * every candidate on that count is tied, and the result is not decided.
+ *
+ * Expects allResults sorted by voteCount, descending (every tally returns it so).
+ */
+export function findSeatCutoffTie(allResults: TallyResult['allResults'], maxWinners: number): SeatTie | null {
+    if (maxWinners < 1 || allResults.length <= maxWinners) return null;
+    const cutoff = allResults[maxWinners - 1].voteCount;
+    if (allResults[maxWinners].voteCount !== cutoff) return null;
+    const candidateIds = allResults.filter((r) => r.voteCount === cutoff).map((r) => r.candidateId);
+    return { candidateIds, label: `Tie between ${candidateIds.length} candidates` };
 }
 
 // Shape of a single ballot row used by the tally algorithms.
@@ -406,16 +440,22 @@ interface ElectionVoteRow {
  * quorum, ballot dedup); none of it survives counting the wrong rows.
  *
  * So: page to exhaustion on a total order, then VERIFY the total against an exact
- * count and refuse if they disagree. The count is taken after the pages, so a ballot
- * cast mid-read shows up as a mismatch and refuses rather than being half-counted.
- * concludeElection surfaces the throw; a refused tally is re-runnable, a wrong one is
- * not.
+ * count and refuse if they disagree. Neither check alone catches every ballot cast
+ * mid-read. A ballot id is a random uuid, so a new ballot sorts anywhere in the order:
+ * one that lands after the read position is an extra row, and the count (taken after
+ * the pages) refuses on the mismatch. One that lands inside a page already read pushes
+ * that page's last row across the boundary instead — the row is read twice, the new
+ * ballot is never read, and the totals still agree. So a repeated id refuses as well,
+ * the same guard tallyPreferentialFull carries. concludeElection surfaces the throw; a
+ * refused tally is re-runnable, a wrong one is not.
  */
 const BALLOT_PAGE = 1000;
 const BALLOT_MAX_PAGES = 500;   // 500k ballots, far past any org, then refuse
+const BALLOT_READ_REFUSAL = 'The ballot count changed while tallying — re-run the count.';
 
 export async function getVotesForElection(electionId: number) {
     const out: Array<{ candidate_id: number; rank_order: number | null }> = [];
+    const seenIds = new Set<string>();
     for (let page = 0; page < BALLOT_MAX_PAGES; page++) {
         const from = page * BALLOT_PAGE;
         const { data, error } = await supabase.from('government_election_votes')
@@ -424,8 +464,12 @@ export async function getVotesForElection(electionId: number) {
             .order('id', { ascending: true })
             .range(from, from + BALLOT_PAGE - 1);
         handleSupabaseError({ error, message: 'Failed to fetch votes' });
-        const rows = (data || []) as Array<{ candidate_id: number; rank_order: number | null }>;
-        out.push(...rows);
+        const rows = (data || []) as Array<{ candidate_id: number; rank_order: number | null; id: string }>;
+        for (const row of rows) {
+            if (seenIds.has(row.id)) throw new Error(BALLOT_READ_REFUSAL);
+            seenIds.add(row.id);
+            out.push(row);
+        }
         if (rows.length < BALLOT_PAGE) break;
         if (page === BALLOT_MAX_PAGES - 1) throw new Error('Too many ballots to tally safely — refusing to report a partial count.');
     }
@@ -435,7 +479,7 @@ export async function getVotesForElection(electionId: number) {
         .eq('election_id', electionId);
     handleSupabaseError({ error: countErr, message: 'Failed to verify the ballot count' });
     if (count == null || count !== out.length) {
-        throw new Error('The ballot count changed while tallying — re-run the count.');
+        throw new Error(BALLOT_READ_REFUSAL);
     }
     return out;
 }
@@ -498,14 +542,54 @@ export function tallyPreferential(votes: ElectionVoteRow[], maxWinners: number):
     return tallySimpleMajority(firstPreferences, maxWinners);
 }
 
-export async function tallyPreferentialFull(electionId: number, maxWinners: number): Promise<TallyResult> {
-    // Full IRV: fetch votes with voter_hash for proper ballot reconstruction
-    const { data: allVotes } = await supabase.from('government_election_votes')
-        .select('voter_hash, candidate_id, rank_order')
-        .eq('election_id', electionId)
-        .order('rank_order');
+const RANKED_READ_REFUSAL = 'Could not read every ranked ballot — refusing to report a partial count.';
 
-    if (!allVotes || allVotes.length === 0) {
+export async function tallyPreferentialFull(electionId: number, maxWinners: number): Promise<TallyResult> {
+    // Full IRV: fetch votes with voter_hash for proper ballot reconstruction.
+    //
+    // Fail closed, as getVotesForElection does. A discarded error read as "No votes
+    // cast", which concludeElection files as a terminal Cancelled. The read used to be
+    // ONE unbounded select, which PostgREST silently caps at its max-rows — and the
+    // count check below then refused every ranked election larger than that cap, so a
+    // big election could never conclude at all. It now pages to exhaustion on a TOTAL
+    // order, (rank_order, id): rank order is what rebuilds each voter's ballot in
+    // preference order, and the id tiebreak makes the paging deterministic.
+    //
+    // A ballot cast mid-read can sort INTO a page already read (its rank puts it inside
+    // that rank's span, and its random uuid id anywhere within it) and shift a row
+    // across the page boundary, so the same row would be read twice while the total
+    // still matched. A repeated id therefore refuses as well; a ballot that lands after
+    // the read position is caught by the exact count. A refused tally is re-runnable, a
+    // wrong one is not.
+    const allVotes: Array<{ voter_hash: string; candidate_id: number; rank_order: number | null; id: number }> = [];
+    const seenIds = new Set<number>();
+    for (let page = 0; page < BALLOT_MAX_PAGES; page++) {
+        const from = page * BALLOT_PAGE;
+        const { data, error: votesErr } = await supabase.from('government_election_votes')
+            .select('voter_hash, candidate_id, rank_order, id')
+            .eq('election_id', electionId)
+            .order('rank_order', { ascending: true })
+            .order('id', { ascending: true })
+            .range(from, from + BALLOT_PAGE - 1);
+        handleSupabaseError({ error: votesErr, message: 'Failed to fetch votes' });
+        const rows = (data || []) as typeof allVotes;
+        for (const row of rows) {
+            if (seenIds.has(row.id)) throw new Error(RANKED_READ_REFUSAL);
+            seenIds.add(row.id);
+            allVotes.push(row);
+        }
+        if (rows.length < BALLOT_PAGE) break;
+        if (page === BALLOT_MAX_PAGES - 1) throw new Error('Too many ballots to tally safely — refusing to report a partial count.');
+    }
+    const { count: ballotCount, error: countErr } = await supabase.from('government_election_votes')
+        .select('id', { count: 'exact', head: true })
+        .eq('election_id', electionId);
+    handleSupabaseError({ error: countErr, message: 'Failed to verify the ballot count' });
+    if (ballotCount == null || ballotCount !== allVotes.length) {
+        throw new Error(RANKED_READ_REFUSAL);
+    }
+
+    if (allVotes.length === 0) {
         return { winners: [], allResults: [], totalVotes: 0, isConclusive: false, reason: 'No votes cast' };
     }
 
@@ -524,67 +608,148 @@ export async function tallyPreferentialFull(electionId: number, maxWinners: numb
         };
     }
 
-    // Build ballots grouped by voter
+    // Build ballots grouped by voter (rows arrive in rank order, so each voter's list
+    // is in preference order).
     const ballotMap = new Map<string, number[]>();
     for (const v of allVotes) {
         if (!ballotMap.has(v.voter_hash)) ballotMap.set(v.voter_hash, []);
         ballotMap.get(v.voter_hash)!.push(v.candidate_id);
     }
-    const ballots = Array.from(ballotMap.values());
-    const totalVoters = ballots.length;
+    return instantRunoff(Array.from(ballotMap.values()), maxWinners);
+}
 
-    // Get all candidate IDs
+// Distinct elimination states the tie search below may visit before it gives up.
+// Zero-vote ties (the common case: candidates who only appear as later preferences)
+// are eliminated together without searching, so a real election never comes close.
+const IRV_STATE_BUDGET = 10_000;
+
+type IrvOutcome =
+    | { kind: 'won'; results: TallyResult['allResults'] }
+    | { kind: 'exhausted' }
+    | { kind: 'tie'; results: TallyResult['allResults']; tie: SeatTie };
+
+/**
+ * Instant-runoff over grouped ballots (each a candidate list in preference order).
+ * Round by round: count each ballot for its highest-ranked continuing candidate; stop
+ * when the leader holds a majority of ALL ballots, or the field is no larger than the
+ * seats; otherwise eliminate the last-placed candidate.
+ *
+ * A TIE FOR LAST PLACE used to be broken by sort order — the candidate whose first
+ * ballot happened to come last was eliminated, and that arbitrary choice could decide
+ * who took office (a 5–5 final round "won" by whoever sorted first). Now every way of
+ * breaking the tie is followed. If they all lead to the same seats, the tie did not
+ * matter and the count goes on (reporting the rounds of the branch that eliminates the
+ * lowest candidate id, so the numbers do not depend on ballot order); if they do not,
+ * the ELECTION is tied and comes back
+ * inconclusive with `tie` set, for concludeElection's tie path. Elimination states are
+ * memoised (an outcome depends only on WHICH candidates are out), and a search that
+ * outgrows IRV_STATE_BUDGET fails closed as a tie rather than guessing.
+ */
+export function instantRunoff(ballots: number[][], maxWinners: number): TallyResult {
+    const totalVoters = ballots.length;
     const allCandidateIds = new Set<number>();
     for (const b of ballots) for (const c of b) allCandidateIds.add(c);
 
-    const eliminated = new Set<number>();
-    const roundResults: Map<number, number>[] = [];
+    const memo = new Map<string, IrvOutcome>();
+    const BUDGET_LABEL = 'Ranked-choice count has too many tied eliminations to resolve safely';
+    let budgetHit = false;
+    const sortedIds = (ids: number[]) => [...ids].sort((a, b) => a - b).join(',');
+    // What an outcome decides: the seated set, a tie (which one, and how described), or nothing.
+    // A 'won' never carries a seat-cutoff tie (outcomeFrom turns one into a 'tie'), so
+    // its sliced seats are a real decision, not an artefact of the sort.
+    const decisionOf = (o: IrvOutcome): string => (o.kind === 'won'
+        ? `won:${sortedIds(o.results.slice(0, maxWinners).map((r) => r.candidateId))}`
+        : o.kind === 'tie' ? `tie:${sortedIds(o.tie.candidateIds)}:${o.tie.label}` : o.kind);
+    const tieLabel = (n: number, remaining: number): string => {
+        if (n < remaining) return `Ranked-choice elimination tie between ${n} candidates decides the result`;
+        if (remaining === maxWinners + 1) return `Ranked-choice tie between ${n} candidates in the final round`;
+        return `Ranked-choice tie between ${n} candidates for ${maxWinners} seat${maxWinners === 1 ? '' : 's'}`;
+    };
 
-    // Run IRV rounds
-    while (true) {
+    function outcomeFrom(eliminated: ReadonlySet<number>): IrvOutcome {
+        const key = [...eliminated].sort((a, b) => a - b).join(',');
+        const cached = memo.get(key);
+        if (cached) return cached;
+
         const counts = new Map<number, number>();
-        for (const cid of allCandidateIds) {
-            if (!eliminated.has(cid)) counts.set(cid, 0);
-        }
-
-        // Count first valid preference for each ballot
+        for (const cid of allCandidateIds) if (!eliminated.has(cid)) counts.set(cid, 0);
         for (const ballot of ballots) {
-            for (const candidateId of ballot) {
-                if (!eliminated.has(candidateId)) {
-                    counts.set(candidateId, (counts.get(candidateId) || 0) + 1);
-                    break;
-                }
-            }
+            const first = ballot.find((c) => !eliminated.has(c));
+            if (first !== undefined) counts.set(first, (counts.get(first) || 0) + 1);
         }
-
-        roundResults.push(new Map(counts));
-
-        // Check if anyone has majority
-        const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-        if (sorted.length === 0) break;
-
-        const leader = sorted[0];
-        if (leader[1] > totalVoters / 2 || sorted.length <= maxWinners) {
-            // Winner found
-            const results = sorted.map(([candidateId, voteCount]) => ({
+        const results = Array.from(counts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([candidateId, voteCount]) => ({
                 candidateId,
                 voteCount,
                 percentage: totalVoters > 0 ? (voteCount / totalVoters) * 100 : 0,
             }));
-            return {
-                winners: results.slice(0, maxWinners),
-                allResults: results,
-                totalVotes: totalVoters,
-                isConclusive: true,
-            };
-        }
 
-        // Eliminate lowest
-        const lowest = sorted[sorted.length - 1];
-        eliminated.add(lowest[0]);
+        let outcome: IrvOutcome;
+        if (results.length === 0) {
+            outcome = { kind: 'exhausted' };
+        } else if (results[0].voteCount > totalVoters / 2 || results.length <= maxWinners) {
+            // A majority with more than one seat fills the remaining seats by count, so a
+            // dead heat for the LAST seat must be a tie HERE, inside the search. Left as a
+            // 'won', decisionOf compared only the sliced seats: branches that each sliced
+            // the same set "agreed" even when one of them only got that set by sort order
+            // (A 6, B 2, C 2 for two seats), the search returned branches[0], and which
+            // branch came first — ballot order, i.e. random uuids — decided the result.
+            const cut = findSeatCutoffTie(results, maxWinners);
+            outcome = cut ? { kind: 'tie', results, tie: cut } : { kind: 'won', results };
+        } else if (memo.size >= IRV_STATE_BUDGET) {
+            budgetHit = true;
+            outcome = { kind: 'tie', results, tie: { candidateIds: results.map((r) => r.candidateId), label: BUDGET_LABEL } };
+        } else {
+            const lowest = results[results.length - 1].voteCount;
+            // Ascending candidate id, NOT result order. Candidates level on a count sit in
+            // the order their first ballot was read, and ballot ids are random uuids; when
+            // every branch below agrees, the count reports branches[0]'s rounds, and
+            // concludeElection stores each candidate's vote_count from them. Following the
+            // branches in read order let the same ballots store different numbers.
+            const tied = results.filter((r) => r.voteCount === lowest).map((r) => r.candidateId)
+                .sort((a, b) => a - b);
+            const without = (ids: number[]) => new Set([...eliminated, ...ids]);
+            if (tied.length === 1) {
+                outcome = outcomeFrom(without(tied));
+            } else if (lowest === 0 && results.length - tied.length >= maxWinners) {
+                // Nobody's ballot sits with a zero-vote candidate, so removing them moves
+                // no ballot and the order cannot matter — as long as enough candidates
+                // remain to fill the seats without them.
+                outcome = outcomeFrom(without(tied));
+            } else {
+                const branches = tied.map((cid) => outcomeFrom(without([cid])));
+                const first = branches[0];
+                if (branches.every((b) => decisionOf(b) === decisionOf(first))) {
+                    // Every way of breaking this tie ends the same: the same seats (the tie
+                    // did not matter), or the same later tie (that one is what decides it).
+                    outcome = first;
+                } else {
+                    outcome = { kind: 'tie', results, tie: { candidateIds: tied, label: tieLabel(tied.length, results.length) } };
+                }
+            }
+        }
+        memo.set(key, outcome);
+        return outcome;
     }
 
-    return { winners: [], allResults: [], totalVotes: totalVoters, isConclusive: false, reason: 'IRV inconclusive' };
+    const outcome = outcomeFrom(new Set());
+    if (outcome.kind === 'exhausted') {
+        return { winners: [], allResults: [], totalVotes: totalVoters, isConclusive: false, reason: 'IRV inconclusive' };
+    }
+    if (outcome.kind === 'tie') {
+        // A search cut short anywhere surfaces as a tie at the top (an undecided branch
+        // makes every branch point above it undecided), so say why rather than name a
+        // tie the truncated search may only have imagined.
+        const tie = budgetHit ? { candidateIds: outcome.tie.candidateIds, label: BUDGET_LABEL } : outcome.tie;
+        return { winners: [], allResults: outcome.results, totalVotes: totalVoters, isConclusive: false, tie };
+    }
+    return {
+        winners: outcome.results.slice(0, maxWinners),
+        allResults: outcome.results,
+        totalVotes: totalVoters,
+        isConclusive: true,
+    };
 }
 
 export function tallyProportional(votes: ElectionVoteRow[], maxWinners: number): TallyResult {

@@ -166,12 +166,15 @@ interface AdminSyncWarrantsPayload {
 
 /**
  * Sends a Discord embed notification for a new intel bulletin.
+ *
+ * `restricted` is REQUIRED and comes from db.bulletinIsRestricted — the one
+ * fail-closed predicate the push fan-out uses too, so the two egress paths
+ * cannot drift. The returned bulletin's own classificationLevel is not enough:
+ * it carries no limiting markers (the insert select embeds none).
  */
 async function notifyDiscordIntelBulletin(
-    // The created bulletin is mapped to IntelBulletin; the legacy snake_case
-    // `duration_minutes` read below is intentionally preserved (undefined at
-    // runtime) so this types-only pass changes no behavior.
-    bulletin: IntelBulletin & { duration_minutes?: number },
+    bulletin: IntelBulletin,
+    restricted: boolean,
 ) {
     try {
         const { data: settingsData } = await db.supabase.from('settings').select('key, value').in('key', ['discordConfig', 'brandingConfig']);
@@ -201,18 +204,27 @@ async function notifyDiscordIntelBulletin(
         };
 
         // A Discord channel can be visible to members who lack the
-        // clearance/markers required to read a CLASSIFIED bulletin in-app. Never
-        // post the title/body/location of a classified bulletin to Discord — only
-        // a generic "view it in the terminal" notice. Unclassified bulletins
-        // (classificationLevel 0) post in full.
-        const isClassified = (bulletin.classificationLevel ?? 0) > 0;
-        const embed: DiscordEmbed = isClassified
+        // clearance/markers required to read a RESTRICTED bulletin in-app. Never
+        // post the title/body/location of a restricted bulletin to Discord — only
+        // a generic "view it in the terminal" notice. Only unrestricted bulletins
+        // (level 0 AND no limiting marker) post in full.
+        //
+        // The notice states a level only when the level IS the restriction: a
+        // marker-only bulletin reads "Level 0" otherwise, which is both wrong and
+        // a hint that a compartment exists. The marker itself is never named, and
+        // the colour is fixed slate rather than the threat colour, because the
+        // threat level is content of a bulletin the channel may not read (see the
+        // broadcast note in lib/db/intel.ts createIntelBulletin).
+        const level = bulletin.classificationLevel ?? 0;
+        const embed: DiscordEmbed = restricted
             ? {
                 title: '📡 CLASSIFIED INTEL BULLETIN',
-                description: `A Level ${bulletin.classificationLevel} intel bulletin was posted. Access it in the operations terminal (clearance required).`,
-                color: threatColorMap[bulletin.threatLevel] || 0x64748b,
+                description: level > 0
+                    ? `A Level ${level} intel bulletin was posted. Access it in the operations terminal (clearance required).`
+                    : 'A restricted intel bulletin was posted. Access it in the operations terminal (clearance required).',
+                color: 0x64748b, // slate — matches the restricted operation notice (lib/discord.ts)
                 fields: [
-                    { name: 'Classification', value: `Level ${bulletin.classificationLevel}`, inline: true },
+                    { name: 'Classification', value: level > 0 ? `Level ${level}` : 'Restricted', inline: true },
                 ],
                 timestamp: new Date().toISOString(),
                 footer: {
@@ -228,7 +240,10 @@ async function notifyDiscordIntelBulletin(
                     { name: 'Threat Level', value: safeValue(bulletin.threatLevel), inline: true },
                     ...(bulletin.location ? [{ name: 'Location', value: safeValue(bulletin.location), inline: true }] : []),
                     { name: 'Classification', value: 'Unclassified', inline: true },
-                    { name: 'Duration', value: bulletin.duration_minutes === 0 ? 'Indefinite (Pinned)' : bulletin.expiresAt ? `Expires ${new Date(bulletin.expiresAt).toUTCString()}` : 'No expiry', inline: false },
+                    // The bulletin is the MAPPED IntelBulletin (camelCase). A pinned
+                    // bulletin is durationMinutes 0 with a 9999-12-31 sentinel expiry; the
+                    // old snake_case read was always undefined, so it posted "Expires 9999".
+                    { name: 'Duration', value: bulletin.durationMinutes === 0 ? 'Indefinite (Pinned)' : bulletin.expiresAt ? `Expires ${new Date(bulletin.expiresAt).toUTCString()}` : 'No expiry', inline: false },
                 ],
                 timestamp: new Date().toISOString(),
                 footer: {
@@ -345,15 +360,20 @@ export const intelActions = {
     // --- BULLETIN ACTIONS ---
     'intel:create_bulletin': async (payload: IntelCreateBulletinPayload) => {
         const bulletin = await db.createIntelBulletin(payload);
+        // ONE fail-closed probe gates BOTH unfiltered egress paths below, so they
+        // cannot disagree. Level AND limiting markers: a Level-0 bulletin carrying
+        // a marker is hidden in-app from non-holders, so it is restricted here too.
+        // A throw is treated as restricted (the bulletin already exists — failing
+        // the action now would only hide a successful create from its author).
+        const restricted = await db.bulletinIsRestricted(bulletin.id).catch(() => true);
         try {
             // sendPushToStaff fans out to ALL staff with no clearance filter, and
-            // push payloads surface on lock screens. Never put a classified
+            // push payloads surface on lock screens. Never put a restricted
             // bulletin's title/body in the push — send a generic notice and let
             // the recipient open the clearance-gated terminal.
-            const isClassified = (bulletin.classificationLevel ?? 0) > 0;
             await sendPushToStaff({
-                title: isClassified ? 'New Classified Intel Bulletin' : `Intel Bulletin: ${bulletin.title}`,
-                body: isClassified ? 'A classified bulletin was posted — view it in the terminal (clearance required).' : bulletin.body.substring(0, 120),
+                title: restricted ? 'New Classified Intel Bulletin' : `Intel Bulletin: ${bulletin.title}`,
+                body: restricted ? 'A classified bulletin was posted — view it in the terminal (clearance required).' : bulletin.body.substring(0, 120),
                 tag: `bulletin-${bulletin.id}`,
                 data: { type: 'bulletin', bulletinId: bulletin.id }
             });
@@ -361,7 +381,7 @@ export const intelActions = {
             log.error('bulletin push notification failed', { err });
         }
         // Discord notification (non-blocking)
-        notifyDiscordIntelBulletin(bulletin).catch(err => {
+        notifyDiscordIntelBulletin(bulletin, restricted).catch(err => {
             log.error('bulletin discord notification failed', { err });
         });
         return bulletin;

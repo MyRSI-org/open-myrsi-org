@@ -7,6 +7,7 @@ import { useMembers } from '../../contexts/MembersContext';
 
 import WindowFrame from '../layout/WindowFrame';
 import { useNotification } from '../../contexts/NotificationContext';
+import { rosterUserIds } from '../views/operations/participantRoster';
 
 interface AddParticipantModalProps {
     isOpen: boolean;
@@ -23,7 +24,10 @@ const AddParticipantModal: React.FC<AddParticipantModalProps> = ({ isOpen, onClo
     const [isLoading, setIsLoading] = useState(false);
 
     const availableMembers = useMemo(() => {
-        const excludedIds = new Set(operation.participants.filter(p => p.timeLeft === null).map(p => p.userId));
+        // Exclude ANYONE already on the roster, current or former. A former row (stamped
+        // when the op concluded) is still a row: offering that member again would ask the
+        // server to add someone it already holds.
+        const excludedIds = rosterUserIds({ participants: operation.participants });
         if (operation.ownerId) excludedIds.add(operation.ownerId);
         return members.filter(member => !excludedIds.has(member.id));
     }, [members, operation.participants, operation.ownerId]);
@@ -72,7 +76,7 @@ const AddParticipantModal: React.FC<AddParticipantModalProps> = ({ isOpen, onClo
             <div className="flex flex-col h-full">
                 <div className="p-4">
                     <p className="text-xs text-slate-400 mb-3 bg-slate-900/50 p-2 rounded-sm border border-slate-800">
-                        Select members to add to this operation. Only members not already active are listed.
+                        Select members to add to this operation. Members already on its roster, current or former, are not listed.
                     </p>
                     <div className="max-h-[50vh] overflow-y-auto custom-scrollbar space-y-2 pr-1">
                         {availableMembers.map(member => {

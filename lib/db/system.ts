@@ -26,6 +26,8 @@ import { SecurityDenial } from '../errors.js';
 import { requireUuid } from '../pgrest.js';
 import { log as baseLog } from '../log.js';
 import { compareSchemaVersion } from '../schemaVersion.js';
+import { assessSessionSecret } from '../sessionSecretPolicy.js';
+import { supabaseKeyProblem, isSecretSupabaseKeyProblem } from '../supabaseKeyGuard.js';
 
 const log = baseLog.child({ module: 'db.system' });
 
@@ -796,10 +798,35 @@ export async function updateRolePermissions(roleId: number, permissionNames: str
     const { data: role } = await supabase.from('roles').select('id').eq('id', id).maybeSingle();
     if (!role) throw new Error('Role not found.');
 
-    const { data: perms } = await supabase.from('permissions').select('id, name').in('name', permissionNames);
+    // Fail CLOSED on the lookup. Unbound, a read fault resolved to "no permissions" and the
+    // replace below silently stripped the role of EVERY permission behind a success.
+    const { data: perms, error: permsError } = await supabase.from('permissions').select('id, name').in('name', permissionNames);
+    handleSupabaseError({ error: permsError, message: 'Failed to resolve permissions — no change was made' });
     const permIds = perms?.map(p => p.id) || [];
-    await supabase.from('role_permissions').delete().eq('role_id', id);
-    if (permIds.length > 0) await supabase.from('role_permissions').insert(permIds.map(pid => ({ role_id: id, permission_id: pid })));
+
+    // ATOMIC REPLACE (schema.sql public.set_role_permissions): the role row is locked,
+    // the ids are validated, and the old set is deleted and the new one inserted in ONE
+    // transaction. The delete-then-insert this replaces could fail between its legs and
+    // leave the role with NO permissions behind an error, with nothing to restore it.
+    //
+    // FAILS CLOSED when the function is absent (42883 / PGRST202 — schema.sql not
+    // re-run): refused with a clear message, never a fallback to the non-atomic path.
+    // The Client-role lock stays HERE (assertRoleIsNotClient above) rather than being
+    // copied into SQL — lib/db/clientRoleLock.ts is its one definition.
+    const { error: rpcError } = await supabase.rpc('set_role_permissions', { p_role_id: id, p_permission_ids: permIds });
+    if (!rpcError) return;
+    const rpcCode = String((rpcError as { code?: string }).code || '');
+    if (rpcCode === '42883' || rpcCode === 'PGRST202') {
+        log.error('set_role_permissions is not deployed — role permission write refused. re-run schema.sql', { roleId: id, code: rpcCode });
+        throw new Error('Database update required — re-run schema.sql (set_role_permissions is missing). No change was made.');
+    }
+    if (String((rpcError as { message?: string }).message || '').includes('ROLE_PERMS_NO_ROLE')) {
+        throw new Error('Role not found.');
+    }
+    handleSupabaseError({ error: rpcError, message: 'Failed to update role permissions' });
+    // handleSupabaseError always throws on a non-null error; never let an RPC error
+    // read as success even if that contract changes.
+    throw new Error('Failed to update role permissions');
 }
 
 export async function createApiKey(label: string, scopes?: unknown, expiresAt?: string | null) {
@@ -2907,6 +2934,41 @@ export async function runDatabaseHealthCheck() {
         }
     } catch {
         results.push({ check: 'Secret Encryption (unreadable)', status: 'WARNING', count: null });
+    }
+
+    // Session secret hygiene. Production refuses to boot only for the exploitable cases (see
+    // lib/sessionSecretPolicy.ts); the rest — 16-31 characters, or a copy of a private key —
+    // starts with a boot-log error that scrolls away, so it is repeated here where an admin will
+    // actually see it. Same classifier as the boot guard, names only, never the value.
+    {
+        const session = assessSessionSecret(process.env);
+        if (session.refuse.length > 0) {
+            results.push({ check: `Session Secret (JWT_SECRET ${session.refuse.join('; ')})`, status: 'ERROR', count: null, action: 'Set a new JWT_SECRET: see Rotating the session secret in DEPLOYMENT_GUIDE.md' });
+        } else if (session.warn.length > 0) {
+            results.push({ check: `Session Secret (JWT_SECRET ${session.warn.join('; ')})`, status: 'WARNING', count: null, action: 'Rotate JWT_SECRET when convenient: see Rotating the session secret in DEPLOYMENT_GUIDE.md' });
+        } else {
+            results.push({ check: 'Session Secret', status: 'OK', count: null });
+        }
+    }
+
+    // The published Supabase key, same reasoning: boot only refuses a SECRET key in production
+    // (server.ts); an unset or unrecognised value starts with a log line that scrolls away, so it
+    // is repeated here. Same classifier as the boot block (lib/supabaseKeyGuard.ts). The row names
+    // the broken rule only — never the key or any part of it — and the problem is spelled out in
+    // `check`, because that is the text Database Tools renders.
+    {
+        const anonProblem = supabaseKeyProblem(process.env.SUPABASE_ANON_KEY, process.env.SUPABASE_SERVICE_ROLE_KEY);
+        const setPublishable = 'Set SUPABASE_ANON_KEY to the publishable (sb_publishable_…) or legacy anon key from Supabase Dashboard → Project Settings → API, then restart';
+        if (anonProblem === 'missing') {
+            results.push({ check: 'Supabase Anon Key (not set — live updates disabled)', status: 'WARNING', count: null, action: setPublishable });
+        } else if (isSecretSupabaseKeyProblem(anonProblem)) {
+            // Production refuses to boot on this, so the row is only ever seen outside production.
+            results.push({ check: `Supabase Anon Key (${anonProblem} — withheld from browsers; replace it with the publishable key)`, status: 'ERROR', count: null, action: `${setPublishable}. Never use the service-role / sb_secret_ key here` });
+        } else if (anonProblem) {
+            results.push({ check: 'Supabase Anon Key (not a recognised publishable key — never sent to browsers; live updates disabled)', status: 'WARNING', count: null, action: setPublishable });
+        } else {
+            results.push({ check: 'Supabase Anon Key', status: 'OK', count: null });
+        }
     }
 
     // API-key lifecycle columns. Named individually so the operator is told WHICH columns are

@@ -3,6 +3,8 @@ import React, { useState } from 'react';
 import { useData } from '../../../contexts/DataContext';
 import { GovernmentType } from '../../../types';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { useGovernment } from '../../../contexts/GovernmentContext';
+import { TEMPLATE_APPLY_WARNING } from './governmentUiRules';
 
 interface GovernmentSetupWizardProps {
     onComplete: () => void;
@@ -54,13 +56,28 @@ const iconColorMap: Record<string, string> = {
 
 const GovernmentSetupWizard: React.FC<GovernmentSetupWizardProps> = ({ onComplete }) => {
     const { rpcAction } = useData();
-    const { addToast } = useNotification();
+    const { addToast, confirm } = useNotification();
+    const { governmentBranches, governmentPositions } = useGovernment();
 
     const [selectedType, setSelectedType] = useState<GovernmentType | null>(null);
     const [isApplying, setIsApplying] = useState(false);
 
     const handleApply = async () => {
         if (!selectedType) return;
+        // "Restructure" reopens this wizard over an EXISTING government, and applying a
+        // template there deletes every position (with its holders, elections and
+        // legislation votes). Confirm first, with the same warning as the admin tab. A
+        // first-time setup has nothing to lose; Custom only rewrites the config.
+        const hasStructure = governmentBranches.length > 0 || governmentPositions.length > 0;
+        if (selectedType !== GovernmentType.Custom && hasStructure) {
+            const confirmed = await confirm({
+                title: 'Apply Template',
+                message: TEMPLATE_APPLY_WARNING,
+                confirmText: 'Apply Template',
+                variant: 'danger',
+            });
+            if (!confirmed) return;
+        }
         setIsApplying(true);
         try {
             if (selectedType === GovernmentType.Custom) {

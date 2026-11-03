@@ -5,6 +5,7 @@ import { HydratedOperation, OperationStatus, OperationType } from '../../../type
 import { useAuth, useFormatDate } from '../../../contexts/AuthContext';
 import { useOperations } from '../../../contexts/OperationsContext';
 import { useNavigation } from '../../../contexts/NavigationContext';
+import { displayRoster } from './participantRoster';
 
 const getTypeColor = (type: OperationType) => {
     switch (type) {
@@ -30,8 +31,11 @@ interface OpBlockProps {
 
 const OpBlock: React.FC<OpBlockProps> = ({ op, compact, viewOperationDetails, formatTime }) => {
     const colors = getTypeColor(op.type);
-    const activeParticipants = op.participants.filter(p => p.timeLeft === null).length;
-    const accepted = op.participants.filter(p => p.rsvpStatus === 'Accepted').length;
+    // Counted over the displayed roster: the whole roster on a concluded op, otherwise
+    // the active rows (participantRoster displayRoster).
+    const roster = displayRoster(op);
+    const paxCount = roster.length;
+    const accepted = roster.filter(p => p.rsvpStatus === 'Accepted').length;
     const isConcluded = op.status === OperationStatus.Concluded;
     const displayTime = op.scheduledStart || op.activeStartTime;
 
@@ -49,7 +53,7 @@ const OpBlock: React.FC<OpBlockProps> = ({ op, compact, viewOperationDetails, fo
             {!compact && (
                 <div className="flex items-center gap-2 mt-0.5 ml-3">
                     <span className="text-[9px] text-slate-500">
-                        <i className="fa-solid fa-users mr-0.5"></i>{accepted > 0 ? `${accepted} RSVP` : `${activeParticipants} PAX`}
+                        <i className="fa-solid fa-users mr-0.5"></i>{accepted > 0 ? `${accepted} RSVP` : `${paxCount} PAX`}
                     </span>
                     {isConcluded && <span className="text-[9px] text-slate-600 italic">Concluded</span>}
                 </div>
@@ -265,10 +269,11 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                             <div className="space-y-3 max-w-3xl">
                                 {dayOps.map(op => {
                                     const colors = getTypeColor(op.type);
-                                    const activeParticipants = op.participants.filter(p => p.timeLeft === null).length;
-                                    const accepted = op.participants.filter(p => p.rsvpStatus === 'Accepted').length;
-                                    const tentative = op.participants.filter(p => p.rsvpStatus === 'Tentative').length;
-                                    const declined = op.participants.filter(p => p.rsvpStatus === 'Declined').length;
+                                    const roster = displayRoster(op);
+                                    const paxCount = roster.length;
+                                    const accepted = roster.filter(p => p.rsvpStatus === 'Accepted').length;
+                                    const tentative = roster.filter(p => p.rsvpStatus === 'Tentative').length;
+                                    const declined = roster.filter(p => p.rsvpStatus === 'Declined').length;
                                     const isConcluded = op.status === OperationStatus.Concluded;
                                     const displayTime = op.scheduledStart || op.activeStartTime;
                                     const isOverdue = op.status === OperationStatus.Scheduled && op.scheduledStart && new Date(op.scheduledStart).getTime() < today.getTime();
@@ -306,7 +311,7 @@ const OperationsCalendarView: React.FC<OperationsCalendarViewProps> = ({ operati
                                                 </div>
                                                 <div className="text-right shrink-0 ml-4 space-y-1">
                                                     <p className="text-xs text-slate-500">
-                                                        <i className="fa-solid fa-users mr-1"></i>{activeParticipants} PAX
+                                                        <i className="fa-solid fa-users mr-1"></i>{paxCount} PAX
                                                     </p>
                                                     {(accepted + tentative + declined) > 0 && (
                                                         <div className="flex items-center gap-1.5 text-[9px] font-mono justify-end">

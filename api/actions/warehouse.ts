@@ -336,13 +336,19 @@ export const warehouseActions = {
 
     'warehouse:fulfil_withdrawal': async ({ userId, requestId }: WithdrawalActionPayload) => {
         const movementId = await db.fulfilWithdrawalRequest(requestId, userId);
-        // Notify the requester that their withdrawal was fulfilled.
-        const requests = await db.listWithdrawalRequests({ stockId: undefined, limit: 1 });
-        const request = requests.find((r) => r.id === requestId);
-        if (request && request.requestedByUserId !== userId) {
-            sendPushToUsers([request.requestedByUserId], {
+        // Notify the requester that their withdrawal was fulfilled. Read THIS request
+        // by primary key (exact, so it needs neither a cap nor an ORDER BY): a newest-1
+        // list read only ever matched when the fulfilled request happened to be the
+        // most recently created one org-wide. Only the two fields the push uses.
+        const { data: request, error } = await db.supabase.from('warehouse_requests')
+            .select('requested_by_user_id, requested_quantity')
+            .eq('id', requestId)
+            .maybeSingle();
+        db.handleSupabaseError({ error, message: 'Failed to load withdrawal request' });
+        if (request && request.requested_by_user_id !== userId) {
+            sendPushToUsers([request.requested_by_user_id], {
                 title: 'Withdrawal fulfilled',
-                body: `Your withdrawal of ${request.requestedQuantity} has been released.`,
+                body: `Your withdrawal of ${request.requested_quantity} has been released.`,
                 tag: `wh-fulfilled-${requestId}`,
                 data: { view: 'warehouse', tab: 'withdrawals', requestId },
             }).catch((err) => log.warn('withdrawal fulfil push failed', { err }));

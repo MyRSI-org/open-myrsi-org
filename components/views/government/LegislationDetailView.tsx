@@ -7,6 +7,7 @@ import WindowFrame from '../../layout/WindowFrame';
 import WikiEditor from '../wiki/WikiEditor';
 import { GovernmentLegislation, LegislationStatus } from '../../../types';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { classifyVoteFailure } from './governmentUiRules';
 
 interface LegislationDetailViewProps {
     legislation: GovernmentLegislation;
@@ -35,6 +36,10 @@ const LegislationDetailView: React.FC<LegislationDetailViewProps> = ({ legislati
     const [commentText, setCommentText] = useState('');
     const [vetoReason, setVetoReason] = useState('');
     const [showVetoForm, setShowVetoForm] = useState(false);
+    // Bills this member has a stored ballot on, from THIS session (keyed by bill id, as the
+    // view is reused across bills): the vote, or '' when the server only reported an
+    // earlier ballot. Keeps the vote buttons from coming back before the refetch lands.
+    const [votedHere, setVotedHere] = useState<Record<number, string>>({});
 
     const canManage = hasPermission('gov:manage');
     const canVoteOnLegislation = hasPermission('gov:elected_official');
@@ -55,6 +60,9 @@ const LegislationDetailView: React.FC<LegislationDetailViewProps> = ({ legislati
 
     // Check if I've already voted
     const myVote = legislation.votes?.find(v => v.userId === currentUser?.id);
+    const votedHereValue = votedHere[legislation.id];
+    const hasVoted = !!myVote || votedHereValue !== undefined;
+    const myVoteValue = myVote?.vote || votedHereValue;
 
     const handleAdvanceStatus = async (action: string) => {
         setIsLoading(true);
@@ -78,10 +86,22 @@ const LegislationDetailView: React.FC<LegislationDetailViewProps> = ({ legislati
                 positionId: myVotingPositions[0]!.id,
                 vote,
             });
+            setVotedHere(prev => ({ ...prev, [legislation.id]: vote }));
             addToast('Vote Cast', <i className="fa-solid fa-check" />, 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50', { description: `You voted "${vote}" on this bill.` });
             await refreshGovernment();
         } catch (err: any) {
-            addToast('Vote Failed', <i className="fa-solid fa-circle-exclamation" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: err.message || 'Failed to cast vote.' });
+            const message: string = err?.message || 'Failed to cast vote.';
+            const failure = classifyVoteFailure(message);
+            if (failure === 'failed') {
+                addToast('Vote Failed', <i className="fa-solid fa-circle-exclamation" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: message });
+            } else {
+                // The ballot IS stored (only the tally refresh failed, or an earlier attempt
+                // already counted). Show the server's words as-is, stop offering the vote —
+                // a retry only answers "already voted" — and refetch the domain.
+                setVotedHere(prev => ({ ...prev, [legislation.id]: failure === 'recorded' ? vote : '' }));
+                addToast(failure === 'recorded' ? 'Vote Recorded' : 'Already Voted', <i className="fa-solid fa-triangle-exclamation" />, 'bg-amber-500/10 text-amber-400 border-amber-500/50', { description: message });
+                await refreshGovernment();
+            }
         } finally {
             setIsLoading(false);
         }
@@ -206,7 +226,7 @@ const LegislationDetailView: React.FC<LegislationDetailViewProps> = ({ legislati
             )}
 
             {/* Cast Vote */}
-            {isVoting && canVoteOnLegislation && myVotingPositions.length > 0 && !myVote && (
+            {isVoting && canVoteOnLegislation && myVotingPositions.length > 0 && !hasVoted && (
                 <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-lg p-4">
                     <h3 className="text-xs font-semibold text-white mb-3">Cast Your Vote</h3>
                     <p className="text-[10px] text-slate-400 mb-3">Voting as: {myVotingPositions[0]?.name}</p>
@@ -218,9 +238,9 @@ const LegislationDetailView: React.FC<LegislationDetailViewProps> = ({ legislati
                 </div>
             )}
 
-            {isVoting && myVote && (
+            {isVoting && hasVoted && (
                 <div className="text-center py-3">
-                    <span className="text-sm text-emerald-400"><i className="fa-solid fa-check-circle mr-1"></i>You voted "{myVote.vote}" on this bill.</span>
+                    <span className="text-sm text-emerald-400"><i className="fa-solid fa-check-circle mr-1"></i>{myVoteValue ? `You voted "${myVoteValue}" on this bill.` : 'You have voted on this bill.'}</span>
                 </div>
             )}
 

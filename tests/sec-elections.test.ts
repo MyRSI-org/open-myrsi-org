@@ -145,7 +145,9 @@ function seedVotingElection(over: Record<string, unknown> = {}) {
 }
 
 function seedBallots(voterCount: number) {
-    h.tables.government_election_votes = Array.from({ length: voterCount }, () => ({ election_id: 1, candidate_id: 7, rank_order: null }));
+    // Real ballot rows carry their (uuid) id, and the tally read refuses a repeated one —
+    // two id-less rows would read as the same row twice.
+    h.tables.government_election_votes = Array.from({ length: voterCount }, (_v, i) => ({ id: `ballot-${i}`, election_id: 1, candidate_id: 7, rank_order: null }));
     h.tables.government_election_voter_registry = Array.from({ length: voterCount }, (_v, i) => ({ id: i + 1, election_id: 1, user_id: 70 + i }));
 }
 
@@ -158,10 +160,12 @@ function seedImportedBallotElection(electionType: string) {
         { id: 7, election_id: 1, user_id: 70, withdrawn_at: null, is_winner: false },
         { id: 8, election_id: 1, user_id: 80, withdrawn_at: null, is_winner: false },
     ];
+    // Real ballot rows carry their id; the ranked-choice read pages on (rank_order, id)
+    // and refuses a repeated id, so the fixture rows need one too.
     h.tables.government_election_votes = [
-        { election_id: 1, candidate_id: 7, rank_order: 1, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}aaa` },
-        { election_id: 1, candidate_id: 8, rank_order: 2, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}bbb` },
-        { election_id: 1, candidate_id: 7, rank_order: 2, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}ccc` },
+        { id: 1, election_id: 1, candidate_id: 7, rank_order: 1, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}aaa` },
+        { id: 2, election_id: 1, candidate_id: 8, rank_order: 2, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}bbb` },
+        { id: 3, election_id: 1, candidate_id: 7, rank_order: 2, voter_hash: `${IMPORTED_BALLOT_HASH_PREFIX}ccc` },
     ];
     h.tables.government_election_voter_registry = [
         { id: 1, election_id: 1, user_id: 101 },

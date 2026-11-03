@@ -202,11 +202,11 @@ export async function createGovernmentOrder(input: GovernmentOrderInput, userId:
 
 export async function updateGovernmentOrder(orderId: string, patch: Partial<GovernmentOrderInput>, userId: number): Promise<void> {
     const { data: existing } = await supabase.from('government_orders')
-        .select('issuer_user_id, status')
+        .select('issuer_user_id, issuer_position_id, status')
         .eq('id', orderId)
-        
+
         .maybeSingle();
-    const ex = existing as { issuer_user_id?: number; status?: string } | null;
+    const ex = existing as { issuer_user_id?: number; issuer_position_id?: number; status?: string } | null;
     if (!ex) throw new Error('Order not found.');
     if (ex.issuer_user_id !== userId) throw new Error('Only the author can edit this order.');
     // ONLY A DRAFT IS EDITABLE. The guard used to read
@@ -223,6 +223,16 @@ export async function updateGovernmentOrder(orderId: string, patch: Partial<Gove
         throw new Error('Published orders cannot be edited. Revoke and issue a replacement if needed.');
     }
 
+    // The same non-empty rule createGovernmentOrder applies. An edit could blank a
+    // draft's title or body (both NOT NULL, so '' was stored), and publishing it then
+    // issued an executive order with no title or no text. A non-string is refused too
+    // rather than crashing on .trim().
+    for (const field of [patch.title, patch.body]) {
+        if (field !== undefined && (typeof field !== 'string' || !field.trim())) {
+            throw new Error('Title and body are required.');
+        }
+    }
+
     const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (patch.title !== undefined) updates.title = patch.title.trim();
     if (patch.body !== undefined) updates.body = patch.body.trim();
@@ -233,6 +243,10 @@ export async function updateGovernmentOrder(orderId: string, patch: Partial<Gove
     if (patch.expiresAt !== undefined) updates.expires_at = patch.expiresAt || null;
 
     if (patch.status === 'active' && ex.status === 'draft') {
+        // Publishing IS issuing: re-check, as createGovernmentOrder does for an active
+        // order, that the author still holds the office the draft names. Without this a
+        // member removed from office could still publish a draft written while in it.
+        await assertCanIssueOrders(userId, ex.issuer_position_id);
         const now = new Date().toISOString();
         updates.status = 'active';
         updates.issued_at = now;

@@ -178,17 +178,22 @@ const LoadingFallback = () => (
     </div>
 );
 
+// Per user, not per browser: one member dismissing the banner on a shared browser must not
+// hide it from the next, who would otherwise never be offered push for their own account.
+const pushBannerDismissedKey = (userId: number | undefined) => `push_banner_dismissed:${userId ?? 'anon'}`;
+
 const PushNotificationBanner = () => {
-    const { subscribeToPush, isPushActive } = useAuth();
+    const { subscribeToPush, isPushActive, currentUser } = useAuth();
+    const dismissedKey = pushBannerDismissedKey(currentUser?.id);
     const [dismissed, setDismissed] = useState(() => {
-        return localStorage.getItem('push_banner_dismissed') === 'true';
+        return localStorage.getItem(dismissedKey) === 'true';
     });
 
     if (isPushActive || dismissed) return null;
     if (!('Notification' in window) || Notification.permission === 'denied') return null;
 
     const handleDismiss = () => {
-        localStorage.setItem('push_banner_dismissed', 'true');
+        localStorage.setItem(dismissedKey, 'true');
         setDismissed(true);
     };
 
@@ -597,7 +602,7 @@ const AppContent: React.FC = () => {
                     </button>
                 </div>
                 <div className="absolute bottom-8 text-[10px] text-slate-600 font-mono uppercase tracking-[0.3em]">
-                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.7.0-open
+                    {brandingConfig?.name || 'Operations'} {'//'} Termlink v15.7.1-open
                 </div>
             </div>
         );
@@ -732,7 +737,8 @@ const AppContent: React.FC = () => {
                 })}
             </div>
             <SchemaUpdateBanner />
-            <PushNotificationBanner />
+            {/* Keyed on the user so the dismissed flag is re-read for whoever is signed in. */}
+            <PushNotificationBanner key={currentUser.id} />
 
             {/* Global Modals */}
             {eamMessage && <EamModal message={eamMessage} onClose={() => setEamMessage(null)} soundUrl={brandingConfig.eamSoundUrl} volume={volume} />}

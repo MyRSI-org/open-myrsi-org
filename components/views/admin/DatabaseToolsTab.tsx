@@ -4,16 +4,7 @@ import { useData } from '../../../contexts/DataContext';
 
 import { TabPageHeader } from '../../shared/ui';
 import { useNotification } from '../../../contexts/NotificationContext';
-
-interface HealthCheckResult {
-    check: string;
-    status: 'OK' | 'WARNING' | 'ERROR';
-    // Nullable: the schema-version and secret-encryption rows are diagnostics, not counts,
-    // and report null. The server has always typed it this way; this side used to claim
-    // otherwise and render a blank cell.
-    count: number | null;
-    action?: string;
-}
+import { HealthCheckRow, type HealthCheckResult } from './HealthCheckRow';
 
 // Zone heading — groups the tab into Operations / Data Hygiene / Danger Zone.
 const ZoneHeader: React.FC<{ icon: string; title: string; subtitle: string; tone?: 'normal' | 'danger' }> = ({ icon, title, subtitle, tone = 'normal' }) => (
@@ -410,21 +401,7 @@ const DatabaseToolsTab: React.FC = () => {
                     {healthReport.length > 0 ? (
                         <div className="space-y-3">
                             {healthReport.map((item) => (
-                                <div key={item.check} className="flex items-center justify-between p-3 rounded-sm bg-slate-800/30 border border-slate-700/30">
-                                    <div>
-                                        <p className="text-sm font-bold text-slate-200">{item.check}</p>
-                                        <p className="text-xs text-slate-500">Records: {item.count}</p>
-                                    </div>
-                                    {/* Three tones, not two. ERROR used to render in the same
-                                        amber as WARNING, so "your credentials are unrecoverable"
-                                        looked identical to "you can remove the old key now". */}
-                                    <div className={`px-2 py-0.5 rounded text-[10px] font-black uppercase border ${item.status === 'OK' ? 'text-green-400 border-green-500/30 bg-green-500/10' :
-                                            item.status === 'ERROR' ? 'text-red-300 border-red-500/40 bg-red-500/15 animate-pulse' :
-                                                'text-amber-400 border-amber-500/30 bg-amber-500/10 animate-pulse'
-                                        }`}>
-                                        {item.status}
-                                    </div>
-                                </div>
+                                <HealthCheckRow key={item.check} item={item} />
                             ))}
                         </div>
                     ) : (

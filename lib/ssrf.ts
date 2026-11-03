@@ -69,6 +69,29 @@ function devLoopbackAllowed(): boolean {
 export interface ResolvedAddress { address: string; family: number }
 
 /**
+ * The IPv4 address an IPv4-mapped IPv6 address in HEX form reaches, or null.
+ * WHATWG URL serialises a mapped literal in hex (`[::ffff:127.0.0.1]` becomes
+ * `::ffff:7f00:1`), dns.lookup echoes an IP literal verbatim, and a dual-stack
+ * socket connects to the embedded IPv4 address.
+ *
+ * Deliberately redundant. isPrivateIpv6Address (lib/linkUrl.ts) now decodes this
+ * form itself, in every spelling, so on a correct build the check that uses this
+ * never fires. It stays as belt-and-braces: the URL parser turns every
+ * `[::ffff:a.b.c.d]` peer URL into this form (`https://[::ffff:169.254.169.254]/`
+ * reaches the guard as `::ffff:a9fe:a9fe`), it is the spelling that already slipped
+ * past that predicate's text matching once, and a regression in the shared IPv6
+ * parsing must not reopen it here. Pinned with the predicate stubbed out by
+ * tests/ssrfMappedBeltAndBraces.test.ts.
+ */
+function hexMappedIpv4(address: string): string | null {
+    const m = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(address);
+    if (!m) return null;
+    const hi = parseInt(m[1], 16);
+    const lo = parseInt(m[2], 16);
+    return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+}
+
+/**
  * Throws if `urlOrOrigin`'s hostname resolves to a private/reserved address.
  * Returns the vetted addresses so callers (ssrfSafeFetch) can PIN the
  * connection to them. Returns [] when the dev loopback bypass is enabled
@@ -98,6 +121,11 @@ export async function assertResolvesToPublicHost(urlOrOrigin: string): Promise<R
             throw new Error('Peer host resolves to a private/reserved address');
         }
         if (r.family === 6 && isPrivateIpv6Address(r.address)) {
+            throw new Error('Peer host resolves to a private/reserved address');
+        }
+        // Belt-and-braces duplicate of the check above (see hexMappedIpv4).
+        const mapped = r.family === 6 ? hexMappedIpv4(r.address) : null;
+        if (mapped && isPrivateIpv4(mapped)) {
             throw new Error('Peer host resolves to a private/reserved address');
         }
     }

@@ -17,6 +17,8 @@ const h = vi.hoisted(() => ({
     platformSettings: {} as Record<string, unknown>,
     // Cache-free Admin-identity re-check, consulted on the DENY path only.
     freshAdmin: false,
+    // The platform-settings read itself faults (contracted never to, hence a backstop).
+    settingsFault: false,
 }));
 
 function sbBuilder() {
@@ -42,7 +44,10 @@ vi.mock('../lib/db', () => ({
     supabase: sbBuilder(),
     // The org-ban gate runs on every authenticated dispatcher request; null = not banned.
     findActiveBan: async () => null,
-    getPlatformSettings: async () => h.platformSettings,
+    getPlatformSettings: async () => {
+        if (h.settingsFault) throw new Error('settings read failed');
+        return h.platformSettings;
+    },
     getUserById: async () => h.userResult!(),
     isOptionalFeatureEnabled: async () => true,
     resolveIsSystemAdminFresh: async () => h.freshAdmin,
@@ -70,6 +75,7 @@ beforeEach(() => {
     h.userResult = () => ({ id: 1, role: 'Member', permissions: [] });
     h.platformSettings = { maintenance_mode: true };
     h.freshAdmin = false;
+    h.settingsFault = false;
 });
 
 describe('maintenance gate — the admin bypass fails closed when identity cannot be read', () => {
@@ -132,6 +138,25 @@ describe('maintenance gate — the admin bypass fails closed when identity canno
         const qRes = mockRes();
         await queryHandler(getReq({ target: 'state', subset: 'not-a-subset' }), asResponse(qRes));
         expect(qRes.statusCode).toBe(400);
+    });
+
+    // The settings read drives both the maintenance and the force-logout gate on both
+    // surfaces, and both refusals live inside its try: a warn-only catch skipped both. The
+    // two surfaces must refuse TOGETHER, or the dashboard loads while every mutation is
+    // refused (or vice versa). Nobody is an Admin when the platform state is unreadable.
+    it('a platform-settings read fault refuses on BOTH surfaces, even the stamped system Admin', async () => {
+        h.settingsFault = true;
+        h.userResult = () => ({ id: 1, isSystemAdmin: true, permissions: [] });
+
+        const svcRes = mockRes();
+        await servicesHandler(postReq('warehouse:list_catalog'), asResponse(svcRes));
+        expect(svcRes.statusCode).toBe(503);
+        expect(svcRes.body.message).toMatch(/maintenance/i);
+
+        const qRes = mockRes();
+        await queryHandler(getReq({ target: 'state', subset: 'not-a-subset' }), asResponse(qRes));
+        expect(qRes.statusCode).toBe(503);
+        expect(qRes.body.message).toMatch(/maintenance/i);
     });
 
     it('the stamped system Admin is still let through on both surfaces (the bypass is not broken)', async () => {

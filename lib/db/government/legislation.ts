@@ -115,10 +115,24 @@ export async function getMotionsState(currentUserId?: number): Promise<Governmen
 // Legislation CRUD
 // ---------------------------------------------------------------------------
 
+const LEGISLATION_BODY_ERROR = 'Bill text must be a rich-text document.';
+
+// Legislation body is edited via the WikiEditor (Tiptap JSON) — sanitize on save.
+// Anything that was NOT an object used to be stored exactly as received, skipping
+// sanitizeTiptapJson, the private-media key normalisation and the image cap, so a
+// raw RPC could persist an arbitrary string that renders as the bill text. Only an
+// absent/empty body keeps the legacy '' (the column default); every other
+// non-object is refused rather than guessed at.
+function sanitizeLegislationBody(body: unknown): unknown {
+    if (body === undefined || body === null || body === '') return '';
+    if (typeof body !== 'object') throw new Error(LEGISLATION_BODY_ERROR);
+    const safe = normalizeDocMediaForStorage(sanitizeTiptapJson(body, 'wiki'));
+    assertDocImageCap(safe);
+    return safe;
+}
+
 export async function createLegislation(data: Partial<GovernmentLegislation> & { userId?: number }): Promise<GovernmentLegislation | null> {
-    // Legislation body is edited via the WikiEditor (Tiptap JSON) — sanitize on save.
-    const safeBody = data.body && typeof data.body === 'object' ? normalizeDocMediaForStorage(sanitizeTiptapJson(data.body, 'wiki')) : (data.body || '');
-    if (safeBody && typeof safeBody === 'object') assertDocImageCap(safeBody);
+    const safeBody = sanitizeLegislationBody(data.body);
     const payload = {
         title: data.title,
         body: safeBody,
@@ -137,18 +151,17 @@ export async function createLegislation(data: Partial<GovernmentLegislation> & {
 }
 
 export async function updateLegislation(legislationId: number, updates: Partial<GovernmentLegislation>) {
-    // Cannot update while in Voting status
-    const { data: leg } = await supabase.from('government_legislation')
+    // Cannot update while in Voting status. Fails CLOSED: a discarded read error made
+    // an unreadable status pass as "not Voting", letting the text change mid-vote.
+    const { data: leg, error: legErr } = await supabase.from('government_legislation')
         .select('status').eq('id', legislationId).single();
+    handleSupabaseError({ error: legErr, message: 'Failed to load legislation' });
     if (leg?.status === 'Voting') throw new Error('Cannot modify legislation while voting is active');
 
     const dbUpdates: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (updates.title !== undefined) dbUpdates.title = updates.title;
     if (updates.body !== undefined) {
-        dbUpdates.body = updates.body && typeof updates.body === 'object'
-            ? normalizeDocMediaForStorage(sanitizeTiptapJson(updates.body, 'wiki'))
-            : updates.body;
-        if (dbUpdates.body && typeof dbUpdates.body === 'object') assertDocImageCap(dbUpdates.body);
+        dbUpdates.body = sanitizeLegislationBody(updates.body);
     }
     if (updates.summary !== undefined) dbUpdates.summary = updates.summary;
     if (updates.sponsorPositionId !== undefined) dbUpdates.sponsor_position_id = updates.sponsorPositionId;
@@ -223,53 +236,158 @@ export async function castLegislationVote(
     if (error && (error as { code?: string }).code === '23505') throw new Error('You have already voted on this legislation.');
     handleSupabaseError({ error, message: 'Failed to cast legislation vote' });
 
-    // Update vote counts
-    await updateLegislationVoteCounts(legislationId);
-    broadcastGovernmentUpdate('legislation');
+    // The ballot is stored from here on. A tally refresh that fails still throws
+    // ('Your vote was recorded, but ...'), but the id-only broadcast goes out regardless
+    // — skipping it left every other member unaware that a ballot had landed.
+    try {
+        await updateLegislationVoteCounts(legislationId);
+    } finally {
+        broadcastGovernmentUpdate('legislation');
+    }
 }
 
+// Refreshes the cached votes_* columns the bill shows while voting is open. They no
+// longer DECIDE anything — concludeLegislationVote recounts the ballot rows itself —
+// but they still fail CLOSED on both I/O steps: a discarded recount read error used to
+// fall through `votes || []` and overwrite the tally with 0/0/0, and a discarded tally
+// write error left a stale tally with no signal. The ballot row itself is already
+// stored — the message says so, so a voter does not retry into "already voted".
 async function updateLegislationVoteCounts(legislationId: number) {
-    const { data: votes } = await supabase.from('government_legislation_votes')
+    const { data: votes, error: readErr } = await supabase.from('government_legislation_votes')
         .select('vote').eq('legislation_id', legislationId);
+    handleSupabaseError({ error: readErr, message: 'Your vote was recorded, but the legislation tally could not be recounted' });
     const counts = { for: 0, against: 0, abstain: 0 };
     for (const v of (votes || [])) {
         if (v.vote in counts) counts[v.vote as keyof typeof counts]++;
     }
-    await supabase.from('government_legislation').update({
+    const { error: writeErr } = await supabase.from('government_legislation').update({
         votes_for: counts.for,
         votes_against: counts.against,
         votes_abstain: counts.abstain,
         updated_at: new Date().toISOString(),
     }).eq('id', legislationId);
+    handleSupabaseError({ error: writeErr, message: 'Your vote was recorded, but the legislation tally could not be saved' });
 }
 
-export async function concludeLegislationVote(legislationId: number): Promise<{ passed: boolean }> {
-    const { data: leg } = await supabase.from('government_legislation')
-        .select('votes_for, votes_against, votes_abstain')
-        .eq('id', legislationId).single();
-    if (!leg) throw new Error('Legislation not found');
+// ---------------------------------------------------------------------------
+// Conclusion recount — every ballot row, or a refusal
+// ---------------------------------------------------------------------------
 
+const RECOUNT_PAGE = 1000;
+const RECOUNT_MAX_PAGES = 500;   // 500k ballots, far past any org, then refuse
+
+interface VoteTally { for: number; against: number; abstain: number }
+
+/**
+ * A bill or motion is DECIDED from its ballot rows, never from the cached votes_*
+ * columns.
+ *
+ * The cache is rewritten after every cast, but only on a best-effort path: the ballot
+ * is stored first, and a recount or cache write that fails after it leaves the cache
+ * one or more votes behind (the voter is told so, and cannot re-cast). The conclusion
+ * used to read that cache — so a failed cache refresh after the deciding vote could
+ * carry a bill the ballots had defeated, or the reverse.
+ *
+ * So the conclusion counts the rows itself: paged to exhaustion on a total order (id),
+ * then VERIFIED against an exact count taken after the pages. That count alone does not
+ * catch every ballot cast mid-read: an identity id is drawn at insert but becomes
+ * visible at commit, so a ballot can appear with an id inside a page already read. It
+ * then pushes that page's last row across the boundary — read twice, the new ballot
+ * never read, and the totals still agree. A repeated id therefore refuses too; a ballot
+ * that lands after the read position is caught by the count. Any read error refuses
+ * as well. A refused conclusion is re-runnable; a wrong one is on the record. Same
+ * shape as getVotesForElection.
+ */
+async function recountBallots(
+    table: 'government_legislation_votes' | 'government_motion_votes',
+    parentColumn: 'legislation_id' | 'motion_id',
+    parentId: number,
+    noun: 'legislation' | 'motion',
+): Promise<VoteTally> {
+    const refusal = `The ${noun} ballot count changed while it was being recounted — conclude it again.`;
+    const tally: VoteTally = { for: 0, against: 0, abstain: 0 };
+    const seenIds = new Set<number>();
+    for (let page = 0; page < RECOUNT_MAX_PAGES; page++) {
+        const from = page * RECOUNT_PAGE;
+        const { data, error } = await supabase.from(table)
+            .select('id, vote')
+            .eq(parentColumn, parentId)
+            .order('id', { ascending: true })
+            .range(from, from + RECOUNT_PAGE - 1);
+        handleSupabaseError({ error, message: `Failed to recount the ${noun} ballots` });
+        const rows = (data || []) as Array<{ id: number; vote: string }>;
+        for (const r of rows) {
+            if (seenIds.has(r.id)) throw new Error(refusal);
+            seenIds.add(r.id);
+            if (r.vote === 'for') tally.for++;
+            else if (r.vote === 'against') tally.against++;
+            else if (r.vote === 'abstain') tally.abstain++;
+        }
+        if (rows.length < RECOUNT_PAGE) break;
+        if (page === RECOUNT_MAX_PAGES - 1) throw new Error(`Too many ${noun} ballots to recount safely — refusing to conclude on a partial count.`);
+    }
+
+    const { count, error: countErr } = await supabase.from(table)
+        .select('id', { count: 'exact', head: true })
+        .eq(parentColumn, parentId);
+    handleSupabaseError({ error: countErr, message: `Failed to verify the ${noun} ballot count` });
+    if (count == null || count !== seenIds.size) throw new Error(refusal);
+    return tally;
+}
+
+/**
+ * What a conclusion decided, carrying the fields its announcement needs: the
+ * gov:conclude_* handlers used to read title/status off a result that only held
+ * `passed`, so every push said the generic "A bill concluded (final).".
+ */
+export interface VoteConclusion {
+    passed: boolean;
+    status: 'Passed' | 'Failed';
+    title: string;
+}
+
+// Only an item in its voting state ('Voting' — the same word in LegislationStatus and
+// MotionStatus, and the only state the UI offers Conclude from) may be concluded. With no
+// status check, concluding a Vetoed bill re-decided it from its old ballots — an un-veto —
+// and a Draft, or a cancelled motion, could be "concluded" too. The conclusion UPDATE
+// carries the same condition, so a status change between the read and the write (a second
+// conclusion, a cancel) matches no row and refuses instead of silently overwriting it.
+
+export async function concludeLegislationVote(legislationId: number): Promise<VoteConclusion> {
+    const { data: leg, error: legErr } = await supabase.from('government_legislation')
+        .select('id, status, title')
+        .eq('id', legislationId).maybeSingle();
+    handleSupabaseError({ error: legErr, message: 'Failed to load legislation' });
+    if (!leg) throw new Error('Legislation not found');
+    if (leg.status !== 'Voting') throw new Error('Legislation is not in voting phase');
+
+    const tally = await recountBallots('government_legislation_votes', 'legislation_id', legislationId, 'legislation');
     const now = new Date().toISOString();
-    const passed = leg.votes_for > leg.votes_against;
-    const { error } = await supabase.from('government_legislation').update({
-        status: passed ? 'Passed' : 'Failed',
+    const passed = tally.for > tally.against;
+    const status = passed ? 'Passed' : 'Failed';
+    // The cache is brought into line with the recount the decision was taken from.
+    const conclusion = {
+        status,
         passed_at: passed ? now : null,
         voting_end: now,
+        votes_for: tally.for,
+        votes_against: tally.against,
+        votes_abstain: tally.abstain,
         updated_at: now,
-    }).eq('id', legislationId);
+    };
+    const { data: concluded, error } = await supabase.from('government_legislation')
+        .update(conclusion).eq('id', legislationId).eq('status', 'Voting').select('id');
     handleSupabaseError({ error, message: 'Failed to conclude vote' });
+    if (!Array.isArray(concluded) || concluded.length === 0) {
+        throw new Error('Legislation is no longer in voting phase — it was not concluded.');
+    }
     broadcastGovernmentUpdate('legislation');
-    return { passed };
+    return { passed, status, title: leg.title };
 }
 
 export async function vetoLegislation(legislationId: number, userId: number, reason: string) {
-    // Verify user holds a position with veto power
-    const { count } = await supabase.from('government_position_holders')
-        .select('id', { count: 'exact', head: true })
-        .eq('user_id', userId).is('ended_at', null)
-        .not('position_id', 'is', null);
-
-    // Check the positions they hold have veto power
+    // Verify the user currently holds a position with veto power. (An unreadable list
+    // reads as no holdings, so a read fault refuses the veto.)
     const { data: holders } = await supabase.from('government_position_holders')
         .select('position:government_positions(can_veto_legislation)')
         .eq('user_id', userId).is('ended_at', null);
@@ -331,11 +449,30 @@ export async function deleteLegislationComment(commentId: number) {
 // Motions CRUD
 // ---------------------------------------------------------------------------
 
+const MOTION_DESCRIPTION_ERROR = 'Motion description must be a rich-text document.';
+
+// Motion description is edited via the WikiEditor (Tiptap JSON) — sanitize on save.
+// The same flaw sanitizeLegislationBody closes: a non-object description used to be
+// stored exactly as received, skipping sanitizeTiptapJson, so a raw RPC could persist
+// an arbitrary string that renders as the motion text. Only an absent/empty
+// description keeps the legacy NULL (what MotionsTab sends for an empty editor);
+// every other non-object is refused rather than guessed at.
+// Deliberately NO normalizeDocMediaForStorage, unlike the bill body: getMotionsState
+// never re-signs private keys (no signDocMediaForClient), so collapsing a signed image
+// URL to its bare key here would break the image on the very next read. The image
+// cap is pure bounding and does apply.
+function sanitizeMotionDescription(description: unknown): unknown {
+    if (description === undefined || description === null || description === '') return null;
+    if (typeof description !== 'object') throw new Error(MOTION_DESCRIPTION_ERROR);
+    const safe = sanitizeTiptapJson(description, 'wiki');
+    assertDocImageCap(safe);
+    return safe;
+}
+
+// There is no motion update path (no gov:update_motion action, no updateMotion): a
+// motion's text is fixed at creation, so createMotion is the only description write.
 export async function createMotion(data: MotionInput): Promise<GovernmentMotion | null> {
-    // Motion description is edited via the WikiEditor (Tiptap JSON) — sanitize on save.
-    const safeDescription = data.description && typeof data.description === 'object'
-        ? sanitizeTiptapJson(data.description, 'wiki')
-        : (data.description || null);
+    const safeDescription = sanitizeMotionDescription(data.description);
     // restricted_to_position_ids is an integer[] (no FK constraint possible), so
     // validate each id refers to a real position before storing the vote-restriction
     // set — otherwise a gov:manage holder could write arbitrary/garbage ids.
@@ -420,42 +557,65 @@ export async function castMotionVote(
         handleSupabaseError({ error, message: 'Failed to cast motion vote' });
     }
 
-    // Update counts
-    await updateMotionVoteCounts(motionId);
-    broadcastGovernmentUpdate('motions');
+    // The ballot is stored from here on — as in castLegislationVote, a failed tally
+    // refresh still throws, but the id-only broadcast goes out regardless.
+    try {
+        await updateMotionVoteCounts(motionId);
+    } finally {
+        broadcastGovernmentUpdate('motions');
+    }
 }
 
+// Same fail-closed contract as updateLegislationVoteCounts: these cached columns are
+// display-only (concludeMotion recounts the ballot rows), but neither a recount read
+// error (formerly 0/0/0) nor a tally write error may pass silently.
 async function updateMotionVoteCounts(motionId: number) {
-    const { data: votes } = await supabase.from('government_motion_votes')
+    const { data: votes, error: readErr } = await supabase.from('government_motion_votes')
         .select('vote').eq('motion_id', motionId);
+    handleSupabaseError({ error: readErr, message: 'Your vote was recorded, but the motion tally could not be recounted' });
     const counts = { for: 0, against: 0, abstain: 0 };
     for (const v of (votes || [])) {
         if (v.vote in counts) counts[v.vote as keyof typeof counts]++;
     }
-    await supabase.from('government_motions').update({
+    const { error: writeErr } = await supabase.from('government_motions').update({
         votes_for: counts.for,
         votes_against: counts.against,
         votes_abstain: counts.abstain,
         updated_at: new Date().toISOString(),
     }).eq('id', motionId);
+    handleSupabaseError({ error: writeErr, message: 'Your vote was recorded, but the motion tally could not be saved' });
 }
 
-export async function concludeMotion(motionId: number): Promise<{ passed: boolean }> {
-    const { data: motion } = await supabase.from('government_motions')
-        .select('votes_for, votes_against').eq('id', motionId).single();
+export async function concludeMotion(motionId: number): Promise<VoteConclusion> {
+    const { data: motion, error: motionErr } = await supabase.from('government_motions')
+        .select('id, status, title').eq('id', motionId).maybeSingle();
+    handleSupabaseError({ error: motionErr, message: 'Failed to load motion' });
     if (!motion) throw new Error('Motion not found');
+    // Voting state only — see the note above concludeLegislationVote.
+    if (motion.status !== 'Voting') throw new Error('Motion is not in voting phase');
 
+    // Decided from the ballot rows (see recountBallots), and the cache updated to match.
+    const tally = await recountBallots('government_motion_votes', 'motion_id', motionId, 'motion');
     const now = new Date().toISOString();
-    const passed = motion.votes_for > motion.votes_against;
-    const { error } = await supabase.from('government_motions').update({
-        status: passed ? 'Passed' : 'Failed',
+    const passed = tally.for > tally.against;
+    const status = passed ? 'Passed' : 'Failed';
+    const conclusion = {
+        status,
         concluded_at: now,
         voting_end: now,
+        votes_for: tally.for,
+        votes_against: tally.against,
+        votes_abstain: tally.abstain,
         updated_at: now,
-    }).eq('id', motionId);
+    };
+    const { data: concluded, error } = await supabase.from('government_motions')
+        .update(conclusion).eq('id', motionId).eq('status', 'Voting').select('id');
     handleSupabaseError({ error, message: 'Failed to conclude motion' });
+    if (!Array.isArray(concluded) || concluded.length === 0) {
+        throw new Error('Motion is no longer in voting phase — it was not concluded.');
+    }
     broadcastGovernmentUpdate('motions');
-    return { passed };
+    return { passed, status, title: motion.title };
 }
 
 export async function cancelMotion(motionId: number) {

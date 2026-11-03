@@ -41,10 +41,10 @@ Copy `.env.example` to `.env` and fill it in (or set them in your host's environ
 | `PORT` | `3000` |
 | `APP_URL` | `https://yourdomain.com` (no trailing slash). **Set this.** It overrides the `appUrl` stored in the database and is what Discord deep links and alliance pairing use — see [Moving to a new domain](#moving-to-a-new-domain) |
 | `SUPABASE_URL` | Project URL |
-| `SUPABASE_ANON_KEY` | Public anon key |
+| `SUPABASE_ANON_KEY` | The project's **publishable** key (`sb_publishable_…`) or its legacy `anon` key. This one is sent to every visitor, so it must never be the service-role / `sb_secret_…` key: the server **refuses to start in production** if it is a secret key (the service-role value, an `sb_secret_…` key, or a JWT whose role is not `anon`, such as a `service_role` one). Anything else it cannot recognise as publishable — a leftover placeholder, say — is never sent to a browser and is reported at boot and in Database Tools, but does not stop the server (live updates stay off). Unset = live updates disabled, nothing else |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Required.** Server-only; bypasses RLS |
 | `SUPABASE_JWT_SECRET` | **Required for live updates.** Project JWT secret (Dashboard → Settings → API → JWT Secret). The server mints short-lived per-user tokens with it to authorize the private realtime channels; unset = realtime disabled (fail-closed), and the app still works via manual refresh |
-| `JWT_SECRET` | Recommended. Session-token signing secret; falls back to the service-role key |
+| `JWT_SECRET` | **Required in production.** Signs every login session. Generate it with `openssl rand -hex 32` and use it for nothing else; there is no fallback to any other key. The server **refuses to start** if it is missing, shorter than 16 characters, or the same value as `SUPABASE_ANON_KEY` or `VAPID_PUBLIC_KEY` — both are sent to every visitor, so pasting either one here would let anyone sign a login. It **starts but warns** (boot log + Database Tools) if it is 16–31 characters or the same value as `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` or `SECRETS_ENCRYPTION_KEY`. Changing it signs everyone out — see [Rotating the session secret](#rotating-the-session-secret) |
 | `SECRETS_ENCRYPTION_KEY` | **Required in production** (the server refuses to start without it, and rejects anything under 32 characters). Encrypts at-rest secrets. Changeable — see [Rotating the encryption key](#rotating-the-encryption-key) |
 | `SECRETS_ENCRYPTION_KEY_PREVIOUS` | Only while rotating. The *old* key, kept readable so existing secrets still decrypt. Remove it once the rotation is finished |
 | `BALLOT_PEPPER` | Optional. Pins the value used to de-duplicate secret-ballot votes so a key rotation cannot re-open a vote in progress — see the rotation section |
@@ -54,7 +54,7 @@ Copy `.env.example` to `.env` and fill it in (or set them in your host's environ
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` | Web push |
 | `GEMINI_API_KEY`, `LIVEKIT_*`, `UEX_API_KEY` | Optional |
 
-The server fails fast on boot if `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` or `SECRETS_ENCRYPTION_KEY` is missing in production — and also if `SECRETS_ENCRYPTION_KEY` is shorter than 32 characters.
+The server fails fast on boot if `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SECRETS_ENCRYPTION_KEY` or `JWT_SECRET` is missing in production — and also if `SECRETS_ENCRYPTION_KEY` is shorter than 32 characters, if `JWT_SECRET` is shorter than 16 characters or reuses a key that is sent to visitors (the anon or VAPID public key), or if `SUPABASE_ANON_KEY` is actually a secret key. A `JWT_SECRET` of 16–31 characters, or one that reuses the service-role, Supabase JWT or encryption key, does not stop the server: it logs an error at boot and shows a warning in Database Tools until you rotate it. Outside production the same problems are logged instead, so a dev server still starts.
 
 Image uploads work out of the box. If you want to change the defaults, five optional variables let you: `MEDIA_MAX_UPLOAD_BYTES` (largest single image, default 5 MB), `MEDIA_MAX_STORAGE_BYTES` (total space uploads may use, default 250 MB), `MEDIA_GC_DRY_RUN=true` (makes the nightly cleanup only *report* unused images instead of deleting them — handy while you build confidence), and two that control how long a link to a private image stays valid: `MEDIA_SIGN_TTL_SECONDS` (default 900, i.e. 15 minutes — used when a page is shown to a reader) and `MEDIA_SIGN_TTL_EDITOR_SECONDS` (default 3600, i.e. an hour — used for the preview of an image you have just uploaded but not yet saved, so a long editing session doesn't lose it). Both are clamped to between 1 minute and 24 hours. Lowering the first is safe; images simply get re-fetched more often.
 
@@ -146,6 +146,14 @@ A `source` of `stored` means `APP_URL` was blank or rejected (unparseable, not `
 The importer already strips `systemConfig.appUrl` from an **Admin → Import** org export, so a normal import never carries another deployment's origin in. A raw database restore bypasses that, which is why `APP_URL` is the reliable control.
 
 Two related things do **not** need changing when you move: Discord OAuth uses the browser's own origin (register the new redirect URL in the Discord Developer Portal), and web-push deep links are origin-relative.
+
+### Rotating the session secret
+
+`JWT_SECRET` signs every login session. **If you generated it with `openssl rand -hex 32` as this guide says, there is nothing to do.** Change it only if it was ever exposed, if the server refuses to start because of it (the error says exactly why: under 16 characters, or a copy of the anon or VAPID public key), or — when convenient — if Database Tools shows a Session Secret warning. Changing it **signs everyone out** — each member just logs in again with Discord.
+
+1. **Pin your public ids first.** The opaque ids of the testimonials on your public org page are derived from `JWT_SECRET` unless `PUBLIC_SALT` is set. So before changing anything, set `PUBLIC_SALT` to your **current (old)** `JWT_SECRET` value and leave it set permanently. Skip this and those ids change.
+2. **Set the new secret.** Generate one with `openssl rand -hex 32` and put it in `JWT_SECRET`. Don't reuse any other key.
+3. **Restart.** Everyone is signed out; logging in again issues sessions under the new secret.
 
 ### Rotating the encryption key
 

@@ -50,7 +50,10 @@ export function computePayouts(
                 userId: r.userId,
                 name: r.name,
                 sharePercent,
-                amount: Math.floor((sharePercent / 100) * netPool),
+                // Floor the EXACT ratio. Routing through the float percentage
+                // (sharePercent / 100 * netPool) drops a unit on exact splits
+                // (a 1:2 split of 900 came out 299 instead of 300).
+                amount: norm > 0 ? Math.floor((r.share * netPool) / totalShare) : 0,
             };
         });
     }
@@ -84,7 +87,8 @@ export function computePayouts(
                 userId,
                 name: r.name,
                 sharePercent,
-                amount: Math.floor((sharePercent / 100) * netPool),
+                // Exact ratio, floored — see the custom branch above.
+                amount: Math.floor((r.totalTime * netPool) / grandTotal),
             };
         });
     }

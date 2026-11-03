@@ -22,6 +22,7 @@ import {
     operationCountdown,
     type OperationCountdown,
 } from './operations/operationStyles';
+import { displayRoster, isActiveParticipant, isOnRoster } from './participantRoster';
 const OperationsCalendarView = lazy(() => import('./OperationsCalendarView'));
 
 const OperationsCenterView: React.FC = () => {
@@ -102,17 +103,21 @@ const OperationsCenterView: React.FC = () => {
         const active = accessible.filter(op => op.status === OperationStatus.Active).length;
         const scheduled = accessible.filter(op => op.status === OperationStatus.Scheduled).length;
         const planning = accessible.filter(op => op.status === OperationStatus.Planning).length;
+        // Active ops only, so the displayed roster IS the active rows: a row stamped by an
+        // earlier conclusion (op reactivated) is not deployed.
         const deployed = accessible
             .filter(op => op.status === OperationStatus.Active)
-            .reduce((sum, op) => sum + op.participants.filter(p => p.timeLeft === null).length, 0);
+            .reduce((sum, op) => sum + displayRoster(op).length, 0);
         return { active, scheduled, planning, deployed };
     }, [operations, hasOperationAccess]);
 
 
+    // "My Active Deployments" — the ACT term on purpose: the section is about where the
+    // viewer is deployed right now, and it only ever holds Active ops.
     const myActiveOperations = useMemo(() => {
         return operations.filter(op =>
             op.status === OperationStatus.Active &&
-            op.participants.some(p => p.userId === currentUser?.id && p.timeLeft === null)
+            isActiveParticipant(op, currentUser?.id)
         ).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     }, [operations, currentUser?.id]);
 
@@ -150,7 +155,7 @@ const OperationsCenterView: React.FC = () => {
         } else if (filter === 'Scheduled') {
             result = result.filter(op => op.status === OperationStatus.Scheduled);
         } else if (filter === 'My Concluded') {
-            result = result.filter(op => op.status === OperationStatus.Concluded && op.participants.some(p => p.userId === currentUser?.id));
+            result = result.filter(op => op.status === OperationStatus.Concluded && isOnRoster(op, currentUser?.id));
         } else if (filter !== 'All') {
             result = result.filter(op => op.status === filter);
         }
@@ -175,7 +180,7 @@ const OperationsCenterView: React.FC = () => {
             if (op.status === OperationStatus.Planning) counts.Planning++;
             if (op.status === OperationStatus.Scheduled) counts.Scheduled++;
             if (isCurrentOp(op)) counts.Current++;
-            if (op.status === OperationStatus.Concluded && op.participants.some(p => p.userId === currentUser?.id)) counts.MyConcluded++;
+            if (op.status === OperationStatus.Concluded && isOnRoster(op, currentUser?.id)) counts.MyConcluded++;
         }
         return counts;
     }, [otherOperations, currentUser?.id, isCurrentOp]);
@@ -385,8 +390,10 @@ const OperationsCenterView: React.FC = () => {
 const UpcomingOpCard: React.FC<{ op: HydratedOperation }> = React.memo(({ op }) => {
     const { viewOperationDetails } = useNavigation();
     const fmt = useFormatDate();
-    const accepted = op.participants.filter(p => p.rsvpStatus === 'Accepted' && p.timeLeft === null).length;
-    const total = op.participants.filter(p => p.timeLeft === null).length;
+    // Upcoming = Scheduled ops, so the displayed roster is the active rows.
+    const roster = displayRoster(op);
+    const accepted = roster.filter(p => p.rsvpStatus === 'Accepted').length;
+    const total = roster.length;
 
     const tA = ACCENTS[operationTypeAccent(op.type)];
     const tIcon = operationTypeIcon(op.type);

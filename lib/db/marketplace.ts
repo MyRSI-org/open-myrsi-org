@@ -696,7 +696,17 @@ export async function markMarketplaceDelivered(id: string, userId: number, actor
             await supabase.from('marketplace_contracts').update({
                 status: fromStatus, delivered_at: null, updated_at: nowIso(),
             }).eq('id', id).eq('status', 'delivered');
-            throw new Error(`Stock movement failed: ${rpcErr.message}`);
+            // Never forward the Postgres text to the seller: the plain Error it was
+            // wrapped in sailed past the dispatcher's opaque-error classifier. The
+            // one expected business failure (the RAISE in
+            // warehouse_marketplace_deliver, schema.sql) gets fixed copy; anything
+            // else is logged and replaced by handleSupabaseError's fixed message.
+            const rpcMessage = typeof rpcErr.message === 'string' ? rpcErr.message : '';
+            if (/^WAREHOUSE_INSUFFICIENT_STOCK\b/.test(rpcMessage)) {
+                log.warn('marketplace delivery refused: insufficient warehouse stock', { contractId: id });
+                throw new Error('Stock movement failed: the linked warehouse stock does not have enough on hand to deliver this contract.');
+            }
+            handleSupabaseError({ error: rpcErr, message: 'Stock movement failed' });
         }
         broadcastToOrg('warehouse:stock_update', {});
     }

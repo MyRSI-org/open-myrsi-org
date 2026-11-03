@@ -143,7 +143,10 @@ export async function upsertGovernmentConfig(config: Partial<GovernmentConfig>):
 
     // Single-org: government_configs holds exactly one row. Upsert on the PK —
     // reuse the existing row's id if present, otherwise insert a fresh one.
-    const { data: existing } = await supabase.from('government_configs').select('id').limit(1).maybeSingle();
+    // Fails CLOSED: a read fault must not pass as "no row yet" — that inserted a SECOND
+    // config, after which every maybeSingle() read of it errors and the config vanishes.
+    const { data: existing, error: existingErr } = await supabase.from('government_configs').select('id').limit(1).maybeSingle();
+    handleSupabaseError({ error: existingErr, message: 'Failed to load government config' });
     if (existing?.id) payload.id = existing.id;
     const { data, error } = await supabase.from('government_configs')
         .upsert(payload, { onConflict: 'id' })
@@ -157,9 +160,11 @@ export async function upsertGovernmentConfig(config: Partial<GovernmentConfig>):
 export async function updateConstitution(content: unknown) {
     const safeContent = content ? normalizeDocMediaForStorage(sanitizeTiptapJson(content, 'wiki')) : null;
     if (safeContent) assertDocImageCap(safeContent);
+    // Single-org: the one config row. The always-true filter is explicit because an
+    // UPDATE with no WHERE clause is refused outright where pg-safeupdate is loaded.
     const { error } = await supabase.from('government_configs')
         .update({ constitution_content: safeContent, updated_at: new Date().toISOString() })
-        ;
+        .not('id', 'is', null);
     handleSupabaseError({ error, message: 'Failed to update constitution' });
     broadcastGovernmentUpdate('structure');
 }
@@ -412,20 +417,27 @@ async function appointPositionHolderFallback(data: Partial<GovernmentPositionHol
         .select('max_holders').eq('id', data.positionId).single();
     if (!position) throw new Error('Position not found');
 
-    const { count } = await supabase.from('government_position_holders')
+    // Both counts fail CLOSED. The seat count used to skip the max_holders check
+    // whenever it came back null — so any read fault (or an unreadable count) seated
+    // the appointee into a full office. "I could not count the holders" is a refusal.
+    const { count, error: countErr } = await supabase.from('government_position_holders')
         .select('id', { count: 'exact', head: true })
         .eq('position_id', data.positionId)
         .is('ended_at', null);
-    if (count !== null && count >= position.max_holders) {
+    handleSupabaseError({ error: countErr, message: 'Failed to count the position\'s holders' });
+    if (count == null) throw new Error('Could not verify how many members hold this position — try again.');
+    if (count >= position.max_holders) {
         throw new Error(`Position is full (${position.max_holders} holder${position.max_holders > 1 ? 's' : ''} max)`);
     }
 
-    const { count: existingCount } = await supabase.from('government_position_holders')
+    const { count: existingCount, error: existingErr } = await supabase.from('government_position_holders')
         .select('id', { count: 'exact', head: true })
         .eq('position_id', data.positionId)
         .eq('user_id', data.userId)
         .is('ended_at', null);
-    if (existingCount && existingCount > 0) {
+    handleSupabaseError({ error: existingErr, message: 'Failed to check for an existing holding' });
+    if (existingCount == null) throw new Error('Could not verify whether this member already holds the position — try again.');
+    if (existingCount > 0) {
         throw new Error('User already holds this position');
     }
 

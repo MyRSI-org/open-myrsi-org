@@ -5,6 +5,7 @@ import { useFormatDate } from '../../../../contexts/AuthContext';
 import { ACCENTS } from '../../../shared/ui/accents';
 import ResponderStack from '../requests/ResponderStack';
 import { useNavigation } from '../../../../contexts/NavigationContext';
+import { displayRoster } from '../participantRoster';
 import {
     operationStatusAccent,
     operationStatusIcon,
@@ -45,13 +46,16 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
     const clearanceName = clearance?.name || (operation.clearanceLevel > 0 ? `LVL ${operation.clearanceLevel}` : '');
     const clearanceA = operation.clearanceLevel > 0 ? ACCENTS[clearanceAccent(operation.clearanceLevel)] : null;
 
-    const activeParticipants = useMemo(
-        () => operation.participants.filter(p => p.timeLeft === null),
-        [operation.participants]
+    // The whole roster on a concluded op (everyone stamped at conclusion), otherwise the
+    // active rows — so a concluded op no longer reads as "0 Active" with an empty team.
+    const isConcluded = operation.status === OperationStatus.Concluded;
+    const rosterParticipants = useMemo(
+        () => displayRoster({ status: operation.status, participants: operation.participants }),
+        [operation.status, operation.participants]
     );
-    const activeUsers = useMemo(
-        () => activeParticipants.map(p => p.user).filter((u): u is NonNullable<typeof u> => !!u),
-        [activeParticipants]
+    const rosterUsers = useMemo(
+        () => rosterParticipants.map(p => p.user).filter((u): u is NonNullable<typeof u> => !!u),
+        [rosterParticipants]
     );
 
     const countdown = operation.scheduledStart && operation.status === OperationStatus.Scheduled
@@ -245,13 +249,13 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
                         </p>
                     </div>
 
-                    {activeUsers.length > 0 && (
+                    {rosterUsers.length > 0 && (
                         <div>
                             <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest mb-2">
-                                Team · {activeUsers.length}{operation.maxParticipants ? ` / ${operation.maxParticipants}` : ''}
+                                Team · {rosterUsers.length}{operation.maxParticipants ? ` / ${operation.maxParticipants}` : ''}
                             </p>
                             <ResponderStack
-                                members={activeUsers}
+                                members={rosterUsers}
                                 leadId={operation.ownerId}
                             />
                         </div>
@@ -275,7 +279,7 @@ const OperationCard: React.FC<Props> = ({ operation }) => {
                     )}
                     <span className="inline-flex items-center gap-1 text-slate-400">
                         <i className="fa-solid fa-users" aria-hidden />
-                        {activeParticipants.length} Active
+                        {rosterParticipants.length} {isConcluded ? 'On roster' : 'Active'}
                     </span>
                 </span>
             </div>

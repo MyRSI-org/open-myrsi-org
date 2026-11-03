@@ -130,6 +130,10 @@ describe('notification bodies never carry gated content', () => {
         // It rode into an OS notification tray — a surface with no permission gate that
         // renders on a lock screen — and the durable row would have made it permanent.
         expect(handler).not.toMatch(/reason\s*\?\.\s*slice/);
-        expect(handler).toContain('open the ledger for details');
+        // Rejection reasons are approver-only (treasury_ledger_entries.rejection_reason), so
+        // pointing a non-approver submitter at the ledger "for details" would send them to a
+        // reason they can no longer see.
+        expect(handler).toContain('Contact a finance officer for details');
+        expect(handler).not.toContain('open the ledger');
     });
 });

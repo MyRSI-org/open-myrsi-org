@@ -11,6 +11,7 @@ import { GovernmentBranchType, PositionFillMethod,
 import { TabPageHeader } from '../../shared/ui';
 import WindowFrame from '../../layout/WindowFrame';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { TEMPLATE_APPLY_WARNING } from '../government/governmentUiRules';
 
 const EMPTY_EDITOR_CONTENT: Record<string, never> = {};
 
@@ -127,9 +128,9 @@ const GovernmentSettingsTab: React.FC = () => {
     const applyTemplate = async (templateType: string) => {
         const confirmed = await confirm({
             title: 'Apply Template',
-            message: 'This will replace all current branches and positions with the template defaults. Position holders will be removed. Continue?',
+            message: TEMPLATE_APPLY_WARNING,
             confirmText: 'Apply Template',
-            variant: 'warning'
+            variant: 'danger'
         });
         if (!confirmed) return;
         setIsLoading(true);

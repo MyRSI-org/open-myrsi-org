@@ -65,9 +65,12 @@ function envSeconds(name: string, def: number): number {
  *  These are FLOORS in practice: a Supabase signed URL cannot be renewed, only re-minted,
  *  and nothing on the client re-mints on a timer — a page left open past the TTL shows
  *  broken images until its view refetches. Do not drop READ below ~15 minutes without first
- *  giving the client a re-sign trigger. Note the stored objects carry a one-year
- *  `cacheControl` (see uploadOrgMedia), so each re-sign is a new cache key and a full
- *  re-download: that, not the round-trip, is the real cost ceiling on lowering READ.
+ *  giving the client a re-sign trigger. Each re-sign is a new URL (new `?token=`) and so a
+ *  new cache key and a full re-download: that, not the round-trip, is the real cost ceiling
+ *  on lowering READ. It is also why private objects carry a `cacheControl` of only READ
+ *  (see uploadOrgMedia) — a longer max-age never produced a hit past the URL's own life, it
+ *  only left clearance-gated images in browser disk caches long after logout. The one-year
+ *  value is kept for the PUBLIC bucket, whose URLs are stable and actually get re-used.
  *
  *  READ   — hydrated into a document a permitted client is rendering right now. Every
  *           consumer (wiki view mount, wiki_page_slice, government view mount, legislation
@@ -79,6 +82,11 @@ function envSeconds(name: string, def: number): number {
  *           save. That property is load-bearing; it is pinned by a test. */
 export const SIGN_TTL_READ = envSeconds('MEDIA_SIGN_TTL_SECONDS', 900);
 export const SIGN_TTL_EDITOR = envSeconds('MEDIA_SIGN_TTL_EDITOR_SECONDS', 3600);
+
+/** Browser/CDN `max-age` for PUBLIC-bucket objects: one year. Keys are random uuids and
+ *  never overwritten (upsert: false), so a stored public URL always names the same bytes.
+ *  Supabase takes bare seconds and adds the `max-age=` itself. */
+const PUBLIC_MEDIA_CACHE_SECONDS = '31536000';
 
 /** Longest-edge cap applied by sharp; bounds stored bytes + downstream render cost. */
 const MEDIA_MAX_DIMENSION = 2048;
@@ -248,7 +256,9 @@ export async function uploadOrgMedia(feature: OrgMediaFeature, buf: Buffer): Pro
     const key = `${KEY_PREFIX}/${feature}/${randomUUID()}.webp`;
     const { error } = await supabase.storage.from(def.bucket).upload(key, out, {
         contentType: 'image/webp',
-        cacheControl: '31536000',
+        // Private objects are cached no longer than a read-signed URL lives (see the
+        // SIGN_TTL_READ note); anything outside the public bucket gets the short value.
+        cacheControl: def.bucket === PUBLIC_BUCKET ? PUBLIC_MEDIA_CACHE_SECONDS : String(SIGN_TTL_READ),
         upsert: false,
     });
     if (error) {

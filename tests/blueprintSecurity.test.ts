@@ -707,7 +707,18 @@ describe('schema', () => {
     it('schema.sql grants nothing to a role — that is the one-shot backfill\'s job', () => {
         // A grants backfill in a re-runnable convergence script restores what an
         // operator deliberately revoked, on every upgrade.
-        expect(SCHEMA_SRC).not.toContain("INSERT INTO public.role_permissions");
+        //
+        // Only what RUNS on a re-run is a backfill: top-level statements, DO blocks
+        // included. A CREATE FUNCTION body runs only when the server calls it, so those
+        // bodies are removed first — public.set_role_permissions (§4.2d) writes
+        // role_permissions as the atomic replace behind the Roles editor, i.e. an
+        // operator's own deliberate edit. Pinned below so no other body can join it.
+        const FN = /CREATE OR REPLACE FUNCTION\s+([\w.]+)\s*\([\s\S]*?\$\$([\s\S]*?)\$\$;/g;
+        expect(SCHEMA_SRC.replace(FN, '')).not.toContain('INSERT INTO public.role_permissions');
+        const writers = [...SCHEMA_SRC.matchAll(FN)]
+            .filter((m) => m[2].includes('INSERT INTO public.role_permissions'))
+            .map((m) => m[1]);
+        expect(writers).toEqual(['public.set_role_permissions']);
     });
 });
 

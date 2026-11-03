@@ -50,14 +50,46 @@ export function canViewAllClassifications(user?: ClearanceUser | null, bypassPer
 // passed all checks). Derive a stable scalar key, preferring id, then code/name;
 // strings (e.g. tests) pass through. Both sides use the same projection, so the
 // same marker yields the same key.
-function markerKey(m: unknown): string {
-    if (m && typeof m === 'object') {
+//
+// A marker that cannot be identified — null/undefined, or an object with no id,
+// code or name — has NO key (null). It used to become 'v:[object Object]' (or
+// 'v:null'), so two malformed markers, one on the item and one on the viewer,
+// matched each other and passed. An unidentifiable ITEM marker now denies (fail
+// closed); an unidentifiable VIEWER marker is dropped and satisfies nothing.
+//
+// The same holds one level down: a key part (id, code, name, or a scalar marker
+// itself) counts only when it is a string or a finite number. Anything else
+// stringifies to text unrelated values share or can forge — { id: {} } keyed as
+// 'id:[object Object]', so two such markers matched; { id: [5] } and an object
+// whose toString() returns '5' keyed as 'id:5' and matched a real marker 5; NaN,
+// Infinity and booleans collide the same way. Such a part is skipped (the next of
+// id → code → name is tried), and a marker with no usable part is unidentifiable.
+// The read side (markerKey) and the write side (heldMarkerIds) share this rule.
+
+/** A marker key part as text, or null when it is not a string or a finite number. */
+function keyPart(v: unknown): string | null {
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+    return null;
+}
+
+/** [kind, value] identifying a marker, or null when it cannot be identified. */
+function markerIdentity(m: unknown): [kind: string, value: string] | null {
+    if (m !== null && typeof m === 'object') {
         const o = m as Record<string, unknown>;
-        if (o.id !== undefined && o.id !== null) return `id:${String(o.id)}`;
-        if (o.code !== undefined && o.code !== null) return `code:${String(o.code)}`;
-        if (o.name !== undefined && o.name !== null) return `name:${String(o.name)}`;
+        for (const kind of ['id', 'code', 'name']) {
+            const value = keyPart(o[kind]);
+            if (value !== null) return [kind, value];
+        }
+        return null;
     }
-    return `v:${String(m)}`;
+    const value = keyPart(m);
+    return value === null ? null : ['v', value];
+}
+
+function markerKey(m: unknown): string | null {
+    const identity = markerIdentity(m);
+    return identity ? `${identity[0]}:${identity[1]}` : null;
 }
 
 export function passesClearance(
@@ -70,9 +102,13 @@ export function passesClearance(
     const level = user?.clearanceLevel?.level ?? 0;
     if ((classificationLevel ?? 0) > level) return false;
     if (itemMarkers && itemMarkers.length > 0) {
-        const held = new Set<string>((user?.limitingMarkers || []).map(markerKey));
+        const held = new Set<string>();
+        for (const k of (user?.limitingMarkers || []).map(markerKey)) {
+            if (k !== null) held.add(k);
+        }
         for (const m of itemMarkers) {
-            if (!held.has(markerKey(m))) return false;
+            const k = markerKey(m);
+            if (k === null || !held.has(k)) return false;
         }
     }
     return true;
@@ -105,18 +141,16 @@ export function filterByClearance<T extends ClearanceItem>(
 // the caller must apply at the relabel site (see updateWikiPage) —
 // assertCanClassify alone does not block setting level to 0.
 
-/** Held limiting-marker id set for the user (markers project to {id,...}). */
+/**
+ * Held limiting-marker id set for the user (markers project to {id,...}): each
+ * marker's identifying value, id → code → name, under the same key-part rule as
+ * the read side. An unidentifiable held marker adds nothing.
+ */
 function heldMarkerIds(user?: ClearanceUser | null): Set<string> {
     const ids = new Set<string>();
     for (const m of (user?.limitingMarkers || [])) {
-        if (m && typeof m === 'object') {
-            const o = m as Record<string, unknown>;
-            if (o.id !== undefined && o.id !== null) { ids.add(String(o.id)); continue; }
-            if (o.code !== undefined && o.code !== null) { ids.add(String(o.code)); continue; }
-            if (o.name !== undefined && o.name !== null) { ids.add(String(o.name)); continue; }
-        } else if (m !== undefined && m !== null) {
-            ids.add(String(m));
-        }
+        const identity = markerIdentity(m);
+        if (identity) ids.add(identity[1]);
     }
     return ids;
 }

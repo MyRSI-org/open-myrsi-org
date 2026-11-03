@@ -536,7 +536,11 @@ export const toHydratedOperation = (dbOp: OperationRowWithEmbeds): HydratedOpera
     participants: (dbOp.participants || []).map((p) => ({
         userId: p.user_id,
         timeJoined: p.joined_at,
-        timeLeft: null,
+        // operation_participants.time_left: NULL = still active; a timestamp = was on
+        // the roster when the op concluded (updateOperationStatus stamps it; leaving
+        // DELETES the row instead). Normalised to null, never undefined, because the
+        // client's "active participant" filters compare `timeLeft === null`.
+        timeLeft: p.time_left ?? null,
         isReady: p.is_ready,
         roleRequested: p.role_requested,
         shipUtilized: p.ship_utilized,

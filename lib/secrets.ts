@@ -5,7 +5,29 @@ import { log as baseLog } from './log.js';
 
 const log = baseLog.child({ module: 'lib.secrets' });
 
-export async function getOrgSecret(key: string): Promise<string | null> {
+/**
+ * The only names getOrgSecret resolves. The env var of the same name wins over the
+ * stored value, so an open-ended `key` would make this a read of ANY environment
+ * variable (SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, SECRETS_ENCRYPTION_KEY, …).
+ */
+export const ORG_SECRET_NAMES = [
+    'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_BOT_TOKEN', 'DISCORD_GUILD_ID',
+    'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_URL',
+    'GEMINI_API_KEY',
+] as const;
+
+export type OrgSecretName = typeof ORG_SECRET_NAMES[number];
+
+const SUPPORTED_NAMES: ReadonlySet<string> = new Set(ORG_SECRET_NAMES);
+
+export async function getOrgSecret(key: OrgSecretName): Promise<string | null> {
+    // The type keeps callers to the allowlist at compile time; this holds it at
+    // runtime too (a cast, an `any`, a computed name). Refuse before any read and
+    // log the requested NAME only, capped, never a value.
+    if (typeof key !== 'string' || !SUPPORTED_NAMES.has(key)) {
+        log.warn('unsupported secret name refused', { key: typeof key === 'string' ? key.slice(0, 64) : `<${typeof key}>` });
+        return null;
+    }
     try {
         // Read the single org's (admin-entered, encrypted) config from settings.
         const { data } = await supabase.from('settings')

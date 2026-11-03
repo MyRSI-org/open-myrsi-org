@@ -149,6 +149,13 @@ export async function getDiscordUser(accessToken: string) {
 }
 
 export async function getDiscordMember(discordUserId: string) {
+    // ROUTE-ID GUARD (see isDiscordRouteId). users.discord_id arrives verbatim
+    // with an org import. A non-snowflake cannot be a guild member, so it takes
+    // the same not-a-member path as a 404.
+    if (!isDiscordRouteId(discordUserId)) {
+        log.warn('refusing member lookup: user id is not a snowflake', { discordUserId });
+        return null;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     const guildId = await getOrgSecret('DISCORD_GUILD_ID');
 
@@ -175,6 +182,10 @@ export async function getDiscordMember(discordUserId: string) {
 }
 
 export async function getDiscordUserById(discordUserId: string) {
+    // ROUTE-ID GUARD (see isDiscordRouteId).
+    if (!isDiscordRouteId(discordUserId)) {
+        throw new Error('Invalid Discord user ID.');
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
 
     if (!botToken) {
@@ -285,6 +296,13 @@ export async function syncDiscordRoles() {
 }
 
 export async function addMemberRole(discordUserId: string, discordRoleId: string): Promise<boolean> {
+    // ROUTE-ID GUARD (see isDiscordRouteId). rank_mappings.discord_role_id is
+    // written without a shape check and carried verbatim by an org import; a
+    // `../` role or user id turns this PUT into e.g. a guild ban.
+    if (!isDiscordRouteId(discordUserId) || !isDiscordRouteId(discordRoleId)) {
+        log.warn('refusing role change: user or role id is not a snowflake', { discordUserId, discordRoleId });
+        return false;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     const guildId = await getOrgSecret('DISCORD_GUILD_ID');
     if (!botToken || !guildId) return false;
@@ -306,6 +324,12 @@ export async function addMemberRole(discordUserId: string, discordRoleId: string
 }
 
 export async function removeMemberRole(discordUserId: string, discordRoleId: string): Promise<boolean> {
+    // ROUTE-ID GUARD (see addMemberRole) — on a DELETE a traversal reaches e.g.
+    // DELETE /channels/{id}.
+    if (!isDiscordRouteId(discordUserId) || !isDiscordRouteId(discordRoleId)) {
+        log.warn('refusing role change: user or role id is not a snowflake', { discordUserId, discordRoleId });
+        return false;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     const guildId = await getOrgSecret('DISCORD_GUILD_ID');
     if (!botToken || !guildId) return false;
@@ -1022,6 +1046,12 @@ export async function updateGuildScheduledEvent(
     eventId: string,
     options: UpdateGuildEventOptions,
 ): Promise<{ ok: boolean; error?: string }> {
+    // ROUTE-ID GUARD (see isDiscordRouteId) — eventId is the persisted
+    // operations.discord_event_id column.
+    if (!isDiscordRouteId(eventId)) {
+        log.warn('refusing to update event: event id is not a snowflake', { eventId });
+        return { ok: false, error: 'Invalid Discord event ID.' };
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     const guildId = await getOrgSecret('DISCORD_GUILD_ID');
     if (!botToken || !guildId) {
@@ -1081,6 +1111,11 @@ export async function updateGuildScheduledEvent(
  * Delete a Discord Guild Scheduled Event.
  */
 export async function deleteGuildScheduledEvent(eventId: string): Promise<void> {
+    // ROUTE-ID GUARD (see updateGuildScheduledEvent).
+    if (!isDiscordRouteId(eventId)) {
+        log.warn('refusing to delete event: event id is not a snowflake', { eventId });
+        return;
+    }
     const botToken = await getOrgSecret('DISCORD_BOT_TOKEN');
     const guildId = await getOrgSecret('DISCORD_GUILD_ID');
     if (!botToken || !guildId) return;

@@ -13,6 +13,10 @@ import { log as baseLog } from '../log.js';
 import { createNotification } from './notifications.js';
 import { SecurityDenial } from '../errors.js';
 import { DISCORD_SNOWFLAKE_RE } from '../discordConfigKeys.js';
+import { constantTimeEqual } from '../constantTime.js';
+import { validateJoinPin } from '../joinPinPolicy.js';
+import { isJoinPinLocked, recordJoinPinFailure, clearJoinPinFailures, JOIN_PIN_MAX_FAILURES, JOIN_PIN_WINDOW_MS } from '../joinPinLockout.js';
+import { recordSecurityEvent } from './securityEvents.js';
 
 const log = baseLog.child({ module: 'db.ops' });
 
@@ -201,7 +205,7 @@ export async function broadcastOpChange(operationId: string) {
 const OPS_SELECT = `
     id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, discord_start_notice, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
     owner:users!operations_owner_id_fkey(id, name, avatar_url),
-    participants:operation_participants(user_id, joined_at, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
+    participants:operation_participants(user_id, joined_at, time_left, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
     log:operation_log_entries(id, operation_id, entry_type, log_entry, author_id, created_at, uec_amount, cost_category, cost_description, author:users!operation_log_entries_author_id_fkey(id, name, avatar_url)),
     limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code)),
     unit:units(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted),
@@ -235,6 +239,37 @@ const OPS_SELECT = `
 // (fail closed — clearance still applies).
 export type OpViewer = { id?: number | string } & ClearanceUser;
 
+/**
+ * The special-operation participation term for READS — the ONE definition shared by
+ * the list / slice (canUserSeeOpInList), the detail handler (operation:get_details),
+ * and the read form of assertOpVisibleToUser, and mirrored by the op-board realtime
+ * predicate (schema.sql private.rt_can_read_op_board).
+ *
+ * ANY operation_participants row satisfies it — time_left null or not. Owner-approved
+ * (2026-11-02): a FORMER participant keeps read access. The definition of "former" is
+ * narrow by construction: leaving or being removed DELETES the row (leaveOperation),
+ * and only concluding an op (updateOperationStatus 'Concluded') stamps time_left — so
+ * a row with time_left set is exactly someone who was still on the roster when the op
+ * concluded. A member who left or was removed has no row and is refused like any
+ * non-participant.
+ *
+ * READS ONLY. Writes that need participation (readiness, live status, seat claims,
+ * timeline, logistics, AAR) stay ACTIVE-only: assertOpVisibleToUser defaults to the
+ * active term and assertIsActiveParticipant keeps `time_left IS NULL`. Clearance level,
+ * limiting markers, the owner / operations:manage bypasses and the banned/deleted
+ * exclusions are applied by the callers exactly as before — this is ONLY the
+ * participation term.
+ *
+ * A missing/non-numeric viewer id never matches (fail closed).
+ */
+export function hasOpReadParticipation(
+    participants: ReadonlyArray<{ userId?: number | null }> | null | undefined,
+    viewerId: number | string | null | undefined,
+): boolean {
+    if (typeof viewerId !== 'number') return false;
+    return (participants || []).some((p) => p.userId != null && p.userId === viewerId);
+}
+
 export function canUserSeeOpInList(
     user: OpViewer,
     op: Pick<HydratedOperation, 'clearanceLevel'> & {
@@ -255,15 +290,13 @@ export function canUserSeeOpInList(
         return false;
     }
     // Special operations are invite-only: visible ONLY to the owner,
-    // operations:manage holders (read-side bypass population), and ACTIVE
-    // participants — mirrors the client `hasAccess` gate (OperationDetailView),
-    // operation:get_details, and assertOpVisibleToUser so list/slice/detail/action
-    // cannot drift. A clearance-0 special op must NOT be readable by every member.
+    // operations:manage holders (read-side bypass population), and participants —
+    // current OR former (hasOpReadParticipation: any roster row, time_left ignored).
+    // Mirrors operation:get_details, the read form of assertOpVisibleToUser and the
+    // op-board realtime predicate so list/slice/detail/sub-resource-read/board cannot
+    // drift. A clearance-0 special op must NOT be readable by every member.
     if (op.isSpecial && !isOwner && !canViewAllClassifications(user, ['operations:manage'])) {
-        const isActiveParticipant = (op.participants || []).some(
-            (p) => p.userId != null && p.userId === user.id && p.timeLeft == null,
-        );
-        if (!isActiveParticipant) return false;
+        if (!hasOpReadParticipation(op.participants, user.id)) return false;
     }
     return true;
 }
@@ -347,7 +380,17 @@ export async function getOperations(user?: User | null): Promise<HydratedOperati
  * and operations:manage bypass — the identical predicate the list
  * (canUserSeeOpInList) and detail (operation:get_details) reads apply. Light
  * select: no participant/log embeds.
+ *
+ * TWO PARTICIPATION TERMS for a special op, chosen by `opts.access`:
+ *   'act'  (DEFAULT) — the caller must be an ACTIVE participant (time_left IS NULL).
+ *          Every write path uses this. It is the default so a caller that forgets
+ *          the option gets the STRICT term, never the wider one.
+ *   'read' — any participant row, former included (hasOpReadParticipation). ONLY
+ *          for sub-resource READS (participant ships, latest alert, template
+ *          extraction) so they agree with list / slice / detail / op-board.
  */
+export type OpVisibilityAccess = 'read' | 'act';
+
 export async function assertOpVisibleToUser(
     operationId: string,
     user?: OpViewer | null,
@@ -355,7 +398,7 @@ export async function assertOpVisibleToUser(
     // definition not yet a participant, and the join PIN (verified in
     // joinOperation) is the invite mechanism — so the special-op participation
     // gate below must NOT block joining. The clearance gate still applies.
-    opts?: { isJoinAttempt?: boolean },
+    opts?: { isJoinAttempt?: boolean; access?: OpVisibilityAccess },
 ): Promise<void> {
     if (!user) throw new Error('Authentication required.');
     const { data, error } = await supabase.from('operations')
@@ -372,17 +415,28 @@ export async function assertOpVisibleToUser(
     if (!visible) throw new Error('Insufficient clearance to act on this operation.');
 
     // Special-operation participation gate: outside the join path a
-    // non-owner / non-manager may act on an op's sub-resources only if they are an
-    // ACTIVE participant — mirrors canUserSeeOpInList (list/slice) and the
-    // operation:get_details deny so the gates can't drift. Lazy lookup: only the
-    // special-op, non-privileged case incurs the extra query.
+    // non-owner / non-manager may touch an op's sub-resources only as a participant.
+    // WRITES ('act', the default) need an ACTIVE row — `time_left IS NULL` — so a
+    // former participant cannot ready up, post, claim a seat or edit logistics on a
+    // concluded op. READS ('read') accept any row, matching canUserSeeOpInList
+    // (list/slice), operation:get_details and the op-board predicate. Lazy lookup:
+    // only the special-op, non-privileged case incurs the extra query. A lookup
+    // fault reads as "no membership" — refused, never passed.
     if (!opts?.isJoinAttempt && data.is_special && !isOwner && !canManage) {
-        const { data: membership } = await supabase.from('operation_participants')
-            .select('user_id')
-            .eq('operation_id', operationId)
-            .eq('user_id', user.id)
-            .is('time_left', null)
-            .maybeSingle();
+        // Two complete statements rather than a conditionally-extended builder, so the
+        // strict ('act') one visibly carries its time_left filter and each is capped.
+        const { data: membership } = opts?.access === 'read'
+            ? await supabase.from('operation_participants')
+                .select('user_id')
+                .eq('operation_id', operationId)
+                .eq('user_id', user.id)
+                .maybeSingle()
+            : await supabase.from('operation_participants')
+                .select('user_id')
+                .eq('operation_id', operationId)
+                .eq('user_id', user.id)
+                .is('time_left', null)
+                .maybeSingle();
         if (!membership) throw new Error('Insufficient access to act on this special operation.');
     }
 }
@@ -390,14 +444,18 @@ export async function assertOpVisibleToUser(
 // The op's classification, read server-side. Used to stamp an extracted template
 // with its source op's clearance so the laundered plan can't be read below it.
 export async function getOperationClassification(operationId: string): Promise<{ classificationLevel: number; markerIds: number[] }> {
-    const { data } = await supabase.from('operations')
+    const { data, error } = await supabase.from('operations')
         .select('clearance_level, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id))')
         .eq('id', operationId)
         .maybeSingle();
-    const markerIds = ((data?.limiting_markers || []) as Array<{ marker?: { id?: number } | null }>)
+    // FAIL CLOSED. An unread fault (or an op deleted mid-request) used to return level 0
+    // with no markers, stamping a classified op's extracted plan UNCLASSIFIED.
+    handleSupabaseError({ error, message: 'Failed to read operation classification' });
+    if (!data) throw new Error('Operation not found.');
+    const markerIds = ((data.limiting_markers || []) as Array<{ marker?: { id?: number } | null }>)
         .map(m => m.marker?.id)
         .filter((n): n is number => typeof n === 'number');
-    return { classificationLevel: data?.clearance_level ?? 0, markerIds };
+    return { classificationLevel: data.clearance_level ?? 0, markerIds };
 }
 
 export async function getOperationByIdLite(operationId: string, user?: User | null): Promise<HydratedOperation | null> {
@@ -414,6 +472,76 @@ export async function getOperationByIdLite(operationId: string, user?: User | nu
     // holder — keep the slice path consistent with getOperations.
     redactJoinCodeForViewer(op, user);
     return op;
+}
+
+/** Client-visible refusal when an atomic writer's database function is not deployed. */
+const OP_SCHEMA_RERUN_REQUIRED = 'Database update required — re-run schema.sql';
+
+/**
+ * Replace an operation's limiting-marker set ATOMICALLY through
+ * public.op_replace_limiting_markers (schema.sql §4.2d), which validates the ids,
+ * deletes the old set and inserts the new one in ONE transaction.
+ *
+ * The markers ARE the compartmentation. The delete-then-insert this replaces had a
+ * window in which the op carried NO markers (readable by every member at its level)
+ * and a best-effort restore that could itself fail and leave it that way. There is
+ * now nothing to restore: an error means nothing changed.
+ *
+ * FAILS CLOSED when the function is absent (42883 / PGRST202 — the operator has not
+ * re-run schema.sql): refused with a clear message, NEVER a fallback to the
+ * non-atomic path, which would reintroduce exactly the window this removes.
+ */
+async function replaceOperationMarkers(operationId: string, markerIds: unknown, failMessage: string): Promise<void> {
+    if (!Array.isArray(markerIds)) throw new Error('Invalid limiting marker list.');
+    const { error } = await supabase.rpc('op_replace_limiting_markers', {
+        p_operation_id: operationId,
+        p_marker_ids: markerIds,
+    });
+    if (!error) return;
+    const code = String((error as { code?: string }).code || '');
+    if (code === '42883' || code === 'PGRST202') {
+        log.error('op_replace_limiting_markers is not deployed — marker write refused. re-run schema.sql', { operationId, code });
+        throw new Error(`${OP_SCHEMA_RERUN_REQUIRED} (op_replace_limiting_markers is missing).`);
+    }
+    const message = String((error as { message?: string }).message || '');
+    if (message.includes('OP_MARKERS_UNKNOWN')) {
+        throw new Error('One or more limiting markers are not valid for this organization.');
+    }
+    if (message.includes('OP_MARKERS_INVALID')) {
+        throw new Error('Invalid limiting marker list.');
+    }
+    handleSupabaseError({ error, message: failMessage });
+    // handleSupabaseError always throws on a non-null error; this line makes "an RPC
+    // error can never read as success" hold even if that contract ever changes.
+    throw new Error(failMessage);
+}
+
+/** One row of the live `limiting_markers:operation_limiting_markers(marker:…)` embed. */
+type LiveMarkerRow = { marker?: { id?: unknown } | null };
+
+/** Sorted, de-duplicated integer ids — or null when any entry is not an integer. */
+function sortedDistinctIds(ids: readonly unknown[]): number[] | null {
+    const out = new Set<number>();
+    for (const id of ids) {
+        if (typeof id !== 'number' || !Number.isInteger(id)) return null;
+        out.add(id);
+    }
+    return [...out].sort((a, b) => a - b);
+}
+
+/**
+ * TRUE only when `requested` names exactly the marker set the live row already
+ * carries (compared as sorted distinct ids). Anything it cannot read as plain
+ * integer ids — a non-array, a string id, a live junction row whose marker did not
+ * resolve — answers FALSE, so the caller takes the validating RPC path. Skipping is
+ * only ever the "nothing would change" answer, never a guess.
+ */
+function isUnchangedMarkerSet(requested: unknown, liveRows: readonly LiveMarkerRow[] | null | undefined): boolean {
+    if (!Array.isArray(requested)) return false;
+    const want = sortedDistinctIds(requested);
+    const have = sortedDistinctIds((liveRows || []).map((r) => r.marker?.id));
+    if (!want || !have || want.length !== have.length) return false;
+    return want.every((id, i) => id === have[i]);
 }
 
 interface CreateOperationInput {
@@ -464,6 +592,17 @@ export async function createOperation(opData: CreateOperationInput) {
     // freely.
     assertCanClassify(opData.user as ClearanceUser | undefined, opData.clearanceLevel ?? 0, opData.markerIds, ['operations:manage']);
 
+    // The join PIN is the only gate on a Special Operation, so it is held to the
+    // shared floor (lib/joinPinPolicy.ts) here, server-side — the wizard's check is a
+    // convenience. A non-Special op stores NO PIN: one smuggled in here would be armed,
+    // unvalidated, by a later edit that only flips isSpecial.
+    let joinCode: string | null = null;
+    if (opData.isSpecial) {
+        const pin = validateJoinPin(opData.joinCode);
+        if (!pin.ok) throw new Error(pin.error);
+        joinCode = pin.pin;
+    }
+
     const dbPayload: Record<string, unknown> = {
         name: opData.name,
         type: opData.type,
@@ -474,7 +613,7 @@ export async function createOperation(opData: CreateOperationInput) {
         tracks_uec: opData.tracksUec,
         owner_id: ownerId,
         is_special: opData.isSpecial,
-        join_code: opData.joinCode,
+        join_code: joinCode,
         clearance_level: opData.clearanceLevel || 0,
         status: opData.isScheduled ? 'Scheduled' : 'Planning',
         unit_id: opData.unitId || null,
@@ -613,8 +752,17 @@ export async function createOperation(opData: CreateOperationInput) {
             await supabase.from('operations').delete().eq('id', op.id);
             throw new Error('One or more limiting markers are not valid for this organization.');
         }
-        const markers = opData.markerIds.map((mid: number) => ({ operation_id: op.id, marker_id: mid }));
-        await supabase.from('operation_limiting_markers').insert(markers);
+        // Attached through the atomic writer (validated + written in one transaction).
+        // ANY refusal — a fault, an id the function rejects, or the function not being
+        // deployed — rolls the op back: an op committed WITHOUT its compartment markers
+        // is visible to every member at its level.
+        try {
+            await replaceOperationMarkers(op.id, opData.markerIds, 'Failed to attach limiting markers');
+        } catch (markerErr) {
+            const { error: rollbackErr } = await supabase.from('operations').delete().eq('id', op.id);
+            if (rollbackErr) log.error('operation could not be rolled back after its markers were refused', { operationId: op.id, code: rollbackErr.code });
+            throw markerErr;
+        }
     }
 
     if (op) {
@@ -746,7 +894,7 @@ export async function getFullOperationDetails(operationId: string) {
     const query = supabase.from('operations').select(`
             id, name, owner_id, status, type, description, tracks_uec, total_uec, total_costs, payout_mode, created_at, updated_at, active_start_time, active_end_time, scheduled_start, scheduled_end, is_special, join_code, clearance_level, is_training, max_participants, unit_id, discord_event_id, discord_announcement_channel_id, discord_announcement_message_id, discord_start_notice, template_id, additional_location_texts, is_joint, joint_version, roe, commander_notes, comms_plan, live_status, aar_summary, aar_lessons_learned, aar_submitted_at, aar_submitted_by, aar_ai_generated_at, location_text, location_id,
             owner:users!operations_owner_id_fkey(id, name, avatar_url),
-            participants:operation_participants(user_id, joined_at, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
+            participants:operation_participants(user_id, joined_at, time_left, is_ready, role_requested, ship_utilized, attendance_status, rsvp_status, rsvp_at, ship_id, user_ship_id, live_status, payout_share_percent, payout_paid_at, payout_paid_by, user:users!operation_participants_user_id_fkey(id, name, avatar_url, role_id, rank:ranks(name, icon_url)), ship:platform_ships!operation_participants_ship_id_fkey(id, name, image_url)),
             log:operation_log_entries(id, operation_id, entry_type, log_entry, author_id, created_at, uec_amount, cost_category, cost_description, author:users!operation_log_entries_author_id_fkey(id, name, avatar_url)),
             limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code)),
             unit:units(id, name, parent_unit_id, sort_order, leader_id, logo_url, banner_url, motto, description, has_radio_channel, linked_channel_id, is_restricted),
@@ -852,7 +1000,7 @@ export async function updateOperationDetails(operationId: string, updates: Updat
     // operations:manage holders + Admins (the read-side bypass population) may
     // classify freely — identical to createOperation's assertCanClassify gate.
     const { data: live } = await supabase.from('operations')
-        .select('id, clearance_level, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code))')
+        .select('id, clearance_level, is_special, join_code, limiting_markers:operation_limiting_markers(marker:security_limiting_markers(id, name, code))')
         .eq('id', operationId)
         .maybeSingle();
     if (!live) throw new Error("Operation not found or access denied.");
@@ -876,7 +1024,30 @@ export async function updateOperationDetails(operationId: string, updates: Updat
     if (updates.maxParticipants !== undefined) dbUpdates.max_participants = updates.maxParticipants;
     if (updates.tracksUec !== undefined) dbUpdates.tracks_uec = updates.tracksUec;
     if (updates.isSpecial !== undefined) dbUpdates.is_special = updates.isSpecial;
-    if (updates.joinCode !== undefined) dbUpdates.join_code = updates.joinCode;
+    // JOIN PIN — same floor as createOperation, applied only when this edit SETS a PIN:
+    // it changes the stored one, or turns the op Special (which arms whatever is
+    // stored). OpAdministerTab re-sends the unchanged PIN on every save, so an edit that
+    // leaves it as it is must not re-validate it — a legacy short PIN keeps working
+    // until somebody actually changes it. Runs before ANY write below (markers
+    // included), so a rejected PIN leaves the op untouched.
+    const becomesSpecial = updates.isSpecial === true && !live.is_special;
+    if (updates.joinCode !== undefined || becomesSpecial) {
+        const supplied = updates.joinCode !== undefined;
+        const raw = supplied ? updates.joinCode : live.join_code;
+        const next = typeof raw === 'string' ? raw.trim() : (raw == null ? '' : raw);
+        const current = typeof live.join_code === 'string' ? live.join_code.trim() : '';
+        const willBeSpecial = updates.isSpecial !== undefined ? !!updates.isSpecial : !!live.is_special;
+        if (next === current && !becomesSpecial) {
+            // Unchanged: leave the column alone.
+        } else if (next === '' && !willBeSpecial) {
+            // Clearing the PIN of an op that is not (or is no longer) Special.
+            if (supplied) dbUpdates.join_code = null;
+        } else {
+            const pin = validateJoinPin(next);
+            if (!pin.ok) throw new Error(pin.error);
+            if (supplied) dbUpdates.join_code = pin.pin;
+        }
+    }
     if (updates.unitId !== undefined) dbUpdates.unit_id = updates.unitId || null;
     if (updates.locationId !== undefined) dbUpdates.location_id = updates.locationId || null;
     if (updates.scheduledStart !== undefined) {
@@ -922,13 +1093,22 @@ export async function updateOperationDetails(operationId: string, updates: Updat
         if (updates.status === 'Concluded' && !dbUpdates.active_end_time) dbUpdates.active_end_time = new Date().toISOString();
     }
 
-    // Handle limiting markers separately (delete + re-insert)
-    if (updates.markerIds !== undefined) {
-        await supabase.from('operation_limiting_markers').delete().eq('operation_id', operationId);
-        if (updates.markerIds.length > 0) {
-            const markers = updates.markerIds.map((mid: number) => ({ operation_id: operationId, marker_id: mid }));
-            await supabase.from('operation_limiting_markers').insert(markers);
-        }
+    // Limiting markers: replaced ATOMICALLY (replaceOperationMarkers →
+    // public.op_replace_limiting_markers). The markers ARE the compartmentation, so
+    // this runs BEFORE the field update and refuses the whole edit on any error —
+    // and because the replace is one transaction there is no cleared-but-not-
+    // reinserted state to restore from. An empty list clears the set.
+    //
+    // A NO-OP IS NOT WRITTEN. OpAdministerTab sends markerIds on EVERY save, so an
+    // unconditional call routes every settings edit through the RPC — and, until
+    // schema.sql is re-run, refuses every one of them. When the requested set equals
+    // the live set read above there is nothing to replace. This is not a fallback: a
+    // CHANGED set still goes only through the RPC and still fails closed when it is
+    // missing, and anything isUnchangedMarkerSet cannot read as plain ids takes the
+    // RPC path, which validates it.
+    if (updates.markerIds !== undefined
+        && !isUnchangedMarkerSet(updates.markerIds, (live as { limiting_markers?: LiveMarkerRow[] | null }).limiting_markers)) {
+        await replaceOperationMarkers(operationId, updates.markerIds, 'Failed to update operation markers');
     }
 
     if (Object.keys(dbUpdates).length === 0 && updates.markerIds === undefined) return;
@@ -1028,17 +1208,68 @@ async function assertUserShipOwnedBy(userShipId: number | null | undefined, owne
     }
 }
 
+// One copy for a wrong PIN AND for a locked-out attempt, thrown the same way: a
+// distinguishable lockout reply would tell a guesser exactly when to switch accounts.
+const INVALID_JOIN_CODE = 'Invalid Join Code.';
+
+/** Audit a join-PIN lockout trip. Fire-and-forget, and structurally guarded: `void`
+ *  protects against a rejected promise, not an absent export in a partial test double,
+ *  and an audit fault must never turn the refusal into a different error. */
+function auditJoinPinLockout(operationId: string, userId: number): void {
+    try {
+        void recordSecurityEvent({
+            event: 'auth.join_pin.locked_out',
+            // Both join actions (operation:join, operation:join_with_role) funnel through
+            // joinOperation; the slug names the family.
+            action: 'operation:join',
+            actorUserId: userId,
+            outcome: 'denied',
+            // Never the attempted PIN.
+            details: { operationId, failures: JOIN_PIN_MAX_FAILURES, windowMinutes: JOIN_PIN_WINDOW_MS / 60_000 },
+        });
+    } catch (err) {
+        log.warn('security event emit threw', { err });
+    }
+}
+
 export async function joinOperation(operationId: string, userId: number, joinCode?: string, roleRequested?: string, shipUtilized?: string, shipId?: number, userShipId?: number) {
     await verifyOperationAccess(operationId);
     await assertUserShipOwnedBy(userShipId, userId, 'joinOperation');
 
-    // Fetch operation details for join code / capacity checks
-    const { data: op } = await supabase.from('operations').select('is_special, join_code, max_participants').eq('id', operationId).single();
+    // Fetch operation details for join code / capacity checks.
+    //
+    // READ THE ERROR. supabase-js RESOLVES { data: null, error } rather than throwing,
+    // and the old `if (op && op.is_special)` read a null op as "not special" — so a read
+    // fault skipped the PIN check and joined the caller to a Special Operation. Fail
+    // CLOSED: a fault or a missing row refuses the join before anything is written.
+    const { data: op, error: opErr } = await supabase.from('operations').select('id, is_special, join_code, max_participants').eq('id', operationId).maybeSingle();
+    if (opErr) handleSupabaseError({ error: opErr, message: 'Failed to join operation' });
+    if (!op) throw new Error("Operation not found or access denied.");
 
-    if (op && op.is_special) {
-        if (!joinCode || op.join_code !== joinCode) {
-            throw new Error("Invalid Join Code.");
+    if (op.is_special) {
+        // The PIN is the ONLY gate here (the join actions skip the participation gate),
+        // so it is brute-force limited per user + op (lib/joinPinLockout.ts) and compared
+        // in constant time. The lockout check, compare and failure record run with no
+        // await between them, so concurrent guesses cannot all slip past the cap.
+        // Both sides are trimmed: the stored PIN is saved trimmed, and an older row saved
+        // untrimmed still matches when typed. A Special op with no stored PIN admits nobody.
+        //
+        // KEY ON THE ROW'S id, NEVER THE REQUEST STRING. operations.id is a uuid, and
+        // Postgres accepts many spellings of one value (upper-case hex, braces, hyphens
+        // dropped or after any group of four) — every read above and op_join_participant
+        // resolve them all to this same row. Keyed on `operationId`, each spelling was a
+        // fresh 5-guess budget (and a fresh audit trip). The database hands back the one
+        // canonical form; a row without it refuses rather than falling back.
+        const pinKey = typeof op.id === 'string' ? op.id : '';
+        if (!pinKey) throw new Error('Failed to join operation');
+        if (isJoinPinLocked(userId, pinKey)) throw new Error(INVALID_JOIN_CODE);
+        const stored = typeof op.join_code === 'string' ? op.join_code.trim() : '';
+        const submitted = typeof joinCode === 'string' ? joinCode.trim() : '';
+        if (!stored || !submitted || !constantTimeEqual(stored, submitted)) {
+            if (recordJoinPinFailure(userId, pinKey).lockedNow) auditJoinPinLockout(pinKey, userId);
+            throw new Error(INVALID_JOIN_CODE);
         }
+        clearJoinPinFailures(userId, pinKey);
     }
 
     // Atomic capacity-check + upsert under a row lock (race-1) — concurrent joins
@@ -1195,10 +1426,16 @@ export async function addOperationParticipant(operationId: string, targetUserId:
         .select('user_id').eq('operation_id', operationId).eq('user_id', targetUserId).maybeSingle();
     const wasAlreadyParticipant = !!priorRow || !!priorErr || targetUserId === adminId;
 
+    // time_left: null RE-ACTIVATES a FORMER participant (a row stamped when the op
+    // concluded). Without it an explicit manager re-add was a silent no-op: the upsert
+    // touched only attendance_status, so the row stayed "former" and every ACTIVE-only
+    // write (readiness, live status, seats, logistics) still refused them. For a
+    // current participant it writes the null that is already there.
     const { error } = await supabase.from('operation_participants').upsert({
         operation_id: operationId,
         user_id: targetUserId,
         attendance_status: 'Registered',
+        time_left: null,
     }, { onConflict: 'operation_id,user_id', ignoreDuplicates: false });
     if (!error) {
         const [targetName, adminName] = await Promise.all([getActorLabel(targetUserId), getActorLabel(adminId)]);
@@ -1207,7 +1444,8 @@ export async function addOperationParticipant(operationId: string, targetUserId:
         // re-adding an existing participant succeeds every single time — an unconditional
         // notify here would be a repeatable push amplifier aimed at a caller-supplied member
         // id. addResponderToRequest guards exactly this and says so in its own comment; this
-        // path is its sibling and had no such guard in the proposal.
+        // path is its sibling and had no such guard in the proposal. ANY prior row counts,
+        // former included: re-activating someone is not a new invitation.
         if (!wasAlreadyParticipant) {
             await createNotification(targetUserId, {
                 type: 'operation_assigned',
@@ -1404,14 +1642,16 @@ export async function setOperationPayoutSplits(
         handleSupabaseError({ error: probe.error, message: 'Failed to set payout splits' });
     }
 
-    // Apply remaining rows in parallel.
-    await Promise.all(splits.slice(1).map(s =>
+    // Apply remaining rows in parallel — and READ the results: a share that failed to
+    // persist must not be reported as a successful split.
+    const rest = await Promise.all(splits.slice(1).map(s =>
         supabase
             .from('operation_participants')
             .update({ payout_share_percent: s.percent })
             .eq('operation_id', operationId)
             .eq('user_id', s.userId)
     ));
+    for (const r of rest) handleSupabaseError({ error: r.error, message: 'Failed to set payout splits' });
 
     await broadcastOperationUpdate(operationId);
 }
@@ -1425,11 +1665,13 @@ export async function toggleParticipantPayoutPaid(
     await verifyOperationAccess(operationId);
 
     // Lock once op is concluded so the audit trail is preserved.
-    const { data: op } = await supabase
+    const { data: op, error: statusErr } = await supabase
         .from('operations')
         .select('status')
         .eq('id', operationId)
         .single();
+    // Fail CLOSED: an unread fault read as "not concluded" and unlocked the audit trail.
+    handleSupabaseError({ error: statusErr, message: 'Failed to update payout status' });
     if (op?.status === 'Concluded') {
         throw new Error('Cannot modify payout state on a concluded operation.');
     }
@@ -1943,8 +2185,10 @@ async function assertValidParentSlot(operationId: string, parentSlotId: unknown,
  *
  * Deliberately STRICTER than updateOperationParticipant's own precondition, which
  * does not filter time_left. This one does, matching assertOpVisibleToUser's
- * special-op rule: seating someone who has already left the operation is not a
- * thing an organiser means to do. The two preconditions now differ on purpose.
+ * special-op WRITE term ('act', the default): seating someone who has already left
+ * the operation is not a thing an organiser means to do. The two preconditions now
+ * differ on purpose. It stays active-only even though former participants keep READ
+ * access (hasOpReadParticipation) — a seat is a write.
  */
 async function assertIsActiveParticipant(operationId: string, userId: number, fnName: string): Promise<void> {
     const { data: row, error } = await supabase.from('operation_participants')
@@ -2200,12 +2444,31 @@ function boardChannelName(operationId: string) {
     return `op-board-${operationId}`;
 }
 
+// ─── THE ONE DELIBERATE EXCEPTION TO SECURITY RULE 4 (realtime carries ids only) ───
+// broadcastBoardAdd sends the element object and broadcastBoardUpdate the `changes`
+// object — board CONTENT, not ids. That is acceptable ONLY because:
+//   * it goes to the private per-op channel `op-board-<uuid>` and NOTHING else —
+//     never 'db-changes', 'auth-alerts' or any other org-wide channel; and
+//   * receipt on that channel is authorized per operation by the realtime RLS policy
+//     rt_recv_op_board → private.rt_can_read_op_board() (schema.sql §4.9 / §6b),
+//     which carries the SAME gate as the app's op reads: owner, operations:manage, or
+//     operations:view + clearance level + every limiting marker + (special op)
+//     participation, with liveness (deleted / revoked / banned) delegated to
+//     private.rt_is_live_member().
+// A receiver therefore gets nothing it could not already read through
+// operation:get_details. If that predicate and the TS read gate ever drift, THIS is
+// where content leaks — change them together (tests/sec-schema-rls.test.ts,
+// tests/opBoardDeltaException.test.ts). Every other broadcast in this file stays
+// id-only, and broadcastBoardDelete below is id-only too. Recorded in SECURITY.md.
 export async function broadcastBoardAdd(operationId: string, element: unknown, clientNonce?: string) {
     await broadcastToChannel(boardChannelName(operationId), 'board_element_update', {
         operationId, op: 'add', element, clientNonce,
     });
 }
 
+// Content-bearing — see the rule-4 exception note above broadcastBoardAdd. `changes`
+// must be updateBoardElement's RETURN (the whitelisted projection it persisted), never
+// a caller's raw payload.
 export async function broadcastBoardUpdate(operationId: string, elementId: number, changes: unknown) {
     await broadcastToChannel(boardChannelName(operationId), 'board_element_update', {
         operationId, op: 'update', elementId, changes,
@@ -2237,23 +2500,39 @@ export async function addBoardElement(operationId: string, data: Record<string, 
     return result;
 }
 
-export async function updateBoardElement(elementId: number, data: Record<string, unknown>, operationId?: string) {
+/**
+ * The ONE whitelist for a board-element update: [client key, column]. It drives both
+ * the write and the realtime delta, so the two cannot drift. Client keys are the
+ * camelCase OperationBoardElement fields the board consumer merges
+ * (OpCommandSignalsTab: `{ ...existing, ...changes }`).
+ */
+const BOARD_ELEMENT_UPDATE_FIELDS: ReadonlyArray<readonly [string, string]> = [
+    ['elementType', 'element_type'], ['label', 'label'], ['posX', 'pos_x'], ['posY', 'pos_y'],
+    ['width', 'width'], ['height', 'height'], ['rotation', 'rotation'], ['color', 'color'],
+    ['data', 'data'], ['layer', 'layer'], ['sortOrder', 'sort_order'],
+];
+
+/**
+ * Returns the PROJECTED changes — exactly the whitelisted fields this call wrote, in
+ * the client's camelCase shape. operation:update_board_element broadcasts THAT, never
+ * the caller's raw `data`: the rule-4 board exception holds only while a receiver gets
+ * nothing it could not read back through operation:get_details, and an unknown key or
+ * an extra field rides no column.
+ */
+export async function updateBoardElement(elementId: number, data: Record<string, unknown>, operationId?: string): Promise<Record<string, unknown>> {
     // Scope by the (already verified) operation.
     if (!operationId) throw new Error('updateBoardElement: operationId is required');
     const updates: Record<string, unknown> = {};
-    if (data.elementType !== undefined) updates.element_type = data.elementType;
-    if (data.label !== undefined) updates.label = data.label;
-    if (data.posX !== undefined) updates.pos_x = data.posX;
-    if (data.posY !== undefined) updates.pos_y = data.posY;
-    if (data.width !== undefined) updates.width = data.width;
-    if (data.height !== undefined) updates.height = data.height;
-    if (data.rotation !== undefined) updates.rotation = data.rotation;
-    if (data.color !== undefined) updates.color = data.color;
-    if (data.data !== undefined) updates.data = data.data;
-    if (data.layer !== undefined) updates.layer = data.layer;
-    if (data.sortOrder !== undefined) updates.sort_order = data.sortOrder;
+    const changes: Record<string, unknown> = {};
+    for (const [key, column] of BOARD_ELEMENT_UPDATE_FIELDS) {
+        if (data[key] !== undefined) {
+            updates[column] = data[key];
+            changes[key] = data[key];
+        }
+    }
     const { error } = await supabase.from('operation_board_elements').update(updates).eq('id', elementId).eq('operation_id', operationId);
     handleSupabaseError({ error, message: 'Failed to update board element' });
+    return changes;
 }
 
 export async function deleteBoardElement(elementId: number, operationId?: string) {

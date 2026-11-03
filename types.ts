@@ -1801,6 +1801,12 @@ export interface LedgerEntry {
     approvedBy?: LedgerCounterparty;
     approvedAt: string | null;
     notes: string | null;
+    /**
+     * The officer's reason for a rejection. APPROVER-ONLY: the server sets it solely
+     * for a caller holding finance:approve and omits the key for everyone else
+     * (lib/db/finances.ts redactLedgerEntryForViewer). Absent also means "no reason".
+     */
+    rejectionReason?: string | null;
     createdAt: string;
     updatedAt: string;
 }

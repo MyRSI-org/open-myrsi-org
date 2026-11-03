@@ -146,7 +146,10 @@ function createLogger(context: Record<string, unknown>): Logger {
         warn: (msg, fields) => emit('warn', context, msg, fields),
         error: (msg, fields) => emit('error', context, msg, fields),
         child(more) {
-            return createLogger({ ...context, ...more });
+            // Context is stamped onto EVERY record this logger emits, so it gets the
+            // same redaction as per-call fields — a log.child({ botToken }) must not
+            // write the credential on each line, unredacted.
+            return createLogger(redactFields({ ...context, ...more }));
         },
     };
 }

@@ -6,7 +6,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // (a revert to verifyOperationAccess would let the read through → test fails).
 
 const spies = vi.hoisted(() => ({
-    assertOpVisibleToUser: vi.fn<(opId: string, user: unknown) => Promise<void>>(),
+    assertOpVisibleToUser: vi.fn<(opId: string, user: unknown, opts?: unknown) => Promise<void>>(),
     verifyOperationAccess: vi.fn(),
     getFullOperationDetails: vi.fn(),
     getUserShipsByUserIds: vi.fn(),
@@ -40,14 +40,14 @@ describe('operation:get_participant_ships visibility gate (M1)', () => {
         await expect(
             (operationActions as Record<string, (p: unknown) => Promise<unknown>>)['operation:get_participant_ships']({ operationId: 'op1', userIds: [2], user: lowPriv }),
         ).rejects.toThrow(/clearance/i);
-        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv);
+        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv, { access: 'read' });
         expect(spies.getUserShipsByUserIds).not.toHaveBeenCalled();
     });
 
     it('returns participant ships once the op IS visible', async () => {
         spies.assertOpVisibleToUser.mockResolvedValue(undefined);
         const ships = await (operationActions as Record<string, (p: unknown) => Promise<unknown>>)['operation:get_participant_ships']({ operationId: 'op1', userIds: [2], user: lowPriv });
-        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv);
+        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv, { access: 'read' });
         expect(ships).toEqual([{ id: 1, name: 'Ship' }]);
     });
 
@@ -74,7 +74,7 @@ describe('operation:template:from_operation visibility gate (sweep / H2 class)',
     it('extracts the template once the op is visible', async () => {
         spies.assertOpVisibleToUser.mockResolvedValue(undefined);
         await (operationActions as Record<string, (p: unknown) => Promise<unknown>>)['operation:template:from_operation']({ operationId: 'op1', user: lowPriv });
-        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv);
+        expect(spies.assertOpVisibleToUser).toHaveBeenCalledWith('op1', lowPriv, { access: 'read' });
         expect(spies.extractTemplatePayloadFromOperation).toHaveBeenCalledWith('op1');
     });
 });

@@ -1,5 +1,6 @@
 
 import express from 'express';
+import type { Server } from 'node:http';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import compression from 'compression';
@@ -13,7 +14,8 @@ import { checkRequestOrigin, allowedOriginsFor } from './lib/csrfOrigin.js';
 import { pruneUserRateLimitBuckets } from './lib/userRateLimit.js';
 import { buildConnectSrc } from './lib/cspConnectSrc.js';
 import { pruneAuthRateLimitBuckets } from './lib/authRateLimit.js';
-import orgUploadHandler, { pruneOrgUploadBuckets } from './api/orgUpload.js';
+import orgUploadHandler, { pruneOrgUploadBuckets, orgUploadPreAuth } from './api/orgUpload.js';
+import { supabaseKeyProblem, isSecretSupabaseKeyProblem } from './lib/supabaseKeyGuard.js';
 import { MAX_UPLOAD_BYTES } from './lib/storage.js';
 import { runOrgMediaGc } from './lib/orgMediaGc.js';
 import { pruneAiRateLimitBuckets } from './lib/aiRateLimit.js';
@@ -138,7 +140,14 @@ const __dirname = path.dirname(__filename);
 // Fail fast at startup if required config is missing in production — catches
 // misconfig on boot instead of on the first DB query / first token verify.
 // Single-org self-hosted: no Stripe/billing — the server just needs its
-// Supabase connection. (JWT_SECRET is validated separately in lib/auth.ts.)
+// Supabase connection. JWT_SECRET is validated separately, by lib/auth.ts at
+// import time (so before this block runs), against the tiers in
+// lib/sessionSecretPolicy.ts. Production REFUSES only the exploitable cases: missing,
+// shorter than 16 characters, or a copy of a key we publish to anyone
+// (SUPABASE_ANON_KEY, VAPID_PUBLIC_KEY). It STARTS with a log.error — repeated as a
+// Database Tools warning — when the secret is 16-31 characters or a copy of a private
+// key (the service-role key, SUPABASE_JWT_SECRET, SECRETS_ENCRYPTION_KEY). There is
+// no fallback to any other key.
 if (process.env.NODE_ENV === 'production') {
     const requiredEnvVars: Array<[string, string]> = [
         ['SUPABASE_URL', 'The Supabase project URL — the server cannot reach the database without it.'],
@@ -166,7 +175,42 @@ if (process.env.NODE_ENV === 'production') {
     }
 }
 
-const app = express();
+// SUPABASE_ANON_KEY is PUBLISHED — target=config and every initial-state response hand it to
+// anyone who asks, logged in or not — so a service-role key pasted into it by mistake is an RLS
+// bypass for every visitor. Three tiers (lib/supabaseKeyGuard.ts isSecretSupabaseKeyProblem):
+//   - UNSET (or blank): a warning. It leaks nothing (realtime simply stays off, as it always has);
+//     a boot failure would be an outage with no security gain.
+//   - a SECRET key (the service-role value, an sb_secret_ key, a non-anon-role JWT): log.error,
+//     and production refuses to start — that is the mistake worth an outage.
+//   - UNRECOGNISED (the .env.example placeholder, a typo): log.error and start, in every
+//     environment. Not exploitable: api/query.ts re-checks per request against the allow-list and
+//     withholds every non-publishable value, so it never reaches a browser; live updates stay off
+//     and Database Tools keeps showing a warning until it is fixed.
+// The per-request guard is what keeps a dev server that only logs here from ever shipping a bad
+// key. Logs name the broken rule only — never the key or any part of it.
+{
+    const problem = supabaseKeyProblem(process.env.SUPABASE_ANON_KEY, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    if (problem === 'missing') {
+        log.warn('SUPABASE_ANON_KEY not set — live updates are disabled', { fix: 'Set it to the project\'s publishable (sb_publishable_…) or legacy anon key from Supabase Dashboard → Project Settings → API.' });
+    } else if (isSecretSupabaseKeyProblem(problem)) {
+        const fix = 'SUPABASE_ANON_KEY must be the publishable (sb_publishable_…) or legacy anon key, never the service-role / secret key. Supabase Dashboard → Project Settings → API.';
+        log.error('SUPABASE_ANON_KEY is a secret key, not a browser-safe one; it will not be sent to clients', { problem, fix });
+        if (process.env.NODE_ENV === 'production') {
+            throw new Error(`Startup aborted: SUPABASE_ANON_KEY ${problem}. ${fix}`);
+        }
+    } else if (problem) {
+        log.error('SUPABASE_ANON_KEY is not a recognised publishable key — it will not be sent to clients; live updates disabled', {
+            problem,
+            fix: 'Set it to the project\'s publishable (sb_publishable_…) or legacy anon key from Supabase Dashboard → Project Settings → API, or leave it blank to run without live updates.',
+        });
+    }
+}
+
+// Exported for the route-ordering tests (tests/rawRoutePreAuth.test.ts), which drive the REAL
+// middleware chain on an ephemeral port: a gate's position relative to a body parser is the
+// property under test there, and a source-text pin cannot prove what Express actually runs first.
+// Importing this module does not listen (see isMainModule below).
+export const app = express();
 // `trust proxy` controls how req.ip resolves X-Forwarded-For, and req.ip backs
 // every IP-keyed control (see lib/clientIp.ts). SECURE BY DEFAULT: 0 = trust no
 // forwarded header and use the real TCP socket peer, which a client cannot spoof.
@@ -623,30 +667,100 @@ app.get('/api/query', async (req, res) => {
 // admin:import_org RPC's admin:access map entry, because this route replaces every
 // seeded table and can re-anchor the acting admin onto a new users.id.
 /**
- * Cheap pre-parse credential check for the import stream.
+ * Single-flight slot: at most ONE org import runs at a time.
+ *
+ * Each import holds up to 64 MB of NDJSON in memory and then pre-clears and rewrites every
+ * seeded table. Two at once is double the memory and two wholesale rewrites interleaving on the
+ * same rows — neither import's result is then the database anyone asked for. A second request
+ * while one is running gets a 409 before its body is read.
+ *
+ * Owned by a per-request symbol, so a release can only ever free the slot its own request took;
+ * a late release from a finished request cannot free a slot a newer import now holds.
+ */
+let orgImportLock: symbol | null = null;
+const ORG_IMPORT_BUSY = 'An org import is already running. Wait for it to finish, then try again.';
+
+function releaseOrgImportLock(lock: symbol): void {
+    if (orgImportLock === lock) orgImportLock = null;
+}
+
+/**
+ * The FULL caller ladder for the import stream, run BEFORE the body parser.
  *
  * `express.text` is route middleware, so it reads the ENTIRE 64 MB body into memory before the
- * handler's first auth line runs. The whole point of splitting the body cap was that an
- * unauthenticated caller could make the server buffer megabytes before any check — and this
- * surface is six times larger than the one that motivated it, so leaving it would be fixing the
- * smaller half of the problem and calling it done.
+ * handler's first line runs. Checking only the token signature here (as this used to) still let
+ * any valid session — a Member, a banned account, a revoked or force-logged-out token that had
+ * not yet expired — make the server buffer 64 MB per request before the admin gate refused it.
+ * So the whole ladder runs here now, in the dispatcher's order: token, force-logout, user,
+ * watermark, ban, then the genuine system Admin. Only a caller who would be allowed to import
+ * can cost us the parse.
  *
- * Signature-only, using the same pure, no-I/O verify the body-cap chooser already calls. The
- * real ladder — force-logout, revocation watermark, the isSystemAdmin gate — stays exactly where
- * it is in the handler and is unchanged; this just refuses an anonymous caller before they can
- * cost us 64 MB.
+ * The handler below re-runs the same ladder unchanged, as defence in depth: this function and
+ * that one are two copies of one rule, and the route stays gated even if one of them is edited
+ * wrong. Keep them in step with each other and with api/services.ts.
+ *
+ * The single-flight slot is taken LAST, after every gate, so an unauthenticated or non-Admin
+ * caller can neither hold it nor learn whether an import is running.
  */
-const importStreamPreAuth: express.RequestHandler = (req, res, next) => {
-    if (!callerIsAuthenticated(req)) {
-        noStore(res);
-        res.status(401).json({ error: 'Unauthorized' });
-        return;
+const importStreamPreAuth: express.RequestHandler = async (req, res, next) => {
+    noStore(res);
+    try {
+        // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+        const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
+        const decoded = token ? verifyToken(token) : null;
+        if (!decoded) { res.status(401).json({ error: 'Unauthorized' }); return; }
+        const platformSettings = await getPlatformSettings();
+        if (isSessionForceLoggedOut(decoded, platformSettings?.force_logout_timestamp)) {
+            res.status(401).json({ error: 'Session expired. Please log in again.', force_logout: true });
+            return;
+        }
+        const user = await getUserById(decoded.userId);
+        if (isSessionRevokedByWatermark(decoded, user?.tokensValidFrom)) {
+            res.status(401).json({ error: 'Session expired. Please log in again.' });
+            return;
+        }
+        // ───────────────────────── ORG BAN GATE ─────────────────────────
+        // Above the admin gate, for the reason the handler's copy gives: the refusal must not
+        // depend on role state an import is about to rewrite. Fails closed into a retryable
+        // 503, never into a ban screen.
+        try {
+            const activeBan = await findActiveBan({ userId: user?.id, discordId: user?.discordId });
+            if (activeBan) { res.status(403).json({ error: 'Forbidden' }); return; }
+        } catch (e) {
+            if ((e as Error)?.name !== 'BanCheckUnavailable') {
+                log.error('ban gate failed unexpectedly on import-stream pre-auth', { userId: user?.id, err: e });
+            }
+            res.status(503).json({ error: 'Unable to verify account status. Please try again.' });
+            return;
+        }
+        // Role IDENTITY, unstamped ⇒ 403 — the same gate, and the same reasoning, as the handler.
+        if (!user || user.isSystemAdmin !== true) { res.status(403).json({ error: 'Forbidden' }); return; }
+
+        if (orgImportLock) { res.status(409).json({ error: ORG_IMPORT_BUSY }); return; }
+        const lock = Symbol('org-import');
+        orgImportLock = lock;
+        res.locals.orgImportLock = lock;
+        // Every exit that never reaches the handler — a parser 413/415, an upload aborted
+        // mid-body — still ends the response, so 'close' frees the slot there. Once the handler
+        // is running it owns the release instead (its `finally`): a client that disconnects
+        // mid-import does not stop importOrgData, so freeing the slot on that 'close' would let
+        // a second import start on top of a first that is still writing.
+        res.once('close', () => { if (res.locals.orgImportRunning !== true) releaseOrgImportLock(lock); });
+        next();
+    } catch (e) {
+        log.error('import-stream pre-auth error', { err: e });
+        if (!res.headersSent) res.status(500).json({ error: 'Internal Server Error' });
     }
-    next();
 };
 
 app.post('/api/admin/import-stream', importStreamPreAuth, express.text({ type: () => true, limit: '64mb', inflate: false }), async (req, res) => {
     noStore(res);
+    // Runs only while holding the slot the pre-auth took. A missing or foreign slot means the
+    // pre-auth did not run for this request, or the slot was already freed by its 'close' —
+    // either way this request does not own the importer, so it must not start one.
+    const importLock = res.locals.orgImportLock as symbol | undefined;
+    if (!importLock || orgImportLock !== importLock) { res.status(409).json({ error: ORG_IMPORT_BUSY }); return; }
+    res.locals.orgImportRunning = true;
     try {
         // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
         const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
@@ -769,11 +883,18 @@ app.post('/api/admin/import-stream', importStreamPreAuth, express.text({ type: (
         log.error('import-stream error', { err: e });
         if (!res.headersSent) res.status(500).json({ error: 'Internal Server Error' });
         else { try { res.end(); } catch { /* already streaming */ } }
+    } finally {
+        // Every handler exit — a gate refusal above, a finished or failed import — frees the
+        // slot. Only here, not on 'close': see the pre-auth.
+        releaseOrgImportLock(importLock);
     }
 });
 
 // Native image upload (raw image bytes). Outside the RPC dispatcher; the handler runs the
 // same auth + permission checks. Per-IP limiter here; per-user throttle inside the handler.
+// orgUploadPreAuth sits BETWEEN the limiter and the raw parser: the parser buffers up to
+// MAX_UPLOAD_BYTES before the handler's first auth line, so without it an anonymous caller
+// could make the server hold a full upload in memory per request just to be told 401.
 const orgUploadLimiter = rateLimit({
     windowMs: 60_000,
     max: 40,
@@ -784,6 +905,7 @@ const orgUploadLimiter = rateLimit({
 app.post(
     '/api/org/upload',
     orgUploadLimiter,
+    orgUploadPreAuth,
     express.raw({ type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif'], limit: MAX_UPLOAD_BYTES, inflate: false }),
     (req, res) => {
         orgUploadHandler(req, res).catch((e) => {
@@ -1196,73 +1318,17 @@ import { withCronLease } from './lib/cronLock.js';
 // production process.argv[1] is this file, so boot runs exactly as before.
 const isMainModule = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
-    log.info('server running', { port });
-    log.info('deployment timestamp', { timestamp: new Date().toISOString() });
-    log.info('serving static files', { distPath });
+/** The one node-cron call the boot makes. Injected so the schedule wiring is testable without
+ *  starting real timers; production passes the node-cron module itself. */
+export type CronScheduler = Pick<typeof cron, 'schedule'>;
 
-    // First-boot install: seed defaults + mint a one-time admin setup code if
-    // no Admin exists yet. Non-blocking — the listener is already up so the
-    // operator can reach the login page as soon as the code is printed.
-    runFirstBootCheck().catch((err) => {
-        log.error('first-boot check threw (unhandled)', { err });
-    });
-
-    // Validate permission-map coverage. A protected action missing from
-    // fullPermissionMap silently 403s in production; surface it at boot so
-    // deploy logs catch the drift immediately.
-    const permCheck = validatePermissionMap();
-    if (permCheck.missing.length > 0) {
-        log.error('protected actions missing from permission map (will silently 403)', { count: permCheck.missing.length, actions: permCheck.missing });
-    }
-    if (permCheck.stale.length > 0) {
-        log.warn('stale permission map entries (no matching action)', { count: permCheck.stale.length, entries: permCheck.stale });
-    }
-    if (permCheck.missing.length === 0 && permCheck.stale.length === 0) {
-        log.info('permission map ok');
-    }
-
-    // SCHEMA PREFLIGHT for the api_keys lifecycle columns. The code refuses API-key
-    // authentication when they are absent (fail closed), and the only symptom a peer sees is
-    // that we look down — so the operator has to be told here, at boot, in the deploy log,
-    // rather than finding out from an ally. Also surfaced in Database Tools and, for admins,
-    // as a banner in the app.
-    findMissingApiKeyColumns()
-        .then((missing) => {
-            if (missing.length > 0) {
-                log.error('DATABASE UPDATE REQUIRED — api_keys is missing columns; API key authentication is REFUSED until schema.sql is re-run', {
-                    missing,
-                    fix: 'Paste the current schema.sql into the Supabase SQL editor and run it.',
-                });
-            }
-        })
-        .catch((err) => log.warn('could not preflight api_keys columns', { err }));
-
-    // Report the public origin this deployment will actually put in Discord deep links
-    // and advertise to alliance peers, plus which source it came from. Deliberately
-    // READ-ONLY — converging the stored row to APP_URL at boot would let a staging
-    // container pointed at a clone of the production database silently rewrite the live
-    // org's origin, with no audit row and no undo. Non-blocking and non-fatal: a DB
-    // hiccup here must never stop the server coming up.
-    resolveOrgAppUrl().then((appUrl) => {
-        log.info('app origin resolved', { effective: appUrl.url, source: appUrl.source });
-        for (const r of appUrl.rejected) {
-            log.warn('app origin candidate ignored', { source: r.source, value: r.value, reason: r.reason });
-        }
-        if (appUrl.drift) {
-            // The migration case: a restored database carries the OLD deployment's
-            // origin. APP_URL wins, so this is informational — but naming the stale
-            // stored value is what turns "links point at the wrong host" into a
-            // one-line diagnosis.
-            log.warn('APP_URL and the stored systemConfig.appUrl disagree — APP_URL wins', appUrl.drift);
-        }
-        if (appUrl.source === 'fallback' && process.env.NODE_ENV === 'production') {
-            log.error('no usable APP_URL — Discord deep links and alliance pairing will use the localhost fallback', { effective: appUrl.url });
-        }
-    }).catch((err) => {
-        log.warn('app origin resolution failed at boot (non-fatal)', { err });
-    });
-
+/**
+ * Register the in-process cron jobs, in this order, each inside its withCronLease lease. A job
+ * error is logged and swallowed inside the lease callback, so a failing job never rejects into
+ * node-cron. The parameter deliberately shadows the node-cron import: production passes that
+ * module, and the job bodies below are unchanged from when they called it directly.
+ */
+export function registerCronJobs(cron: CronScheduler): void {
     cron.schedule('* * * * *', async () => {
       await withCronLease('duty_cleanup', 50, async () => {
         const t0 = Date.now();
@@ -1382,43 +1448,130 @@ const server = isMainModule ? app.listen(Number(port), '0.0.0.0', () => {
     });
 
     log.info('cron jobs initialized');
-}) : null;
+}
+
+/**
+ * Everything the listener does once the port is bound: the boot banner, the first-boot install,
+ * the permission-map and api_keys preflights, the app-origin report, then the cron jobs.
+ * Every async step is non-blocking and non-fatal.
+ */
+export function onServerListening(cron: CronScheduler): void {
+    log.info('server running', { port });
+    log.info('deployment timestamp', { timestamp: new Date().toISOString() });
+    log.info('serving static files', { distPath });
+
+    // First-boot install: seed defaults + mint a one-time admin setup code if
+    // no Admin exists yet. Non-blocking — the listener is already up so the
+    // operator can reach the login page as soon as the code is printed.
+    runFirstBootCheck().catch((err) => {
+        log.error('first-boot check threw (unhandled)', { err });
+    });
+
+    // Validate permission-map coverage. A protected action missing from
+    // fullPermissionMap silently 403s in production; surface it at boot so
+    // deploy logs catch the drift immediately.
+    const permCheck = validatePermissionMap();
+    if (permCheck.missing.length > 0) {
+        log.error('protected actions missing from permission map (will silently 403)', { count: permCheck.missing.length, actions: permCheck.missing });
+    }
+    if (permCheck.stale.length > 0) {
+        log.warn('stale permission map entries (no matching action)', { count: permCheck.stale.length, entries: permCheck.stale });
+    }
+    if (permCheck.missing.length === 0 && permCheck.stale.length === 0) {
+        log.info('permission map ok');
+    }
+
+    // SCHEMA PREFLIGHT for the api_keys lifecycle columns. The code refuses API-key
+    // authentication when they are absent (fail closed), and the only symptom a peer sees is
+    // that we look down — so the operator has to be told here, at boot, in the deploy log,
+    // rather than finding out from an ally. Also surfaced in Database Tools and, for admins,
+    // as a banner in the app.
+    findMissingApiKeyColumns()
+        .then((missing) => {
+            if (missing.length > 0) {
+                log.error('DATABASE UPDATE REQUIRED — api_keys is missing columns; API key authentication is REFUSED until schema.sql is re-run', {
+                    missing,
+                    fix: 'Paste the current schema.sql into the Supabase SQL editor and run it.',
+                });
+            }
+        })
+        .catch((err) => log.warn('could not preflight api_keys columns', { err }));
+
+    // Report the public origin this deployment will actually put in Discord deep links
+    // and advertise to alliance peers, plus which source it came from. Deliberately
+    // READ-ONLY — converging the stored row to APP_URL at boot would let a staging
+    // container pointed at a clone of the production database silently rewrite the live
+    // org's origin, with no audit row and no undo. Non-blocking and non-fatal: a DB
+    // hiccup here must never stop the server coming up.
+    resolveOrgAppUrl().then((appUrl) => {
+        log.info('app origin resolved', { effective: appUrl.url, source: appUrl.source });
+        for (const r of appUrl.rejected) {
+            log.warn('app origin candidate ignored', { source: r.source, value: r.value, reason: r.reason });
+        }
+        if (appUrl.drift) {
+            // The migration case: a restored database carries the OLD deployment's
+            // origin. APP_URL wins, so this is informational — but naming the stale
+            // stored value is what turns "links point at the wrong host" into a
+            // one-line diagnosis.
+            log.warn('APP_URL and the stored systemConfig.appUrl disagree — APP_URL wins', appUrl.drift);
+        }
+        if (appUrl.source === 'fallback' && process.env.NODE_ENV === 'production') {
+            log.error('no usable APP_URL — Discord deep links and alliance pairing will use the localhost fallback', { effective: appUrl.url });
+        }
+    }).catch((err) => {
+        log.warn('app origin resolution failed at boot (non-fatal)', { err });
+    });
+
+    registerCronJobs(cron);
+}
 
 // Slowloris mitigation: cap how long a client may take to send headers / a full
-// request. More valuable self-hosted (direct origin, no CDN in front). Guarded —
-// `server` is null on test import.
-if (server) {
+// request. More valuable self-hosted (direct origin, no CDN in front).
+export function applyServerTimeouts(server: Pick<Server, 'requestTimeout' | 'headersTimeout'>): void {
     server.requestTimeout = 60_000;
     server.headersTimeout = 20_000;
 }
 
-// Graceful Shutdown
-const gracefulShutdown = (signal: string) => {
-    log.info('signal received, starting graceful shutdown', { signal });
-    server?.close(() => {
-        log.info('all connections drained, server closed cleanly');
-        process.exit(0);
-    });
-    // Force exit after 30 seconds if connections don't drain
-    setTimeout(() => {
-        log.error('forced shutdown after 30s timeout');
-        process.exit(1);
-    }, 30_000);
-};
+/** The process surfaces the shutdown and the process handlers touch — injected so tests never
+ *  call the real process.exit or register real process listeners. */
+export type ShutdownProcess = Pick<NodeJS.Process, 'exit'>;
+export type HandlerProcess = Pick<NodeJS.Process, 'on'>;
 
-if (isMainModule) {
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+// Graceful Shutdown
+export function createGracefulShutdown(server: Pick<Server, 'close'>, proc: ShutdownProcess): (signal: string) => void {
+    return (signal: string) => {
+        log.info('signal received, starting graceful shutdown', { signal });
+        server.close(() => {
+            log.info('all connections drained, server closed cleanly');
+            proc.exit(0);
+        });
+        // Force exit after 30 seconds if connections don't drain
+        setTimeout(() => {
+            log.error('forced shutdown after 30s timeout');
+            proc.exit(1);
+        }, 30_000);
+    };
+}
+
+export function installProcessHandlers(proc: HandlerProcess, gracefulShutdown: (signal: string) => void): void {
+    proc.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    proc.on('SIGINT', () => gracefulShutdown('SIGINT'));
     // Log async failures that would otherwise be silent (or only show Node's default
     // stderr trace). An unhandled rejection is logged but not fatal — one stray
     // background error shouldn't take the server down. An uncaught exception leaves
     // the process in an unknown state, so log it and shut down cleanly; the process
     // manager (see DEPLOYMENT_GUIDE) restarts it.
-    process.on('unhandledRejection', (reason) => {
+    proc.on('unhandledRejection', (reason) => {
         log.error('unhandled promise rejection', { err: reason });
     });
-    process.on('uncaughtException', (err) => {
+    proc.on('uncaughtException', (err) => {
         log.error('uncaught exception', { err });
         gracefulShutdown('uncaughtException');
     });
+}
+
+if (isMainModule) {
+    const server = app.listen(Number(port), '0.0.0.0', () => onServerListening(cron));
+    applyServerTimeouts(server);
+    installProcessHandlers(process, createGracefulShutdown(server, process));
 }

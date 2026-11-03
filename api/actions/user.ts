@@ -52,6 +52,12 @@ interface SubscribePushPayload {
     expirationTime?: number | null;
 }
 
+interface LogoutPayload {
+    userId: number;
+    /** The signing-out browser's push endpoint, when it holds a subscription. */
+    pushEndpoint?: unknown;
+}
+
 interface TestPushPayload { userId: number; }
 
 interface ApplyJobPayload { jobId: string; userId: number; statement: string; }
@@ -106,7 +112,21 @@ export const userActions = {
     // stolen token can't outlive the session (the dispatcher rejects any token issued
     // before that time). userId is forced to the signed-in caller, so this only ever
     // logs the caller out.
-    'user:logout': ({ userId }: { userId: number }) => db.revokeUserSessions(userId),
+    //
+    // It also drops THIS browser's push subscription. Moving the watermark alone left
+    // the row in place, so the next person on a shared browser kept receiving the
+    // previous member's EAM directives, finance memos and personal notifications —
+    // and the banner stayed hidden because the browser still held a subscription.
+    // Scoped to the caller AND the endpoint the browser sent: the endpoint is the only
+    // client-supplied key here, and pairing it with the forced userId means a crafted
+    // endpoint can never reach another member's row. Absent (no subscription, or a
+    // browser without push) is normal, not an error. Runs before the revoke and never
+    // throws, so a cleanup fault cannot fail the logout and a revoke fault cannot skip
+    // the cleanup.
+    'user:logout': async ({ userId, pushEndpoint }: LogoutPayload) => {
+        if (typeof pushEndpoint === 'string' && pushEndpoint) await db.deleteOwnPushSubscription(userId, pushEndpoint);
+        return db.revokeUserSessions(userId);
+    },
     'user:toggle_duty': ({ userId }: ToggleDutyPayload) => db.toggleUserDutyStatus(userId),
     'user:heartbeat': ({ userId }: HeartbeatPayload) => db.updateUserHeartbeat(userId),
     'user:initiate_rsi_update': ({ userId, newHandle }: InitiateRsiUpdatePayload) => db.initiateRsiHandleUpdate(userId, newHandle),
@@ -134,7 +154,12 @@ export const userActions = {
     },
     'user:set_radio_channel': ({ userId, channelName }: SetRadioChannelPayload) => db.updateUser(userId, { voiceChannelName: channelName }),
     'user:delete_self': ({ userId }: DeleteSelfPayload) => db.deleteUser(userId),
-    'user:subscribe_push': (payload: SubscribePushPayload) => db.savePushSubscription(payload.userId, payload),
+    // Only the subscription itself, never `payload`: the dispatcher injects the caller's
+    // full user record as payload.user, and passing the whole payload stored a copy of
+    // it in every push_subscriptions row. savePushSubscription rebuilds the stored
+    // object field by field as well, so neither layer alone is load-bearing.
+    'user:subscribe_push': ({ userId, endpoint, keys, expirationTime }: SubscribePushPayload) =>
+        db.savePushSubscription(userId, { endpoint, keys, expirationTime }),
     'user:test_push': async ({ userId }: TestPushPayload) => {
         await sendPushToUsers([userId], {
             title: 'Signal Test',

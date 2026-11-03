@@ -10,6 +10,15 @@ type CacheEntry = { value: any; expiresAt: number };
 const cache = new Map<string, CacheEntry>();
 const MAX_CACHE_ENTRIES = 500;
 
+// Single-org: the deployment IS the org. The old multi-tenant slug→orgId
+// resolver queried a non-existent `organizations` table (42P01 on every hit).
+// Page visibility is gated solely by publicPageConfig.enabled inside
+// getPublicPageData; cache keys use a fixed sentinel. (The stub that replaced
+// the resolver returned this sentinel for every slug that reached it — the
+// handler 404s an invalid slug before any resource lookup — so its null/404
+// arms were unreachable.)
+const ORG_CACHE_ID = 'org';
+
 function getCached<T>(key: string): T | null {
     const hit = cache.get(key);
     if (!hit) return null;
@@ -89,9 +98,7 @@ export default async function publicHandler(req: Request, res: Response) {
                     if (page) setCached(pageKey, page, 60_000);
                 }
                 if (!page || !page.modules?.stats) return notFound(res);
-                const orgId = await resolveOrgId(slug);
-                if (!orgId) return notFound(res);
-                const cacheKey = `stats:${orgId}`;
+                const cacheKey = `stats:${ORG_CACHE_ID}`;
                 const cached = getCached<any>(cacheKey);
                 if (cached) return sendJson(res, cached, 300);
                 const stats = await pub.getPublicStatsForOrg();
@@ -99,8 +106,6 @@ export default async function publicHandler(req: Request, res: Response) {
                 return sendJson(res, stats, 300);
             }
             case 'testimonials': {
-                const orgId = await resolveOrgId(slug);
-                if (!orgId) return notFound(res);
                 const pageKey = `page:${slug}`;
                 let page = getCached<any>(pageKey);
                 if (!page) {
@@ -118,7 +123,7 @@ export default async function publicHandler(req: Request, res: Response) {
                 // Empty featured set is not an error — return an empty list (200) so
                 // the client hides the card cleanly instead of treating a 404 as a fault.
                 if (featured.length === 0) return sendJson(res, { items: [] }, 120);
-                const cacheKey = `testimonials:${orgId}:${featured.join(',')}`;
+                const cacheKey = `testimonials:${ORG_CACHE_ID}:${featured.join(',')}`;
                 const cached = getCached<any>(cacheKey);
                 if (cached) return sendJson(res, cached, 120);
                 const items = await pub.getPublicFeaturedTestimonials(featured);
@@ -127,8 +132,6 @@ export default async function publicHandler(req: Request, res: Response) {
                 return sendJson(res, body, 120);
             }
             case 'services': {
-                const orgId = await resolveOrgId(slug);
-                if (!orgId) return notFound(res);
                 const pageKey = `page:${slug}`;
                 let page = getCached<any>(pageKey);
                 if (!page) {
@@ -136,7 +139,7 @@ export default async function publicHandler(req: Request, res: Response) {
                     if (page) setCached(pageKey, page, 60_000);
                 }
                 if (!page || !page.modules?.services) return notFound(res);
-                const cacheKey = `services:${orgId}`;
+                const cacheKey = `services:${ORG_CACHE_ID}`;
                 const cached = getCached<any>(cacheKey);
                 if (cached) return sendJson(res, cached, 600);
                 const items = await pub.getPublicServicesForOrg();
@@ -152,12 +155,4 @@ export default async function publicHandler(req: Request, res: Response) {
         // Preserve 404-parity: even on unexpected errors, do not differentiate.
         return notFound(res);
     }
-}
-
-// Single-org: the deployment IS the org. The old multi-tenant slug→orgId
-// resolver queried a non-existent `organizations` table (42P01 on every hit).
-// Page visibility is gated solely by publicPageConfig.enabled inside
-// getPublicPageData; cache keys use a fixed sentinel.
-function resolveOrgId(slug: string): string | null {
-    return slug ? 'org' : null;
 }

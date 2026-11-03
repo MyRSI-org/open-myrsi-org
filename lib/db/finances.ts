@@ -1,6 +1,7 @@
 import { supabase, handleSupabaseError, broadcastToOrg } from './common.js';
 import { clampListOffset } from '../pgrest.js';
 import { log as baseLog } from '../log.js';
+import { permissionSatisfied } from '../permissionImplications.js';
 import { toTreasuryAccount, toLedgerEntry } from './mappers.js';
 import type { Tables } from './rows.js';
 import type {
@@ -33,6 +34,125 @@ const MAX_LEDGER_LIMIT = 500;
 const MAX_LEDGER_EXPORT_LIMIT = 5000;
 /** Rows per export round-trip. */
 const LEDGER_EXPORT_PAGE = MAX_LEDGER_LIMIT;
+
+// ---------------------------------------------------------------------------
+// Rejection reasons — APPROVER-ONLY
+// ---------------------------------------------------------------------------
+//
+// An officer's reason for rejecting an entry is officer-authored free text about a
+// member's finances, and finance:view — the gate on every ledger read — is a member
+// default. finance_reject_entry used to append it into `notes`, so it reached every
+// member through the ledger tab and the CSV export. It now lives in its own column
+// (schema.sql §3.10) and is returned ONLY to a caller holding finance:approve: the
+// permission that gates finance:reject_entry, so the people who can write a reason are
+// the people who can read one. Every read here defaults to NON-approver — a caller
+// that has not been proven an approver is not one — and the column is never even
+// SELECTed for a non-approver.
+//
+// The non-approver path also cuts any '\n[rejected] …' tail out of notes, ALWAYS, not
+// only on an old database: schema.sql moves those tails into the column, but until the
+// operator re-applies it they are still inline, and an org import from an older
+// instance can bring them back afterwards. On clean data the cut is a no-op.
+
+/** Decides whether the rejection reason reaches this caller. Build it with ledgerViewerFor. */
+export interface LedgerViewer {
+    canSeeRejectionReason: boolean;
+}
+
+const NON_APPROVER: LedgerViewer = Object.freeze({ canSeeRejectionReason: false });
+
+/**
+ * The reader of a ledger response, from the SERVER-resolved permission list the
+ * dispatcher injects (payload.user) — never a client-supplied flag. Same predicate the
+ * dispatcher applies to finance:reject_entry, so the two cannot drift.
+ */
+export function ledgerViewerFor(permissions: readonly string[] | null | undefined): LedgerViewer {
+    return { canSeeRejectionReason: permissionSatisfied(permissions, 'finance:approve') };
+}
+
+/**
+ * The tail finance_reject_entry used to append: E'\n[rejected] <reason>'. Also matched
+ * at the very start of the string, which the function never wrote (it always led with
+ * the newline) — cutting a little too much from a note is cosmetic, missing a reason
+ * is a leak.
+ */
+const LEGACY_REJECTION_TAIL = /(?:^|\n)\[rejected\] [\s\S]*$/;
+
+/** notes with any legacy rejection tail removed; a note that was ONLY the tail becomes null. */
+export function stripLegacyRejectionSuffix(notes: string | null | undefined): string | null {
+    if (!notes) return notes ?? null;
+    const cut = notes.replace(LEGACY_REJECTION_TAIL, '');
+    return cut === notes ? notes : (cut || null);
+}
+
+/**
+ * The single exit for a ledger entry headed to a non-approver: the reason field is
+ * dropped whatever the row carried, and so is any reason still riding in notes.
+ * Approvers get the entry untouched.
+ */
+export function redactLedgerEntryForViewer(entry: LedgerEntry, viewer: LedgerViewer): LedgerEntry {
+    if (viewer.canSeeRejectionReason) return entry;
+    const out: LedgerEntry = { ...entry, notes: stripLegacyRejectionSuffix(entry.notes) };
+    delete out.rejectionReason;
+    return out;
+}
+
+// rejection_reason is declared HERE rather than read off Tables<'treasury_ledger_entries'>,
+// following lib/db/bans.ts: the generated lib/database.types.ts does not know the column
+// until it is regenerated against a migrated database, and the code must compile first.
+interface LedgerRejectionReasonRow {
+    id: string;
+    rejection_reason: string | null;
+}
+
+/** Ids per reason lookup — keeps the `in.(…)` filter well inside proxy URL limits. */
+const REJECTION_REASON_CHUNK = 100;
+let warnedRejectionColumnMissing = false;
+
+/**
+ * Approver path: fetch reasons for just the rejected rows on this page, in a follow-up
+ * read, rather than widening LEDGER_SELECT. That keeps the shared select — and every
+ * write path's RETURNING — free of a column an un-migrated database does not have, so
+ * the only read that can hit "undefined column" is this one, and it degrades to "no
+ * reason field" (the approver still sees the reason inline in notes on such a
+ * database, exactly as before). Any OTHER error throws: a blip must not read as "no
+ * reason given".
+ */
+async function attachRejectionReasons(entries: LedgerEntry[]): Promise<LedgerEntry[]> {
+    const ids = entries.filter(e => e.status === 'rejected').map(e => e.id);
+    if (ids.length === 0) return entries;
+    const reasons = new Map<string, string>();
+    for (let i = 0; i < ids.length; i += REJECTION_REASON_CHUNK) {
+        const chunk = ids.slice(i, i + REJECTION_REASON_CHUNK);
+        const { data, error } = await supabase.from('treasury_ledger_entries')
+            .select('id, rejection_reason')
+            .in('id', chunk)
+            .order('id', { ascending: true })
+            .limit(chunk.length);
+        if (error && (error.code === '42703' || error.code === 'PGRST204')) {
+            if (!warnedRejectionColumnMissing) {
+                warnedRejectionColumnMissing = true;
+                log.warn('treasury_ledger_entries.rejection_reason is missing — re-run schema.sql; rejection reasons stay inline in notes until then');
+            }
+            return entries;
+        }
+        handleSupabaseError({ error, message: 'Failed to load rejection reasons' });
+        for (const row of (data || []) as LedgerRejectionReasonRow[]) {
+            if (row.rejection_reason) reasons.set(row.id, row.rejection_reason);
+        }
+    }
+    return entries.map((e) => {
+        const reason = reasons.get(e.id);
+        return reason === undefined ? e : { ...e, rejectionReason: reason };
+    });
+}
+
+/** Every ledger read path funnels its mapped entries through here before returning. */
+async function presentLedgerEntries(entries: LedgerEntry[], viewer: LedgerViewer): Promise<LedgerEntry[]> {
+    return viewer.canSeeRejectionReason
+        ? attachRejectionReasons(entries)
+        : entries.map(e => redactLedgerEntryForViewer(e, viewer));
+}
 
 // ---------------------------------------------------------------------------
 // Accounts
@@ -166,8 +286,11 @@ function ledgerPageQuery(opts: LedgerFilterOpts, limit: number, offset: number) 
     return q;
 }
 
+// `viewer` is a SEPARATE argument, never a field of opts: finance:export_csv hands its
+// whole request payload through as opts, so an opts-borne flag would be client-settable.
 export async function listLedgerEntries(
     opts: ListLedgerOpts = {},
+    viewer: LedgerViewer = NON_APPROVER,
 ): Promise<LedgerEntry[]> {
     const limit = Math.max(1, Math.min(MAX_LEDGER_LIMIT, opts.limit ?? DEFAULT_LEDGER_LIMIT));
     const offset = clampListOffset(opts.offset);
@@ -175,7 +298,7 @@ export async function listLedgerEntries(
     const { data, error } = await ledgerPageQuery(opts, limit, offset);
     if (error && error.code === '42P01') return [];
     handleSupabaseError({ error, message: 'Failed to load ledger' });
-    return (data || []).map(r => toLedgerEntry(r as unknown as LedgerRow));
+    return presentLedgerEntries((data || []).map(r => toLedgerEntry(r as unknown as LedgerRow)), viewer);
 }
 
 /**
@@ -188,6 +311,7 @@ export async function listLedgerEntries(
  */
 export async function getLedgerEntry(
     entryId: string,
+    viewer: LedgerViewer = NON_APPROVER,
 ): Promise<LedgerEntry | null> {
     const { data, error } = await supabase.from('treasury_ledger_entries')
         .select(LEDGER_SELECT)
@@ -195,7 +319,9 @@ export async function getLedgerEntry(
 
         .maybeSingle();
     handleSupabaseError({ error, message: 'Failed to load ledger entry' });
-    return data ? toLedgerEntry(data as unknown as LedgerRow) : null;
+    if (!data) return null;
+    const [entry] = await presentLedgerEntries([toLedgerEntry(data as unknown as LedgerRow)], viewer);
+    return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -463,11 +589,11 @@ export async function recordAdjustment(
  * The 30-day read also discarded its error outright (`const { data: recentConfirmed } = …`),
  * so any fault rendered the net as a confident 0.
  */
-export async function getFinancesOverview(): Promise<FinancesOverview> {
+export async function getFinancesOverview(viewer: LedgerViewer = NON_APPROVER): Promise<FinancesOverview> {
     const [accounts, statsResult, recentEntries] = await Promise.all([
         listTreasuryAccounts(),
         supabase.rpc('finance_overview_stats'),
-        listLedgerEntries({ limit: 10 }),
+        listLedgerEntries({ limit: 10 }, viewer),
     ]);
 
     handleSupabaseError({ error: statsResult.error, message: 'Failed to load finance overview' });
@@ -538,6 +664,7 @@ export function csvEscape(value: unknown): string {
  */
 export async function exportLedgerCsv(
     opts: ExportLedgerOpts = {},
+    viewer: LedgerViewer = NON_APPROVER,
 ): Promise<string> {
     const requested = Math.trunc(Number(opts.limit));
     // Absent / non-numeric / non-positive means "the whole window", not a 1-row
@@ -565,12 +692,16 @@ export async function exportLedgerCsv(
         offset += page.length;
         if (rows.length > ceiling) { rows.splice(ceiling); truncated = true; break; }
     }
-    const entries = rows.map(r => toLedgerEntry(r));
+    const entries = await presentLedgerEntries(rows.map(r => toLedgerEntry(r)), viewer);
 
+    // The rejection_reason column exists only in an approver's file — appended LAST so
+    // every other column keeps its position for anything that parses by index.
+    const withReason = viewer.canSeeRejectionReason;
     const header = [
         'created_at', 'account_id', 'entry_type', 'amount', 'status',
         'memo', 'counterparty_name', 'counterparty_text',
         'created_by', 'approved_by', 'approved_at', 'notes', 'entry_id',
+        ...(withReason ? ['rejection_reason'] : []),
     ];
     const lines = [header.join(',')];
     for (const r of entries) {
@@ -588,6 +719,7 @@ export async function exportLedgerCsv(
             r.approvedAt,
             r.notes,
             r.id,
+            ...(withReason ? [r.rejectionReason] : []),
         ].map(csvEscape).join(','));
     }
 

@@ -5,6 +5,7 @@ import { useDebouncedValue } from '../../../hooks/useDebouncedValue';
 import type { WarehouseStock, WarehouseCatalogCategory, QmLocation } from '../../../types';
 import { SkeletonCardGrid } from '../../shared/ui/Skeleton';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { buildStockCsv, type StockExportRow } from './stockCsv';
 
 const CATEGORY_LABEL: Record<WarehouseCatalogCategory, string> = {
     ore: 'Ore',
@@ -18,25 +19,6 @@ const CATEGORY_LABEL: Record<WarehouseCatalogCategory, string> = {
 
 const PAGE_SIZE = 60;
 const CSV_EXPORT_PAGE_SIZE = 200;
-const CSV_HEADER = ['Commodity', 'Quality', 'Category', 'Unit', 'Location', 'On Hand', 'Reserved', 'Notes'] as const;
-
-function csvEscape(v: unknown): string {
-    if (v == null) return '';
-    const s = String(v);
-    if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-}
-
-interface StockExportRow {
-    commodity: string;
-    quality: string;
-    category: string;
-    unit: string;
-    location: string;
-    onHand: number;
-    reserved: number;
-    notes: string;
-}
 
 /** Reserved-quantity badge with a breakdown tooltip (requests vs. open contracts). */
 function ReservedBadge({ quantityReserved, fromRequests }: { quantityReserved: number; fromRequests: number }) {
@@ -190,20 +172,7 @@ export default function WhStockTab({ locations, canManage, canRequest, canAdmin,
                 return;
             }
 
-            const lines = [CSV_HEADER.join(',')];
-            for (const r of collected) {
-                lines.push([
-                    csvEscape(r.commodity),
-                    csvEscape(r.quality),
-                    csvEscape(r.category),
-                    csvEscape(r.unit),
-                    csvEscape(r.location),
-                    csvEscape(r.onHand),
-                    csvEscape(r.reserved),
-                    csvEscape(r.notes),
-                ].join(','));
-            }
-            const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+            const blob = new Blob([buildStockCsv(collected)], { type: 'text/csv;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;

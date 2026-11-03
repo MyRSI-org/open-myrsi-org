@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // The GET /api/query `subset=settings` branch was a dead, ungated round-trip. It
 // reduced EVERY settings row into one blob, had NO SUBSET_REQUIRED_PERMISSION
@@ -111,6 +113,34 @@ describe('GET /api/query?subset=settings — dead, ungated branch removed', () =
         await handler(mockReq({ target: 'state', subset: 'main' }, 'tok'), res);
         expect(res.statusCode).toBe(200);
         expect(h.calls.getMainState).toBe(1);
+    });
+});
+
+// callerHasSubsetPermission carried a ctx parameter and a ctx-owner short-circuit left over
+// from the multi-tenant build. Every call site passed null, so it was unreachable — but a
+// future caller handing it a ctx would have reopened an owner bypass on every subset gate.
+describe('callerHasSubsetPermission — the multi-tenant owner bypass is gone', () => {
+    it('takes (currentUser, requiredPerm) only, and its body consults no ctx / owner field', () => {
+        // Normalised: the tree is CRLF locally and LF in CI.
+        const src = readFileSync(resolve(__dirname, '..', 'api', 'query.ts'), 'utf8').replace(/\r\n/g, '\n');
+        const at = src.indexOf('function callerHasSubsetPermission(');
+        expect(at, 'callerHasSubsetPermission was renamed').toBeGreaterThan(-1);
+        const end = src.indexOf('\n}\n', at);
+        expect(end).toBeGreaterThan(at);
+        const fn = src.slice(at, end);
+        expect(fn).toMatch(/^function callerHasSubsetPermission\(currentUser: any, requiredPerm: string\): boolean \{/);
+        expect(fn).not.toMatch(/ownerId|auth_user_id|ctx/);
+        // Every call site uses the two-argument form (no leftover null ctx).
+        const calls = [...src.matchAll(/callerHasSubsetPermission\(([^)]*)\)/g)].map((m) => m[1]).filter((a) => !/:\s/.test(a));
+        expect(calls.length).toBeGreaterThanOrEqual(4);
+        for (const args of calls) expect(args.split(',').length, args).toBe(2);
+    });
+
+    it('a member without the subset permission is refused even though their row carries an auth_user_id', async () => {
+        h.decoded = { userId: 6 }; h.user = memberUser; // holds warrant/intel/hr view, NOT operations:view
+        const res = mockRes();
+        await handler(mockReq({ target: 'state', subset: 'operations' }, 'tok'), res);
+        expect(res.statusCode).toBe(403);
     });
 });
 

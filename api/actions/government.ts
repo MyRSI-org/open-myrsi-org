@@ -467,15 +467,14 @@ export const governmentActions = {
     'gov:cast_legislation_vote': ({ legislationId, userId, positionId, vote }: CastLegislationVotePayload) =>
         db.castLegislationVote(legislationId, userId, positionId, vote),
 
+    // The verdict and title come from the conclusion itself. Its result used to carry
+    // only `passed`, so this read a title/status that was never there (and a 'Defeated'
+    // that is never stored) — every push said "A bill concluded (final).". The title is
+    // presented as the other pushes here present it: the stored one, then a generic one.
     'gov:conclude_legislation_vote': async ({ legislationId }: ConcludeLegislationVotePayload) => {
         const result = await db.concludeLegislationVote(legislationId);
-        const title = asResult(result).title || 'A bill';
-        const status = asResult(result).status;
-        const verdict = status === 'Passed' ? 'passed'
-            : status === 'Defeated' ? 'was defeated'
-            : `concluded (${status || 'final'})`;
         notifyOrg('Legislation concluded',
-            `${title} ${verdict}.`,
+            `${result.title || 'A bill'} ${result.passed ? 'passed' : 'was defeated'}.`,
             `gov-legislation-concluded-${legislationId}`,
             { tab: 'legislation', legislationId });
         return result;
@@ -530,15 +529,11 @@ export const governmentActions = {
     'gov:cast_motion_vote': ({ motionId, userId, vote }: CastMotionVotePayload) =>
         db.castMotionVote(motionId, userId, vote),
 
+    // Same fix as gov:conclude_legislation_vote.
     'gov:conclude_motion': async ({ motionId }: ConcludeMotionPayload) => {
         const result = await db.concludeMotion(motionId);
-        const title = asResult(result).title || 'A motion';
-        const status = asResult(result).status;
-        const verdict = status === 'Passed' ? 'passed'
-            : status === 'Failed' || status === 'Defeated' ? 'was defeated'
-            : `concluded (${status || 'final'})`;
         notifyOrg('Motion concluded',
-            `${title} ${verdict}.`,
+            `${result.title || 'A motion'} ${result.passed ? 'passed' : 'was defeated'}.`,
             `gov-motion-concluded-${motionId}`,
             { tab: 'motions', motionId });
         return result;
@@ -566,8 +561,12 @@ export const governmentActions = {
     'gov:create_order': async ({ input, userId }: CreateOrderPayload) => {
         const result = await db.createGovernmentOrder(input, userId);
         const title = asResult(result).title || input?.title || 'An executive order';
-        // Orders are often published in 'Draft' first; only notify once it goes live.
-        if (!asResult(result).status || asResult(result).status === 'Active') {
+        // Orders are often saved as a draft first; only notify once one is in force.
+        // Compared against the STORED value: orders.ts writes lower-case 'active' (the
+        // column CHECK allows nothing else), so the old `=== 'Active'` never matched and
+        // an issued order was never announced. A result without a status is NOT taken
+        // as live — that branch would announce a draft's title to the whole org.
+        if (asResult(result).status === 'active') {
             notifyOrg('Executive order issued',
                 `${title} is now in force.`,
                 `gov-order-issued-${asResult(result).id}`,
@@ -578,11 +577,11 @@ export const governmentActions = {
 
     'gov:update_order': async ({ orderId, patch, userId }: UpdateOrderPayload) => {
         const result = await db.updateGovernmentOrder(orderId, patch, userId);
-        // A status flip from Draft → Active publishes the order — notify on that transition.
-        // Compared as a widened string to preserve the original runtime check (the
-        // GovernmentOrderInput status union is lower-case, so a strict `=== 'Active'`
-        // would be flagged as a non-overlapping comparison).
-        if ((patch?.status as string | undefined) === 'Active') {
+        // A status flip draft → active publishes the order — notify on that transition.
+        // updateGovernmentOrder refuses any order that is not a draft, so reaching here
+        // with status 'active' means the publish happened. Lower-case, as stored: the
+        // old `=== 'Active'` comparison never matched, so publishing was never announced.
+        if (patch?.status === 'active') {
             const title = asResult(result).title || 'An executive order';
             notifyOrg('Executive order issued',
                 `${title} is now in force.`,

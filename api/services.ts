@@ -699,9 +699,12 @@ export const fullPermissionMap: Record<string, string> = {
     'wiki:update_page': 'wiki:edit_page',
     'wiki:delete_page': 'wiki:delete_page',
     'wiki:reorder_pages': 'wiki:edit_page',
-    // Full unfiltered page dump (bypasses the clearance filter applied to the
-    // wiki read path) — restrict to Admin so a clearance-limited wiki editor
-    // can't export above-clearance classified pages.
+    // Page dump for backup/migration. admin:access is the admin-panel bucket, NOT
+    // "Admin only" — the seeded Dispatcher holds it too — so it is not what keeps
+    // classified pages in: exportWikiPages applies the read path's clearance filter
+    // (filterByClearance) itself, and the handler additionally requires wiki:view,
+    // the permission the 'wiki' read subset demands, so an export can never be a
+    // way round the wiki read gate.
     'wiki:export_pages': 'admin:access',
     'wiki:import_pages': 'admin:access',
 
@@ -1067,6 +1070,23 @@ export default async function handler(req: Request, res: Response) {
 
     const { action, payload } = req.body;
 
+    // LOGOUT CLEARS THE COOKIE FIRST, ABOVE EVERY GATE. Clearing it belongs in the dispatcher,
+    // not the handler: handlers receive (payload, token) and have no `res`. And it belongs HERE,
+    // before the maintenance 503, the force-logout and watermark 401s, the ban gate and the
+    // per-user 429, because the client can only remove its localStorage copy, never the HttpOnly
+    // cookie. Any of those refusals used to answer a logout WITHOUT the clear, the client showed
+    // a logout anyway, landed on `/`, and the surviving 24-hour cookie signed the member straight
+    // back in on the next page load (credentialFromRequest prefers it). On a shared machine that
+    // is the next person inheriting the session. Unconditional is safe: a logout only ever drops
+    // privilege, and the CSRF origin gate already stops a cross-site page forcing one. What this
+    // cannot cover is a refusal that never reaches the dispatcher (the per-IP apiLimiter in
+    // server.ts, or no network at all), which is why SessionContext.logout() refuses to report
+    // success when the RPC fails. appendSetCookie rather than setHeader so an OAuth-state
+    // Set-Cookie is not clobbered.
+    if (action === 'user:logout') {
+        appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE));
+    }
+
     // Hoisted to handler scope: every denial path below records it on the audit row,
     // so an operator can see WHERE a probe came from and not just that it happened.
     const ip = getClientIp(req);
@@ -1104,8 +1124,14 @@ export default async function handler(req: Request, res: Response) {
     // auth bootstrap actions skip force-logout. user:heartbeat skips maintenance
     // but is still subject to force-logout, so a revoked session can't keep
     // heart-beating indefinitely.
+    // user:logout skips maintenance (only) because a logout only ever DROPS privilege:
+    // the 503 answered a non-admin logout after the cookie clear above but before the
+    // handler moved tokens_valid_from, so the client reported "Sign-out failed" and any
+    // copy of the token stayed live for the rest of its 24 hours. It is deliberately NOT
+    // in forceLogoutBypass — a force-logged-out session still gets the 401 — and every
+    // later gate (token verify, watermark, ban, per-user limit, permission map) still runs.
     const forceLogoutBypass = ['auth:begin_oauth', 'auth:discord_callback', 'auth:finalize_setup', 'auth:redeem_setup_code', 'system:get_push_config', 'system:preflight'];
-    const maintenanceBypass = ['user:heartbeat', ...forceLogoutBypass];
+    const maintenanceBypass = ['user:heartbeat', 'user:logout', ...forceLogoutBypass];
     if (!forceLogoutBypass.includes(action) || !maintenanceBypass.includes(action)) {
         try {
             const platformSettings = await db.getPlatformSettings();
@@ -1152,7 +1178,23 @@ export default async function handler(req: Request, res: Response) {
                 }
             }
         } catch (e) {
-            log.warn('maintenance check failed', { err: e });
+            // FAIL CLOSED. This block IS the maintenance and force-logout gates, and both of
+            // their refusals live inside the try, so a catch that only warned SKIPPED both
+            // gates for the request whenever anything in here threw. getPlatformSettings is
+            // written never to throw (it serves last-known-good), so this is the backstop for
+            // a future change to that contract: with the platform state unreadable, neither
+            // "maintenance is off" nor "this session was not force-logged-out" is known, so
+            // the request is refused with the maintenance copy. Nobody is an Admin here: the
+            // Admin pass is an exemption from a maintenance window that was actually READ.
+            // The maintenance-bypass actions still proceed exactly as they do during a real
+            // window (a read fault neither widens nor narrows maintenanceBypass), and every
+            // later gate still runs for them. Twin of the api/query.ts router, where
+            // initial-state is the exempt path; keep the two matched.
+            if (!maintenanceBypass.includes(action)) {
+                log.error('maintenance check failed; refusing', { action, err: e });
+                return res.status(503).json({ message: 'The platform is currently undergoing maintenance. Please try again later.' });
+            }
+            log.warn('maintenance check failed', { action, err: e });
         }
     }
 
@@ -1304,6 +1346,22 @@ export default async function handler(req: Request, res: Response) {
         });
     }
 
+    // --- PAYLOAD SHAPE ---
+    // A payload that is PRESENT must be a plain JSON object. A truthy primitive used to reach
+    // the identity-overwrite loop below, where `field in payload` throws a TypeError on a
+    // string/number/boolean (an unaudited 500), and a falsy one (0, '', false, null) skipped
+    // both injection blocks and reached its handler with NO actor ids at all. An array is an
+    // object to `typeof` but is never a valid action payload. Refused here, above the
+    // injection and every dispatch, with opaque copy and an audit row that records the TYPE,
+    // never the value. A MISSING payload (undefined) keeps today's behaviour.
+    if (payload !== undefined && (typeof payload !== 'object' || payload === null || Array.isArray(payload))) {
+        auditDenial('request.invalid_payload.denied', {
+            action: typeof action === 'string' ? action : null, user: fullUser, ip,
+            details: { payloadType: payload === null ? 'null' : Array.isArray(payload) ? 'array' : typeof payload },
+        });
+        return res.status(400).json({ success: false, message: 'Invalid request payload.' });
+    }
+
     // --- PAYLOAD INJECTION ---
     if (payload && typeof payload === 'object') {
         if (fullUser) {
@@ -1437,22 +1495,22 @@ export default async function handler(req: Request, res: Response) {
                     && action.startsWith('operation:')
                     && !OWNER_BYPASS_EXCLUDED_OPERATION_ACTIONS.has(action)
                     && !isStatusChangingUpdate
-                    && payload.operationId) {
+                    && payload?.operationId) {
                     isOpOwner = (await db.getFullOperationDetails(payload.operationId))?.ownerId === user?.id;
                 }
 
-                const isUnitLeader = action === 'unit:update_details' && payload.unitId && user?.unit?.id === payload.unitId && user?.unit?.leaderId === user.id;
+                const isUnitLeader = action === 'unit:update_details' && payload?.unitId && user?.unit?.id === payload.unitId && user?.unit?.leaderId === user.id;
 
                 // Bulletin authors can delete their own bulletins
                 let isBulletinAuthor = false;
-                if (action === 'intel:delete_bulletin' && payload.bulletinId && user?.id) {
+                if (action === 'intel:delete_bulletin' && payload?.bulletinId && user?.id) {
                     const { data: bulletin } = await db.supabase.from('intel_bulletins').select('created_by_id').eq('id', payload.bulletinId).single();
                     isBulletinAuthor = bulletin?.created_by_id === user.id;
                 }
 
                 // Lead responder can manage their request's team
                 let isRequestLead = false;
-                if ((action === 'request:add_responder' || action === 'request:remove_responder') && payload.requestId && user?.id) {
+                if ((action === 'request:add_responder' || action === 'request:remove_responder') && payload?.requestId && user?.id) {
                     const { data: req } = await db.supabase.from('service_requests').select('lead_responder_id').eq('id', payload.requestId).single();
                     isRequestLead = req?.lead_responder_id === user.id;
                 }
@@ -1559,18 +1617,6 @@ export default async function handler(req: Request, res: Response) {
             res.setHeader('Retry-After', String(userLimit.retryAfter));
             return res.status(429).json({ success: false, message: 'Too many requests. Please slow down and try again shortly.' });
         }
-    }
-
-    // Clearing the cookie belongs HERE, not in the handler: handlers receive (payload, token)
-    // and have no `res`. BEFORE dispatch, not after, and deliberately so: the client can only
-    // remove its localStorage copy, never the HttpOnly cookie, so if this sat in the success
-    // branch a failing `user:logout` (offline, or revokeUserSessions throwing) would show the
-    // user a logout, land them on `/`, and leave a live 24-hour cookie that signs them straight
-    // back in on the next page load. On a shared machine that is a real exposure — and a
-    // regression, because removing the localStorage token alone used to be sufficient.
-    // res.append rather than setHeader so an OAuth-state Set-Cookie is not clobbered.
-    if (action === 'user:logout') {
-        appendSetCookie(res, clearSessionCookie(SESSION_COOKIE_IS_SECURE));
     }
 
     try {

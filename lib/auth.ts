@@ -2,6 +2,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { log as baseLog } from './log.js';
+import { assessSessionSecret, SESSION_SECRET_FIX_HINT } from './sessionSecretPolicy.js';
 
 const log = baseLog.child({ module: 'lib.auth' });
 
@@ -10,13 +11,41 @@ const log = baseLog.child({ module: 'lib.auth' });
 // token-signing leak does not equal a DB superuser leak.
 const SECRET = process.env.JWT_SECRET;
 
+// PRESENCE IS NOT STRENGTH, but not every weakness is worth an outage either. WHAT is unsafe,
+// and which problems refuse vs only warn, is decided in ONE place — lib/sessionSecretPolicy.ts —
+// shared with the admin Database Tools health check (lib/db/system.ts runDatabaseHealthCheck) so
+// the boot guard and the screen can never disagree. Read the rules and their reasoning there;
+// this block only acts on the verdict:
+//   production, refuse tier -> throw at load (the server does not start);
+//   production, warn tier   -> one log.error with the problems + fix, then start;
+//   elsewhere               -> a dev server always starts: a missing secret gets the per-process
+//                              ephemeral key below, any other problem one log.warn saying what
+//                              production would do.
+// Names only, never the value: neither the error nor a log line may become the leak.
+const sessionSecret = assessSessionSecret(process.env);
+const isProduction = process.env.NODE_ENV === 'production';
+
 if (!SECRET) {
-    if (process.env.NODE_ENV === 'production') {
+    if (isProduction) {
         throw new Error('CRITICAL: JWT_SECRET is not configured. Set JWT_SECRET to a dedicated random value (e.g. `node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"`).');
     }
     // In dev, warn but allow startup with a per-process random secret; tokens
     // will not survive server restarts.
     log.error('jwt_secret not set, using ephemeral random secret (tokens invalidate on restart)', { env: 'dev' });
+} else if (sessionSecret.refuse.length > 0) {
+    // Every problem, both tiers, so the operator fixes it in one pass.
+    const problems = [...sessionSecret.refuse, ...sessionSecret.warn];
+    if (isProduction) {
+        throw new Error(`CRITICAL: JWT_SECRET is unsafe (${problems.join('; ')}). ${SESSION_SECRET_FIX_HINT}`);
+    }
+    log.warn('jwt_secret is unsafe; production would refuse to start', { problems, hint: SESSION_SECRET_FIX_HINT });
+} else if (sessionSecret.warn.length > 0) {
+    const problems = sessionSecret.warn;
+    if (isProduction) {
+        log.error('jwt_secret is weaker than recommended; starting anyway, rotate it when convenient', { problems, hint: SESSION_SECRET_FIX_HINT });
+    } else {
+        log.warn('jwt_secret is weaker than recommended; production would start but log an error', { problems, hint: SESSION_SECRET_FIX_HINT });
+    }
 }
 
 const SIGNING_KEY = SECRET || randomBytes(32).toString('hex');

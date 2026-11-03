@@ -242,7 +242,9 @@ export interface LocationInput {
 }
 
 export async function createQmLocation(input: LocationInput): Promise<QmLocation> {
-    const name = (input.name || '').trim();
+    // Collapse line breaks: location names reach the warehouse stock CSV, where a bare
+    // CR/LF would start a new spreadsheet row (formula-injection defence in depth).
+    const name = (input.name || '').replace(/[\r\n]+/g, ' ').trim();
     if (!name) throw new Error('Location name is required.');
     const { data, error } = await supabase.from('quartermaster_locations')
         .insert({
@@ -265,7 +267,7 @@ export interface LocationUpdateInput extends Partial<LocationInput> {
 
 export async function updateQmLocation(input: LocationUpdateInput): Promise<QmLocation> {
     const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-    if (input.name !== undefined) patch.name = input.name.trim();
+    if (input.name !== undefined) patch.name = input.name.replace(/[\r\n]+/g, ' ').trim();
     if (input.type !== undefined) patch.type = input.type;
     if (input.parentId !== undefined) patch.parent_id = input.parentId;
     if (input.description !== undefined) patch.description = input.description;
@@ -1715,9 +1717,12 @@ export async function updatePlatformItemCategory(id: number, patch: Record<strin
 }
 
 export async function deletePlatformItemCategory(id: number) {
-    const { count } = await supabase.from('quartermaster_catalog')
+    const { count, error: countErr } = await supabase.from('quartermaster_catalog')
         .select('id', { count: 'exact', head: true })
         .eq('platform_category_id', id);
+    // Fail closed: an unread count is not "no references". The FK is ON DELETE SET
+    // NULL, so deleting anyway would silently unlink every item in the category.
+    handleSupabaseError({ error: countErr, message: 'Failed to check quartermaster platform category usage' });
     if (count && count > 0) {
         throw new Error(`Cannot delete: ${count} item row(s) reference this category. Reassign first.`);
     }
@@ -1807,8 +1812,13 @@ export async function syncPlatformItemCatalog() {
     const { categories, items, errors: fetchErrors } = await fetchAllUexItems();
 
     // Pass 1: categories
-    const { data: existingCats } = await supabase.from('quartermaster_platform_categories')
+    const { data: existingCats, error: existingErr } = await supabase.from('quartermaster_platform_categories')
         .select('id, uex_category_id, display_name');
+    // Fail closed: an unread category table is not an empty one. Proceeding would
+    // re-insert every category (each refused by the uex_category_id UNIQUE), leave
+    // the FK lookup empty, and upsert every item with platform_category_id = null —
+    // wiping the whole catalogue's category assignment on one transient fault.
+    handleSupabaseError({ error: existingErr, message: 'Failed to load quartermaster platform categories for sync' });
     const existingByUexId = new Map<number, { id: number; display_name: string }>();
     for (const r of (existingCats || [])) {
         existingByUexId.set(r.uex_category_id, { id: r.id, display_name: r.display_name });
@@ -1945,9 +1955,13 @@ export async function updatePlatformItem(id: number, patch: Record<string, unkno
 }
 
 export async function deletePlatformItem(id: number) {
-    const { count } = await supabase.from('quartermaster_inventory')
+    const { count, error: countErr } = await supabase.from('quartermaster_inventory')
         .select('id', { count: 'exact', head: true })
         .eq('catalog_id', id);
+    // Fail closed: an unread count is not "no references". The FK is ON DELETE SET
+    // NULL, so deleting anyway would silently detach (or, for name-less rows, fail
+    // the has-name check on) every inventory row that still points here.
+    handleSupabaseError({ error: countErr, message: 'Failed to check platform item usage' });
     if (count && count > 0) {
         throw new Error(`Cannot delete: ${count} inventory row(s) reference this item. Use merge to reassign them first.`);
     }

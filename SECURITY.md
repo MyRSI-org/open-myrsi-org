@@ -57,6 +57,10 @@ Activity beyond good-faith research — unauthorised access to a deployment you 
 - Third-party services (Supabase, Discord, LiveKit, Gemini, UEX) themselves — report those to the respective vendor.
 - Denial-of-service via traffic volume, social engineering, and findings that require a compromised admin account or physical/host access.
 
+### Documented design exception: tactical-board realtime deltas
+
+Live updates ride private Supabase Realtime channels and, by design, carry **ids only** — the browser then fetches content through the server's permission-gated read paths. There is **one deliberate exception**: the per-operation tactical-board channel `op-board-<operation id>` carries board element **content** (`broadcastBoardAdd` / `broadcastBoardUpdate` in `lib/db/ops.ts`), so live board edits don't need a full refetch. Receipt on that channel is authorized per operation by the realtime RLS policy `rt_recv_op_board` → `private.rt_can_read_op_board()` (`schema.sql` §4.9 / §6b), which applies the same gate as opening the operation in the app — owner, `operations:manage`, or `operations:view` plus clearance level, every limiting marker and (for Special Operations) participation — and drops deleted, revoked and banned accounts. Board content is never sent on any org-wide channel, and every other broadcast stays id-only (pinned by `tests/opBoardDeltaException.test.ts` and `tests/sec-schema-rls.test.ts`). A way to receive board content for an operation you can't open in the app is in scope and we'd like to hear about it.
+
 ## Self-hosting hardening
 
 Because **the server is the security boundary** (it runs under the Supabase service-role key, bypassing RLS), a secure deployment depends on you:

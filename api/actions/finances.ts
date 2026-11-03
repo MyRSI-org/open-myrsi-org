@@ -94,8 +94,15 @@ interface RecordAdjustmentPayload {
     counterpartyText?: string | null;
 }
 
+// The caller's server-resolved user record, injected by services.ts (PAYLOAD
+// INJECTION overwrites any client-sent `user`). Ledger reads pass its permissions to
+// db.ledgerViewerFor, which decides whether an officer's rejection reason is returned.
+interface ViewerPayload {
+    user?: { permissions?: string[] | null };
+}
+
 // finance:export_csv spreads its filter fields into the ledger-filter opts.
-type ExportCsvPayload = ListLedgerPayload;
+type ExportCsvPayload = ListLedgerPayload & ViewerPayload;
 
 /**
  * Finances RPC action handlers. Permission checks are enforced in services.ts
@@ -121,13 +128,13 @@ export const financesActions = {
         db.getTreasuryAccount(accountId),
 
     // --- LEDGER ---
-    'finance:list_ledger': async ({ accountId, entryType, status, counterpartyUserId, fromDate, toDate, limit, offset }: ListLedgerPayload) =>
+    'finance:list_ledger': async ({ user, accountId, entryType, status, counterpartyUserId, fromDate, toDate, limit, offset }: ListLedgerPayload & ViewerPayload) =>
         db.listLedgerEntries({
             accountId, entryType, status, counterpartyUserId, fromDate, toDate, limit, offset,
-        }),
+        }, db.ledgerViewerFor(user?.permissions)),
 
-    'finance:get_entry': async ({ entryId }: GetEntryPayload) =>
-        db.getLedgerEntry(entryId),
+    'finance:get_entry': async ({ user, entryId }: GetEntryPayload & ViewerPayload) =>
+        db.getLedgerEntry(entryId, db.ledgerViewerFor(user?.permissions)),
 
     'finance:submit_deposit': async ({
         userId, accountId, amount, memo, counterpartyUserId, counterpartyText, notes, operationId,
@@ -187,12 +194,15 @@ export const financesActions = {
                 // THE REASON IS DROPPED, deliberately. It is officer-authored free text
                 // about a member's finances, and it was riding into an OS notification tray
                 // — a surface with no permission gate, that renders on a lock screen, and
-                // that the durable row would now make permanent. The submitter reads it
-                // in-app on the permission-gated ledger, which is where it belongs.
+                // that the durable row would now make permanent. It is APPROVER-ONLY on
+                // the ledger too (db.ledgerViewerFor): a submitter without finance:approve
+                // sees that the entry was rejected, not the officer's reasoning — so the
+                // copy points them at a finance officer, not at a ledger that would show
+                // them no reason.
                 await db.createNotification(entry.createdByUserId, {
                     type: 'finance_rejected',
                     title: 'Your entry was rejected',
-                    body: 'Your submitted entry was rejected — open the ledger for details.',
+                    body: 'Your submitted entry was rejected. Contact a finance officer for details.',
                     link: 'finances',
                     metadata: { entryId },
                 }).catch((err) => log.warn('reject notify failed', { entryId, err }));
@@ -210,11 +220,11 @@ export const financesActions = {
         db.recordAdjustment(userId, { accountId, amount, reason, counterpartyText }),
 
     // --- OVERVIEW / EXPORT ---
-    'finance:get_overview': async () =>
-        db.getFinancesOverview(),
+    'finance:get_overview': async (payload?: ViewerPayload) =>
+        db.getFinancesOverview(db.ledgerViewerFor(payload?.user?.permissions)),
 
     'finance:export_csv': async (opts: ExportCsvPayload) => {
-        const csv = await db.exportLedgerCsv(opts);
+        const csv = await db.exportLedgerCsv(opts, db.ledgerViewerFor(opts?.user?.permissions));
         return { csv, filename: `ledger-${new Date().toISOString().slice(0, 10)}.csv` };
     },
 

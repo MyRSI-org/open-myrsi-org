@@ -4,6 +4,7 @@ import { useAuth, useFormatDate } from '../../../../contexts/AuthContext';
 import { useData } from '../../../../contexts/DataContext';
 
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { canAddAarEntry } from '../participantRoster';
 
 const AAR_AI_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 
@@ -19,7 +20,6 @@ const formatRemaining = (ms: number) => {
 interface OpAARTabProps {
     operation: HydratedOperation;
     canManage: boolean;
-    isParticipant: boolean;
     onRefresh: () => void;
 }
 
@@ -30,7 +30,7 @@ const categoryConfig: Record<string, { icon: string; color: string; label: strin
     action_item: { icon: 'fa-solid fa-clipboard-check', color: 'text-purple-400', label: 'Action Items', bgClass: 'bg-purple-500/10 border-purple-500/20' },
 };
 
-const OpAARTab: React.FC<OpAARTabProps> = ({ operation, canManage, isParticipant, onRefresh }) => {
+const OpAARTab: React.FC<OpAARTabProps> = ({ operation, canManage, onRefresh }) => {
     const { currentUser } = useAuth();
     const fmt = useFormatDate();
     const { rpcAction } = useData();
@@ -227,7 +227,9 @@ const OpAARTab: React.FC<OpAARTabProps> = ({ operation, canManage, isParticipant
         onRefresh();
     };
 
-    const canContribute = isParticipant || canManage;
+    // Not the view's active-only isParticipant: this tab exists only on a concluded op,
+    // where concluding has stamped every row that took part. See canAddAarEntry.
+    const canContribute = canManage || canAddAarEntry(operation, currentUser?.id);
     const inputClass = "w-full bg-black/20 border border-slate-700/50 text-white text-sm rounded-lg px-3 py-2.5 outline-hidden focus:border-purple-500/40 focus:ring-1 focus:ring-purple-500/30 transition-all";
     const labelClass = "text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1.5 block";
 

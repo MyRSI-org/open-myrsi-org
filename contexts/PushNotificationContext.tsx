@@ -4,9 +4,11 @@
 // checkPushSubscription. Consumers: DashboardApp.tsx (PushNotificationBanner)
 // and components/views/personnel/ProfileView.tsx (diagnostics card).
 
-import React, { createContext, use, useCallback, useEffect, useState } from 'react';
+import React, { createContext, use, useCallback, useEffect, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { urlBase64ToUint8Array } from '../utils/pushUtils';
+import { getCurrentPushSubscription } from '../utils/sessionLogout';
+import { useSession } from './SessionContext';
 
 export interface PushNotificationContextValue {
     /** True iff the browser currently has an active push subscription. Polled
@@ -29,6 +31,8 @@ export interface PushNotificationContextValue {
 const PushNotificationContext = createContext<PushNotificationContextValue | null>(null);
 
 export const PushNotificationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    // Mounted inside SessionProvider (contexts/AuthContext.tsx), so the session is readable here.
+    const { currentUser } = useSession();
     const [isPushActive, setIsPushActive] = useState(false);
 
     const checkPushSubscription = useCallback(async () => {
@@ -78,6 +82,30 @@ export const PushNotificationProvider: React.FC<{ children: React.ReactNode }> =
             await checkPushSubscription();
         })();
     }, [checkPushSubscription]);
+
+    // RE-BIND an inherited subscription to whoever is signed in now. Logout drops the
+    // subscription, but a session can also end without a logout — expiry, a force-logout,
+    // a revocation — and the browser keeps its subscription through all of them. Its row
+    // still names the previous member, so the next person on a shared browser received
+    // that member's directives and notifications, and never saw the banner because the
+    // browser already held a subscription. savePushSubscription deletes the old row for
+    // the endpoint before inserting, so this moves it to the current user. Once per user
+    // id per page load; a failure only means the row stays where it was.
+    const reboundForRef = useRef<number | null>(null);
+    useEffect(() => {
+        const userId = currentUser?.id;
+        if (!userId || reboundForRef.current === userId) return;
+        reboundForRef.current = userId;
+        void (async () => {
+            const sub = await getCurrentPushSubscription();
+            if (!sub) return;
+            try {
+                await apiService.rpc('user:subscribe_push', sub.toJSON());
+            } catch (e) {
+                console.warn('[Push] Re-binding the existing subscription failed', e);
+            }
+        })();
+    }, [currentUser?.id]);
 
     const value: PushNotificationContextValue = {
         isPushActive,

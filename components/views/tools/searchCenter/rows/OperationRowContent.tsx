@@ -8,6 +8,7 @@ import {
     timeAgoShort,
 } from '../../../operations/operations/operationStyles';
 import { ACCENTS } from '../../../../shared/ui/accents';
+import { displayRoster } from '../../../operations/participantRoster';
 
 interface Props {
     operation: HydratedOperation;
@@ -22,7 +23,9 @@ const OperationRowContent: React.FC<Props> = ({ operation, onClick, isSelected }
     const clearanceA = (operation.clearanceLevel || 0) > 0
         ? ACCENTS[clearanceAccent(operation.clearanceLevel)]
         : null;
-    const activeParticipants = operation.participants.filter(p => p.timeLeft == null).length;
+    // Concluded ops count everyone who was on the roster at conclusion (concluding stamps
+    // time_left on every row); other ops count active rows only. Same rule as OperationCard.
+    const activeParticipants = displayRoster(operation).length;
     return (
         <SearchResultCard
             accent={accent}

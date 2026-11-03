@@ -271,12 +271,14 @@ export const operationActions = {
         }
         // Special operations are invite-only: their planning content
         // (roe / commander notes / comms plan / tasks / board) is readable only by
-        // the owner, operations:manage holders, and ACTIVE participants — mirrors
-        // the client `hasAccess` gate and canUserSeeOpInList / assertOpVisibleToUser
-        // so list / slice / detail / action gates can't drift. A clearance-0
-        // special op must not be openable by every member.
+        // the owner, operations:manage holders, and participants — current OR
+        // former (a row whose time_left was stamped when the op concluded). The
+        // participation term is the SHARED read predicate hasOpReadParticipation, the
+        // same one canUserSeeOpInList (list/slice), the read form of
+        // assertOpVisibleToUser and the op-board realtime policy apply, so they
+        // cannot drift. A clearance-0 special op must not be openable by every member.
         if (op.isSpecial && !isOwner && !canManage
-            && !op.participants?.some(p => p.userId === user?.id && p.timeLeft == null)) {
+            && !db.hasOpReadParticipation(op.participants, user?.id)) {
             throw new Error('Insufficient access to view this special operation.');
         }
         // Strip the join PIN for anyone but the owner / managers.
@@ -322,7 +324,12 @@ export const operationActions = {
         // author-clearance clamp (assertCanClassify) + current-visibility guard
         // (passesClearance against the live row) — operations:create alone is not a
         // clearance bypass, and the op-owner dispatcher bypass makes this reachable.
-        const result = await db.updateOperationDetails(operationId, updates, userId, user) as unknown as OperationMutationResult | null;
+        //
+        // updateOperationDetails resolves VOID, so the soft-fail markers below need an
+        // object of their own. They used to be Object.assign'ed onto `result || {}` — a
+        // throwaway — so OpAdministerTab's "Saved — Discord event did not sync" warning
+        // could never fire.
+        const result: OperationMutationResult = (await db.updateOperationDetails(operationId, updates, userId, user) as unknown as OperationMutationResult | null | undefined) ?? {};
 
         // Mirror amendments onto the linked Discord scheduled event + announcement
         // embed, if either are linked. Soft dependency: failures surface as a
@@ -358,7 +365,7 @@ export const operationActions = {
                     },
                 );
                 if (!discordResult.ok) {
-                    Object.assign(result || {}, { discordEventFailed: discordResult.error || 'Discord event update failed.' });
+                    Object.assign(result, { discordEventFailed: discordResult.error || 'Discord event update failed.' });
                 }
             }
             // Edit the announcement embed in place when one is linked. Reactions
@@ -374,7 +381,7 @@ export const operationActions = {
                             input,
                         );
                         if (!editResult.ok) {
-                            Object.assign(result || {}, { discordAnnouncementFailed: editResult.error || 'Discord announcement edit failed.' });
+                            Object.assign(result, { discordAnnouncementFailed: editResult.error || 'Discord announcement edit failed.' });
                             if (editResult.gone) {
                                 // The message no longer exists on Discord — clear the stored ID
                                 // so the next "Repost Announcement" click starts fresh.
@@ -386,7 +393,7 @@ export const operationActions = {
                     }
                 } catch (err) {
                     log.error('discord announcement edit failed', { action: 'operation:update', err });
-                    Object.assign(result || {}, { discordAnnouncementFailed: err instanceof Error ? err.message : 'Discord announcement edit failed.' });
+                    Object.assign(result, { discordAnnouncementFailed: err instanceof Error ? err.message : 'Discord announcement edit failed.' });
                 }
             }
         }
@@ -462,7 +469,12 @@ export const operationActions = {
     'operation:update_status': ({ operationId, status, userId }: UpdateStatusPayload) => db.updateOperationStatus(operationId, status, userId),
     // These operations:view-gated sub-resource actions re-apply the per-op
     // clearance predicate (assertOpVisibleToUser) — without it a member could
-    // join/write to ops the list/detail gates hide from them.
+    // join/write to ops the list/detail gates hide from them. Every WRITE calls it
+    // WITHOUT `access`, i.e. the default 'act' term: on a special op the caller must
+    // be an ACTIVE participant (a former participant keeps read access only). Only
+    // the sub-resource READS (get_participant_ships, get_latest_alert,
+    // template:from_operation, template:create's source read) pass { access: 'read' };
+    // tests/opParticipationConsistency.test.ts pins that split per action.
     'operation:join': async ({ operationId, userId, joinCode, user }: JoinPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
         // isJoinAttempt: a first-time joiner isn't yet a participant, so the
         // special-op participation gate must be skipped here — the join PIN
@@ -544,7 +556,8 @@ export const operationActions = {
         // operations:view but insufficient clearance/missing marker read the
         // participant roster + ship loadouts of a hidden op. Use the per-op
         // visibility predicate (clearance level + every marker + owner/manage).
-        await db.assertOpVisibleToUser(operationId, user);
+        // A READ: a former participant may still see it, exactly as get_details.
+        await db.assertOpVisibleToUser(operationId, user, { access: 'read' });
         // Validate that the requested user IDs are actual participants
         const op = await db.getFullOperationDetails(operationId);
         if (!op) throw new Error('Operation not found');
@@ -709,8 +722,11 @@ export const operationActions = {
     },
     'operation:update_board_element': async ({ elementId, data, operationId }: UpdateBoardElementPayload) => {
         await db.verifyOperationAccess(operationId);
-        await db.updateBoardElement(elementId, data, operationId);
-        await db.broadcastBoardUpdate(operationId, elementId, data);
+        // Broadcast what was PERSISTED (updateBoardElement's whitelisted projection),
+        // never the raw payload: the board delta is content on op-board-<id>, and the
+        // rule-4 exception covers only what get_details could read back.
+        const changes = await db.updateBoardElement(elementId, data, operationId);
+        await db.broadcastBoardUpdate(operationId, elementId, changes);
     },
     'operation:delete_board_element': async ({ elementId, operationId }: DeleteBoardElementPayload) => {
         await db.verifyOperationAccess(operationId);
@@ -758,13 +774,20 @@ export const operationActions = {
 
     // Gated alert-content fetch for the operation_alert trigger.
     'operation:get_latest_alert': async ({ operationId, user }: { operationId: string; user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
-        await db.assertOpVisibleToUser(operationId, user);
+        // A READ of op content — the same participation term as get_details.
+        await db.assertOpVisibleToUser(operationId, user, { access: 'read' });
         return db.getLatestOperationAlert(operationId);
     },
 
     // AAR
     'operation:add_aar_entry': async ({ operationId, data, userId, user }: AddAarEntryPayload & { user?: Parameters<typeof db.assertOpVisibleToUser>[1] }) => {
-        await db.assertOpVisibleToUser(operationId, user);
+        // The ONE write that takes the READ term (owner decision, 15.7.1). The AAR exists
+        // only after an op concludes, and concluding stamps time_left on every active row,
+        // so the strict term would leave no one who took part a special op able to
+        // contribute. Former participants already keep read access; adding an entry
+        // reveals nothing new. Clearance and limiting markers still apply. Deleting
+        // entries stays on the strict term (and operations:manage in fullPermissionMap).
+        await db.assertOpVisibleToUser(operationId, user, { access: 'read' });
         const r = await db.addAAREntry(operationId, { ...data, userId });
         await db.broadcastOpChange(operationId);
         return r;
@@ -812,7 +835,12 @@ export const operationActions = {
         // from the client — so the template inherits the op's restriction.
         let clearance: { classificationLevel: number; markerIds: number[] } | undefined;
         if (sourceOperationId) {
-            await db.assertOpVisibleToUser(sourceOperationId, user);
+            // A READ of the SOURCE op (its classification, to stamp the template) —
+            // the write lands on the caller's own template, never on the op. Kept in
+            // step with template:from_operation: refusing a former participant here
+            // while from_operation lets them extract would push them to
+            // template:import, which saves the same plan UNclassified.
+            await db.assertOpVisibleToUser(sourceOperationId, user, { access: 'read' });
             clearance = await db.getOperationClassification(sourceOperationId);
         }
         const tpl = await db.createOperationTemplate(userId, name, description ?? null, payload, clearance);
@@ -842,7 +870,8 @@ export const operationActions = {
         // clearance. operations:create alone is not a clearance/marker check, so
         // a member lacking the op's clearance could otherwise exfiltrate its plan
         // via this path. Gate on the canonical per-op visibility predicate first.
-        await db.assertOpVisibleToUser(operationId, user);
+        // A READ (nothing is persisted): former participants pass, as on get_details.
+        await db.assertOpVisibleToUser(operationId, user, { access: 'read' });
         return db.extractTemplatePayloadFromOperation(operationId);
     },
     // JSON import: client supplies a parsed payload (and optional name/description).

@@ -74,6 +74,12 @@ export default function LedgerRow({ entry, accounts, onApprove, onReject, onReve
                             {entry.memo && <span className="text-slate-400"> · memo: <span className="font-mono text-amber-200/80">{entry.memo}</span></span>}
                         </div>
                         {entry.notes && <div className="text-[11px] text-slate-500 mt-0.5 truncate">{entry.notes}</div>}
+                        {/* Approver-only: the server includes rejectionReason solely for finance:approve holders. */}
+                        {entry.rejectionReason && (
+                            <div className="text-[11px] text-rose-300/80 mt-0.5 truncate" title={entry.rejectionReason}>
+                                <span className="font-bold uppercase tracking-widest text-[10px]">Rejected:</span> {entry.rejectionReason}
+                            </div>
+                        )}
                     </div>
                 </div>
                 <div className="flex items-center gap-4 justify-between sm:justify-end shrink-0">

@@ -16,7 +16,7 @@
  * Dependency-free on purpose: it compiles under both tsconfigs and a test can read it
  * without pulling in the server.
  */
-export const EXPECTED_SCHEMA_VERSION = '15.7.0-open';
+export const EXPECTED_SCHEMA_VERSION = '15.7.1-open';
 
 /**
  * Compare the stamp read from the database against what this build expects.

@@ -234,12 +234,16 @@ export const hrActions = {
         if (payload.reason && payload.reason.length > MAX_TRANSFER_REASON) {
             throw new Error('Reason is too long.');
         }
-        await db.supabase.from('hr_transfer_requests').insert({
+        const { error } = await db.supabase.from('hr_transfer_requests').insert({
             user_id: payload.userId,
             current_unit_id: payload.currentUnitId,
             target_unit_id: payload.targetUnitId,
             reason: stripHtml(payload.reason, MAX_TRANSFER_REASON)
         });
+        // supabase-js RESOLVES a failed insert as `{ error }` rather than throwing, so
+        // an unread error reported success to the member (CreateTransferModal then
+        // files its companion application and closes) with no transfer row stored.
+        if (error) throw new Error('Failed to submit transfer request.');
     },
     'hr:process_transfer': ({ id, status, notes }: ProcessTransferPayload) => db.processTransferRequest(id, status, notes),
     'hr:create_template': (payload: CreateTemplatePayload) => db.createInterviewTemplate(payload),

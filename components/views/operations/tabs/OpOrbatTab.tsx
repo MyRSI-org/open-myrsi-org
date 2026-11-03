@@ -6,6 +6,8 @@ import { useData } from '../../../../contexts/DataContext';
 import OpOrbatNodeGraph from './OpOrbatNodeGraph';
 import OpShipSeatsPanel from './OpShipSeatsPanel';
 import { useNotification } from '../../../../contexts/NotificationContext';
+import { activeRoster, displayRoster, isFormerRow } from '../participantRoster';
+import FormerParticipantBadge from '../FormerParticipantBadge';
 
 interface OpOrbatTabProps {
     operation: HydratedOperation;
@@ -36,10 +38,18 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
     const [color, setColor] = useState('#3b82f6');
     const [saving, setSaving] = useState(false);
 
-    const activeParticipants = useMemo(() => (operation.participants || []).filter(p => p.timeLeft === null), [operation.participants]);
+    // DISPLAY: the roster list and its stats — the whole roster on a concluded op (former
+    // participants marked), otherwise the active rows.
+    const rosterParticipants = useMemo(
+        () => displayRoster({ status: operation.status, participants: operation.participants }),
+        [operation.status, operation.participants],
+    );
+    // ACTION: ORBAT node assignment offers ACTIVE participants only, like every other
+    // assignment control (seats, readiness, live status).
+    const assignableParticipants = useMemo(() => activeRoster({ participants: operation.participants }), [operation.participants]);
 
     const sortedRosterParticipants = useMemo(() => {
-        let list = [...activeParticipants];
+        let list = [...rosterParticipants];
 
         if (rosterSearch.trim()) {
             const term = rosterSearch.toLowerCase();
@@ -59,17 +69,17 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
         });
 
         return list;
-    }, [activeParticipants, rosterSearch, rosterSort, operation.ownerId]);
+    }, [rosterParticipants, rosterSearch, rosterSort, operation.ownerId]);
 
     const rosterStats = useMemo(() => {
-        const ready = activeParticipants.filter(p => p.isReady).length;
-        const total = activeParticipants.length;
-        const accepted = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Accepted).length;
-        const tentative = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Tentative).length;
-        const declined = activeParticipants.filter(p => p.rsvpStatus === RSVPStatus.Declined).length;
-        const pending = activeParticipants.filter(p => !p.rsvpStatus || p.rsvpStatus === RSVPStatus.Pending).length;
+        const ready = rosterParticipants.filter(p => p.isReady).length;
+        const total = rosterParticipants.length;
+        const accepted = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Accepted).length;
+        const tentative = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Tentative).length;
+        const declined = rosterParticipants.filter(p => p.rsvpStatus === RSVPStatus.Declined).length;
+        const pending = rosterParticipants.filter(p => !p.rsvpStatus || p.rsvpStatus === RSVPStatus.Pending).length;
         return { ready, total, accepted, tentative, declined, pending };
-    }, [activeParticipants]);
+    }, [rosterParticipants]);
 
     const openAddForm = (defaultParentId?: number) => {
         setEditingNode(null);
@@ -224,6 +234,7 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
                                             <p className="font-bold text-sm text-white truncate flex items-center gap-1.5">
                                                 {p.user?.name || 'Unknown'}
                                                 {p.userId === operation.ownerId && <i className="fa-solid fa-crown text-[10px] text-amber-400" title="Lead"></i>}
+                                                {isFormerRow(p) && <FormerParticipantBadge />}
                                             </p>
                                             <div className="flex gap-2 items-center flex-wrap">
                                                 <span className="text-[10px] text-slate-400 uppercase tracking-wider">{p.user?.rank?.name || p.user?.role || 'Member'}</span>
@@ -333,7 +344,7 @@ const OpOrbatTab: React.FC<OpOrbatTabProps> = ({ operation, canManage, onRefresh
                                     <label className={labelClass}>Assign Participant</label>
                                     <select value={assignedUserId} onChange={e => setAssignedUserId(e.target.value)} className={`${inputClass} w-full`}>
                                         <option value="">- None -</option>
-                                        {activeParticipants.map(p => <option key={p.userId} value={p.userId}>{p.user?.name}</option>)}
+                                        {assignableParticipants.map(p => <option key={p.userId} value={p.userId}>{p.user?.name}</option>)}
                                     </select>
                                 </div>
                             </div>

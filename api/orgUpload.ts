@@ -9,7 +9,7 @@
 // Public features return a URL to store; private (wiki/government) features return the
 // object key (signed on read).
 
-import { Request, Response } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import { verifyToken, isSessionForceLoggedOut, isSessionRevokedByWatermark } from '../lib/auth.js';
 import { getUserById, getPlatformSettings, isOptionalFeatureEnabled, resolveIsSystemAdminFresh, recordSecurityEvent, findActiveBan } from '../lib/db.js';
 import { getClientIp } from '../lib/clientIp.js';
@@ -110,6 +110,28 @@ function auditUploadDenial(event: string, ctx: {
     } catch (err) {
         log.warn('security event emit threw', { err });
     }
+}
+
+/**
+ * Pre-parse credential check, mounted on the route (server.ts) BETWEEN the per-IP limiter and the
+ * raw body parser. That parser is route middleware: it buffers the whole body — up to
+ * MAX_UPLOAD_BYTES — before the handler below runs its first auth line, so an anonymous caller
+ * could make the server hold a full upload in memory per request just to be told 401.
+ *
+ * Signature + expiry only (pure HMAC, no I/O), deliberately: the full ladder — force-logout,
+ * watermark, ban, maintenance, permission, throttle, module gate — stays in the handler, which
+ * re-verifies the token itself. This only refuses a caller with no valid session before the
+ * body is read. Same 401 body as the handler's, so a client cannot tell which one answered.
+ */
+export function orgUploadPreAuth(req: Request, res: Response, next: NextFunction): void {
+    // DUAL-ACCEPT: cookie preferred, Authorization header still honoured for sessions issued before the cookie existed.
+    const token = credentialFromRequest(req.headers['authorization'], req.headers['cookie'], SESSION_COOKIE_IS_SECURE);
+    if (!token || !verifyToken(token)) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.status(401).json({ message: 'Unauthorized' });
+        return;
+    }
+    next();
 }
 
 export default async function orgUploadHandler(req: Request, res: Response): Promise<void> {

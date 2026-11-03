@@ -6,7 +6,7 @@ import { signToken, signAdminSetupGrant, verifyAdminSetupGrant, signIdentityGran
 import { verifyRsiHandle, generateRsiVerificationCode, isValidRsiHandle } from '../../lib/rsi.js';
 import { stripSensitiveUserFields } from '../../lib/db/userFilters.js';
 import { adminExists } from '../../lib/firstBoot.js';
-import { timingSafeEqual, createHash } from 'node:crypto';
+import { constantTimeEqual } from '../../lib/constantTime.js';
 import { log as baseLog } from '../../lib/log.js';
 import type { User } from '../../types.js';
 
@@ -139,13 +139,9 @@ interface OrgClaimPayload {
 const CLAIM_MAX_ATTEMPTS = 10;
 
 // Constant-time string compare for the setup code — avoids a timing
-// side-channel on the `===` compare. Hashing first makes it length-independent
-// (timingSafeEqual requires equal-length buffers).
-export function constantTimeEqual(a: string, b: string): boolean {
-    const ha = createHash('sha256').update(a).digest();
-    const hb = createHash('sha256').update(b).digest();
-    return timingSafeEqual(ha, hb);
-}
+// side-channel on the `===` compare. Moved to lib/constantTime.ts so the db layer
+// can share it for the join PIN; re-exported here so existing importers keep working.
+export { constantTimeEqual };
 
 /** Validate the single-org admin setup code against the DB, enforcing rate limits.
  *  On success the code is deleted (single-use). The code is printed to the server

@@ -7,6 +7,7 @@ import { useConfig } from '../../../../contexts/ConfigContext';
 import { useOperations } from '../../../../contexts/OperationsContext';
 
 import { toLocalDatetimeValue, formatOpDateTimeWithZone } from '../../../../lib/time';
+import { validateJoinPin, JOIN_PIN_MIN_LENGTH, JOIN_PIN_MAX_LENGTH } from '../../../../lib/joinPinPolicy';
 import { useNotification } from '../../../../contexts/NotificationContext';
 
 interface OpAdministerTabProps {
@@ -199,6 +200,17 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
 
     const handleSave = async () => {
         if (!editName.trim()) return;
+        // Mirror of the server's join-PIN rule (lib/db/ops.ts updateOperationDetails),
+        // here only so the operator gets the reason instead of the generic failure
+        // toast: a PIN is checked when it is CHANGED or the op is being made Special. An
+        // unchanged legacy short PIN is re-sent on every save and still saves.
+        if (editIsSpecial && (!operation.isSpecial || editJoinCode.trim() !== (operation.joinCode || '').trim())) {
+            const pin = validateJoinPin(editJoinCode);
+            if (!pin.ok) {
+                addToast("Invalid Join PIN", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: pin.error });
+                return;
+            }
+        }
         setSaving(true);
         try {
             const result: any = await updateOperationDetails(operation.id, {
@@ -234,7 +246,13 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
             onRefresh();
         } catch (err) {
             console.error("Failed to update:", err);
-            addToast("Update Failed", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: "Failed to update operation settings." });
+            // Show the server's own message when there is one: some carry the operator's
+            // fix ("Database update required — re-run schema.sql …") and the generic text
+            // hid it. Server messages are already sanitised (handleSupabaseError). Only a
+            // non-empty STRING message is rendered — never an object.
+            const message = (err as { message?: unknown } | null | undefined)?.message;
+            const serverMessage = typeof message === 'string' ? message.trim() : '';
+            addToast("Update Failed", <i className="fa-solid fa-xmark"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: serverMessage || "Failed to update operation settings." });
         } finally {
             setSaving(false);
         }
@@ -414,7 +432,8 @@ const OpAdministerTab: React.FC<OpAdministerTabProps> = ({ operation, canManage,
                             {editIsSpecial && (
                                 <div>
                                     <label className={labelClass}>Join Code / PIN</label>
-                                    <input type="text" value={editJoinCode} onChange={e => setEditJoinCode(e.target.value)} placeholder="Enter access code..."
+                                    <input type="text" value={editJoinCode} onChange={e => setEditJoinCode(e.target.value)} placeholder={`At least ${JOIN_PIN_MIN_LENGTH} characters`}
+                                        maxLength={JOIN_PIN_MAX_LENGTH}
                                         className={`${inputClass} max-w-xs font-mono tracking-widest`} />
                                 </div>
                             )}

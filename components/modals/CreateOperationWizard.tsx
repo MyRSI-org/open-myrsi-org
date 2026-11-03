@@ -4,6 +4,7 @@ import {
     OperationTemplatePayload, OperationTemplatePhase, OperationTemplateMilestone, OperationTemplateTask,
 } from '../../types';
 import { isSyncRestrictedWithheld } from '../../lib/markerSyncVisibility';
+import { validateJoinPin, JOIN_PIN_MIN_LENGTH, JOIN_PIN_MAX_LENGTH } from '../../lib/joinPinPolicy';
 import { useData } from '../../contexts/DataContext';
 import { useMembers } from '../../contexts/MembersContext';
 import { useConfig } from '../../contexts/ConfigContext';
@@ -272,7 +273,12 @@ const CreateOperationWizard: React.FC<CreateOperationWizardProps> = ({ isOpen, o
         };
         if (!state.name.trim()) v.basics = 'Operation name is required.';
         else if (!state.description.trim()) v.basics = 'Briefing description is required.';
-        else if (state.isSpecial && !state.joinCode.trim()) v.basics = 'Special Operations require a Join Code/PIN.';
+        else if (state.isSpecial) {
+            // Same policy the server enforces (lib/joinPinPolicy.ts); this copy only
+            // saves the round-trip.
+            const pin = validateJoinPin(state.joinCode);
+            if (!pin.ok) v.basics = pin.error;
+        }
 
         if (state.isScheduled && !state.scheduledStart) v.security = 'Scheduled operations require a start time.';
         if (state.createDiscordEvent && (!state.scheduledStart || !state.scheduledEnd)) v.security = 'Discord events need a start AND end time.';
@@ -534,7 +540,8 @@ const BasicsStep: React.FC<{
             <div className="bg-amber-950/20 p-3 rounded-lg border border-amber-500/20 animate-fade-in">
                 <label className="block text-[10px] font-black text-amber-300 uppercase tracking-widest mb-2">Access PIN Code</label>
                 <input type="text" value={state.joinCode} onChange={e => dispatch({ type: 'set', key: 'joinCode', value: e.target.value })}
-                    placeholder="e.g. 1234"
+                    placeholder={`At least ${JOIN_PIN_MIN_LENGTH} characters`}
+                    minLength={JOIN_PIN_MIN_LENGTH} maxLength={JOIN_PIN_MAX_LENGTH}
                     className="w-full bg-slate-950/50 border border-amber-500/30 rounded-lg p-2 text-white font-mono text-center tracking-widest outline-hidden focus:ring-1 focus:ring-amber-500"
                     required disabled={disabled} />
             </div>

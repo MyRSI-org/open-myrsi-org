@@ -102,18 +102,27 @@ export default async function handler(req: Request, res: Response) {
 
         let html = getIndexHtml();
 
+        // Every replace below whose replacement carries operator/DB text uses a
+        // FUNCTION replacer. A string replacement is a template: `$'`, `$\``, `$&`
+        // and `$1` expand to slices of the document, and escapeHtml /
+        // escapeJsonForScript leave `$` and backtick alone (escapeHtml even turns
+        // `$'` into `$&#39;`, i.e. a `$&`). A login-screen notice could otherwise
+        // splice document HTML — `</script>` included — into the inline boot script
+        // served to every anonymous visitor. A function's return value is inserted
+        // verbatim.
+
         // Inject metadata via regex replacement.
         const replaceTag = (htmlContent: string, tagType: string, attrName: string, attrValue: string, contentValue: string) => {
             const regex = new RegExp(`<${tagType}[^>]*${attrName}=["']${attrValue}["'][^>]*>`, 'i');
             const replacement = `<${tagType} ${attrName}="${attrValue}" content="${escapeHtml(contentValue)}" />`;
 
             if (regex.test(htmlContent)) {
-                return htmlContent.replace(regex, replacement);
+                return htmlContent.replace(regex, () => replacement);
             }
-            return htmlContent.replace('</head>', `${replacement}\n</head>`);
+            return htmlContent.replace('</head>', () => `${replacement}\n</head>`);
         };
 
-        html = html.replace(/<title>.*?<\/title>/i, `<title>${escapeHtml(title)}</title>`);
+        html = html.replace(/<title>.*?<\/title>/i, () => `<title>${escapeHtml(title)}</title>`);
 
         html = replaceTag(html, 'meta', 'name', 'description', description);
         html = replaceTag(html, 'meta', 'name', 'theme-color', themeColor);
@@ -150,7 +159,7 @@ export default async function handler(req: Request, res: Response) {
             <link rel="icon" href="${safeLinkIconUrl}">
             <link rel="apple-touch-icon" href="${safeLinkIconUrl}">
         `;
-        html = html.replace('</head>', `${headLinks}\n</head>`);
+        html = html.replace('</head>', () => `${headLinks}\n</head>`);
 
         // Per-org accent theme: an UNLAYERED :root override of the sky ramp beats the
         // @layer theme defaults regardless of source order, re-tinting the app before
@@ -158,7 +167,7 @@ export default async function handler(req: Request, res: Response) {
         // RE-VALIDATED accent hex — no attacker-controlled string reaches this CSS context.
         const orgThemeCss = orgAccent ? accentRampCss(orgAccent) : null;
         if (orgThemeCss) {
-            html = html.replace('</head>', `<style id="__org_theme__">:root{${orgThemeCss}}</style>\n</head>`);
+            html = html.replace('</head>', () => `<style id="__org_theme__">:root{${orgThemeCss}}</style>\n</head>`);
         }
 
         // Inject a pre-rendered boot splash so the browser paints a branded
@@ -276,12 +285,12 @@ export default async function handler(req: Request, res: Response) {
     </div>
     <p style="margin-top:1.5rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-align:center">First time visits may take a moment.</p>
   </div>
-  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.7.0-open</div>
+  <div style="position:absolute;bottom:2rem;font-size:0.625rem;color:#475569;font-family:ui-monospace,monospace;text-transform:uppercase;letter-spacing:0.3em;text-align:center;padding:0 1rem">${safeName} // Termlink v15.7.1-open</div>
   <style>@keyframes __bsSweep{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}@keyframes __bsPulse{0%,100%{opacity:1}50%{opacity:0.5}}</style>
 </div>
 <script>(function(){var i=document.getElementById('__bs_icon__');if(i){i.onerror=function(){this.style.display='none';};}})();window.__BRANDING__=${safeBrandingJson};window.__SETUP_COMPLETED__=${setupCompletedFlag}${publicPageScript}</script>`;
 
-            html = html.replace('<div id="root"></div>', `<div id="root"></div>${splashHtml}`);
+            html = html.replace('<div id="root"></div>', () => `<div id="root"></div>${splashHtml}`);
         }
 
         // Stamp the per-request CSP nonce (set by server.ts) onto every <script>
@@ -290,7 +299,7 @@ export default async function handler(req: Request, res: Response) {
         // harmless. style="" needs no nonce (style-src is still 'unsafe-inline').
         const cspNonce: string = res.locals.cspNonce || '';
         if (cspNonce) {
-            html = html.replace(/<script/g, `<script nonce="${cspNonce}"`);
+            html = html.replace(/<script/g, () => `<script nonce="${cspNonce}"`);
         }
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');

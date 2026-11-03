@@ -25,6 +25,7 @@ import { useOpRadio } from '../../../hooks/useOpRadio';
 import { useRadio } from '../../../contexts/RadioContext';
 import CallsignChip from '../../shared/ui/CallsignChip';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { displayRoster, isActiveParticipant, isOnRoster } from './participantRoster';
 
 const getTypeStyles = (type: OperationType) => {
     switch (type) {
@@ -320,25 +321,27 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
     const [isManageParticipantModalOpen, setIsManageParticipantModalOpen] = useState(false);
     const [editingParticipant, setEditingParticipant] = useState<any | null>(null);
 
-    // Stable join-key for the active participant set so this effect doesn't
-    // re-fetch every time a realtime tick rebuilds the participants array reference.
-    const activeParticipantIdsKey = useMemo(() => {
-        return (operation.participants || [])
-            .filter(p => p.timeLeft === null)
+    // Stable join-key for the displayed roster so this effect doesn't re-fetch every
+    // time a realtime tick rebuilds the participants array reference. The displayed
+    // roster, not the active one: on a concluded op every row is stamped, and the
+    // server's read path for operation:get_participant_ships accepts former
+    // participants, so their ships still resolve.
+    const rosterParticipantIdsKey = useMemo(() => {
+        return displayRoster({ status: operation.status, participants: operation.participants })
             .map(p => p.userId)
             .sort((a, b) => a - b)
             .join(',');
-    }, [operation.participants]);
+    }, [operation.status, operation.participants]);
 
     useEffect(() => {
         // Not gated on organizationId (always undefined in single-org), which would block the allied-ship fetch.
         if (!operation.isJoint) return;
-        if (!activeParticipantIdsKey) return;
-        const alliedUserIds = activeParticipantIdsKey.split(',').map(Number);
+        if (!rosterParticipantIdsKey) return;
+        const alliedUserIds = rosterParticipantIdsKey.split(',').map(Number);
         rpcAction('operation:get_participant_ships', { operationId: operation.id, userIds: alliedUserIds })
             .then((data: any) => { if (Array.isArray(data)) setAlliedShips(data); })
             .catch(() => {});
-    }, [operation.isJoint, operation.id, activeParticipantIdsKey, rpcAction]);
+    }, [operation.isJoint, operation.id, rosterParticipantIdsKey, rpcAction]);
 
     useEffect(() => {
         if (!isFetching && operations.length > 0 && !operations.find(op => op.id === initialOperation.id)) {
@@ -351,9 +354,19 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
     const typeStyles = getTypeStyles(operation.type);
     const isOwner = currentUser?.id === operation.ownerId;
     const canManage = isOwner || hasPermission('operations:manage');
-    const isParticipant = operation.participants?.some(p => p.userId === currentUser?.id && p.timeLeft === null) ?? false;
-    const hasAccess = !operation.isSpecial || isParticipant || canManage;
-    const activeParticipants = (operation.participants || []).filter(p => p.timeLeft === null);
+    // ACT term — an active row. Gates every participant action this view hands down
+    // (ready, RSVP, withdraw, live status). A former participant is NOT a participant
+    // for actions. The AAR tab, which exists only once the op has concluded, uses its
+    // own term instead (canAddAarEntry).
+    const isParticipant = isActiveParticipant(operation, currentUser?.id);
+    // READ term — any roster row, current or former. Mirrors the server's
+    // hasOpReadParticipation (owner-approved: a former participant of a special op keeps
+    // read access). Using the ACT term here showed a former participant the
+    // Restricted Access screen over a detail the server had already sent them.
+    const hasAccess = !operation.isSpecial || isOnRoster(operation, currentUser?.id) || canManage;
+    // What the Situation tab lists and counts: the whole roster on a concluded op,
+    // otherwise the active rows.
+    const rosterParticipants = displayRoster(operation);
     const currentPhaseIdx = PHASE_STEPS.findIndex(p => p.key === operation.status);
 
     const handleAction = async (action: () => Promise<void>, actionName: string) => {
@@ -685,7 +698,7 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
                                 operation={operation}
                                 canManage={canManage}
                                 isParticipant={isParticipant}
-                                activeParticipants={activeParticipants}
+                                rosterParticipants={rosterParticipants}
                                 onRefresh={refreshDetails}
                                 loadingAction={loadingAction}
                                 onAction={handleAction}
@@ -742,7 +755,7 @@ const OperationDetailView: React.FC<OperationDetailViewProps> = ({ operation: in
                     )}
                     {activeSection === 'aar' && operation.status === OperationStatus.Concluded && (
                         <div key="aar" className="animate-fade-in">
-                            <OpAARTab operation={operation} canManage={canManage} isParticipant={isParticipant} onRefresh={refreshDetails} />
+                            <OpAARTab operation={operation} canManage={canManage} onRefresh={refreshDetails} />
                         </div>
                     )}
                 </div>

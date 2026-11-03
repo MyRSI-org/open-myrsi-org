@@ -7,6 +7,7 @@ import WindowFrame from '../../layout/WindowFrame';
 import WikiEditor from '../wiki/WikiEditor';
 import { GovernmentMotion, MotionStatus } from '../../../types';
 import { useNotification } from '../../../contexts/NotificationContext';
+import { classifyVoteFailure } from './governmentUiRules';
 
 const statusColors: Record<string, string> = {
     Open: 'bg-amber-500/10 text-amber-400',
@@ -24,6 +25,11 @@ const MotionsTab: React.FC = () => {
 
     const [showCreateModal, setShowCreateModal] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
+    // Motions this member has a stored ballot on, from THIS session: the government
+    // subset carries no per-viewer hasVoted, so without this the vote buttons came back
+    // after every vote and a second click could only answer "already voted". The value
+    // is the vote when known ('' when not, e.g. the server reported an earlier ballot).
+    const [votedHere, setVotedHere] = useState<Record<number, string>>({});
 
     // Create form
     const [formTitle, setFormTitle] = useState('');
@@ -75,9 +81,23 @@ const MotionsTab: React.FC = () => {
         setIsLoading(true);
         try {
             await rpcAction('gov:cast_motion_vote', { motionId, vote });
+            setVotedHere(prev => ({ ...prev, [motionId]: vote }));
             addToast('Vote Cast', <i className="fa-solid fa-check" />, 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50');
             await refreshGovernment();
-        } catch (err: any) { addToast('Vote Failed', <i className="fa-solid fa-circle-exclamation" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: err.message || 'Failed to cast vote.' }); }
+        } catch (err: any) {
+            const message: string = err?.message || 'Failed to cast vote.';
+            const failure = classifyVoteFailure(message);
+            if (failure === 'failed') {
+                addToast('Vote Failed', <i className="fa-solid fa-circle-exclamation" />, 'bg-red-500/10 text-red-400 border-red-500/50', { description: message });
+            } else {
+                // The ballot IS stored (only the tally refresh failed, or an earlier attempt
+                // already counted). Show the server's words as-is, stop offering the vote —
+                // a retry only answers "already voted" — and refetch the domain.
+                setVotedHere(prev => ({ ...prev, [motionId]: failure === 'recorded' ? vote : '' }));
+                addToast(failure === 'recorded' ? 'Vote Recorded' : 'Already Voted', <i className="fa-solid fa-triangle-exclamation" />, 'bg-amber-500/10 text-amber-400 border-amber-500/50', { description: message });
+                await refreshGovernment();
+            }
+        }
         finally { setIsLoading(false); }
     };
 
@@ -112,6 +132,8 @@ const MotionsTab: React.FC = () => {
     const renderMotionCard = (motion: GovernmentMotion) => {
         const total = motion.votesFor + motion.votesAgainst + motion.votesAbstain;
         const isVoting = motion.status === MotionStatus.Voting;
+        const hasVoted = !!motion.hasVoted || motion.id in votedHere;
+        const myVote = motion.myVote || votedHere[motion.id];
 
         return (
             <div key={motion.id} className="bg-slate-800/40 border border-slate-700/50 rounded-lg p-4">
@@ -156,7 +178,7 @@ const MotionsTab: React.FC = () => {
                 )}
 
                 {/* Quick vote */}
-                {isVoting && canParticipate && !motion.hasVoted && (
+                {isVoting && canParticipate && !hasVoted && (
                     <div className="flex gap-1.5">
                         <button onClick={() => handleCastVote(motion.id, 'for')} disabled={isLoading} className="flex-1 py-1.5 text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded-sm hover:bg-emerald-500/20 transition-colors disabled:opacity-40">For</button>
                         <button onClick={() => handleCastVote(motion.id, 'against')} disabled={isLoading} className="flex-1 py-1.5 text-[10px] font-bold text-red-400 bg-red-500/10 border border-red-500/20 rounded-sm hover:bg-red-500/20 transition-colors disabled:opacity-40">Against</button>
@@ -164,9 +186,9 @@ const MotionsTab: React.FC = () => {
                     </div>
                 )}
 
-                {isVoting && motion.hasVoted && (
+                {isVoting && hasVoted && (
                     <p className="text-[10px] text-emerald-400"><i className="fa-solid fa-check mr-0.5"></i>
-                        Voted{motion.myVote && !motion.isSecretBallot ? ` "${motion.myVote}"` : ''}
+                        Voted{myVote && !motion.isSecretBallot ? ` "${myVote}"` : ''}
                     </p>
                 )}
 

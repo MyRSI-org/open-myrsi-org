@@ -60,7 +60,7 @@ Everything updates live across clients via Supabase Realtime. Modules like Acade
 > The full walkthrough — Supabase project, Discord app, environment variables, reverse proxy — lives in [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md).
 
 1. **Database** — in the Supabase SQL Editor, optionally run `reset_db.sql`, then run `schema.sql` (the consolidated single-org schema).
-2. **Configure** — copy `.env.example` to `.env` and fill in your Supabase URL + service-role key, `JWT_SECRET`, `SECRETS_ENCRYPTION_KEY`, and Discord credentials (LiveKit / Gemini / UEX keys are optional).
+2. **Configure** — copy `.env.example` to `.env` and fill in your Supabase URL, service-role key and publishable (anon) key, `JWT_SECRET`, `SECRETS_ENCRYPTION_KEY`, and Discord credentials (LiveKit / Gemini / UEX keys are optional). Generate `JWT_SECRET` and `SECRETS_ENCRYPTION_KEY` with `openssl rand -hex 32`, one each. In production the server refuses to start if `SECRETS_ENCRYPTION_KEY` is under 32 characters, if `JWT_SECRET` is under 16 characters or copies the publishable/anon or VAPID public key (both are sent to every visitor), or if the anon key is actually a secret key; a weaker-than-recommended `JWT_SECRET` otherwise starts with a warning (see the deployment guide).
 3. **Install & build**
    ```bash
    npm install

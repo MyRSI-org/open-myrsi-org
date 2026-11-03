@@ -35,6 +35,7 @@ const h = vi.hoisted(() => ({
     permissions: [] as Array<{ id: number; name: string }>,
     users: {} as Record<number, { id: number; role_id: number }>,
     writes: [] as Array<{ table: string; op: string; payload: unknown; filters: Record<string, unknown> }>,
+    rpcs: [] as Array<{ fn: string; args: unknown }>,
 }));
 
 const PERM_ID = (name: string): number => {
@@ -106,7 +107,10 @@ vi.mock('../lib/db/common', () => {
         return b;
     }
     return {
-        supabase: { from: (t: string) => builder(t), rpc: () => Promise.resolve({ data: null, error: null }) },
+        supabase: {
+            from: (t: string) => builder(t),
+            rpc: (fn: string, args: unknown) => { h.rpcs.push({ fn, args }); return Promise.resolve({ data: null, error: null }); },
+        },
         handleSupabaseError: ({ error, message }: { error: unknown; message: string }) => { if (error) throw new Error(message); },
         broadcastToOrg: () => {},
         broadcastToChannel: () => {},
@@ -131,6 +135,9 @@ const updateRankMapping = (adminActions as unknown as Record<string, Handler>)['
 const ADMIN = { id: 1, roleId: 4, role: 'Admin', permissions: ['admin:access', 'admin:config:roles', 'admin:config:discord', 'admin:user:update_role'] };
 
 const writesTo = (table: string) => h.writes.filter((w) => w.table === table);
+// The role-permission replace is ONE atomic RPC now (schema.sql set_role_permissions),
+// so "no write" must also mean "no replace RPC".
+const roleReplaces = () => h.rpcs.filter((r) => r.fn === 'set_role_permissions');
 
 beforeEach(() => {
     h.systemRoles = {
@@ -155,6 +162,7 @@ beforeEach(() => {
     h.deleteError = null;
     h.users = {};
     h.writes = [];
+    h.rpcs = [];
 });
 
 // ---------------------------------------------------------------------------
@@ -198,12 +206,14 @@ describe('admin:update_role_permissions', () => {
         await expect(updateRolePerms({ roleId: 1, permissionNames: ['admin:access'], user: ADMIN }))
             .rejects.toThrow('The Client role is locked. Its permissions cannot be modified.');
         expect(writesTo('role_permissions')).toEqual([]);
+        expect(roleReplaces()).toEqual([]);
     });
 
     it('refuses a STRING Client id — the old compare let `{ roleId: "1" }` through', async () => {
         await expect(updateRolePerms({ roleId: '1', permissionNames: ['admin:access'], user: ADMIN }))
             .rejects.toThrow(/Client role is locked/);
         expect(writesTo('role_permissions')).toEqual([]);
+        expect(roleReplaces()).toEqual([]);
     });
 
     // The single most important assertion in this file: on a getSystemRoles read
@@ -215,13 +225,14 @@ describe('admin:update_role_permissions', () => {
         await expect(updateRolePerms({ roleId: 1, permissionNames: ['admin:access'], user: ADMIN }))
             .rejects.toThrow(/Repair Database/);
         expect(writesTo('role_permissions')).toEqual([]);
+        expect(roleReplaces()).toEqual([]);
     });
 
-    it('KEEP — an Admin still rewrites the Dispatcher role, and the write lands', async () => {
+    it('KEEP — an Admin still rewrites the Dispatcher role, and the write lands (one atomic replace)', async () => {
         await expect(updateRolePerms({ roleId: 3, permissionNames: ['request:dispatch'], user: ADMIN })).resolves.toBeUndefined();
-        const rp = writesTo('role_permissions');
-        expect(rp.some((w) => w.op === 'delete' && Number(w.filters.role_id) === 3)).toBe(true);
-        expect(rp.some((w) => w.op === 'insert')).toBe(true);
+        expect(roleReplaces()).toEqual([{ fn: 'set_role_permissions', args: { p_role_id: 3, p_permission_ids: [41] } }]);
+        // Never the old non-atomic delete-then-insert from Node.
+        expect(writesTo('role_permissions')).toEqual([]);
     });
 });
 

@@ -288,15 +288,25 @@ export interface WarehouseCatalogInput {
     description?: string | null;
 }
 
+// Single-line warehouse text — commodity name, quality label, unit, stock notes —
+// is exported cell-for-cell by exportWarehouseCsv, and a raw CR/LF there is a
+// spreadsheet ROW break: 'x\r=HYPERLINK(...)' put a live formula at the start of
+// a new row, past the export's leading-character neutraliser. Collapse line
+// breaks at write time instead of trusting every consumer to quote correctly.
+// (The catalog CSV import already gets this from stripHtmlSingleLine.)
+function singleLine(value: string | null | undefined): string {
+    return (value ?? '').replace(/[\r\n]+/g, ' ').trim();
+}
+
 export async function createWarehouseCatalogItem(input: WarehouseCatalogInput): Promise<WarehouseCatalogItem> {
-    const name = (input.name || '').trim();
+    const name = singleLine(input.name);
     if (!name) throw new Error('Commodity name is required.');
     const { data, error } = await supabase.from('warehouse_catalog')
         .insert({
             name,
             category: input.category,
-            quality_label: input.qualityLabel?.trim() || null,
-            unit: (input.unit || 'units').trim() || 'units',
+            quality_label: singleLine(input.qualityLabel) || null,
+            unit: singleLine(input.unit || 'units') || 'units',
             description: input.description?.trim() || null,
         })
         .select('id, name, category, quality_label, unit, description, archived_at, created_at, updated_at')
@@ -313,10 +323,10 @@ export interface WarehouseCatalogUpdateInput extends Partial<WarehouseCatalogInp
 
 export async function updateWarehouseCatalogItem(input: WarehouseCatalogUpdateInput): Promise<WarehouseCatalogItem> {
     const patch: Partial<Tables<'warehouse_catalog'>> = { updated_at: new Date().toISOString() };
-    if (input.name !== undefined) patch.name = input.name.trim();
+    if (input.name !== undefined) patch.name = singleLine(input.name);
     if (input.category !== undefined) patch.category = input.category;
-    if (input.qualityLabel !== undefined) patch.quality_label = input.qualityLabel?.trim() || null;
-    if (input.unit !== undefined) patch.unit = (input.unit || 'units').trim() || 'units';
+    if (input.qualityLabel !== undefined) patch.quality_label = singleLine(input.qualityLabel) || null;
+    if (input.unit !== undefined) patch.unit = singleLine(input.unit || 'units') || 'units';
     if (input.description !== undefined) patch.description = input.description?.trim() || null;
     const { data, error } = await supabase.from('warehouse_catalog')
         .update(patch)
@@ -855,14 +865,14 @@ async function ensureCatalogFromPlatformCommodity(
 
 export async function createWarehouseStock(input: WarehouseStockInput): Promise<WarehouseStock> {
     const catalogId = input.source === 'platform'
-        ? await ensureCatalogFromPlatformCommodity(input.catalogId, input.qualityLabel?.trim() || null)
+        ? await ensureCatalogFromPlatformCommodity(input.catalogId, singleLine(input.qualityLabel) || null)
         : input.catalogId;
 
     const { data, error } = await supabase.from('warehouse_stock')
         .insert({
             catalog_id: catalogId,
             location_id: input.locationId,
-            notes: input.notes?.trim() || null,
+            notes: singleLine(input.notes) || null,
         })
         .select(`
             id, catalog_id, location_id, notes, created_at, updated_at,
@@ -1345,13 +1355,16 @@ export interface WarehouseStockExportPage {
 // Excel/LibreOffice/Sheets, so an operator who merely opens the export executes
 // the payload. The warehouse stock export ships operator-controlled
 // commodity/quality/category/unit/location/notes to the client, which assembles
-// the CSV (WhStockTab.handleStartCsvExport), so neutralize at this output
+// the CSV (components/views/warehouse/stockCsv.ts), so neutralize at this output
 // boundary by prefixing a literal-text apostrophe (mirrors the formula branch of
 // lib/db/finances.csvEscape). We deliberately prepend ONLY the marker here and
 // do NOT RFC-4180 quote-wrap — the client assembler already quote-wraps, so
 // wrapping here would double-wrap benign delimiter-bearing values.
+// The trigger is also caught BEHIND leading whitespace (' =cmd', '\n=cmd'):
+// importers that trim a cell before evaluating it would otherwise see a bare
+// formula. Rows stored before singleLine() existed can still carry such values.
 function neutralizeCsvFormula(value: string): string {
-    return /^[=+\-@\t\r]/.test(value) ? "'" + value : value;
+    return /^(?:[\t\r]|\s*[=+\-@])/.test(value) ? "'" + value : value;
 }
 
 // Stock CSV export, paginated. Returns raw row objects so the client can
@@ -1416,9 +1429,12 @@ export async function updatePlatformCommodityCategory(id: number, patch: Partial
 }
 
 export async function deletePlatformCommodityCategory(id: number) {
-    const { count } = await supabase.from('warehouse_platform_commodities')
+    const { count, error: countErr } = await supabase.from('warehouse_platform_commodities')
         .select('id', { count: 'exact', head: true })
         .eq('platform_category_id', id);
+    // Fail closed: an unread count is not "no references". The FK is ON DELETE SET
+    // NULL, so deleting anyway would silently unlink every commodity in the category.
+    handleSupabaseError({ error: countErr, message: 'Failed to check warehouse platform category usage' });
     if (count && count > 0) {
         throw new Error(`Cannot delete: ${count} commodity row(s) reference this category. Reassign first.`);
     }
@@ -1500,7 +1516,11 @@ export async function syncPlatformCommodityCatalog() {
         if (slug && !distinctKinds.has(slug)) distinctKinds.set(slug, c.kind);
     }
 
-    const { data: existingCats } = await supabase.from('warehouse_platform_categories').select('id, slug, display_name');
+    const { data: existingCats, error: existingCatsErr } = await supabase.from('warehouse_platform_categories').select('id, slug, display_name');
+    // Fail closed BEFORE any write. Without the existing map every category insert
+    // trips UNIQUE(slug), nothing lands in catFkLookup, and pass 2 then upserts
+    // platform_category_id = NULL onto every commodity — wiping all assignments.
+    handleSupabaseError({ error: existingCatsErr, message: 'Failed to load warehouse platform categories for sync' });
     const existingBySlug = new Map<string, { id: number; display_name: string }>();
     for (const r of (existingCats || [])) {
         existingBySlug.set(r.slug, { id: r.id, display_name: r.display_name });

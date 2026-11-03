@@ -37,6 +37,7 @@ import { useDataCore } from './DataCoreContext';
 import { useRequests } from './RequestsContext';
 import { useUI } from './UIContext';
 import { getSupabase } from '../lib/supabaseClient';
+import { endServerSession, getCurrentPushSubscription } from '../utils/sessionLogout';
 import {
     formatUserDateTime,
     formatUserDate,
@@ -901,16 +902,25 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }, [discordConfig, addToast, beginOAuth]);
 
     const logout = useCallback(async () => {
-        // Tell the server to end this session (so a stolen token stops working), then
-        // clear locally. Best-effort: always clear the local session even if the call
-        // fails (offline, or before the database column for it exists).
-        try { await apiService.rpc('user:logout', {}); } catch { /* fall through to local clear */ }
+        // Tell the server to end this session (so a stolen token stops working, and so the
+        // HttpOnly cookie is cleared — nothing on this side can remove it), and drop this
+        // browser's push subscription. Only clear locally once the server has confirmed:
+        // clearing on a failed call showed a logout, landed on `/`, and boot signed the
+        // member straight back in on the surviving cookie. See endServerSession.
+        const outcome = await endServerSession({
+            rpc: (action, payload) => apiService.rpc(action, payload),
+            getPushSubscription: getCurrentPushSubscription,
+        });
+        if (outcome === 'failed') {
+            addToast("Sign-out Failed", <i className="fa-solid fa-triangle-exclamation"></i>, "bg-red-500/10 text-red-400 border-red-500/50", { description: "Your session could not be ended, so you are still signed in. Check your connection and try again in a moment." });
+            return;
+        }
         localStorage.removeItem('myrsi_auth_token');
         setCurrentUser(null);
         setNeedsSetup(false);
         setPendingUser(null);
         window.location.href = '/';
-    }, []);
+    }, [addToast]);
 
     const handleNewUserSetup = useCallback(async (rsiHandle: string, verificationCode?: string, skipVerification?: boolean) => {
         if (!pendingUser) return;
