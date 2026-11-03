@@ -547,7 +547,7 @@ describe('listIntelReports', () => {
         fake.queue('intel_reports', { data: [] });
         await listIntelReports({ cursor: c });
         expect(hasCall(fake.find('intel_reports')[0], 'or', `created_at.lt.2026-10-02T00:00:00Z,and(created_at.eq.2026-10-02T00:00:00Z,id.lt.${UUID})`)).toBe(true);
-        const lower = UUID.replace(/^0/, '0').replace('0b8a', '0a00');
+        const lower = UUID.replace('0b8a', '0a00');
         fake.queue('intel_reports', { data: [
             reportRow({ id: UUID, created_at: '2026-10-02T00:00:00Z' }),            // boundary → dropped
             reportRow({ id: lower, created_at: '2026-10-02T00:00:00Z' }),            // same ts, lower id → kept
