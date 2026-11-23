@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: '24'
           # Without it setup-node takes the runner's cached 24.x (24.21.0 on 2026-10-18), below
-          # the engines floor of 24.22.1, the Node 24 security release. npm only warns on that.
+          # the engines floor of 24.22.3, the Node 24 security release. npm only warns on that.
           check-latest: true
           cache: 'npm'
 
@@ -67,7 +67,7 @@ jobs:
         with:
           node-version: '24'
           # Without it setup-node takes the runner's cached 24.x (24.21.0 on 2026-10-18), below
-          # the engines floor of 24.22.1, the Node 24 security release. npm only warns on that.
+          # the engines floor of 24.22.3, the Node 24 security release. npm only warns on that.
           check-latest: true
           cache: 'npm'
 
